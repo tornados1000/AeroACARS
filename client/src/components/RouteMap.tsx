@@ -72,6 +72,7 @@ export function RouteMap({ dptIcao, arrIcao, currentLat, currentLon }: Props) {
   // Track padding (matches CSS) — the pins sit `--track-padding` from
   // each end, the plane / fill use the same offsets.
   const trackProgressPct = progress * 100;
+  const progressLabel = `${Math.round(progress * 100)}%`;
 
   return (
     <div className="route-map">
@@ -97,12 +98,26 @@ export function RouteMap({ dptIcao, arrIcao, currentLat, currentLon }: Props) {
           style={{ left: `${trackProgressPct}%` }}
           aria-hidden="true"
         >
-          <svg viewBox="0 0 24 24" width="20" height="20">
+          {/* Rotate the plane glyph 90° so the nose points along the
+              track toward the arrival pin instead of straight up. */}
+          <svg
+            viewBox="0 0 24 24"
+            width="20"
+            height="20"
+            style={{ transform: "rotate(90deg)" }}
+          >
             <path
               fill="currentColor"
               d="M21 16v-2l-8-5V3.5a1.5 1.5 0 0 0-3 0V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5z"
             />
           </svg>
+        </div>
+        <div
+          className="route-map__progress"
+          style={{ left: `${trackProgressPct}%` }}
+          aria-hidden="true"
+        >
+          {progressLabel}
         </div>
       </div>
     </div>
