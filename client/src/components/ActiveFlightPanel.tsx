@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useTranslation } from "react-i18next";
 import type { ActiveFlightInfo } from "../types";
 import { ManualFileDialog } from "./ManualFileDialog";
+import { WeatherBriefing } from "./WeatherBriefing";
 
 interface Props {
   /** Active-flight info, owned by Dashboard. Pure display. */
@@ -217,6 +218,8 @@ export function ActiveFlightPanel({ info, onEnded }: Props) {
           <dd>{info.position_count}</dd>
         </div>
       </dl>
+
+      <WeatherBriefing dptIcao={info.dpt_airport} arrIcao={info.arr_airport} />
 
       {error && (
         <p className="active-flight__error" role="alert">

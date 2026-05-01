@@ -12,6 +12,18 @@
     "log": "ACARS log",
     "settings": "Settings"
   },
+  "weather": {
+    "title": "Weather briefing",
+    "departure": "Departure",
+    "arrival": "Arrival",
+    "refresh": "Refresh",
+    "loading": "Loading METAR…",
+    "error": "Could not load METAR.",
+    "wind": "Wind",
+    "visibility": "Visibility",
+    "temp_dew": "Temp / Dewpoint",
+    "qnh": "QNH"
+  },
   "activity_log": {
     "title": "ACARS activity log",
     "count_one": "{{count}} entry",

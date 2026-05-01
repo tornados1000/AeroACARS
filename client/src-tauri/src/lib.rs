@@ -18,6 +18,7 @@ use api_client::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use metar::{MetarError, MetarSnapshot};
+use recorder::{FlightLogEvent, FlightOutcome, FlightRecorder};
 use storage::{PositionQueue, QueuedPosition};
 use sim_core::{FlightPhase, SimKind, SimSnapshot};
 use tauri::{AppHandle, Manager};
@@ -1414,6 +1415,18 @@ async fn flight_adopt(
         ),
         Some(format!("PIREP {}", flight.pirep_id)),
     );
+    record_event(
+        &app,
+        &flight.pirep_id,
+        &FlightLogEvent::FlightStarted {
+            timestamp: Utc::now(),
+            pirep_id: flight.pirep_id.clone(),
+            airline_icao: flight.airline_icao.clone(),
+            flight_number: flight.flight_number.clone(),
+            dpt_airport: flight.dpt_airport.clone(),
+            arr_airport: flight.arr_airport.clone(),
+        },
+    );
     Ok(info)
 }
 
@@ -1749,6 +1762,18 @@ async fn flight_start(
         ),
         Some(format!("PIREP prefiled as {}", flight.pirep_id)),
     );
+    record_event(
+        &app,
+        &flight.pirep_id,
+        &FlightLogEvent::FlightStarted {
+            timestamp: Utc::now(),
+            pirep_id: flight.pirep_id.clone(),
+            airline_icao: flight.airline_icao.clone(),
+            flight_number: flight.flight_number.clone(),
+            dpt_airport: flight.dpt_airport.clone(),
+            arr_airport: flight.arr_airport.clone(),
+        },
+    );
     Ok(info)
 }
 
@@ -1807,6 +1832,25 @@ fn validate_for_filing(
 fn open_position_queue(app: &AppHandle) -> Option<PositionQueue> {
     let dir = app.path().app_data_dir().ok()?;
     PositionQueue::open(dir).ok()
+}
+
+/// Open (or create) the per-flight JSONL recorder. None when we can't
+/// resolve the app data dir — caller treats it as "skip recording for
+/// this tick" rather than failing the streamer.
+fn open_flight_recorder(app: &AppHandle, pirep_id: &str) -> Option<FlightRecorder> {
+    let dir = app.path().app_data_dir().ok()?;
+    FlightRecorder::open(dir, pirep_id).ok()
+}
+
+/// Best-effort append to the flight log. Swallows errors so a missing
+/// disk doesn't surface as a UI failure — the log is purely for replay
+/// and post-flight analysis.
+fn record_event(app: &AppHandle, pirep_id: &str, event: &FlightLogEvent) {
+    if let Some(rec) = open_flight_recorder(app, pirep_id) {
+        if let Err(e) = rec.append(event) {
+            tracing::warn!(error = ?e, "could not append to flight log");
+        }
+    }
 }
 
 /// Drain queued positions for `pirep_id` by replaying each one through
@@ -2049,6 +2093,15 @@ async fn flight_end(
                     body.fuel_used.unwrap_or(0.0)
                 )),
             );
+            record_event(
+                &app,
+                &flight.pirep_id,
+                &FlightLogEvent::FlightEnded {
+                    timestamp: Utc::now(),
+                    pirep_id: flight.pirep_id.clone(),
+                    outcome: FlightOutcome::Filed,
+                },
+            );
             consume_bid_best_effort(&client, flight.bid_id).await;
             Ok(())
         }
@@ -2198,6 +2251,15 @@ async fn flight_end_manual(
                 ),
                 Some("Source tagged 'manual' — admin will review".into()),
             );
+            record_event(
+                &app,
+                &flight.pirep_id,
+                &FlightLogEvent::FlightEnded {
+                    timestamp: Utc::now(),
+                    pirep_id: flight.pirep_id.clone(),
+                    outcome: FlightOutcome::Manual,
+                },
+            );
             consume_bid_best_effort(&client, flight.bid_id).await;
             Ok(())
         }
@@ -2244,6 +2306,15 @@ async fn flight_cancel(
         ),
         Some(format!("PIREP {}", flight.pirep_id)),
     );
+    record_event(
+        &app,
+        &flight.pirep_id,
+        &FlightLogEvent::FlightEnded {
+            timestamp: Utc::now(),
+            pirep_id: flight.pirep_id.clone(),
+            outcome: FlightOutcome::Cancelled,
+        },
+    );
     Ok(())
 }
 
@@ -2287,6 +2358,15 @@ async fn flight_forget(
         flight.stop.store(true, Ordering::Relaxed);
         tracing::info!(pirep_id = %flight.pirep_id, "active flight forgotten (no phpVMS call)");
         discard_queued_positions_for(&app, &flight.pirep_id);
+        record_event(
+            &app,
+            &flight.pirep_id,
+            &FlightLogEvent::FlightEnded {
+                timestamp: Utc::now(),
+                pirep_id: flight.pirep_id.clone(),
+                outcome: FlightOutcome::Forgotten,
+            },
+        );
     }
     clear_persisted_flight(&app);
     Ok(())
@@ -2337,6 +2417,12 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                 continue;
             };
 
+            // Snapshot the current phase BEFORE stepping so we can pass
+            // the from→to pair to the recorder when it changes.
+            let prev_phase = {
+                let stats = flight.stats.lock().expect("flight stats");
+                stats.phase
+            };
             // Update running stats AND step the flight-phase FSM.
             let phase_change = step_flight(&flight, &snap);
             // Detect when the touchdown-analyzer window has just locked
@@ -2369,6 +2455,16 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                         alt_msl_ft = snap.altitude_msl_ft,
                         gs_kt = snap.groundspeed_kt,
                         "position posted"
+                    );
+                    // Mirror the snapshot into the per-flight JSONL log
+                    // for offline replay / debugging. Best-effort.
+                    record_event(
+                        &app,
+                        &flight.pirep_id,
+                        &FlightLogEvent::Position {
+                            timestamp: Utc::now(),
+                            snapshot: snap.clone(),
+                        },
                     );
                 }
                 Err(e) => {
@@ -2419,6 +2515,18 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                         "Alt {:.0} ft, GS {:.0} kt, AGL {:.0} ft",
                         snap.altitude_msl_ft, snap.groundspeed_kt, snap.altitude_agl_ft
                     )),
+                );
+                record_event(
+                    &app,
+                    &flight.pirep_id,
+                    &FlightLogEvent::PhaseChanged {
+                        timestamp: Utc::now(),
+                        from: prev_phase,
+                        to: new_phase,
+                        altitude_msl_ft: snap.altitude_msl_ft,
+                        groundspeed_kt: snap.groundspeed_kt,
+                        altitude_agl_ft: snap.altitude_agl_ft,
+                    },
                 );
                 // METAR snapshot at the two phase transitions where it
                 // matters most: just after takeoff for the departure
@@ -2919,6 +3027,17 @@ fn announce_landing_score(app: &AppHandle, flight: &ActiveFlight) {
                     peak_g,
                     bounce_part,
                 )),
+            );
+            record_event(
+                app,
+                &flight.pirep_id,
+                &FlightLogEvent::LandingScored {
+                    timestamp: Utc::now(),
+                    score: score.label().to_string(),
+                    peak_vs_fpm: peak_vs,
+                    peak_g_force: peak_g,
+                    bounce_count: bounces,
+                },
             );
             // Re-acquire to flag it as announced.
             let mut stats = flight.stats.lock().expect("flight stats");
@@ -3547,6 +3666,15 @@ async fn try_resume_flight(
         pirep_id = %persisted.pirep_id,
         age_minutes = age.num_minutes(),
         "resuming in-progress flight"
+    );
+    record_event(
+        app,
+        &persisted.pirep_id,
+        &FlightLogEvent::FlightResumed {
+            timestamp: Utc::now(),
+            pirep_id: persisted.pirep_id.clone(),
+            age_minutes: age.num_minutes(),
+        },
     );
 
     // Backfill missing airline ICAO + planned registration. PersistedFlight
