@@ -21,14 +21,22 @@ interface Checkpoint {
   fsm: FlightPhase[];
 }
 
+// Ten checkpoints — every FSM phase has a visually distinct slot
+// except for the very short ones (TakeoffRoll merges into Takeoff,
+// Final merges into Approach, BlocksOn merges into Gate). Keeps
+// Climb / Cruise / Descent as separate steps so the pilot sees a
+// proper "rising arc" through the flight.
 const CHECKPOINTS: Checkpoint[] = [
   { key: "boarding", fsm: ["preflight", "boarding"] },
-  { key: "taxi_out", fsm: ["pushback", "taxi_out"] },
+  { key: "pushback", fsm: ["pushback"] },
+  { key: "taxi", fsm: ["taxi_out"] },
   { key: "takeoff", fsm: ["takeoff_roll", "takeoff"] },
-  { key: "cruise", fsm: ["climb", "cruise"] },
-  { key: "approach", fsm: ["descent", "approach", "final"] },
+  { key: "climb", fsm: ["climb"] },
+  { key: "cruise", fsm: ["cruise"] },
+  { key: "descent", fsm: ["descent"] },
+  { key: "approach", fsm: ["approach", "final"] },
   { key: "landing", fsm: ["landing", "taxi_in"] },
-  { key: "arrived", fsm: ["blocks_on", "arrived", "pirep_submitted"] },
+  { key: "gate", fsm: ["blocks_on", "arrived", "pirep_submitted"] },
 ];
 
 function activeIndex(phase: FlightPhase): number {

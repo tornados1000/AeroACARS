@@ -30,12 +30,15 @@
     "title": "Flug-Phasen",
     "nodes": {
       "boarding": "Boarding",
-      "taxi_out": "Taxi",
+      "pushback": "Pushback",
+      "taxi": "Rollen",
       "takeoff": "Start",
-      "cruise": "Reise",
+      "climb": "Steigflug",
+      "cruise": "Reiseflug",
+      "descent": "Sinkflug",
       "approach": "Anflug",
       "landing": "Landung",
-      "arrived": "Gate"
+      "gate": "Gate"
     }
   },
   "briefing": {

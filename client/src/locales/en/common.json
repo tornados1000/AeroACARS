@@ -30,12 +30,15 @@
     "title": "Flight phases",
     "nodes": {
       "boarding": "Boarding",
-      "taxi_out": "Taxi",
+      "pushback": "Pushback",
+      "taxi": "Taxi",
       "takeoff": "Takeoff",
+      "climb": "Climb",
       "cruise": "Cruise",
+      "descent": "Descent",
       "approach": "Approach",
       "landing": "Landing",
-      "arrived": "Gate"
+      "gate": "Gate"
     }
   },
   "briefing": {
