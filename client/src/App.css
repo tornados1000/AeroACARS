@@ -207,6 +207,62 @@ button:disabled {
   color: var(--warning);
 }
 
+/* ===== Route map (Cockpit) — pin → pin with live position glyph ===== */
+
+.route-map {
+  width: 100%;
+  padding: 8px 0 4px;
+}
+
+.route-map svg {
+  width: 100%;
+  height: 80px;
+  display: block;
+}
+
+.route-map__track {
+  stroke: var(--surface-2);
+  stroke-width: 3;
+  stroke-linecap: round;
+}
+
+.route-map__track-fill {
+  stroke: var(--accent);
+  stroke-width: 3;
+  stroke-linecap: round;
+  transition: x2 0.8s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.route-map__pin {
+  fill: var(--accent);
+  stroke: var(--surface);
+  stroke-width: 2;
+}
+
+.route-map__icao {
+  fill: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  font-family: "SF Mono", "Cascadia Code", "Source Code Pro", Menlo, Consolas,
+    monospace;
+}
+
+.route-map__plane {
+  transition: transform 0.8s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.route-map__plane-bg {
+  fill: var(--surface);
+  stroke: var(--accent);
+  stroke-width: 2;
+  filter: drop-shadow(0 0 4px color-mix(in srgb, var(--accent) 60%, transparent));
+}
+
+.route-map__plane-shape {
+  fill: var(--accent);
+}
+
 /* ===== Live tapes (Cockpit) — IAS, GS, altitude, V/S, heading ===== */
 
 .live-tapes {

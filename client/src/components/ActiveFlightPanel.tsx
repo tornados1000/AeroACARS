@@ -5,6 +5,7 @@ import type { ActiveFlightInfo, FlightPhase, SimSnapshot } from "../types";
 import { LiveTapes } from "./LiveTapes";
 import { ManualFileDialog } from "./ManualFileDialog";
 import { PhaseTimeline } from "./PhaseTimeline";
+import { RouteMap } from "./RouteMap";
 import { WeatherBriefing } from "./WeatherBriefing";
 
 interface Props {
@@ -209,6 +210,13 @@ export function ActiveFlightPanel({ info, simSnapshot, onEnded }: Props) {
       </header>
 
       <PhaseTimeline phase={info.phase as FlightPhase} />
+
+      <RouteMap
+        dptIcao={info.dpt_airport}
+        arrIcao={info.arr_airport}
+        currentLat={simSnapshot?.lat ?? null}
+        currentLon={simSnapshot?.lon ?? null}
+      />
 
       <LiveTapes snapshot={simSnapshot ?? null} />
 
