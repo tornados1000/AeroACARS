@@ -724,6 +724,19 @@ input:disabled {
   font-size: 12px;
 }
 
+.active-flight__forget {
+  font-size: 11px;
+  color: var(--text-muted);
+  background: transparent;
+  border-color: transparent;
+}
+
+.active-flight__forget:hover:not(:disabled) {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+}
+
 /* ===== Start-flight button + error on bid cards ===== */
 
 .bid-card__start {

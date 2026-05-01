@@ -244,6 +244,7 @@ export function BidsList({
         "flight_already_active",
         "bid_not_found",
         "aircraft_not_available",
+        "aircraft_mismatch",
         "phpvms_error",
       ];
       const message = knownCodes.includes(ui.code)

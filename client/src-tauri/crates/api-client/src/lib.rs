@@ -248,6 +248,42 @@ pub struct SimBrief {
     pub url: Option<String>,
     #[serde(default)]
     pub aircraft_id: Option<i64>,
+    /// SimBrief-derived subfleet info, including the fares (passenger / cargo
+    /// counts) the OFP was generated against. We carry these forward into the
+    /// final filed PIREP so the VA gets accurate load numbers.
+    #[serde(default)]
+    pub subfleet: Option<SimBriefSubfleet>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SimBriefSubfleet {
+    #[serde(default)]
+    pub type_: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub fares: Vec<Fare>,
+}
+
+/// Single fare-class entry. Fields are permissive — phpVMS varies which keys
+/// it returns based on context (subfleet vs. PIREP file).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Fare {
+    pub id: i64,
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub capacity: Option<i32>,
+    /// Number of passengers (or cargo units) the OFP was generated for.
+    #[serde(default)]
+    pub count: Option<i32>,
+    #[serde(default)]
+    pub price: Option<f64>,
+    /// 0 = passenger fare, 1 = cargo (phpVMS convention).
+    #[serde(default, rename = "type")]
+    pub fare_type: Option<i32>,
 }
 
 /// `GET /api/user/bids` returns a list of these.
@@ -334,6 +370,17 @@ pub struct FileBody {
     pub source_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+    /// Final passenger / cargo loads per fare class.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fares: Option<Vec<FareEntry>>,
+}
+
+/// Minimal fare entry for filing — phpVMS uses `id` to look up the fare class
+/// and `count` for the loaded amount.
+#[derive(Debug, Clone, Serialize)]
+pub struct FareEntry {
+    pub id: i64,
+    pub count: i32,
 }
 
 /// Body for `POST /api/pireps/{id}/update`. Used to advance the in-flight

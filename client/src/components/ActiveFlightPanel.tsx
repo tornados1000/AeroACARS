@@ -31,7 +31,7 @@ function fmtDistance(nm: number, locale: string): string {
 export function ActiveFlightPanel({ onEnded }: Props) {
   const { t, i18n } = useTranslation();
   const [info, setInfo] = useState<ActiveFlightInfo | null>(null);
-  const [busy, setBusy] = useState<"end" | "cancel" | null>(null);
+  const [busy, setBusy] = useState<"end" | "cancel" | "forget" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [tick, setTick] = useState(0);
 
@@ -83,10 +83,36 @@ export function ActiveFlightPanel({ onEnded }: Props) {
 
   async function handleCancel() {
     if (busy) return;
+    if (!confirm(t("active_flight.confirm_cancel"))) return;
     setBusy("cancel");
     setError(null);
     try {
       await invoke("flight_cancel");
+      setInfo(null);
+      onEnded?.();
+    } catch (err: unknown) {
+      const msg =
+        typeof err === "object" && err !== null && "message" in err
+          ? String((err as { message: string }).message)
+          : String(err);
+      setError(msg);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  /**
+   * Force-discard local active-flight state without touching phpVMS. Useful
+   * when the cancel call fails because the PIREP is already gone server-side
+   * but our local state still thinks a flight is active.
+   */
+  async function handleForget() {
+    if (busy) return;
+    if (!confirm(t("active_flight.confirm_forget"))) return;
+    setBusy("forget");
+    setError(null);
+    try {
+      await invoke("flight_forget");
       setInfo(null);
       onEnded?.();
     } catch (err: unknown) {
@@ -130,6 +156,17 @@ export function ActiveFlightPanel({ onEnded }: Props) {
             {busy === "cancel"
               ? t("active_flight.cancelling")
               : t("active_flight.cancel")}
+          </button>
+          <button
+            type="button"
+            className="active-flight__forget"
+            onClick={handleForget}
+            disabled={busy !== null}
+            title={t("active_flight.forget_hint")}
+          >
+            {busy === "forget"
+              ? t("active_flight.forgetting")
+              : t("active_flight.forget")}
           </button>
         </div>
       </header>

@@ -136,8 +136,13 @@
     "positions": "Positions sent",
     "end": "End flight (file PIREP)",
     "filing": "Filing…",
-    "cancel": "Cancel",
-    "cancelling": "Cancelling…"
+    "cancel": "Discard flight",
+    "cancelling": "Discarding…",
+    "confirm_cancel": "Really discard this flight? The PIREP will be cancelled on phpVMS. This cannot be undone.",
+    "forget": "Forget locally",
+    "forgetting": "Forgetting…",
+    "forget_hint": "Drop local flight state without contacting phpVMS — useful if the PIREP is already gone server-side.",
+    "confirm_forget": "Drop local flight state? phpVMS will NOT be contacted. Only use this if 'Discard flight' fails."
   },
   "bids": {
     "title": "My booked flights",
@@ -180,6 +185,7 @@
       "flight_already_active": "Another flight is already active.",
       "bid_not_found": "Bid not found — please refresh.",
       "aircraft_not_available": "Aircraft not available — see details below. Common causes: the aircraft is parked at another airport, is currently 'in use' by an open PIREP, or your rank doesn't grant access. Fix in phpVMS admin: cancel orphan PIREPs and verify the aircraft's location.",
+      "aircraft_mismatch": "Aircraft type mismatch — you're in the wrong aircraft for this bid. Load the correct type in the simulator or pick a different bid.",
       "phpvms_error": "phpVMS rejected the flight — see details."
     }
   }

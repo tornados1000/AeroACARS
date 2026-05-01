@@ -136,8 +136,13 @@
     "positions": "Positionen gesendet",
     "end": "Flug beenden (PIREP einreichen)",
     "filing": "Reiche ein…",
-    "cancel": "Abbrechen",
-    "cancelling": "Breche ab…"
+    "cancel": "Flug verwerfen",
+    "cancelling": "Verwerfe…",
+    "confirm_cancel": "Flug wirklich verwerfen? Der PIREP wird auf phpVMS storniert. Diese Aktion kann nicht rückgängig gemacht werden.",
+    "forget": "Lokal vergessen",
+    "forgetting": "Vergesse…",
+    "forget_hint": "Lokalen Flug-Status verwerfen ohne phpVMS zu kontaktieren — z. B. wenn der PIREP serverseitig schon weg ist.",
+    "confirm_forget": "Lokalen Flug-Status verwerfen? phpVMS wird NICHT kontaktiert. Nur nutzen, wenn ‚Flug verwerfen‘ fehlschlägt."
   },
   "bids": {
     "title": "Meine gebuchten Flüge",
@@ -180,6 +185,7 @@
       "flight_already_active": "Ein anderer Flug ist bereits aktiv.",
       "bid_not_found": "Bid nicht gefunden — bitte aktualisieren.",
       "aircraft_not_available": "Flugzeug nicht verfügbar — Details siehe unten. Häufige Ursachen: das Flugzeug steht an einem anderen Flughafen, ist gerade „in use“ durch einen offenen PIREP, oder Ihr Rang hat keinen Zugriff. Aufräumen via phpVMS-Admin (PIREPs canceln + Aircraft-Standort prüfen).",
+      "aircraft_mismatch": "Flugzeug-Typ passt nicht — Sie sitzen im falschen Flugzeug für diese Bid. Laden Sie den richtigen Typ im Simulator oder wählen Sie eine andere Bid.",
       "phpvms_error": "phpVMS hat den Flug abgelehnt — siehe Details."
     }
   }

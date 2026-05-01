@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use api_client::{
-    Airport, ApiError, Bid, Client, Connection, FileBody, PositionEntry, PrefileBody, Profile,
-    UpdateBody,
+    Airport, ApiError, Bid, Client, Connection, FareEntry, FileBody, PositionEntry, PrefileBody,
+    Profile, UpdateBody,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,12 @@ use sim_msfs::MsfsAdapter;
 const KEYRING_ACCOUNT: &str = "primary";
 const SITE_CONFIG_FILE: &str = "site.json";
 const SIM_CONFIG_FILE: &str = "sim.json";
+/// File holding the current in-progress flight, written on flight_start and
+/// removed on flight_end / flight_cancel. Lets us resume after a client crash.
+const ACTIVE_FLIGHT_FILE: &str = "active_flight.json";
+
+/// Anything older than this is considered stale and discarded on resume.
+const RESUME_MAX_AGE_HOURS: i64 = 12;
 
 /// How often the background task posts the latest position to phpVMS while a
 /// flight is active. Spec §10 talks about "configurable intervals"; for now we
@@ -41,6 +47,41 @@ const DISTANCE_EPSILON_M: f64 = 5.0;
 /// to start the flight. Generous enough to cover taxi positions and remote
 /// stands; tight enough to reject "I'm at EDDF instead of EDDP".
 const MAX_START_DISTANCE_NM: f64 = 5.0;
+
+/// MSFS often returns SimVar values as localization keys, not plain text.
+/// The ATC MODEL var is one of them — e.g. `TT:ATCCOM.AC_MODEL_A320.0.text`
+/// or `ATCCOM.AC_MODEL A320.0.text`. Pull out the readable code, or return
+/// `None` if the input is an unresolved key we can't decode.
+fn clean_atc_model(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(start) = s.find("AC_MODEL") {
+        let after = &s[start + "AC_MODEL".len()..];
+        let after = after.trim_start_matches(|c: char| c == '_' || c == ' ');
+        if let Some(end) = after.find('.') {
+            let model = &after[..end];
+            if !model.is_empty() {
+                return Some(model.to_uppercase());
+            }
+        }
+    }
+    let upper = s.to_uppercase();
+    if upper.starts_with("TT:") || upper.contains("ATCCOM.") || upper.ends_with(".TEXT") {
+        return None;
+    }
+    Some(upper)
+}
+
+/// Loose check: does the aircraft title from MSFS appear to mention the given
+/// ICAO code? Used as a permissive backup when ATC MODEL parses to one code
+/// but the title says something completely different.
+fn title_mentions_icao(title: &str, icao: &str) -> bool {
+    let title_upper = title.to_uppercase();
+    let icao_upper = icao.to_uppercase();
+    title_upper.contains(&icao_upper)
+}
 
 /// Shared application state — wraps the currently-authenticated client (if any)
 /// and (on Windows) the MSFS adapter.
@@ -65,9 +106,26 @@ struct ActiveFlight {
     flight_number: String,
     dpt_airport: String,
     arr_airport: String,
+    /// Final loads (per fare-class id) captured at flight start so we can
+    /// include them in the filed PIREP — even if the bid is gone by then.
+    fares: Vec<(i64, i32)>,
     /// Mutable running stats updated by the streamer task.
     stats: Mutex<FlightStats>,
     stop: AtomicBool,
+}
+
+/// On-disk representation of an active flight, used for resume after a client
+/// crash. Not the same as `ActiveFlight` because we only persist serializable,
+/// non-Mutex fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedFlight {
+    pirep_id: String,
+    bid_id: i64,
+    started_at: DateTime<Utc>,
+    flight_number: String,
+    dpt_airport: String,
+    arr_airport: String,
+    fares: Vec<(i64, i32)>,
 }
 
 #[derive(Default)]
@@ -103,7 +161,7 @@ pub struct LoginResult {
 
 /// Errors returned to the UI in a serializable shape.
 /// `code` is a stable, machine-readable identifier the frontend uses for i18n.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct UiError {
     code: String,
     message: String,
@@ -204,11 +262,14 @@ async fn phpvms_login(
     write_site_config(&app, &SiteConfig { url: url.clone() })?;
 
     let base_url = client.connection().base_url().to_string();
-    *state.client.lock().expect("client mutex") = Some(client);
+    *state.client.lock().expect("client mutex") = Some(client.clone());
 
     // Auto-start the simulator adapter using the persisted selection.
     let saved_kind = read_sim_config(&app).kind;
     apply_sim_kind(&state, saved_kind);
+
+    // Try to resume an in-progress flight (e.g. after a client crash).
+    try_resume_flight(&app, &state, &client);
 
     tracing::info!(pilot = profile.name.as_str(), ?saved_kind, "logged in");
     Ok(LoginResult { profile, base_url })
@@ -250,10 +311,11 @@ async fn phpvms_load_session(
     match client.get_profile().await {
         Ok(profile) => {
             let base_url = client.connection().base_url().to_string();
-            *state.client.lock().expect("client mutex") = Some(client);
+            *state.client.lock().expect("client mutex") = Some(client.clone());
             // Auto-start the simulator adapter when we restore an existing session.
             let saved_kind = read_sim_config(&app).kind;
             apply_sim_kind(&state, saved_kind);
+            try_resume_flight(&app, &state, &client);
             tracing::info!(?saved_kind, "session restored");
             Ok(Some(LoginResult { profile, base_url }))
         }
@@ -283,6 +345,57 @@ async fn phpvms_get_bids(
 ) -> Result<Vec<Bid>, UiError> {
     let client = current_client(&state)?;
     Ok(client.get_bids().await?)
+}
+
+// ---- Active-flight persistence (for resume after crash/restart) ----
+
+fn active_flight_path(app: &AppHandle) -> Result<PathBuf, UiError> {
+    app.path()
+        .app_config_dir()
+        .map(|dir| dir.join(ACTIVE_FLIGHT_FILE))
+        .map_err(|e| UiError::new("config_path", e.to_string()))
+}
+
+fn write_persisted_flight(app: &AppHandle, flight: &PersistedFlight) -> Result<(), UiError> {
+    let path = active_flight_path(app)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| UiError::new("config_write", e.to_string()))?;
+    }
+    let bytes = serde_json::to_vec_pretty(flight)
+        .map_err(|e| UiError::new("config_serialize", e.to_string()))?;
+    std::fs::write(&path, bytes).map_err(|e| UiError::new("config_write", e.to_string()))
+}
+
+fn read_persisted_flight(app: &AppHandle) -> Option<PersistedFlight> {
+    let path = active_flight_path(app).ok()?;
+    if !path.exists() {
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    serde_json::from_slice::<PersistedFlight>(&bytes).ok()
+}
+
+fn clear_persisted_flight(app: &AppHandle) {
+    let Ok(path) = active_flight_path(app) else { return };
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+fn save_active_flight(app: &AppHandle, flight: &ActiveFlight) {
+    let persisted = PersistedFlight {
+        pirep_id: flight.pirep_id.clone(),
+        bid_id: flight.bid_id,
+        started_at: flight.started_at,
+        flight_number: flight.flight_number.clone(),
+        dpt_airport: flight.dpt_airport.clone(),
+        arr_airport: flight.arr_airport.clone(),
+        fares: flight.fares.clone(),
+    };
+    if let Err(e) = write_persisted_flight(app, &persisted) {
+        tracing::warn!(error = ?e, "could not persist active flight");
+    }
 }
 
 // ---- Airport cache ----
@@ -445,6 +558,48 @@ async fn flight_start(
             )
         })?;
 
+    // ---- Aircraft-mismatch gate (spec §7) ----
+    // Compare the aircraft type the bid expects (from get_aircraft) to what's
+    // loaded in the simulator (parsed ATC MODEL or, as a backup, the TITLE).
+    // Permissive: only block when both sides resolve to clearly different codes.
+    let expected_aircraft = client.get_aircraft(aircraft_id).await?;
+    let expected_icao = expected_aircraft
+        .icao
+        .as_ref()
+        .map(|s| s.trim().to_uppercase())
+        .filter(|s| !s.is_empty());
+    let sim_icao = snapshot
+        .aircraft_icao
+        .as_deref()
+        .and_then(clean_atc_model);
+    let sim_title = snapshot
+        .aircraft_title
+        .as_deref()
+        .unwrap_or("")
+        .to_string();
+    if let (Some(expected), Some(actual)) = (expected_icao.as_ref(), sim_icao.as_ref()) {
+        let title_supports_expected = title_mentions_icao(&sim_title, expected);
+        if expected != actual && !title_supports_expected {
+            let registration = expected_aircraft
+                .registration
+                .as_deref()
+                .unwrap_or("?");
+            tracing::warn!(
+                expected = %expected,
+                actual = %actual,
+                title = %sim_title,
+                registration = %registration,
+                "aircraft type mismatch — blocking flight start"
+            );
+            return Err(UiError::new(
+                "aircraft_mismatch",
+                format!(
+                    "Aircraft mismatch: bid wants {expected} ({registration}), sim has {actual} (title \"{sim_title}\"). Load the correct aircraft type in the sim or pick a matching bid.",
+                ),
+            ));
+        }
+    }
+
     let body = PrefileBody {
         airline_id,
         aircraft_id: aircraft_id.to_string(),
@@ -545,6 +700,21 @@ async fn flight_start(
         tracing::info!(pirep_id = %pirep.id, "PIREP status set to BOARDING");
     }
 
+    // Capture fares from the SimBrief OFP so we can file accurate loads
+    // even if the bid is gone by the time we end the flight.
+    let fares: Vec<(i64, i32)> = bid
+        .flight
+        .simbrief
+        .as_ref()
+        .and_then(|sb| sb.subfleet.as_ref())
+        .map(|sf| {
+            sf.fares
+                .iter()
+                .filter_map(|f| f.count.map(|c| (f.id, c)))
+                .collect()
+        })
+        .unwrap_or_default();
+
     let flight = Arc::new(ActiveFlight {
         pirep_id: pirep.id.clone(),
         bid_id,
@@ -552,9 +722,12 @@ async fn flight_start(
         flight_number: bid.flight.flight_number.clone(),
         dpt_airport: bid.flight.dpt_airport_id.clone(),
         arr_airport: bid.flight.arr_airport_id.clone(),
+        fares,
         stats: Mutex::new(FlightStats::default()),
         stop: AtomicBool::new(false),
     });
+
+    save_active_flight(&app, &flight);
 
     {
         let mut guard = state.active_flight.lock().expect("active_flight lock");
@@ -570,7 +743,10 @@ async fn flight_start(
 
 /// File the active PIREP with computed final stats.
 #[tauri::command]
-async fn flight_end(state: tauri::State<'_, AppState>) -> Result<(), UiError> {
+async fn flight_end(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), UiError> {
     let flight = {
         let mut guard = state.active_flight.lock().expect("active_flight lock");
         guard
@@ -587,27 +763,52 @@ async fn flight_end(state: tauri::State<'_, AppState>) -> Result<(), UiError> {
     };
     let elapsed_minutes = (Utc::now() - flight.started_at).num_minutes() as i32;
 
+    // Translate captured fares (id, count) into the FileBody shape phpVMS wants.
+    let fares = if flight.fares.is_empty() {
+        None
+    } else {
+        Some(
+            flight
+                .fares
+                .iter()
+                .map(|(id, count)| FareEntry {
+                    id: *id,
+                    count: *count,
+                })
+                .collect(),
+        )
+    };
+
     let body = FileBody {
         flight_time: Some(elapsed_minutes.max(0)),
         fuel_used: None,
         distance: Some(distance_nm),
         source_name: Some(format!("CloudeAcars/{}", env!("CARGO_PKG_VERSION"))),
         notes: None,
+        fares,
     };
     tracing::info!(
         pirep_id = %flight.pirep_id,
         elapsed_minutes,
         distance_nm,
+        fare_classes = flight.fares.len(),
         "filing PIREP"
     );
-    client.file_pirep(&flight.pirep_id, &body).await?;
+    let result = client.file_pirep(&flight.pirep_id, &body).await;
+    // Always clear local persistence — if filing failed, the user can either
+    // retry via support tooling or just start a fresh flight.
+    clear_persisted_flight(&app);
+    result?;
     tracing::info!(pirep_id = %flight.pirep_id, "PIREP filed");
     Ok(())
 }
 
 /// Cancel the active PIREP without filing it.
 #[tauri::command]
-async fn flight_cancel(state: tauri::State<'_, AppState>) -> Result<(), UiError> {
+async fn flight_cancel(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), UiError> {
     let flight = {
         let mut guard = state.active_flight.lock().expect("active_flight lock");
         guard
@@ -616,8 +817,32 @@ async fn flight_cancel(state: tauri::State<'_, AppState>) -> Result<(), UiError>
     };
     flight.stop.store(true, Ordering::Relaxed);
     let client = current_client(&state)?;
-    client.cancel_pirep(&flight.pirep_id).await?;
+    let result = client.cancel_pirep(&flight.pirep_id).await;
+    // Clear local persistence regardless — the user wants this gone.
+    clear_persisted_flight(&app);
+    result?;
     tracing::info!(pirep_id = %flight.pirep_id, "PIREP cancelled");
+    Ok(())
+}
+
+/// Drop local active-flight state without contacting phpVMS. Useful when the
+/// stored PIREP is orphaned/dead on the server side and the user wants a
+/// clean slate.
+#[tauri::command]
+async fn flight_forget(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), UiError> {
+    if let Some(flight) = state
+        .active_flight
+        .lock()
+        .expect("active_flight lock")
+        .take()
+    {
+        flight.stop.store(true, Ordering::Relaxed);
+        tracing::info!(pirep_id = %flight.pirep_id, "active flight forgotten (no phpVMS call)");
+    }
+    clear_persisted_flight(&app);
     Ok(())
 }
 
@@ -875,6 +1100,59 @@ fn sim_status(app: AppHandle, _state: tauri::State<'_, AppState>) -> SimStatus {
     }
 }
 
+/// On login or session restore, check the on-disk active-flight file. If it's
+/// recent enough, recreate the in-memory ActiveFlight and restart position
+/// streaming — picks up exactly where the previous run left off.
+fn try_resume_flight(app: &AppHandle, state: &tauri::State<'_, AppState>, client: &Client) {
+    let Some(persisted) = read_persisted_flight(app) else {
+        return;
+    };
+    // Drop sessions that are clearly stale (e.g. a flight from days ago) so
+    // we don't keep flogging a long-dead PIREP forever.
+    let age = Utc::now() - persisted.started_at;
+    if age > chrono::Duration::hours(RESUME_MAX_AGE_HOURS) {
+        tracing::info!(
+            pirep_id = %persisted.pirep_id,
+            age_hours = age.num_hours(),
+            "discarding stale persisted flight"
+        );
+        clear_persisted_flight(app);
+        return;
+    }
+
+    {
+        let guard = state.active_flight.lock().expect("active_flight lock");
+        if guard.is_some() {
+            tracing::warn!("active flight already in memory, skipping resume");
+            return;
+        }
+    }
+
+    tracing::info!(
+        pirep_id = %persisted.pirep_id,
+        age_minutes = age.num_minutes(),
+        "resuming in-progress flight"
+    );
+
+    let flight = Arc::new(ActiveFlight {
+        pirep_id: persisted.pirep_id.clone(),
+        bid_id: persisted.bid_id,
+        started_at: persisted.started_at,
+        flight_number: persisted.flight_number.clone(),
+        dpt_airport: persisted.dpt_airport.clone(),
+        arr_airport: persisted.arr_airport.clone(),
+        fares: persisted.fares.clone(),
+        stats: Mutex::new(FlightStats::default()),
+        stop: AtomicBool::new(false),
+    });
+
+    {
+        let mut guard = state.active_flight.lock().expect("active_flight lock");
+        *guard = Some(Arc::clone(&flight));
+    }
+    spawn_position_streamer(app.clone(), flight, client.clone());
+}
+
 // ---- Bootstrap ----
 
 fn init_tracing() {
@@ -905,6 +1183,7 @@ pub fn run() {
             flight_start,
             flight_end,
             flight_cancel,
+            flight_forget,
         ])
         .run(tauri::generate_context!())
         .expect("error while running CloudeAcars");
