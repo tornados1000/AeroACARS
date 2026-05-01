@@ -355,6 +355,8 @@ struct PersistedFlightStats {
     cruise_peak_msl: Option<f32>,
     #[serde(default)]
     peak_altitude_ft: Option<f32>,
+    #[serde(default)]
+    aircraft_banner_logged: bool,
 }
 
 impl PersistedFlightStats {
@@ -390,6 +392,7 @@ impl PersistedFlightStats {
             approach_runway: stats.approach_runway.clone(),
             cruise_peak_msl: stats.cruise_peak_msl,
             peak_altitude_ft: stats.peak_altitude_ft,
+            aircraft_banner_logged: stats.aircraft_banner_logged,
         }
     }
 
@@ -431,6 +434,7 @@ impl PersistedFlightStats {
         stats.approach_runway = self.approach_runway;
         stats.cruise_peak_msl = self.cruise_peak_msl;
         stats.peak_altitude_ft = self.peak_altitude_ft;
+        stats.aircraft_banner_logged = self.aircraft_banner_logged;
     }
 }
 
@@ -544,6 +548,12 @@ struct FlightStats {
     /// V/S / G that the aircraft actually saw — independent of the
     /// snapshot rate or SimConnect's PLANE TOUCHDOWN * latching.
     snapshot_buffer: std::collections::VecDeque<TelemetrySample>,
+
+    /// True once the "Aircraft: {title}" banner has been emitted to
+    /// the activity log for this flight. Persisted across resumes
+    /// so a Tauri restart mid-flight doesn't re-fire the banner — it
+    /// belongs to the *flight*, not the session.
+    aircraft_banner_logged: bool,
 
     /// When the streamer last successfully posted a position to phpVMS.
     /// Drives the cockpit's LIVE / REC indicator — a long gap means
@@ -1161,12 +1171,25 @@ async fn phpvms_load_session(
             let saved_kind = read_sim_config(&app).kind;
             apply_sim_kind(&state, saved_kind);
             try_resume_flight(&app, &state, &client).await;
-            log_activity(
-                &state,
-                ActivityLevel::Info,
-                format!("Session restored — {}", profile.name),
-                Some(format!("Sim: {:?}", saved_kind)),
-            );
+            // Throttle "Session restored" entries: at most once per
+            // 60 s. A session-restore is benign noise on rapid Tauri
+            // restarts (debug cycles, dev HMR rebuilds) and the
+            // activity log was filling up with 4-6 of these in a
+            // row from yesterday's testing. Real users restart the
+            // app maybe twice a day, so 60 s is plenty.
+            use std::sync::atomic::{AtomicI64, Ordering};
+            static LAST_SESSION_LOG_S: AtomicI64 = AtomicI64::new(0);
+            let now_s = Utc::now().timestamp();
+            let prev_s = LAST_SESSION_LOG_S.load(Ordering::Relaxed);
+            if now_s - prev_s >= 60 {
+                LAST_SESSION_LOG_S.store(now_s, Ordering::Relaxed);
+                log_activity(
+                    &state,
+                    ActivityLevel::Info,
+                    format!("Session restored — {}", profile.name),
+                    Some(format!("Sim: {:?}", saved_kind)),
+                );
+            }
             Ok(Some(LoginResult { profile, base_url }))
         }
         // Stored key was rejected — drop it so the next login goes via the form.
@@ -1921,6 +1944,17 @@ async fn flight_start(
             flight.arr_airport
         ),
         Some(format!("PIREP prefiled as {}", flight.pirep_id)),
+    );
+    // Announce the initial Boarding phase explicitly. Without this
+    // entry the activity log shows the flight jumping straight from
+    // "Flight started" to "Phase: Pushback" later, leaving the
+    // Boarding stage of the timeline unrepresented in the textual
+    // log even though the UI marks it as the active checkpoint.
+    log_activity(
+        &state,
+        ActivityLevel::Info,
+        "Phase: Boarding".to_string(),
+        None,
     );
     record_event(
         &app,
@@ -3015,7 +3049,12 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
             }
         }
         FlightPhase::Approach => {
-            if snap.altitude_agl_ft < 1500.0 {
+            // 1500 ft AGL was too eager — pilots reported a 3 min
+            // "Final" segment because most aircraft intercept the
+            // ILS at that altitude and still have several miles to
+            // run. Real-world Final starts ~700 ft AGL (FAF crossed
+            // for non-precision, decision height area for ILS).
+            if snap.altitude_agl_ft < 700.0 {
                 next_phase = FlightPhase::Final;
             }
         }
@@ -3216,17 +3255,26 @@ fn build_pirep_fields(
     f.insert("Departure Airport".into(), flight.dpt_airport.clone());
     f.insert("Arrival Airport".into(), flight.arr_airport.clone());
 
+    // Times: render as readable UTC `HH:MM:SS UTC` instead of full
+    // ISO 8601 with microseconds. The PIREP custom-field column on
+    // phpVMS is narrow and pilots reading it want a glanceable
+    // timestamp, not a 30-character mil-spec timestamp. The full
+    // ISO string is still available in the FlightStarted / Landing
+    // events written to the JSONL flight log on disk.
+    fn fmt_time(t: &DateTime<Utc>) -> String {
+        t.format("%H:%M:%S UTC").to_string()
+    }
     if let Some(t) = stats.block_off_at {
-        f.insert("Blocks Off Time".into(), t.to_rfc3339());
+        f.insert("Blocks Off Time".into(), fmt_time(&t));
     }
     if let Some(t) = stats.takeoff_at {
-        f.insert("Takeoff Time".into(), t.to_rfc3339());
+        f.insert("Takeoff Time".into(), fmt_time(&t));
     }
     if let Some(t) = stats.landing_at {
-        f.insert("Landing Time".into(), t.to_rfc3339());
+        f.insert("Landing Time".into(), fmt_time(&t));
     }
     if let Some(t) = stats.block_on_at {
-        f.insert("Blocks On Time".into(), t.to_rfc3339());
+        f.insert("Blocks On Time".into(), fmt_time(&t));
     }
 
     // Skip 0-value weight/fuel fields — Fenix and some addons don't wire the
@@ -3534,10 +3582,16 @@ fn detect_telemetry_changes(app: &AppHandle, flight: &ActiveFlight, snap: &SimSn
     let mut stats = flight.stats.lock().expect("flight stats");
 
     // ---- Aircraft + sim banner — first tick only.
-    let first_tick = stats.last_logged_squawk.is_none()
-        && stats.last_logged_com1.is_none()
-        && stats.last_logged_lights.is_none();
+    // Aircraft banner: gated on a dedicated per-flight flag rather
+    // than the heuristic "all three diff fields are still None"
+    // because the heuristic is too fragile (a stale resumed flight
+    // could already have those fields set, suppressing the banner
+    // when it should fire). The flag is persisted, so a Tauri
+    // restart mid-flight doesn't re-fire — the banner belongs to
+    // the flight, not the session.
+    let first_tick = !stats.aircraft_banner_logged;
     if first_tick {
+        stats.aircraft_banner_logged = true;
         let title = snap.aircraft_title.as_deref().unwrap_or("(unknown)");
         // Some aircraft (Fenix, FBW) return a localization key like
         // "ATCCOM.AC_MODEL A320.0.text" in `ATC MODEL` rather than the plain
@@ -3613,61 +3667,28 @@ fn detect_telemetry_changes(app: &AppHandle, flight: &ActiveFlight, snap: &SimSn
         }
     }
 
-    // ---- COM frequencies
-    if let Some(f) = snap.com1_mhz {
-        if stats.last_logged_com1.map(|v| (v - f).abs() > 0.001) != Some(false) {
-            if !first_tick {
-                log_activity_handle(
-                    app,
-                    ActivityLevel::Info,
-                    format!("COM1 → {:.3} MHz", f),
-                    None,
-                );
-            }
-            stats.last_logged_com1 = Some(f);
-        }
-    }
-    if let Some(f) = snap.com2_mhz {
-        if stats.last_logged_com2.map(|v| (v - f).abs() > 0.001) != Some(false) {
-            if !first_tick {
-                log_activity_handle(
-                    app,
-                    ActivityLevel::Info,
-                    format!("COM2 → {:.3} MHz", f),
-                    None,
-                );
-            }
-            stats.last_logged_com2 = Some(f);
-        }
-    }
-
-    // ---- NAV frequencies
-    if let Some(f) = snap.nav1_mhz {
-        if stats.last_logged_nav1.map(|v| (v - f).abs() > 0.001) != Some(false) {
-            if !first_tick {
-                log_activity_handle(
-                    app,
-                    ActivityLevel::Info,
-                    format!("NAV1 → {:.3} MHz", f),
-                    None,
-                );
-            }
-            stats.last_logged_nav1 = Some(f);
-        }
-    }
-    if let Some(f) = snap.nav2_mhz {
-        if stats.last_logged_nav2.map(|v| (v - f).abs() > 0.001) != Some(false) {
-            if !first_tick {
-                log_activity_handle(
-                    app,
-                    ActivityLevel::Info,
-                    format!("NAV2 → {:.3} MHz", f),
-                    None,
-                );
-            }
-            stats.last_logged_nav2 = Some(f);
-        }
-    }
+    // ---- COM / NAV frequency logging removed (2026-05).
+    // In practice frequencies change every sector handoff (Departure
+    // → Center → Center → Approach → Tower → Ground), which fills
+    // the log without telling the VA admin anything useful. Plus
+    // Fenix's RMP doesn't write to the standard SimVars at all, so
+    // for that aircraft we'd be logging stale defaults from the
+    // sim's COM panel rather than what the pilot actually tuned.
+    // Squawk stays in the log — that genuinely changes only ~1-2x
+    // per flight at meaningful moments.
+    //
+    // The fields on the snapshot remain populated so the debug
+    // panel and inspector keep working.
+    let _ = (
+        snap.com1_mhz,
+        snap.com2_mhz,
+        snap.nav1_mhz,
+        snap.nav2_mhz,
+        &stats.last_logged_com1,
+        &stats.last_logged_com2,
+        &stats.last_logged_nav1,
+        &stats.last_logged_nav2,
+    );
 
     // ---- Exterior lights
     let lights = LightsState {
