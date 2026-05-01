@@ -129,6 +129,16 @@
       "on_ground": "On ground"
     }
   },
+  "active_flight": {
+    "title": "Active flight",
+    "elapsed": "Elapsed",
+    "distance": "Distance",
+    "positions": "Positions sent",
+    "end": "End flight (file PIREP)",
+    "filing": "Filing…",
+    "cancel": "Cancel",
+    "cancelling": "Cancelling…"
+  },
   "bids": {
     "title": "My booked flights",
     "loading": "Loading flights…",
@@ -140,6 +150,14 @@
     "route": "Route",
     "open_flight_page": "Open flight page",
     "open_ofp": "Open OFP / briefing",
+    "start_flight": "Start flight",
+    "starting": "Starting…",
+    "start_disabled_no_sim": "Simulator is not connected",
+    "start_disabled_active_flight": "Another flight is already active",
+    "start_disabled_not_on_ground": "You must be on the ground to start the flight",
+    "start_disabled_too_far": "You are {{distance}} nm from {{airport}} — start the flight at the departure airport",
+    "distance_to_departure": "Distance to the departure airport",
+    "from_airport": "from {{airport}}",
     "error": {
       "not_logged_in": "Not signed in — please sign in again.",
       "network": "Could not reach the server.",
@@ -150,6 +168,19 @@
       "server": "Server error while fetching bids.",
       "bad_response": "The server response could not be understood.",
       "unknown": "Unexpected error while loading bids."
+    }
+  },
+  "flight": {
+    "error": {
+      "no_sim_snapshot": "No simulator data — is the simulator connected?",
+      "not_on_ground": "You must be on the ground to start the flight.",
+      "not_at_departure": "You are not at the departure airport — please taxi to the right airport.",
+      "missing_airline": "This flight has no airline assigned.",
+      "missing_aircraft": "No aircraft for this flight — please prepare a SimBrief OFP first.",
+      "flight_already_active": "Another flight is already active.",
+      "bid_not_found": "Bid not found — please refresh.",
+      "aircraft_not_available": "Aircraft not available — see details below. Common causes: the aircraft is parked at another airport, is currently 'in use' by an open PIREP, or your rank doesn't grant access. Fix in phpVMS admin: cancel orphan PIREPs and verify the aircraft's location.",
+      "phpvms_error": "phpVMS rejected the flight — see details."
     }
   }
 }

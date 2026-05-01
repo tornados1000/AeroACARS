@@ -624,6 +624,143 @@ input:disabled {
   flex-shrink: 0;
 }
 
+/* ===== Active flight ===== */
+
+.active-flight {
+  background: var(--surface);
+  border: 1px solid color-mix(in srgb, var(--accent) 50%, var(--border));
+  border-radius: 10px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.active-flight__header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.active-flight__label {
+  display: block;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.active-flight__callsign {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.active-flight__route {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: "SF Mono", "Cascadia Code", "Source Code Pro", Menlo, Consolas,
+    monospace;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.active-flight__icao {
+  letter-spacing: 0.02em;
+}
+
+.active-flight__arrow {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.active-flight__actions {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.active-flight__stats {
+  margin: 0;
+  display: flex;
+  gap: 24px;
+  flex-wrap: wrap;
+  font-size: 13px;
+}
+
+.active-flight__stats > div {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.active-flight__stats dt {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+
+.active-flight__stats dd {
+  margin: 0;
+  font-weight: 600;
+  font-family: "SF Mono", "Cascadia Code", "Source Code Pro", Menlo, Consolas,
+    monospace;
+}
+
+.active-flight__error {
+  margin: 0;
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border));
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 12px;
+}
+
+/* ===== Start-flight button + error on bid cards ===== */
+
+.bid-card__start {
+  /* The primary action sits first in the action row. */
+}
+
+.bid-card__distance {
+  display: inline-flex;
+  align-items: center;
+  font-size: 12px;
+  font-weight: 500;
+  font-family: "SF Mono", "Cascadia Code", "Source Code Pro", Menlo, Consolas,
+    monospace;
+  padding: 4px 8px;
+  border-radius: 6px;
+  margin-right: auto;
+}
+
+.bid-card__distance--near {
+  color: var(--success);
+  background: color-mix(in srgb, var(--success) 12%, transparent);
+}
+
+.bid-card__distance--far {
+  color: var(--text-muted);
+  background: color-mix(in srgb, var(--offline) 18%, transparent);
+}
+
+.bid-card__start-error {
+  margin: 0;
+  padding: 6px 14px 8px;
+  color: var(--danger);
+  font-size: 12px;
+  background: color-mix(in srgb, var(--danger) 10%, var(--surface));
+  border-top: 1px solid color-mix(in srgb, var(--danger) 30%, var(--border));
+}
+
 /* ===== Bids list ===== */
 
 .bids {
@@ -873,13 +1010,21 @@ input:disabled {
   white-space: nowrap;
 }
 
+.bid-card__actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 8px 14px 10px;
+  border-top: 1px solid var(--border);
+  background: color-mix(in srgb, var(--accent) 4%, var(--surface));
+}
+
 .bid-card__details {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 10px 14px;
+  gap: 6px;
+  padding: 8px 14px 10px;
   border-top: 1px solid var(--border);
-  background: color-mix(in srgb, var(--accent) 4%, var(--surface));
 }
 
 .bid-card__route-text {

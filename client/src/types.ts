@@ -135,6 +135,7 @@ export interface SimSnapshot {
   outside_air_temp_c: number | null;
   aircraft_title: string | null;
   aircraft_icao: string | null;
+  aircraft_registration: string | null;
   simulator: Simulator;
   sim_version: string | null;
 }
@@ -154,4 +155,22 @@ export interface SimStatus {
   snapshot: SimSnapshot | null;
   last_error: string | null;
   available: boolean;
+}
+
+export interface ActiveFlightInfo {
+  pirep_id: string;
+  bid_id: number;
+  started_at: string;
+  flight_number: string;
+  dpt_airport: string;
+  arr_airport: string;
+  distance_nm: number;
+  position_count: number;
+}
+
+export interface AirportInfo {
+  icao: string;
+  name: string | null;
+  lat: number | null;
+  lon: number | null;
 }

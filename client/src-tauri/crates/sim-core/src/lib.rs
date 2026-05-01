@@ -65,6 +65,8 @@ pub struct SimSnapshot {
     // Identity
     pub aircraft_title: Option<String>,
     pub aircraft_icao: Option<String>,
+    /// Aircraft registration / tail number as set in the sim (e.g. "D-AILU").
+    pub aircraft_registration: Option<String>,
     pub simulator: Simulator,
     pub sim_version: Option<String>,
 }

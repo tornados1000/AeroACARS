@@ -174,6 +174,12 @@ pub struct Airport {
     pub iata: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub lat: Option<f64>,
+    #[serde(default)]
+    pub lon: Option<f64>,
+    #[serde(default)]
+    pub elevation: Option<f64>,
 }
 
 /// phpVMS exposes distance as a multi-unit object:
@@ -251,6 +257,126 @@ pub struct Bid {
     pub user_id: i64,
     pub flight_id: String,
     pub flight: Flight,
+}
+
+// ---- PIREP lifecycle types ----
+
+/// Body for `POST /api/pireps/prefile`.
+/// phpVMS validates these; only the listed fields are required, the rest are
+/// dropped if `None` (skipped via `skip_serializing_if`).
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct PrefileBody {
+    pub airline_id: i64,
+    pub aircraft_id: String,
+    pub flight_number: String,
+    pub dpt_airport_id: String,
+    pub arr_airport_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alt_airport_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flight_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_leg: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planned_distance: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planned_flight_time: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    pub source_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+/// Single position entry posted to `POST /api/pireps/{id}/acars/position`.
+/// We map our internal `SimSnapshot` to this on the way out.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct PositionEntry {
+    pub lat: f64,
+    pub lon: f64,
+    pub altitude: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub altitude_agl: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heading: Option<f32>,
+    /// Groundspeed in knots.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gs: Option<f32>,
+    /// Vertical speed in fpm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vs: Option<f32>,
+    /// Indicated airspeed in knots.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ias: Option<f32>,
+    /// Free-form log line shown on the live map.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log: Option<String>,
+    /// ISO-8601 UTC timestamp.
+    pub sim_time: String,
+}
+
+/// Body for `POST /api/pireps/{id}/file` — final flight stats at submission.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct FileBody {
+    /// Total flight time in minutes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flight_time: Option<i32>,
+    /// Fuel used (units configured site-side).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fuel_used: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distance: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+/// Body for `POST /api/pireps/{id}/update`. Used to advance the in-flight
+/// status (Boarding, Pushback, Takeoff, Airborne, …) so the PIREP shows up
+/// in the live-flight view.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct UpdateBody {
+    /// phpVMS PirepState. 1 = IN_PROGRESS, 2 = PENDING, etc.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<i32>,
+    /// phpVMS PirepStatus code (e.g. "BST" boarding, "OFB" pushback,
+    /// "TKO" takeoff, "ENR" enroute, "APP" approach).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PirepCreated {
+    pub id: String,
+}
+
+/// Subset of `GET /api/fleet/aircraft/{id}` we use for diagnostic purposes,
+/// e.g. when phpVMS rejects a prefile with `aircraft-not-available`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AircraftDetails {
+    pub id: i64,
+    #[serde(default)]
+    pub registration: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub icao: Option<String>,
+    /// ICAO of the airport where the aircraft is currently parked.
+    #[serde(default)]
+    pub airport_id: Option<String>,
+    /// 0 = parked, 1 = in use, 2 = in flight (phpVMS AircraftState).
+    #[serde(default)]
+    pub state: Option<i32>,
+    /// "A" active, "S" stored, etc.
+    #[serde(default)]
+    pub status: Option<String>,
 }
 
 // phpVMS resource responses are wrapped: `{ "data": {...} }`.
@@ -346,6 +472,119 @@ impl Client {
     /// `GET /api/user/bids`
     pub async fn get_bids(&self) -> Result<Vec<Bid>, ApiError> {
         self.get_data("/api/user/bids").await
+    }
+
+    /// `GET /api/airports/{icao}` — single airport lookup with coordinates.
+    pub async fn get_airport(&self, icao: &str) -> Result<Airport, ApiError> {
+        let path = format!("/api/airports/{}", icao.trim().to_uppercase());
+        self.get_data(&path).await
+    }
+
+    /// POST a JSON body and decode the response envelope `{ data: T }`.
+    async fn post_data<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T, ApiError> {
+        let url = self.endpoint(path)?;
+        let response = self
+            .http
+            .post(url)
+            .header("X-API-Key", &self.conn.api_key)
+            .header(header::ACCEPT, "application/json")
+            .json(body)
+            .send()
+            .await
+            .map_err(ApiError::from)?;
+        let response = check_status(response, path).await?;
+        let text = response
+            .text()
+            .await
+            .map_err(|e| ApiError::BadResponse(format!("read body for {path}: {e}")))?;
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let head: String = text.chars().take(2000).collect();
+            tracing::debug!(path = %path, body_len = text.len(), head = %head, "post response");
+        }
+        match serde_json::from_str::<DataEnvelope<T>>(&text) {
+            Ok(envelope) => Ok(envelope.data),
+            Err(e) => {
+                tracing::warn!(path = %path, error = %e, "JSON decode failed for POST response");
+                Err(ApiError::BadResponse(format!(
+                    "JSON decode failed for {path}: {e}"
+                )))
+            }
+        }
+    }
+
+    /// POST and ignore the response body (status-check only).
+    async fn post_void<B: Serialize>(&self, path: &str, body: &B) -> Result<(), ApiError> {
+        let url = self.endpoint(path)?;
+        let response = self
+            .http
+            .post(url)
+            .header("X-API-Key", &self.conn.api_key)
+            .header(header::ACCEPT, "application/json")
+            .json(body)
+            .send()
+            .await
+            .map_err(ApiError::from)?;
+        let _ = check_status(response, path).await?;
+        Ok(())
+    }
+
+    /// `POST /api/pireps/prefile` — create an in-flight PIREP.
+    pub async fn prefile_pirep(&self, body: &PrefileBody) -> Result<PirepCreated, ApiError> {
+        self.post_data("/api/pireps/prefile", body).await
+    }
+
+    /// `POST /api/pireps/{pirep_id}/acars/position` — push a batch of positions.
+    pub async fn post_positions(
+        &self,
+        pirep_id: &str,
+        positions: &[PositionEntry],
+    ) -> Result<(), ApiError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            positions: &'a [PositionEntry],
+        }
+        let path = format!("/api/pireps/{pirep_id}/acars/position");
+        self.post_void(&path, &Body { positions }).await
+    }
+
+    /// `POST /api/pireps/{pirep_id}/file` — submit the PIREP.
+    pub async fn file_pirep(&self, pirep_id: &str, body: &FileBody) -> Result<(), ApiError> {
+        let path = format!("/api/pireps/{pirep_id}/file");
+        self.post_void(&path, body).await
+    }
+
+    /// `POST /api/pireps/{pirep_id}/cancel` — cancel an in-flight PIREP.
+    pub async fn cancel_pirep(&self, pirep_id: &str) -> Result<(), ApiError> {
+        #[derive(Serialize)]
+        struct Empty {}
+        let path = format!("/api/pireps/{pirep_id}/cancel");
+        self.post_void(&path, &Empty {}).await
+    }
+
+    /// `POST /api/pireps/{pirep_id}/update` — change PIREP status/state during flight.
+    pub async fn update_pirep(&self, pirep_id: &str, body: &UpdateBody) -> Result<(), ApiError> {
+        let path = format!("/api/pireps/{pirep_id}/update");
+        self.post_void(&path, body).await
+    }
+
+    /// `GET /api/fleet/aircraft/{id}` — single aircraft, used for diagnostics.
+    /// We also try `/api/aircraft/{id}` as a fallback because phpVMS deployments
+    /// vary on this exact path.
+    pub async fn get_aircraft(&self, id: i64) -> Result<AircraftDetails, ApiError> {
+        match self
+            .get_data::<AircraftDetails>(&format!("/api/fleet/aircraft/{id}"))
+            .await
+        {
+            Ok(a) => Ok(a),
+            Err(ApiError::NotFound) => {
+                self.get_data(&format!("/api/aircraft/{id}")).await
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 

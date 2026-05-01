@@ -102,6 +102,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+chrono.workspace = true
 
 # Internal crates — wired up for use as the project grows
 api-client.workspace = true

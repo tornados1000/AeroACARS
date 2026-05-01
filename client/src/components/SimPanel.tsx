@@ -8,6 +8,8 @@ const POLL_MS = 500;
 interface Props {
   /** Lift the connection state so other parts of the dashboard can react. */
   onStateChange?: (state: SimStatus["state"]) => void;
+  /** Lift the latest snapshot so siblings (e.g. BidsList) can use lat/lon. */
+  onSnapshotChange?: (snapshot: SimSnapshot | null) => void;
   /** When true, render the full telemetry grid below the compact summary. */
   debugMode: boolean;
 }
@@ -43,7 +45,29 @@ function fmtHeading(deg: number): string {
   return `${Math.round(norm).toString().padStart(3, "0")}°`;
 }
 
-export function SimPanel({ onStateChange, debugMode }: Props) {
+/**
+ * MSFS often returns localization keys instead of plain text for ATC MODEL,
+ * e.g. "TT:ATCCOM.AC_MODEL_A320.0.text" or "ATCCOM.AC_MODEL A320.0.text".
+ * Try to pull the model code out; if we can't, return null so the field is
+ * hidden rather than showing a useless string to the user.
+ */
+function cleanAtcModel(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const s = raw.trim();
+  if (!s) return null;
+  const match = s.match(/AC_MODEL[_ ]([^.\s]+)\.\d+\.text$/i);
+  if (match) return match[1];
+  // Looks like an unresolved localization key — hide it.
+  if (s.toUpperCase().startsWith("TT:")) return null;
+  if (s.endsWith(".text") || s.includes("ATCCOM.")) return null;
+  return s;
+}
+
+export function SimPanel({
+  onStateChange,
+  onSnapshotChange,
+  debugMode,
+}: Props) {
   const { t, i18n } = useTranslation();
   const [status, setStatus] = useState<SimStatus | null>(null);
 
@@ -59,6 +83,7 @@ export function SimPanel({ onStateChange, debugMode }: Props) {
           if (prev?.state !== next.state) onStateChange?.(next.state);
           return next;
         });
+        onSnapshotChange?.(next.snapshot);
       } catch {
         if (!cancelled) {
           setStatus({
@@ -68,6 +93,7 @@ export function SimPanel({ onStateChange, debugMode }: Props) {
             last_error: "ipc",
             available: false,
           });
+          onSnapshotChange?.(null);
         }
       }
     }
@@ -78,7 +104,7 @@ export function SimPanel({ onStateChange, debugMode }: Props) {
       cancelled = true;
       if (timer) clearInterval(timer);
     };
-  }, [onStateChange]);
+  }, [onStateChange, onSnapshotChange]);
 
   if (!status) {
     return (
@@ -155,9 +181,20 @@ function CompactSummary({
 }) {
   const { t } = useTranslation();
   const aircraft = snap.aircraft_title?.trim() || t("sim.aircraft_unknown");
+  const registration = snap.aircraft_registration?.trim();
+  const icaoModel = cleanAtcModel(snap.aircraft_icao);
+  const extras = [icaoModel, registration].filter(Boolean);
   return (
     <dl className="sim-panel__compact">
-      <Row label={t("sim.fields.aircraft")}>{aircraft}</Row>
+      <Row label={t("sim.fields.aircraft")}>
+        <span>{aircraft}</span>
+        {extras.length > 0 && (
+          <span className="sim-panel__compact-muted">
+            {" — "}
+            {extras.join(" · ")}
+          </span>
+        )}
+      </Row>
       <Row label={t("sim.fields.position")}>
         {fmtCoord(snap.lat)} · {fmtCoord(snap.lon)}
       </Row>

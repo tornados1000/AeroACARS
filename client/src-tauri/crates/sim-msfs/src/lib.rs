@@ -39,6 +39,9 @@ mod adapter {
         title: String,
         #[simconnect(name = "ATC MODEL")]
         atc_model: String,
+        /// Tail number / registration set in MSFS (e.g. "D-AILU").
+        #[simconnect(name = "ATC ID")]
+        atc_id: String,
         #[simconnect(name = "PLANE LATITUDE", unit = "degrees")]
         lat: f64,
         #[simconnect(name = "PLANE LONGITUDE", unit = "degrees")]
@@ -109,6 +112,7 @@ mod adapter {
             outside_air_temp_c: None,
             aircraft_title: Some(t.title.clone()).filter(|s| !s.is_empty()),
             aircraft_icao: Some(t.atc_model.clone()).filter(|s| !s.is_empty()),
+            aircraft_registration: Some(t.atc_id.clone()).filter(|s| !s.is_empty()),
             simulator: kind.as_simulator(),
             sim_version: None,
         }

@@ -548,6 +548,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "api-client",
+ "chrono",
  "geo",
  "metar",
  "recorder",

@@ -1,8 +1,38 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useTranslation } from "react-i18next";
-import type { Bid, Flight, UiError } from "../types";
+import type {
+  ActiveFlightInfo,
+  AirportInfo,
+  Bid,
+  Flight,
+  SimConnectionState,
+  SimSnapshot,
+  UiError,
+} from "../types";
+
+/**
+ * Maximum distance (in nautical miles) between the aircraft and the bid's
+ * departure airport before "Start flight" is enabled. Mirrors the server-side
+ * threshold in `cloudeacars-app/src/lib.rs::MAX_START_DISTANCE_NM`.
+ */
+const MAX_START_DISTANCE_NM = 5.0;
+
+/** Great-circle distance in nautical miles. */
+function distanceNm(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const R = 6_371_008.8; // metres
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const phi1 = toRad(lat1);
+  const phi2 = toRad(lat2);
+  const dphi = toRad(lat2 - lat1);
+  const dlam = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dphi / 2) ** 2 +
+    Math.cos(phi1) * Math.cos(phi2) * Math.sin(dlam / 2) ** 2;
+  const meters = 2 * R * Math.asin(Math.sqrt(a));
+  return meters / 1852;
+}
 
 type State =
   | { kind: "loading" }
@@ -12,8 +42,16 @@ type State =
 
 interface Props {
   baseUrl: string;
+  /** Sim connection state to gate the Start Flight button. */
+  simState: SimConnectionState;
+  /** Latest sim snapshot — used to compute distance to each bid's dpt airport. */
+  simSnapshot: SimSnapshot | null;
+  /** Whether a flight is already active (disables Start on every bid). */
+  hasActiveFlight: boolean;
   /** Notify the parent when a bid is selected so it can drive the next step. */
   onSelect?: (bid: Bid | null) => void;
+  /** Notify the parent that a flight just started. */
+  onFlightStarted?: (flight: ActiveFlightInfo) => void;
 }
 
 const KNOWN_ERROR_CODES = new Set([
@@ -77,11 +115,27 @@ function airlineMonogram(flight: Flight): string {
   );
 }
 
-export function BidsList({ baseUrl, onSelect }: Props) {
+export function BidsList({
+  baseUrl,
+  simState,
+  simSnapshot,
+  hasActiveFlight,
+  onSelect,
+  onFlightStarted,
+}: Props) {
   const { t, i18n } = useTranslation();
   const [state, setState] = useState<State>({ kind: "loading" });
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [startingId, setStartingId] = useState<number | null>(null);
+  const [startError, setStartError] = useState<{
+    bidId: number;
+    message: string;
+  } | null>(null);
+  /** Cached airport coords keyed by uppercase ICAO. */
+  const [airports, setAirports] = useState<Record<string, AirportInfo>>({});
+  /** Tracks ICAOs we've already requested so we don't fetch the same one twice. */
+  const requestedIcaosRef = useRef<Set<string>>(new Set());
 
   const fetchBids = useCallback(async () => {
     try {
@@ -116,6 +170,31 @@ export function BidsList({ baseUrl, onSelect }: Props) {
     setRefreshing(false);
   }
 
+  // Whenever the bids change, fetch the coordinates of every unique departure
+  // airport in the background. Results are cached server-side too, so this is
+  // cheap on subsequent calls.
+  useEffect(() => {
+    if (state.kind !== "ready") return;
+    const uniqueIcaos = new Set(
+      state.bids.map((b) => b.flight.dpt_airport_id.trim().toUpperCase()),
+    );
+    for (const icao of uniqueIcaos) {
+      if (!icao || requestedIcaosRef.current.has(icao)) continue;
+      if (airports[icao]) continue;
+      requestedIcaosRef.current.add(icao);
+      void (async () => {
+        try {
+          const info = await invoke<AirportInfo>("airport_get", { icao });
+          setAirports((prev) => ({ ...prev, [icao]: info }));
+        } catch {
+          // Leave the icao un-cached; the user will still get a clear error
+          // if they try to start the flight (server-side check kicks in).
+          requestedIcaosRef.current.delete(icao);
+        }
+      })();
+    }
+  }, [state, airports]);
+
   function handleSelect(bid: Bid) {
     const next = bid.id === selectedId ? null : bid.id;
     setSelectedId(next);
@@ -140,6 +219,39 @@ export function BidsList({ baseUrl, onSelect }: Props) {
       await openUrl(url);
     } catch {
       // ignore
+    }
+  }
+
+  async function startFlight(bid: Bid) {
+    if (startingId !== null || hasActiveFlight) return;
+    setStartingId(bid.id);
+    setStartError(null);
+    try {
+      const result = await invoke<ActiveFlightInfo>("flight_start", {
+        bidId: bid.id,
+      });
+      onFlightStarted?.(result);
+    } catch (err: unknown) {
+      const ui = asUiError(err);
+      // Map known backend error codes to localized messages; fall back to the
+      // raw server-supplied message if the code is unfamiliar.
+      const knownCodes = [
+        "no_sim_snapshot",
+        "not_on_ground",
+        "not_at_departure",
+        "missing_airline",
+        "missing_aircraft",
+        "flight_already_active",
+        "bid_not_found",
+        "aircraft_not_available",
+        "phpvms_error",
+      ];
+      const message = knownCodes.includes(ui.code)
+        ? `${t(`flight.error.${ui.code}`)} (${ui.message})`
+        : ui.message;
+      setStartError({ bidId: bid.id, message });
+    } finally {
+      setStartingId(null);
     }
   }
 
@@ -183,6 +295,52 @@ export function BidsList({ baseUrl, onSelect }: Props) {
             const monogram = airlineMonogram(f);
             const level = formatLevel(f.level);
             const isSelected = bid.id === selectedId;
+
+            // Compute distance from the aircraft to this bid's dpt airport (if
+            // we have both pieces of info). Drives the proactive gating: the
+            // Start button is enabled only when the aircraft is on the ground
+            // and within MAX_START_DISTANCE_NM of the departure airport.
+            const dptIcao = f.dpt_airport_id.trim().toUpperCase();
+            const dptCoords = airports[dptIcao];
+            let distanceToDptNm: number | null = null;
+            if (
+              simSnapshot &&
+              dptCoords &&
+              dptCoords.lat !== null &&
+              dptCoords.lon !== null
+            ) {
+              distanceToDptNm = distanceNm(
+                simSnapshot.lat,
+                simSnapshot.lon,
+                dptCoords.lat,
+                dptCoords.lon,
+              );
+            }
+            const onGround = simSnapshot?.on_ground ?? false;
+            const tooFar =
+              distanceToDptNm !== null &&
+              distanceToDptNm > MAX_START_DISTANCE_NM;
+
+            const startDisabled =
+              startingId !== null ||
+              hasActiveFlight ||
+              simState !== "connected" ||
+              !onGround ||
+              tooFar;
+
+            let startTitle = "";
+            if (simState !== "connected") {
+              startTitle = t("bids.start_disabled_no_sim");
+            } else if (hasActiveFlight) {
+              startTitle = t("bids.start_disabled_active_flight");
+            } else if (!onGround) {
+              startTitle = t("bids.start_disabled_not_on_ground");
+            } else if (tooFar && distanceToDptNm !== null) {
+              startTitle = t("bids.start_disabled_too_far", {
+                distance: distanceToDptNm.toFixed(1),
+                airport: dptIcao,
+              });
+            }
 
             return (
               <li key={bid.id}>
@@ -248,33 +406,66 @@ export function BidsList({ baseUrl, onSelect }: Props) {
                     </div>
                   </button>
 
-                  {isSelected && (
+                  {/* Always-visible action row so the user can see how to start
+                      a flight without first clicking to expand the card. */}
+                  <div className="bid-card__actions">
+                    <button
+                      type="button"
+                      className="button button--primary bid-card__start"
+                      onClick={() => void startFlight(bid)}
+                      disabled={startDisabled}
+                      title={startTitle}
+                    >
+                      {startingId === bid.id
+                        ? t("bids.starting")
+                        : t("bids.start_flight")}
+                    </button>
+                    {distanceToDptNm !== null && (
+                      <span
+                        className={`bid-card__distance ${
+                          tooFar ? "bid-card__distance--far" : "bid-card__distance--near"
+                        }`}
+                        title={t("bids.distance_to_departure", {
+                          airport: dptIcao,
+                        })}
+                      >
+                        {tooFar ? "✕ " : "✓ "}
+                        {distanceToDptNm < 1
+                          ? `< 1 nm ${t("bids.from_airport", { airport: dptIcao })}`
+                          : `${distanceToDptNm.toFixed(1)} nm ${t("bids.from_airport", { airport: dptIcao })}`}
+                      </span>
+                    )}
+                    {f.simbrief?.id && (
+                      <button
+                        type="button"
+                        className="button"
+                        onClick={() => void openOfp(f)}
+                      >
+                        {t("bids.open_ofp")} ↗
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="button"
+                      onClick={() => void openFlightPage(f)}
+                    >
+                      {t("bids.open_flight_page")} ↗
+                    </button>
+                  </div>
+
+                  {startError?.bidId === bid.id && (
+                    <p className="bid-card__start-error" role="alert">
+                      {startError.message}
+                    </p>
+                  )}
+
+                  {isSelected && f.route && (
                     <div className="bid-card__details">
-                      {f.route && (
-                        <div className="bid-card__route-text">
-                          <span className="bid-card__route-label">
-                            {t("bids.route")}:
-                          </span>{" "}
-                          <code>{f.route}</code>
-                        </div>
-                      )}
-                      <div className="bid-card__actions">
-                        {f.simbrief?.id && (
-                          <button
-                            type="button"
-                            className="button button--primary"
-                            onClick={() => void openOfp(f)}
-                          >
-                            {t("bids.open_ofp")} ↗
-                          </button>
-                        )}
-                        <button
-                          type="button"
-                          className="button"
-                          onClick={() => void openFlightPage(f)}
-                        >
-                          {t("bids.open_flight_page")} ↗
-                        </button>
+                      <div className="bid-card__route-text">
+                        <span className="bid-card__route-label">
+                          {t("bids.route")}:
+                        </span>{" "}
+                        <code>{f.route}</code>
                       </div>
                     </div>
                   )}

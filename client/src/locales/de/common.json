@@ -129,6 +129,16 @@
       "on_ground": "Am Boden"
     }
   },
+  "active_flight": {
+    "title": "Aktiver Flug",
+    "elapsed": "Dauer",
+    "distance": "Strecke",
+    "positions": "Positionen gesendet",
+    "end": "Flug beenden (PIREP einreichen)",
+    "filing": "Reiche ein…",
+    "cancel": "Abbrechen",
+    "cancelling": "Breche ab…"
+  },
   "bids": {
     "title": "Meine gebuchten Flüge",
     "loading": "Flüge werden geladen…",
@@ -140,6 +150,14 @@
     "route": "Route",
     "open_flight_page": "Flugseite öffnen",
     "open_ofp": "OFP / Briefing öffnen",
+    "start_flight": "Flug starten",
+    "starting": "Starte…",
+    "start_disabled_no_sim": "Simulator ist nicht verbunden",
+    "start_disabled_active_flight": "Ein anderer Flug ist bereits aktiv",
+    "start_disabled_not_on_ground": "Sie müssen am Boden sein, um den Flug zu starten",
+    "start_disabled_too_far": "Sie sind {{distance}} nm von {{airport}} entfernt — starten Sie den Flug am Abflugflughafen",
+    "distance_to_departure": "Distanz zum Abflugflughafen",
+    "from_airport": "von {{airport}}",
     "error": {
       "not_logged_in": "Nicht angemeldet — bitte melden Sie sich erneut an.",
       "network": "Server nicht erreichbar.",
@@ -150,6 +168,19 @@
       "server": "Server-Fehler beim Abruf der Bids.",
       "bad_response": "Antwort konnte nicht verstanden werden.",
       "unknown": "Unerwarteter Fehler beim Laden der Bids."
+    }
+  },
+  "flight": {
+    "error": {
+      "no_sim_snapshot": "Keine Simulator-Daten — ist der Simulator verbunden?",
+      "not_on_ground": "Sie müssen am Boden sein, um den Flug zu starten.",
+      "not_at_departure": "Sie sind nicht am Abflugflughafen — bitte fahren Sie zum Abflugflughafen.",
+      "missing_airline": "Der Flug hat keine Airline-Zuordnung.",
+      "missing_aircraft": "Kein Flugzeug für diesen Flug — bitte erstellen Sie zuerst einen SimBrief-OFP.",
+      "flight_already_active": "Ein anderer Flug ist bereits aktiv.",
+      "bid_not_found": "Bid nicht gefunden — bitte aktualisieren.",
+      "aircraft_not_available": "Flugzeug nicht verfügbar — Details siehe unten. Häufige Ursachen: das Flugzeug steht an einem anderen Flughafen, ist gerade „in use“ durch einen offenen PIREP, oder Ihr Rang hat keinen Zugriff. Aufräumen via phpVMS-Admin (PIREPs canceln + Aircraft-Standort prüfen).",
+      "phpvms_error": "phpVMS hat den Flug abgelehnt — siehe Details."
     }
   }
 }

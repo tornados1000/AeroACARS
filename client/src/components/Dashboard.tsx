@@ -1,6 +1,14 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { useTranslation } from "react-i18next";
-import type { Bid, LoginResult, SimConnectionState } from "../types";
+import type {
+  ActiveFlightInfo,
+  Bid,
+  LoginResult,
+  SimConnectionState,
+  SimSnapshot,
+} from "../types";
+import { ActiveFlightPanel } from "./ActiveFlightPanel";
 import { BidsList } from "./BidsList";
 import { SimPanel } from "./SimPanel";
 
@@ -23,6 +31,33 @@ export function Dashboard({
     ? `${profile.airline.icao} · ${profile.airline.name}`
     : null;
   const [, setSelectedBid] = useState<Bid | null>(null);
+  const [activeFlight, setActiveFlight] = useState<ActiveFlightInfo | null>(
+    null,
+  );
+  const [simState, setSimState] = useState<SimConnectionState>("disconnected");
+  const [simSnapshot, setSimSnapshot] = useState<SimSnapshot | null>(null);
+
+  // On dashboard mount, check whether a flight is already active (e.g. after
+  // the app was restarted while a flight was running).
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const flight = await invoke<ActiveFlightInfo | null>("flight_status");
+        if (!cancelled) setActiveFlight(flight);
+      } catch {
+        // ignore
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  function handleSimStateChange(next: SimConnectionState) {
+    setSimState(next);
+    onSimStateChange?.(next);
+  }
 
   return (
     <>
@@ -74,9 +109,22 @@ export function Dashboard({
         </button>
       </section>
 
-      <SimPanel onStateChange={onSimStateChange} debugMode={debugMode} />
+      <SimPanel
+        onStateChange={handleSimStateChange}
+        onSnapshotChange={setSimSnapshot}
+        debugMode={debugMode}
+      />
 
-      <BidsList baseUrl={session.base_url} onSelect={setSelectedBid} />
+      <ActiveFlightPanel onEnded={() => setActiveFlight(null)} />
+
+      <BidsList
+        baseUrl={session.base_url}
+        simState={simState}
+        simSnapshot={simSnapshot}
+        hasActiveFlight={activeFlight !== null}
+        onSelect={setSelectedBid}
+        onFlightStarted={setActiveFlight}
+      />
     </>
   );
 }

@@ -5,10 +5,17 @@
 //! per-user config dir. The API key itself is stored via `secrets` (OS keyring),
 //! never on disk in plaintext.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use api_client::{ApiError, Bid, Client, Connection, Profile};
+use api_client::{
+    Airport, ApiError, Bid, Client, Connection, FileBody, PositionEntry, PrefileBody, Profile,
+    UpdateBody,
+};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sim_core::{SimKind, SimSnapshot};
 use tauri::{AppHandle, Manager};
@@ -21,6 +28,20 @@ const KEYRING_ACCOUNT: &str = "primary";
 const SITE_CONFIG_FILE: &str = "site.json";
 const SIM_CONFIG_FILE: &str = "sim.json";
 
+/// How often the background task posts the latest position to phpVMS while a
+/// flight is active. Spec §10 talks about "configurable intervals"; for now we
+/// hard-code a sane default and make it tunable later.
+const POSITION_INTERVAL_SECS: u64 = 10;
+
+/// Minimum great-circle distance between two consecutive samples before we
+/// add it to the running total. Filters out GPS jitter while parked.
+const DISTANCE_EPSILON_M: f64 = 5.0;
+
+/// How close (in nautical miles) the aircraft must be to the departure airport
+/// to start the flight. Generous enough to cover taxi positions and remote
+/// stands; tight enough to reject "I'm at EDDF instead of EDDP".
+const MAX_START_DISTANCE_NM: f64 = 5.0;
+
 /// Shared application state — wraps the currently-authenticated client (if any)
 /// and (on Windows) the MSFS adapter.
 #[derive(Default)]
@@ -28,6 +49,45 @@ struct AppState {
     client: Mutex<Option<Client>>,
     #[cfg(target_os = "windows")]
     msfs: Mutex<MsfsAdapter>,
+    active_flight: Mutex<Option<Arc<ActiveFlight>>>,
+    /// In-process airport-coords cache. Keyed by ICAO uppercase. Populated on
+    /// first lookup so we don't re-fetch on every snapshot tick.
+    airports: Mutex<HashMap<String, Airport>>,
+}
+
+/// In-memory record of an in-progress flight. Held inside an `Arc` so the
+/// background streaming task can hold a reference without going through the
+/// AppState mutex.
+struct ActiveFlight {
+    pirep_id: String,
+    bid_id: i64,
+    started_at: DateTime<Utc>,
+    flight_number: String,
+    dpt_airport: String,
+    arr_airport: String,
+    /// Mutable running stats updated by the streamer task.
+    stats: Mutex<FlightStats>,
+    stop: AtomicBool,
+}
+
+#[derive(Default)]
+struct FlightStats {
+    last_lat: Option<f64>,
+    last_lon: Option<f64>,
+    distance_nm: f64,
+    position_count: u32,
+}
+
+#[derive(Serialize)]
+pub struct ActiveFlightInfo {
+    pirep_id: String,
+    bid_id: i64,
+    started_at: String,
+    flight_number: String,
+    dpt_airport: String,
+    arr_airport: String,
+    distance_nm: f64,
+    position_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,6 +285,441 @@ async fn phpvms_get_bids(
     Ok(client.get_bids().await?)
 }
 
+// ---- Airport cache ----
+
+#[derive(Serialize)]
+pub struct AirportInfo {
+    icao: String,
+    name: Option<String>,
+    lat: Option<f64>,
+    lon: Option<f64>,
+}
+
+/// Fetch an airport by ICAO, caching the result so we don't re-hit the network
+/// on each sim snapshot.
+#[tauri::command]
+async fn airport_get(
+    state: tauri::State<'_, AppState>,
+    icao: String,
+) -> Result<AirportInfo, UiError> {
+    let key = icao.trim().to_uppercase();
+    // Block-scope the lock so the MutexGuard is dropped before any `await`,
+    // keeping the future `Send`.
+    let cached: Option<Airport> = {
+        let guard = state.airports.lock().expect("airports lock");
+        guard.get(&key).cloned()
+    };
+    if let Some(c) = cached {
+        return Ok(AirportInfo {
+            icao: key,
+            name: c.name,
+            lat: c.lat,
+            lon: c.lon,
+        });
+    }
+    let client = current_client(&state)?;
+    let airport = client.get_airport(&key).await?;
+    let info = AirportInfo {
+        icao: key.clone(),
+        name: airport.name.clone(),
+        lat: airport.lat,
+        lon: airport.lon,
+    };
+    {
+        let mut guard = state.airports.lock().expect("airports lock");
+        guard.insert(key, airport);
+    }
+    Ok(info)
+}
+
+// ---- Flight workflow ----
+
+fn flight_info(flight: &ActiveFlight) -> ActiveFlightInfo {
+    let stats = flight.stats.lock().expect("flight stats");
+    ActiveFlightInfo {
+        pirep_id: flight.pirep_id.clone(),
+        bid_id: flight.bid_id,
+        started_at: flight.started_at.to_rfc3339(),
+        flight_number: flight.flight_number.clone(),
+        dpt_airport: flight.dpt_airport.clone(),
+        arr_airport: flight.arr_airport.clone(),
+        distance_nm: stats.distance_nm,
+        position_count: stats.position_count,
+    }
+}
+
+#[tauri::command]
+fn flight_status(state: tauri::State<'_, AppState>) -> Option<ActiveFlightInfo> {
+    let guard = state.active_flight.lock().expect("active_flight lock");
+    guard.as_ref().map(|f| flight_info(f.as_ref()))
+}
+
+/// Start tracking a flight: prefile a PIREP and begin position streaming.
+#[tauri::command]
+async fn flight_start(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    bid_id: i64,
+) -> Result<ActiveFlightInfo, UiError> {
+    {
+        let guard = state.active_flight.lock().expect("active_flight lock");
+        if guard.is_some() {
+            return Err(UiError::new(
+                "flight_already_active",
+                "another flight is already active",
+            ));
+        }
+    }
+
+    let client = current_client(&state)?;
+    let bids = client.get_bids().await?;
+    let bid = bids
+        .into_iter()
+        .find(|b| b.id == bid_id)
+        .ok_or_else(|| UiError::new("bid_not_found", "bid not found in current bids"))?;
+
+    // ---- Pre-flight gating: must be on the ground at the departure airport ----
+    let snapshot = current_snapshot(&app).ok_or_else(|| {
+        UiError::new("no_sim_snapshot", "no sim snapshot yet — is the simulator connected?")
+    })?;
+    if !snapshot.on_ground {
+        return Err(UiError::new(
+            "not_on_ground",
+            "you must be on the ground to start a flight",
+        ));
+    }
+
+    // Cached or live fetch of the departure airport. The lock is taken in a
+    // narrow scope each time so the MutexGuard never crosses an `await`.
+    let dpt_icao = bid.flight.dpt_airport_id.trim().to_uppercase();
+    let cached_dpt: Option<Airport> = {
+        let guard = state.airports.lock().expect("airports lock");
+        guard.get(&dpt_icao).cloned()
+    };
+    let dpt_airport = match cached_dpt {
+        Some(a) => a,
+        None => {
+            let fetched = client.get_airport(&dpt_icao).await?;
+            let mut guard = state.airports.lock().expect("airports lock");
+            guard.insert(dpt_icao.clone(), fetched.clone());
+            fetched
+        }
+    };
+    if let (Some(lat), Some(lon)) = (dpt_airport.lat, dpt_airport.lon) {
+        let distance_nm =
+            ::geo::distance_m(snapshot.lat, snapshot.lon, lat, lon) / 1852.0;
+        if distance_nm > MAX_START_DISTANCE_NM {
+            return Err(UiError::new(
+                "not_at_departure",
+                format!(
+                    "you are {:.1} nm from {} — start the flight at the departure airport",
+                    distance_nm, dpt_icao
+                ),
+            ));
+        }
+        tracing::info!(
+            dpt = %dpt_icao,
+            distance_nm,
+            "preflight gate passed"
+        );
+    } else {
+        tracing::warn!(
+            dpt = %dpt_icao,
+            "no coordinates for departure airport — skipping distance check"
+        );
+    }
+
+    let airline_id = bid.flight.airline.as_ref().map(|a| a.id).ok_or_else(|| {
+        UiError::new("missing_airline", "bid has no airline relation")
+    })?;
+    let aircraft_id = bid
+        .flight
+        .simbrief
+        .as_ref()
+        .map(|sb| sb.aircraft_id)
+        .flatten()
+        .ok_or_else(|| {
+            UiError::new(
+                "missing_aircraft",
+                "no aircraft on this bid — please prepare a SimBrief OFP first",
+            )
+        })?;
+
+    let body = PrefileBody {
+        airline_id,
+        aircraft_id: aircraft_id.to_string(),
+        flight_number: bid.flight.flight_number.clone(),
+        dpt_airport_id: bid.flight.dpt_airport_id.clone(),
+        arr_airport_id: bid.flight.arr_airport_id.clone(),
+        alt_airport_id: bid.flight.alt_airport_id.clone(),
+        flight_type: bid.flight.flight_type.clone(),
+        route_code: bid.flight.route_code.clone(),
+        route_leg: bid.flight.route_leg.clone(),
+        level: bid.flight.level.filter(|&l| l > 0),
+        planned_distance: bid.flight.distance.as_ref().and_then(|d| d.nmi),
+        planned_flight_time: bid.flight.flight_time,
+        route: bid.flight.route.clone().filter(|s| !s.is_empty()),
+        source_name: format!("CloudeAcars/{}", env!("CARGO_PKG_VERSION")),
+        notes: None,
+    };
+
+    tracing::info!(
+        airline_id,
+        aircraft_id,
+        flight_number = body.flight_number.as_str(),
+        "prefiling PIREP"
+    );
+    let pirep = match client.prefile_pirep(&body).await {
+        Ok(p) => p,
+        Err(ApiError::Server { status: 400, body: err_body })
+            if err_body.contains("aircraft-not-available") =>
+        {
+            // Diagnose: fetch aircraft details to tell the user *why* it's
+            // unavailable (wrong airport, "in use" by an orphan PIREP, etc.).
+            let detail = match client.get_aircraft(aircraft_id).await {
+                Ok(a) => {
+                    let reg = a
+                        .registration
+                        .as_deref()
+                        .or(a.name.as_deref())
+                        .unwrap_or("?");
+                    let where_ = a.airport_id.as_deref().unwrap_or("?");
+                    let state = match a.state {
+                        Some(0) => "parked",
+                        Some(1) => "in use",
+                        Some(2) => "in flight",
+                        _ => "unknown",
+                    };
+                    format!(
+                        "{reg} (id {}): currently at {where_}, state '{state}'. Wanted at {dpt_icao}.",
+                        a.id
+                    )
+                }
+                Err(e) => format!(
+                    "could not fetch aircraft {} details: {e}",
+                    aircraft_id
+                ),
+            };
+            tracing::warn!(aircraft_id, %detail, "aircraft not available");
+            return Err(UiError::new(
+                "aircraft_not_available",
+                format!("Aircraft not available — {detail}"),
+            ));
+        }
+        Err(ApiError::Server { status, body: err_body }) => {
+            // Try to extract a human-readable message from a phpVMS JSON error body.
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&err_body) {
+                if let Some(title) = json.get("title").and_then(|v| v.as_str()) {
+                    return Err(UiError::new(
+                        "phpvms_error",
+                        format!("phpVMS rejected the flight (HTTP {status}): {title}"),
+                    ));
+                }
+            }
+            return Err(UiError::new(
+                "phpvms_error",
+                format!("phpVMS rejected the flight (HTTP {status})"),
+            ));
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    // Advance the PIREP status to BOARDING and ensure state is IN_PROGRESS so
+    // it appears in phpVMS's "Aktive Flüge" view.
+    //
+    // phpVMS 7 PirepState values: REJECTED = -1, IN_PROGRESS = 0, PENDING = 1,
+    // ACCEPTED = 2. We send 0 explicitly so this also recovers any PIREP that
+    // accidentally got pushed to PENDING earlier (e.g. by a buggier client).
+    let update_body = UpdateBody {
+        state: Some(0),
+        status: Some("BST".to_string()),
+        notes: None,
+    };
+    if let Err(e) = client.update_pirep(&pirep.id, &update_body).await {
+        tracing::warn!(
+            pirep_id = %pirep.id,
+            error = %e,
+            "could not advance PIREP status to BOARDING (flight will still be tracked)"
+        );
+    } else {
+        tracing::info!(pirep_id = %pirep.id, "PIREP status set to BOARDING");
+    }
+
+    let flight = Arc::new(ActiveFlight {
+        pirep_id: pirep.id.clone(),
+        bid_id,
+        started_at: Utc::now(),
+        flight_number: bid.flight.flight_number.clone(),
+        dpt_airport: bid.flight.dpt_airport_id.clone(),
+        arr_airport: bid.flight.arr_airport_id.clone(),
+        stats: Mutex::new(FlightStats::default()),
+        stop: AtomicBool::new(false),
+    });
+
+    {
+        let mut guard = state.active_flight.lock().expect("active_flight lock");
+        *guard = Some(Arc::clone(&flight));
+    }
+
+    spawn_position_streamer(app.clone(), Arc::clone(&flight), client);
+
+    let info = flight_info(flight.as_ref());
+    tracing::info!(pirep_id = %flight.pirep_id, "flight started");
+    Ok(info)
+}
+
+/// File the active PIREP with computed final stats.
+#[tauri::command]
+async fn flight_end(state: tauri::State<'_, AppState>) -> Result<(), UiError> {
+    let flight = {
+        let mut guard = state.active_flight.lock().expect("active_flight lock");
+        guard
+            .take()
+            .ok_or_else(|| UiError::new("no_active_flight", "no flight is active"))?
+    };
+    flight.stop.store(true, Ordering::Relaxed);
+
+    let client = current_client(&state)?;
+
+    let (distance_nm, _position_count) = {
+        let stats = flight.stats.lock().expect("flight stats");
+        (stats.distance_nm, stats.position_count)
+    };
+    let elapsed_minutes = (Utc::now() - flight.started_at).num_minutes() as i32;
+
+    let body = FileBody {
+        flight_time: Some(elapsed_minutes.max(0)),
+        fuel_used: None,
+        distance: Some(distance_nm),
+        source_name: Some(format!("CloudeAcars/{}", env!("CARGO_PKG_VERSION"))),
+        notes: None,
+    };
+    tracing::info!(
+        pirep_id = %flight.pirep_id,
+        elapsed_minutes,
+        distance_nm,
+        "filing PIREP"
+    );
+    client.file_pirep(&flight.pirep_id, &body).await?;
+    tracing::info!(pirep_id = %flight.pirep_id, "PIREP filed");
+    Ok(())
+}
+
+/// Cancel the active PIREP without filing it.
+#[tauri::command]
+async fn flight_cancel(state: tauri::State<'_, AppState>) -> Result<(), UiError> {
+    let flight = {
+        let mut guard = state.active_flight.lock().expect("active_flight lock");
+        guard
+            .take()
+            .ok_or_else(|| UiError::new("no_active_flight", "no flight is active"))?
+    };
+    flight.stop.store(true, Ordering::Relaxed);
+    let client = current_client(&state)?;
+    client.cancel_pirep(&flight.pirep_id).await?;
+    tracing::info!(pirep_id = %flight.pirep_id, "PIREP cancelled");
+    Ok(())
+}
+
+/// Spawn the background task that pushes the latest sim snapshot to phpVMS at
+/// `POSITION_INTERVAL_SECS`. Stops when `flight.stop` is set or the active
+/// flight is replaced.
+///
+/// We use `tauri::async_runtime::spawn` rather than bare `tokio::spawn` so the
+/// task always lands on Tauri's runtime, regardless of feature flags.
+fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Client) {
+    tauri::async_runtime::spawn(async move {
+        tracing::info!(pirep_id = %flight.pirep_id, "position streamer started");
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(POSITION_INTERVAL_SECS));
+        // Skip the immediate first tick so we don't post before we have a snapshot.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if flight.stop.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let snapshot = current_snapshot(&app);
+            let Some(snap) = snapshot else {
+                tracing::warn!(
+                    pirep_id = %flight.pirep_id,
+                    "no sim snapshot yet — skipping position post"
+                );
+                continue;
+            };
+
+            // Update running stats first (so the UI sees them even if the post fails).
+            update_stats(&flight, &snap);
+            let position = snapshot_to_position(&snap);
+
+            match client
+                .post_positions(&flight.pirep_id, &[position])
+                .await
+            {
+                Ok(()) => {
+                    tracing::info!(
+                        pirep_id = %flight.pirep_id,
+                        lat = snap.lat,
+                        lon = snap.lon,
+                        alt_msl_ft = snap.altitude_msl_ft,
+                        gs_kt = snap.groundspeed_kt,
+                        "position posted"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        pirep_id = %flight.pirep_id,
+                        error = %e,
+                        "position post failed; will retry on next tick"
+                    );
+                }
+            }
+        }
+        tracing::info!(pirep_id = %flight.pirep_id, "position streamer stopped");
+    });
+}
+
+#[cfg(target_os = "windows")]
+fn current_snapshot(app: &AppHandle) -> Option<SimSnapshot> {
+    let state = app.state::<AppState>();
+    let adapter = state.msfs.lock().expect("msfs lock");
+    adapter.snapshot()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn current_snapshot(_app: &AppHandle) -> Option<SimSnapshot> {
+    None
+}
+
+fn update_stats(flight: &ActiveFlight, snap: &SimSnapshot) {
+    let mut stats = flight.stats.lock().expect("flight stats");
+    if let (Some(prev_lat), Some(prev_lon)) = (stats.last_lat, stats.last_lon) {
+        let d_m = ::geo::distance_m(prev_lat, prev_lon, snap.lat, snap.lon);
+        if d_m > DISTANCE_EPSILON_M {
+            stats.distance_nm += d_m / 1852.0;
+        }
+    }
+    stats.last_lat = Some(snap.lat);
+    stats.last_lon = Some(snap.lon);
+    stats.position_count = stats.position_count.saturating_add(1);
+}
+
+fn snapshot_to_position(snap: &SimSnapshot) -> PositionEntry {
+    PositionEntry {
+        lat: snap.lat,
+        lon: snap.lon,
+        altitude: snap.altitude_msl_ft,
+        altitude_agl: Some(snap.altitude_agl_ft),
+        heading: Some(snap.heading_deg_magnetic),
+        gs: Some(snap.groundspeed_kt),
+        vs: Some(snap.vertical_speed_fpm),
+        ias: Some(snap.indicated_airspeed_kt),
+        log: None,
+        sim_time: snap.timestamp.to_rfc3339(),
+    }
+}
+
 // ---- Simulator selection + status ----
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -405,6 +900,11 @@ pub fn run() {
             sim_get_kind,
             sim_set_kind,
             sim_status,
+            airport_get,
+            flight_status,
+            flight_start,
+            flight_end,
+            flight_cancel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running CloudeAcars");
