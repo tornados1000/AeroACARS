@@ -232,6 +232,22 @@
       "touchdown": "Letzter Touchdown (vom Sim erfasst)"
     }
   },
+  "inspector": {
+    "title": "SimVar / LVar Inspektor",
+    "hint": "Trage einen SimVar- oder LVar-Namen ein, um den Wert live zu beobachten. Nützlich, um z.B. herauszufinden, welcher LVar zu welchem Cockpit-Schalter gehört.",
+    "placeholder_name": "z.B. L:S_OH_EXT_LT_BEACON oder LIGHT BEACON",
+    "placeholder_unit": "Einheit (Number, bool, knots, …)",
+    "kind_number": "Zahl",
+    "kind_bool": "Bool",
+    "kind_string": "Text",
+    "add": "Hinzufügen",
+    "remove": "Entfernen",
+    "empty": "Noch keine Variablen unter Beobachtung.",
+    "col_name": "Name",
+    "col_unit": "Einheit",
+    "col_value": "Wert",
+    "col_actions": "Aktionen"
+  },
   "resume": {
     "title": "Aktiver Flug erkannt",
     "countdown": "In {{seconds}}s wird der Flug fortgesetzt — solange läuft kein Position-Stream",

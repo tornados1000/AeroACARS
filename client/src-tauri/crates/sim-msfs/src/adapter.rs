@@ -18,7 +18,8 @@ use sim_core::{AircraftProfile, SimKind, SimSnapshot, Simulator};
 mod sys;
 mod telemetry;
 
-use telemetry::{Touchdown, TELEMETRY_FIELDS, TOUCHDOWN_FIELDS};
+use telemetry::{InspectorState, Touchdown, TELEMETRY_FIELDS, TOUCHDOWN_FIELDS};
+pub use telemetry::{InspectorWatch, WatchKind, WatchValue};
 
 // IDs used in our SimConnect calls — chosen freely as long as they're
 // unique within the connection. Data definition #1 holds the per-tick
@@ -31,6 +32,11 @@ const DEFINITION_ID: sys::SIMCONNECT_DATA_DEFINITION_ID = 1;
 const REQUEST_ID: sys::SIMCONNECT_DATA_REQUEST_ID = 1;
 const TOUCHDOWN_DEFINITION_ID: sys::SIMCONNECT_DATA_DEFINITION_ID = 2;
 const TOUCHDOWN_REQUEST_ID: sys::SIMCONNECT_DATA_REQUEST_ID = 2;
+/// Definition #3: live inspector watchlist, re-registered on every
+/// add/remove. Lives in its own slot so a typo in a user-supplied
+/// SimVar name can't take down the per-tick telemetry.
+const INSPECTOR_DEFINITION_ID: sys::SIMCONNECT_DATA_DEFINITION_ID = 3;
+const INSPECTOR_REQUEST_ID: sys::SIMCONNECT_DATA_REQUEST_ID = 3;
 const STALE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Public connection state mirrored to the frontend.
@@ -58,6 +64,10 @@ struct Shared {
     /// asynchronously by SimConnect — we merge it into each emitted
     /// `SimSnapshot` so downstream consumers see a unified view.
     touchdown: Mutex<Option<Touchdown>>,
+    /// User-driven SimVar/LVar inspector watchlist. UI mutates the
+    /// vec via add_watch / remove_watch (which sets `dirty=true`),
+    /// the worker re-registers definition #3 on the next tick.
+    inspector: Mutex<InspectorState>,
 }
 
 impl Default for MsfsAdapter {
@@ -74,6 +84,7 @@ impl MsfsAdapter {
                 snapshot: Mutex::new(None),
                 last_error: Mutex::new(None),
                 touchdown: Mutex::new(None),
+                inspector: Mutex::new(InspectorState::default()),
             }),
             worker: None,
             stop: Arc::new(AtomicBool::new(false)),
@@ -125,6 +136,29 @@ impl MsfsAdapter {
 
     pub fn last_error(&self) -> Option<String> {
         self.shared.last_error.lock().unwrap().clone()
+    }
+
+    // ---- Inspector (Phase B) ----
+
+    /// Add a SimVar/LVar to the live inspector watchlist. Returns the
+    /// stable id assigned to this entry — pass it to `remove_watch`.
+    /// Re-registration of SimConnect data definition #3 happens on the
+    /// next worker tick (asynchronous, sub-second).
+    pub fn add_watch(&self, name: String, unit: String, kind: WatchKind) -> u32 {
+        let mut g = self.shared.inspector.lock().unwrap();
+        g.add(name, unit, kind)
+    }
+
+    pub fn remove_watch(&self, id: u32) {
+        let mut g = self.shared.inspector.lock().unwrap();
+        g.remove(id);
+    }
+
+    /// Snapshot of the current watchlist (cloning so the caller doesn't
+    /// hold the inspector mutex). Each entry carries its latest value
+    /// — `value: None` means we haven't received a tick yet.
+    pub fn watches(&self) -> Vec<InspectorWatch> {
+        self.shared.inspector.lock().unwrap().watches.clone()
     }
 }
 
@@ -191,8 +225,38 @@ fn run_dispatch(
     let mut last_data = Instant::now();
     let mut got_first = false;
     let simulator = kind.as_simulator();
+    // Force inspector re-registration after a reconnect — the new
+    // SimConnect handle starts with an empty definition table even
+    // if the user already populated the watchlist before the drop.
+    if !shared.inspector.lock().unwrap().watches.is_empty() {
+        shared.inspector.lock().unwrap().dirty = true;
+    }
 
     while !stop.load(Ordering::Relaxed) {
+        // Re-register the inspector watchlist whenever the UI has
+        // mutated it. The dirty flag avoids hot-looping the
+        // SimConnect call in the steady state.
+        let needs_inspector_register = {
+            let g = shared.inspector.lock().unwrap();
+            g.dirty
+        };
+        if needs_inspector_register {
+            let watches = shared.inspector.lock().unwrap().watches.clone();
+            match conn.register_inspector(&watches) {
+                Ok(()) => {
+                    if !watches.is_empty() {
+                        if let Err(e) = conn.request_inspector_per_second() {
+                            tracing::warn!(error = %e, "request_inspector failed");
+                        }
+                    }
+                    shared.inspector.lock().unwrap().dirty = false;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "register_inspector failed; will retry");
+                }
+            }
+        }
+
         // Drain whatever messages SimConnect has queued for us.
         loop {
             match conn.get_next_dispatch() {
@@ -254,6 +318,9 @@ fn run_dispatch(
                         TOUCHDOWN_REQUEST_ID => {
                             let td = Touchdown::from_block(&bytes);
                             *shared.touchdown.lock().unwrap() = Some(td);
+                        }
+                        INSPECTOR_REQUEST_ID => {
+                            shared.inspector.lock().unwrap().ingest(&bytes);
                         }
                         other => {
                             tracing::trace!(request_id = other, "unknown SimObjectData request_id");
@@ -398,6 +465,71 @@ impl Connection {
                     field.name
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// Re-register the inspector data definition from scratch using
+    /// the supplied watchlist. Always clears the existing definition
+    /// first so a removed entry actually goes away — SimConnect has
+    /// no per-field "remove" call. An empty watchlist is valid (just
+    /// clears the definition and skips the request).
+    fn register_inspector(&mut self, watches: &[InspectorWatch]) -> Result<(), String> {
+        let hr = unsafe {
+            sys::SimConnect_ClearDataDefinition(self.handle, INSPECTOR_DEFINITION_ID)
+        };
+        // ClearDataDefinition returns S_OK even when the definition
+        // didn't exist yet — non-zero is a real error.
+        if hr != 0 {
+            return Err(format!("ClearDataDefinition returned 0x{hr:08X}"));
+        }
+        for (idx, w) in watches.iter().enumerate() {
+            let cname = std::ffi::CString::new(w.name.as_str())
+                .map_err(|_| format!("watch #{idx} name contained NUL"))?;
+            let cunit = std::ffi::CString::new(w.unit.as_str())
+                .map_err(|_| format!("watch #{idx} unit contained NUL"))?;
+            let datatype = match w.kind {
+                WatchKind::Number => sys::SIMCONNECT_DATATYPE_FLOAT64,
+                WatchKind::Bool => sys::SIMCONNECT_DATATYPE_INT32,
+                WatchKind::String => sys::SIMCONNECT_DATATYPE_STRING256,
+            };
+            let hr = unsafe {
+                sys::SimConnect_AddToDataDefinition(
+                    self.handle,
+                    INSPECTOR_DEFINITION_ID,
+                    cname.as_ptr(),
+                    cunit.as_ptr(),
+                    datatype,
+                    0.0,
+                    u32::MAX,
+                )
+            };
+            if hr != 0 {
+                return Err(format!(
+                    "AddToDataDefinition for inspector watch \"{}\" returned 0x{hr:08X}",
+                    w.name
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn request_inspector_per_second(&mut self) -> Result<(), String> {
+        let hr = unsafe {
+            sys::SimConnect_RequestDataOnSimObject(
+                self.handle,
+                INSPECTOR_REQUEST_ID,
+                INSPECTOR_DEFINITION_ID,
+                sys::SIMCONNECT_OBJECT_ID_USER,
+                sys::SIMCONNECT_PERIOD_SECOND,
+                0,
+                0,
+                0,
+                0,
+            )
+        };
+        if hr != 0 {
+            return Err(format!("HRESULT 0x{hr:08X}"));
         }
         Ok(())
     }

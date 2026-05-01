@@ -3939,6 +3939,92 @@ fn sim_status(app: AppHandle, _state: tauri::State<'_, AppState>) -> SimStatus {
     }
 }
 
+// ---- Live SimVar / LVar inspector (Settings → Debug) ----
+//
+// These commands forward to the MsfsAdapter's inspector watchlist
+// (Phase B). Non-Windows targets just return errors / empty lists
+// since the adapter is Windows-only anyway.
+
+#[derive(serde::Deserialize)]
+struct InspectorAddArgs {
+    name: String,
+    unit: String,
+    /// "number" | "bool" | "string" — matches sim_msfs::WatchKind.
+    kind: String,
+}
+
+#[tauri::command]
+fn inspector_add(
+    _state: tauri::State<'_, AppState>,
+    args: InspectorAddArgs,
+) -> Result<u32, UiError> {
+    #[cfg(target_os = "windows")]
+    {
+        let kind = match args.kind.as_str() {
+            "number" => sim_msfs::WatchKind::Number,
+            "bool" => sim_msfs::WatchKind::Bool,
+            "string" => sim_msfs::WatchKind::String,
+            _ => {
+                return Err(UiError::new(
+                    "invalid_watch_kind",
+                    format!("unknown kind: {}", args.kind),
+                ))
+            }
+        };
+        let trimmed_name = args.name.trim().to_string();
+        let trimmed_unit = args.unit.trim().to_string();
+        if trimmed_name.is_empty() {
+            return Err(UiError::new(
+                "empty_name",
+                "SimVar / LVar name cannot be empty",
+            ));
+        }
+        let adapter = _state.msfs.lock().expect("msfs lock");
+        let id = adapter.add_watch(trimmed_name, trimmed_unit, kind);
+        Ok(id)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = args;
+        Err(UiError::new("unsupported", "inspector is Windows-only"))
+    }
+}
+
+#[tauri::command]
+fn inspector_remove(
+    _state: tauri::State<'_, AppState>,
+    id: u32,
+) -> Result<(), UiError> {
+    #[cfg(target_os = "windows")]
+    {
+        let adapter = _state.msfs.lock().expect("msfs lock");
+        adapter.remove_watch(id);
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = id;
+        Err(UiError::new("unsupported", "inspector is Windows-only"))
+    }
+}
+
+#[tauri::command]
+fn inspector_list(_state: tauri::State<'_, AppState>) -> Vec<serde_json::Value> {
+    #[cfg(target_os = "windows")]
+    {
+        let adapter = _state.msfs.lock().expect("msfs lock");
+        adapter
+            .watches()
+            .into_iter()
+            .map(|w| serde_json::to_value(w).unwrap_or(serde_json::Value::Null))
+            .collect()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Vec::new()
+    }
+}
+
 /// On login or session restore, check the on-disk active-flight file. If it's
 /// recent enough, recreate the in-memory ActiveFlight and restart position
 /// streaming — picks up exactly where the previous run left off.
@@ -4118,6 +4204,9 @@ pub fn run() {
             flight_discover_resumable,
             flight_adopt,
             flight_resume_confirm,
+            inspector_add,
+            inspector_remove,
+            inspector_list,
         ])
         .run(tauri::generate_context!())
         .expect("error while running CloudeAcars");

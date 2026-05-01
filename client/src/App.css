@@ -1196,6 +1196,108 @@ button:disabled {
   box-shadow: inset 0 0 0 1px currentColor;
 }
 
+/* ----- SimVar / LVar Inspector (Settings → Debug) ----- */
+
+.inspector-add {
+  display: grid;
+  grid-template-columns: 1fr auto auto auto;
+  gap: 6px;
+  margin: 4px 0 8px;
+}
+
+.inspector-add input,
+.inspector-add select {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 12px;
+  color: var(--text);
+  font-family: "SF Mono", "Cascadia Code", "Source Code Pro", Menlo, Consolas,
+    monospace;
+}
+
+.inspector-add__name {
+  min-width: 0;
+}
+
+.inspector-add__unit {
+  width: 130px;
+}
+
+.inspector-add__kind {
+  width: 88px;
+}
+
+.inspector-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  font-family: "SF Mono", "Cascadia Code", "Source Code Pro", Menlo, Consolas,
+    monospace;
+  font-feature-settings: "tnum" 1;
+}
+
+.inspector-table th,
+.inspector-table td {
+  padding: 5px 8px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+
+.inspector-table th {
+  font-weight: 500;
+  color: var(--text-muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.inspector-table__name {
+  word-break: break-all;
+}
+
+.inspector-table__unit {
+  color: var(--text-muted);
+  width: 110px;
+}
+
+.inspector-table__value {
+  width: 140px;
+  font-variant-numeric: tabular-nums;
+}
+
+.inspector-table__error {
+  color: #ef4444;
+  font-size: 11px;
+}
+
+.inspector-table__actions {
+  width: 32px;
+  text-align: right;
+}
+
+.inspector-remove {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  width: 22px;
+  height: 22px;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.inspector-remove:hover {
+  border-color: #ef4444;
+  color: #ef4444;
+}
+
 /* ===== Login form ===== */
 
 .login {

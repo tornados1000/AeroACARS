@@ -1,5 +1,6 @@
 import { useTranslation } from "react-i18next";
 import type { SimSnapshot, SimStatus } from "../types";
+import { SimInspector } from "./SimInspector";
 
 /**
  * Display-only sim telemetry panel for the Settings tab's debug
@@ -93,6 +94,7 @@ export function SimDebugPanel({ status }: Props) {
           <MassFuelGrid snap={snapshot} locale={i18n.language} />
           <SwitchStatePanel snap={snapshot} />
           <TouchdownGrid snap={snapshot} locale={i18n.language} />
+          <SimInspector />
         </>
       )}
     </section>

@@ -305,6 +305,128 @@ impl Touchdown {
         t
     }
 
+    pub fn _dummy() {} // keep impl block aligned
+}
+
+// ---- Live SimVar/LVar Inspector (debug feature) ----
+//
+// A user-driven watchlist that registers arbitrary SimVar / LVar
+// names against SimConnect at runtime. Lives behind a separate data
+// definition (#3) so the user can add a name with a typo without
+// breaking real telemetry.
+
+/// Type discriminator for watched values. Matches the SimConnect
+/// data type we use for the corresponding `AddToDataDefinition` call.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchKind {
+    /// FLOAT64. Use for raw numeric SimVars and LVars (most cases).
+    Number,
+    /// INT32. Use for SimConnect bool SimVars (e.g. SIM ON GROUND).
+    Bool,
+    /// STRING256. Use for TITLE / ATC MODEL etc.
+    String,
+}
+
+impl WatchKind {
+    pub fn size(self) -> usize {
+        match self {
+            WatchKind::Number => 8,
+            WatchKind::Bool => 4,
+            WatchKind::String => 256,
+        }
+    }
+}
+
+/// Latest value for one watch entry.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum WatchValue {
+    Number(f64),
+    Bool(bool),
+    String(String),
+}
+
+/// One entry in the inspector's watchlist. `value` is None until the
+/// next dispatch tick after registration.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InspectorWatch {
+    pub id: u32,
+    pub name: String,
+    pub unit: String,
+    pub kind: WatchKind,
+    /// Set whenever a SIMCONNECT_RECV_EXCEPTION fires for this entry
+    /// during registration, so the UI can render an error indicator
+    /// instead of a stale value.
+    pub error: Option<String>,
+    pub value: Option<WatchValue>,
+}
+
+/// Mutable inspector state, owned by the adapter's `Shared`.
+#[derive(Debug, Default)]
+pub struct InspectorState {
+    pub watches: Vec<InspectorWatch>,
+    pub next_id: u32,
+    /// Set when the watchlist has changed and the worker needs to
+    /// re-register data definition #3.
+    pub dirty: bool,
+}
+
+impl InspectorState {
+    pub fn add(&mut self, name: String, unit: String, kind: WatchKind) -> u32 {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.watches.push(InspectorWatch {
+            id,
+            name,
+            unit,
+            kind,
+            error: None,
+            value: None,
+        });
+        self.dirty = true;
+        id
+    }
+
+    pub fn remove(&mut self, id: u32) {
+        let before = self.watches.len();
+        self.watches.retain(|w| w.id != id);
+        if self.watches.len() != before {
+            self.dirty = true;
+        }
+    }
+
+    /// Parse the data block returned by SimConnect for the inspector
+    /// definition — fields are at fixed offsets in watchlist order,
+    /// same parsing model as the main telemetry block.
+    pub fn ingest(&mut self, bytes: &[u8]) {
+        let mut off = 0usize;
+        for w in &mut self.watches {
+            match w.kind {
+                WatchKind::Number => {
+                    if let Some(v) = read_f64(bytes, off) {
+                        w.value = Some(WatchValue::Number(v));
+                    }
+                    off += 8;
+                }
+                WatchKind::Bool => {
+                    if let Some(v) = read_i32(bytes, off) {
+                        w.value = Some(WatchValue::Bool(v != 0));
+                    }
+                    off += 4;
+                }
+                WatchKind::String => {
+                    if let Some(v) = read_str256(bytes, off) {
+                        w.value = Some(WatchValue::String(v));
+                    }
+                    off += 256;
+                }
+            }
+        }
+    }
+}
+
+impl Touchdown {
     /// `true` while no *real* touchdown has happened yet.
     ///
     /// MSFS populates the PLANE TOUCHDOWN * SimVars with the

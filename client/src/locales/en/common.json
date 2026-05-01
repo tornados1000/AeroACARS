@@ -232,6 +232,22 @@
       "touchdown": "Last Touchdown (sim-latched)"
     }
   },
+  "inspector": {
+    "title": "SimVar / LVar Inspector",
+    "hint": "Type a SimVar or LVar name to watch its value live. Useful for figuring out which LVar a cockpit switch maps to.",
+    "placeholder_name": "e.g. L:S_OH_EXT_LT_BEACON or LIGHT BEACON",
+    "placeholder_unit": "Unit (Number, bool, knots, …)",
+    "kind_number": "Number",
+    "kind_bool": "Bool",
+    "kind_string": "String",
+    "add": "Add",
+    "remove": "Remove",
+    "empty": "No variables being watched yet.",
+    "col_name": "Name",
+    "col_unit": "Unit",
+    "col_value": "Value",
+    "col_actions": "Actions"
+  },
   "resume": {
     "title": "Active flight detected",
     "countdown": "Resuming in {{seconds}}s — no position stream is running yet",
