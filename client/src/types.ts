@@ -212,6 +212,12 @@ export interface ActiveFlightInfo {
   arr_gate: string | null;
   /** Approach runway from `ATC RUNWAY SELECTED` at Final. */
   approach_runway: string | null;
+  /** ISO-8601 UTC timestamp of the most recent successful
+   *  position-post, or null if none has succeeded yet. */
+  last_position_at: string | null;
+  /** Positions sitting in the offline queue waiting to replay.
+   *  0 means we're online and current. */
+  queued_position_count: number;
 }
 
 export interface AirportInfo {

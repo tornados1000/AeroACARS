@@ -500,6 +500,17 @@ struct FlightStats {
     block_fuel_kg: Option<f32>,
     last_fuel_kg: Option<f32>,
 
+    /// When the streamer last successfully posted a position to phpVMS.
+    /// Drives the cockpit's LIVE / REC indicator — a long gap means
+    /// the network is having trouble (or the streamer is dead) and
+    /// the dashboard should warn the pilot before they file a PIREP
+    /// without recent telemetry.
+    last_position_at: Option<DateTime<Utc>>,
+    /// Number of positions currently sitting in the offline queue
+    /// waiting to be replayed. >0 means we lost the network briefly
+    /// and the dashboard should surface that.
+    queued_position_count: u32,
+
     // ---- Gates / runway (from MSFS ATC SimVars) ----
     /// Parking stand the pilot pushed back from. Captured the first
     /// time `step_flight` sees a non-empty `parking_name` while still
@@ -702,6 +713,14 @@ pub struct ActiveFlightInfo {
     arr_gate: Option<String>,
     /// `ATC RUNWAY SELECTED` snapshotted while on Final.
     approach_runway: Option<String>,
+    /// ISO-8601 UTC timestamp of the last successful position-post.
+    /// Powers the cockpit's LIVE recording indicator — "X seconds
+    /// ago" derived client-side.
+    last_position_at: Option<String>,
+    /// Number of positions sitting in the offline queue. Non-zero
+    /// means the streamer hit a network failure recently and the
+    /// dashboard should warn the pilot.
+    queued_position_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1251,6 +1270,8 @@ fn flight_info(flight: &ActiveFlight) -> ActiveFlightInfo {
         dep_gate: stats.dep_gate.clone(),
         arr_gate: stats.arr_gate.clone(),
         approach_runway: stats.approach_runway.clone(),
+        last_position_at: stats.last_position_at.map(|t| t.to_rfc3339()),
+        queued_position_count: stats.queued_position_count,
     }
 }
 
@@ -2516,6 +2537,18 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                         gs_kt = snap.groundspeed_kt,
                         "position posted"
                     );
+                    // Stamp the success time + clear any stale queue
+                    // count so the dashboard's LIVE indicator stays
+                    // green and back-fills the "last send" line.
+                    {
+                        let mut stats = flight.stats.lock().expect("flight stats");
+                        stats.last_position_at = Some(Utc::now());
+                        let queue_len = queue
+                            .as_ref()
+                            .and_then(|q| q.len().ok())
+                            .unwrap_or(0) as u32;
+                        stats.queued_position_count = queue_len;
+                    }
                     // Mirror the snapshot into the per-flight JSONL log
                     // for offline replay / debugging. Best-effort.
                     record_event(
@@ -2539,12 +2572,19 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                             position: serde_json::to_value(&position).unwrap_or_default(),
                         };
                         match q.enqueue(queued) {
-                            Ok(len) => log_activity_handle(
-                                &app,
-                                ActivityLevel::Warn,
-                                "Position queued (offline)".to_string(),
-                                Some(format!("{} pending", len)),
-                            ),
+                            Ok(len) => {
+                                {
+                                    let mut stats =
+                                        flight.stats.lock().expect("flight stats");
+                                    stats.queued_position_count = len as u32;
+                                }
+                                log_activity_handle(
+                                    &app,
+                                    ActivityLevel::Warn,
+                                    "Position queued (offline)".to_string(),
+                                    Some(format!("{} pending", len)),
+                                );
+                            }
                             Err(qe) => tracing::warn!(error = ?qe, "could not enqueue position"),
                         }
                     }

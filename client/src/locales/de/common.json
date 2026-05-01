@@ -19,6 +19,20 @@
     "empty_hint": "Wechseln Sie ins Briefing, um einen gebuchten Flug zu starten oder einen offenen PIREP zu adoptieren.",
     "go_briefing": "Zum Briefing"
   },
+  "recording": {
+    "status": {
+      "live": "LIVE",
+      "queued": "OFFLINE",
+      "stale": "FEHLER",
+      "idle": "WARTET"
+    },
+    "no_post_yet": "noch nicht gesendet",
+    "last_send_secs": "vor {{secs}} s gesendet",
+    "queued_pending_one": "{{count}} Position offline",
+    "queued_pending_other": "{{count}} Positionen offline",
+    "queued_pending": "{{count}} Positionen offline",
+    "total_sent": "Gesamt gesendet"
+  },
   "tapes": {
     "ias": "IAS",
     "gs": "GS",

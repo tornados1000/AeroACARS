@@ -420,6 +420,93 @@ button:disabled {
   color: var(--text-muted);
 }
 
+/* ===== Live recording indicator (cockpit, top of active-flight) ===== */
+
+.live-rec {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px 4px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  white-space: nowrap;
+  font-family: "SF Mono", "Cascadia Code", "Source Code Pro", Menlo, Consolas,
+    monospace;
+}
+
+.live-rec__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: 0 0 auto;
+}
+
+.live-rec__label {
+  color: currentColor;
+}
+
+.live-rec__detail {
+  color: var(--text-muted);
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: 0.02em;
+}
+
+.live-rec__count {
+  margin-left: 4px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, currentColor 18%, transparent);
+  color: currentColor;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+/* States */
+.live-rec--live {
+  color: var(--success, #22c55e);
+  border-color: color-mix(in srgb, var(--success, #22c55e) 50%, var(--border));
+  background: color-mix(in srgb, var(--success, #22c55e) 12%, var(--surface-2));
+}
+
+.live-rec--live .live-rec__dot {
+  animation: rec-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes rec-pulse {
+  0% {
+    box-shadow: 0 0 0 0 currentColor;
+  }
+  70% {
+    box-shadow: 0 0 0 6px color-mix(in srgb, currentColor 0%, transparent);
+  }
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 0%, transparent);
+  }
+}
+
+.live-rec--queued {
+  color: var(--warning, orange);
+  border-color: color-mix(in srgb, var(--warning, orange) 50%, var(--border));
+  background: color-mix(in srgb, var(--warning, orange) 12%, var(--surface-2));
+}
+
+.live-rec--stale {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 50%, var(--border));
+  background: color-mix(in srgb, var(--danger) 12%, var(--surface-2));
+}
+
+.live-rec--idle {
+  color: var(--text-muted);
+}
+
 /* ===== Phase timeline (Cockpit) — animated SVG plane on a track ===== */
 
 .phase-timeline {

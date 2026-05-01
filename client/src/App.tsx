@@ -7,6 +7,7 @@ import { CockpitView } from "./components/CockpitView";
 import { BriefingView } from "./components/BriefingView";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { ActivityLogPanel } from "./components/ActivityLogPanel";
+import { LiveRecordingIndicator } from "./components/LiveRecordingIndicator";
 import { useSimSession } from "./hooks/useSimSession";
 import type { ActiveFlightInfo, LoginResult } from "./types";
 
@@ -157,6 +158,13 @@ function App() {
             <span className="status-pill__dot" />
             {t("status.simulator")}
           </span>
+          {activeFlight && (
+            <LiveRecordingIndicator
+              lastPositionAt={activeFlight.last_position_at}
+              queuedCount={activeFlight.queued_position_count}
+              positionCount={activeFlight.position_count}
+            />
+          )}
         </div>
       </header>
 

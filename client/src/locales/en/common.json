@@ -19,6 +19,20 @@
     "empty_hint": "Head to Briefing to start a booked flight or adopt an in-progress PIREP.",
     "go_briefing": "Open briefing"
   },
+  "recording": {
+    "status": {
+      "live": "LIVE",
+      "queued": "OFFLINE",
+      "stale": "STALLED",
+      "idle": "STARTING"
+    },
+    "no_post_yet": "no post yet",
+    "last_send_secs": "sent {{secs}} s ago",
+    "queued_pending_one": "{{count}} position queued",
+    "queued_pending_other": "{{count}} positions queued",
+    "queued_pending": "{{count}} positions queued",
+    "total_sent": "Total sent"
+  },
   "tapes": {
     "ias": "IAS",
     "gs": "GS",
