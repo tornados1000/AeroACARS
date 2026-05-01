@@ -62,5 +62,28 @@
     "current_airport": "Current airport",
     "home_airport": "Home airport",
     "site": "Site"
+  },
+  "bids": {
+    "title": "My booked flights",
+    "loading": "Loading flights…",
+    "empty": "You don't have any booked flights. Book one on your phpVMS site and click \"Refresh\" here.",
+    "refresh": "Refresh",
+    "flight_time": "Scheduled flight time",
+    "distance": "Distance",
+    "cruise_level": "Cruise altitude",
+    "route": "Route",
+    "open_flight_page": "Open flight page",
+    "open_ofp": "Open OFP / briefing",
+    "error": {
+      "not_logged_in": "Not signed in — please sign in again.",
+      "network": "Could not reach the server.",
+      "unauthenticated": "Session expired — please sign in again.",
+      "forbidden": "You don't have permission to fetch bids.",
+      "not_found": "The bids endpoint was not found on the site.",
+      "rate_limited": "Too many requests — please wait a moment.",
+      "server": "Server error while fetching bids.",
+      "bad_response": "The server response could not be understood.",
+      "unknown": "Unexpected error while loading bids."
+    }
   }
 }

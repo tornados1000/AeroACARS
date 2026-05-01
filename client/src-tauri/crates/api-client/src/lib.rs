@@ -7,17 +7,45 @@
 //! Authentication: phpVMS API key sent via the `X-API-Key` header (phpVMS standard).
 //! All requests advertise `User-Agent: CloudeAcars/<version>` so the server can identify us.
 
-#![allow(dead_code)] // Phase 1: only auth + profile implemented; others stubbed.
+#![allow(dead_code)] // Some endpoints land in later phases; their wrappers are stubbed.
 
+use std::fmt;
 use std::time::Duration;
 
-use reqwest::{header, Client as HttpClient, StatusCode};
-use serde::{Deserialize, Serialize};
+use reqwest::{header, Client as HttpClient, Response, StatusCode};
+use serde::de::{self, DeserializeOwned, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 use url::Url;
 
-/// Default request timeout. ACARS position posts are time-sensitive but
-/// also tolerant of variable network conditions for VAs hosted abroad.
+/// phpVMS sometimes encodes string-ish fields (e.g. `flight_number`) as JSON
+/// numbers when the value happens to be all digits. Accept either form.
+fn de_str_or_int<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    struct V;
+    impl<'de> Visitor<'de> for V {
+        type Value = String;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("string or integer")
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<String, E> {
+            Ok(v.to_owned())
+        }
+        fn visit_string<E: de::Error>(self, v: String) -> Result<String, E> {
+            Ok(v)
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+    }
+    d.deserialize_any(V)
+}
+
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Error)]
@@ -42,7 +70,6 @@ pub enum ApiError {
 
 impl ApiError {
     /// Stable identifier surfaced to the UI for i18n key lookup.
-    /// The frontend maps these to localized error messages.
     pub fn code(&self) -> &'static str {
         match self {
             ApiError::InvalidUrl(_) => "invalid_url",
@@ -91,19 +118,39 @@ impl Connection {
     }
 }
 
-/// Subset of `GET /api/user` we need in Phase 1.
-/// phpVMS returns more fields; we deserialize only what we use.
+// ---- Resource types ----
+
+/// Subset of `GET /api/user` we need.
+///
+/// phpVMS exposes `home_airport` / `curr_airport` (the ICAO strings) NOT a
+/// `_id` suffix, despite the underlying DB columns being named that way. Took
+/// us one debug round to spot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
     pub id: i64,
     pub pilot_id: i64,
+    /// Formatted pilot identifier, e.g. `GSG0001`.
+    #[serde(default)]
+    pub ident: Option<String>,
     pub name: String,
     pub email: Option<String>,
     pub airline_id: Option<i64>,
-    pub curr_airport_id: Option<String>,
-    pub home_airport_id: Option<String>,
+    /// ICAO of the airport the pilot is currently at.
+    #[serde(default, alias = "curr_airport_id")]
+    pub curr_airport: Option<String>,
+    /// ICAO of the pilot's home airport.
+    #[serde(default, alias = "home_airport_id")]
+    pub home_airport: Option<String>,
     #[serde(default)]
     pub airline: Option<Airline>,
+    #[serde(default)]
+    pub rank: Option<Rank>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Rank {
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,13 +159,107 @@ pub struct Airline {
     pub icao: String,
     pub iata: Option<String>,
     pub name: String,
+    /// Optional URL to the airline's logo, exposed by phpVMS Airline resources.
+    /// May be absent or empty depending on VA configuration.
+    #[serde(default)]
+    pub logo: Option<String>,
 }
 
-/// phpVMS resource responses are wrapped: `{ "data": {...} }`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Airport {
+    pub id: String,
+    #[serde(default)]
+    pub icao: Option<String>,
+    #[serde(default)]
+    pub iata: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// phpVMS exposes distance as a multi-unit object:
+/// `{ "m": 483372, "km": 483.37, "mi": 300.35, "nmi": 261 }`.
+/// Any of these may be missing depending on the serializer.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Distance {
+    #[serde(default)]
+    pub m: Option<f64>,
+    #[serde(default)]
+    pub mi: Option<f64>,
+    #[serde(default)]
+    pub km: Option<f64>,
+    #[serde(default)]
+    pub nmi: Option<f64>,
+}
+
+/// Subset of phpVMS's Flight resource we use in Phase 1. Permissive on optional fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Flight {
+    pub id: String,
+    /// phpVMS encodes this as a JSON number when the value is purely numeric
+    /// (e.g. `284`) and as a string otherwise (e.g. `"VL12A"`). Accept both.
+    #[serde(deserialize_with = "de_str_or_int")]
+    pub flight_number: String,
+    #[serde(default)]
+    pub route_code: Option<String>,
+    #[serde(default)]
+    pub route_leg: Option<String>,
+    #[serde(default)]
+    pub callsign: Option<String>,
+    pub dpt_airport_id: String,
+    pub arr_airport_id: String,
+    #[serde(default)]
+    pub alt_airport_id: Option<String>,
+    /// Scheduled flight time in minutes.
+    #[serde(default)]
+    pub flight_time: Option<i32>,
+    /// Cruise level (e.g. 360 == FL360).
+    #[serde(default)]
+    pub level: Option<i32>,
+    #[serde(default)]
+    pub route: Option<String>,
+    #[serde(default)]
+    pub flight_type: Option<String>,
+    #[serde(default)]
+    pub distance: Option<Distance>,
+    #[serde(default)]
+    pub airline: Option<Airline>,
+    #[serde(default)]
+    pub dpt_airport: Option<Airport>,
+    #[serde(default)]
+    pub arr_airport: Option<Airport>,
+    /// SimBrief OFP relation when the pilot has prepared this flight in SimBrief.
+    #[serde(default)]
+    pub simbrief: Option<SimBrief>,
+}
+
+/// SimBrief OFP record returned with a bid/flight when the pilot has prepared one.
+/// `id` looks like `"1777622821_5F3E3B3842"` (a SimBrief-side identifier).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimBrief {
+    pub id: String,
+    /// JSON briefing endpoint exposed by phpVMS Core.
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub aircraft_id: Option<i64>,
+}
+
+/// `GET /api/user/bids` returns a list of these.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Bid {
+    pub id: i64,
+    pub user_id: i64,
+    pub flight_id: String,
+    pub flight: Flight,
+}
+
+// phpVMS resource responses are wrapped: `{ "data": {...} }`.
 #[derive(Deserialize)]
 struct DataEnvelope<T> {
     data: T,
 }
+
+// ---- Client ----
 
 /// A reusable client. `Clone` is cheap because the inner reqwest client is
 /// `Arc`-backed and `Connection` only holds a URL + API key string.
@@ -145,53 +286,95 @@ impl Client {
 
     fn endpoint(&self, path: &str) -> Result<Url, ApiError> {
         let path = path.trim_start_matches('/');
-        let joined = format!("{}/{}", self.conn.base_url.as_str().trim_end_matches('/'), path);
+        let joined = format!(
+            "{}/{}",
+            self.conn.base_url.as_str().trim_end_matches('/'),
+            path
+        );
         Url::parse(&joined).map_err(|_| ApiError::InvalidUrl(joined))
     }
 
-    /// `GET /api/user` — current user (the pilot the API key belongs to).
-    /// Used as the auth probe during login and to populate the dashboard.
-    pub async fn get_profile(&self) -> Result<Profile, ApiError> {
-        let url = self.endpoint("/api/user")?;
+    /// GET a `{ "data": T }` resource and decode it.
+    async fn get_data<T: DeserializeOwned>(&self, path: &str) -> Result<T, ApiError> {
+        let url = self.endpoint(path)?;
         let response = self
             .http
             .get(url)
             .header("X-API-Key", &self.conn.api_key)
             .header(header::ACCEPT, "application/json")
             .send()
-            .await?;
+            .await
+            .map_err(ApiError::from)?;
 
-        let status = response.status();
-        match status {
-            StatusCode::OK => {}
-            StatusCode::UNAUTHORIZED => return Err(ApiError::Unauthenticated),
-            StatusCode::FORBIDDEN => return Err(ApiError::Forbidden),
-            StatusCode::NOT_FOUND => return Err(ApiError::NotFound),
-            StatusCode::TOO_MANY_REQUESTS => {
-                let retry_after_seconds = response
-                    .headers()
-                    .get(header::RETRY_AFTER)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(60);
-                return Err(ApiError::RateLimited { retry_after_seconds });
-            }
-            s if s.is_server_error() => {
-                let body = response.text().await.unwrap_or_default();
-                return Err(ApiError::Server { status: s.as_u16(), body });
-            }
-            s => {
-                let body = response.text().await.unwrap_or_default();
-                return Err(ApiError::Server { status: s.as_u16(), body });
+        let response = check_status(response, path).await?;
+        // Read the body as text so we can log a snippet on decode failure —
+        // the default error from `response.json()` doesn't include the offending
+        // JSON, which makes API-shape mismatches very hard to diagnose.
+        let body = response
+            .text()
+            .await
+            .map_err(|e| ApiError::BadResponse(format!("read body for {path}: {e}")))?;
+        // Logged at DEBUG so it's silent by default but available for diagnosing
+        // schema mismatches on a new VA via `RUST_LOG=api_client=debug`.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let head: String = body.chars().take(2000).collect();
+            tracing::debug!(path = %path, body_len = body.len(), head = %head, "response body");
+        }
+        match serde_json::from_str::<DataEnvelope<T>>(&body) {
+            Ok(envelope) => Ok(envelope.data),
+            Err(e) => {
+                let snippet: String = body.chars().take(800).collect();
+                tracing::warn!(
+                    path = %path,
+                    error = %e,
+                    body_len = body.len(),
+                    body_snippet = %snippet,
+                    "JSON decode failed"
+                );
+                Err(ApiError::BadResponse(format!(
+                    "JSON decode failed for {path}: {e}"
+                )))
             }
         }
+    }
 
-        let envelope: DataEnvelope<Profile> = response
-            .json()
-            .await
-            .map_err(|e| ApiError::BadResponse(format!("JSON decode failed for /api/user: {e}")))?;
+    /// `GET /api/user`
+    pub async fn get_profile(&self) -> Result<Profile, ApiError> {
+        self.get_data("/api/user").await
+    }
 
-        Ok(envelope.data)
+    /// `GET /api/user/bids`
+    pub async fn get_bids(&self) -> Result<Vec<Bid>, ApiError> {
+        self.get_data("/api/user/bids").await
+    }
+}
+
+async fn check_status(response: Response, path: &str) -> Result<Response, ApiError> {
+    let status = response.status();
+    if status == StatusCode::OK {
+        return Ok(response);
+    }
+    match status {
+        StatusCode::UNAUTHORIZED => Err(ApiError::Unauthenticated),
+        StatusCode::FORBIDDEN => Err(ApiError::Forbidden),
+        StatusCode::NOT_FOUND => Err(ApiError::NotFound),
+        StatusCode::TOO_MANY_REQUESTS => {
+            let retry_after_seconds = response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(60);
+            Err(ApiError::RateLimited { retry_after_seconds })
+        }
+        s => {
+            let body = response.text().await.unwrap_or_default();
+            tracing::warn!(%s, %path, body_len = body.len(), "phpVMS returned non-OK");
+            Err(ApiError::Server {
+                status: s.as_u16(),
+                body,
+            })
+        }
     }
 }
 

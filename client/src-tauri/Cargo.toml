@@ -42,8 +42,12 @@ url = "2"
 # Persistence
 rusqlite = { version = "0.32", features = ["bundled"] }
 
-# OS keyring
-keyring = "3"
+# OS keyring. Since keyring v3 the platform backends are opt-in features —
+# without these flags the crate falls back to a no-op mock that silently
+# accepts writes (the bug we hit on first try). `apple-native` and
+# `windows-native` are gated internally by `#[cfg(target_os = ...)]` so
+# only the appropriate one is compiled per target.
+keyring = { version = "3", features = ["apple-native", "windows-native"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }

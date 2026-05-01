@@ -261,6 +261,14 @@ input:disabled {
   font-weight: 600;
 }
 
+.dashboard__ident {
+  margin: 0 0 4px 0;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+}
+
 .dashboard__site {
   margin: 0;
   color: var(--text-muted);
@@ -292,6 +300,293 @@ input:disabled {
 .dashboard__pilot dd {
   margin: 0;
   font-weight: 500;
+}
+
+/* ===== Bids list ===== */
+
+.bids {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.bids__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.bids__header h2 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.bids__refresh {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  font-size: 12px;
+}
+
+.bids__refresh:disabled {
+  opacity: 0.6;
+}
+
+.bids__hint {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 13px;
+  background: var(--surface);
+  border: 1px dashed var(--border);
+  border-radius: 12px;
+  padding: 16px 18px;
+}
+
+.bids__error {
+  margin: 0;
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border));
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 13px;
+}
+
+.bids__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+}
+
+.bid-card {
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  overflow: hidden;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.bid-card:hover {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+}
+
+.bid-card--selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
+.bid-card__body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 16px 18px;
+  text-align: left;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  width: 100%;
+  transition: background 0.15s ease;
+}
+
+.bid-card__body:hover {
+  background: color-mix(in srgb, var(--accent) 6%, var(--surface));
+}
+
+.bid-card__brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.bid-card__logo {
+  /* Sized to comfortably hold both wide logos (e.g. Lufthansa wordmark)
+     and square logos (e.g. UPS shield). The container is fixed-area; the
+     image inside scales with object-fit so neither shape gets clipped.
+     White background regardless of theme so black-on-transparent logos
+     stay readable in dark mode. */
+  width: 96px;
+  height: 64px;
+  border-radius: 10px;
+  background: #ffffff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  flex-shrink: 0;
+  padding: 6px;
+}
+
+.bid-card__logo img {
+  max-width: 100%;
+  max-height: 100%;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+}
+
+.bid-card__logo--placeholder {
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--accent) 80%, transparent),
+    color-mix(in srgb, var(--accent) 40%, transparent)
+  );
+  color: white;
+  font-weight: 700;
+  font-size: 22px;
+  letter-spacing: 0.05em;
+  padding: 0;
+}
+
+.bid-card__top {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.bid-card__title {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.bid-card__callsign {
+  font-weight: 600;
+  font-size: 15px;
+  letter-spacing: 0.01em;
+}
+
+.bid-card__airline {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.bid-card__route {
+  display: grid;
+  grid-template-columns: minmax(80px, 1fr) minmax(80px, 2fr) minmax(80px, 1fr);
+  align-items: center;
+  gap: 14px;
+}
+
+.bid-card__leg {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.bid-card__leg--arrival {
+  text-align: right;
+}
+
+.bid-card__icao {
+  font-family: "SF Mono", "Cascadia Code", "Source Code Pro", Menlo, Consolas,
+    monospace;
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: 0.02em;
+}
+
+.bid-card__airport-name {
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bid-card__path {
+  position: relative;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.bid-card__path::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 0;
+  border-top: 2px dashed
+    color-mix(in srgb, var(--accent) 60%, var(--border));
+  transform: translateY(-50%);
+}
+
+.bid-card__plane {
+  position: relative;
+  z-index: 1;
+  background: var(--surface);
+  padding: 0 8px;
+  font-size: 18px;
+  color: var(--accent);
+  transform: rotate(0deg);
+}
+
+.bid-card--selected .bid-card__path::before {
+  border-top-color: var(--accent);
+}
+
+.bid-card__meta {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  color: var(--text-muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.bid-card__details {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px 18px 16px;
+  border-top: 1px solid var(--border);
+  background: color-mix(in srgb, var(--accent) 4%, var(--surface));
+}
+
+.bid-card__route-text {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+  word-break: break-all;
+}
+
+.bid-card__actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.bid-card__route-label {
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 11px;
+}
+
+.bid-card__route-text code {
+  background: var(--surface-2);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-family: "SF Mono", "Cascadia Code", "Source Code Pro", Menlo, Consolas,
+    monospace;
 }
 
 .phase {

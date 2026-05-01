@@ -62,5 +62,28 @@
     "current_airport": "Aktueller Flughafen",
     "home_airport": "Heimatflughafen",
     "site": "Seite"
+  },
+  "bids": {
+    "title": "Meine gebuchten Flüge",
+    "loading": "Flüge werden geladen…",
+    "empty": "Sie haben aktuell keine gebuchten Flüge. Buchen Sie einen Flug auf Ihrer phpVMS-Seite und klicken Sie hier auf „Aktualisieren“, dann erscheint er.",
+    "refresh": "Aktualisieren",
+    "flight_time": "Geplante Flugzeit",
+    "distance": "Distanz",
+    "cruise_level": "Reiseflughöhe",
+    "route": "Route",
+    "open_flight_page": "Flugseite öffnen",
+    "open_ofp": "OFP / Briefing öffnen",
+    "error": {
+      "not_logged_in": "Nicht angemeldet — bitte melden Sie sich erneut an.",
+      "network": "Server nicht erreichbar.",
+      "unauthenticated": "Sitzung abgelaufen — bitte erneut anmelden.",
+      "forbidden": "Keine Berechtigung zum Abruf der Bids.",
+      "not_found": "Bids-Endpunkt auf der Seite nicht gefunden.",
+      "rate_limited": "Zu viele Anfragen — bitte kurz warten.",
+      "server": "Server-Fehler beim Abruf der Bids.",
+      "bad_response": "Antwort konnte nicht verstanden werden.",
+      "unknown": "Unerwarteter Fehler beim Laden der Bids."
+    }
   }
 }

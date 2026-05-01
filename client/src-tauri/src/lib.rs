@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use api_client::{ApiError, Client, Connection, Profile};
+use api_client::{ApiError, Bid, Client, Connection, Profile};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 use tracing_subscriber::EnvFilter;
@@ -191,6 +191,24 @@ async fn phpvms_load_session(
     }
 }
 
+/// Pull the active client out of state, or fail with `not_logged_in`.
+fn current_client(state: &tauri::State<'_, AppState>) -> Result<Client, UiError> {
+    let guard = state.client.lock().expect("client mutex");
+    guard
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| UiError::new("not_logged_in", "no active session"))
+}
+
+/// `GET /api/user/bids` — the pilot's open bids.
+#[tauri::command]
+async fn phpvms_get_bids(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<Bid>, UiError> {
+    let client = current_client(&state)?;
+    Ok(client.get_bids().await?)
+}
+
 // ---- Bootstrap ----
 
 fn init_tracing() {
@@ -212,6 +230,7 @@ pub fn run() {
             phpvms_login,
             phpvms_logout,
             phpvms_load_session,
+            phpvms_get_bids,
         ])
         .run(tauri::generate_context!())
         .expect("error while running CloudeAcars");
