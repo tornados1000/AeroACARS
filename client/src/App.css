@@ -1304,10 +1304,10 @@ button:disabled {
    with a single dense band split into three logical groups. */
 
 .info-strip {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-  gap: 14px;
-  padding: 10px 14px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  padding: 8px 12px;
   margin-top: 8px;
   background: var(--surface);
   border: 1px solid var(--border);
@@ -1317,10 +1317,16 @@ button:disabled {
 .info-strip__group {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
   min-width: 0;
+  flex: 1 1 auto;
 }
 
+/* Subtle vertical separator between groups, drawn on the left of
+   every group except the first. CSS adjacent-sibling means once a
+   group wraps to a new row the separator visually still hangs left,
+   but flex-wrap aligns rows so it stays at the row's left edge —
+   acceptable in practice, and we keep the markup simple. */
 .info-strip__group + .info-strip__group {
   border-left: 1px solid var(--border);
   padding-left: 14px;
@@ -1328,24 +1334,30 @@ button:disabled {
 
 .info-strip__group-label {
   margin: 0;
-  font-size: 10px;
+  font-size: 9px;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.05em;
   color: var(--text-muted);
 }
 
 .info-strip__cells {
   display: flex;
   flex-wrap: wrap;
-  gap: 10px 14px;
+  gap: 4px 12px;
+  align-items: baseline;
 }
 
+/* Inline label/value: keeps each cell on a single horizontal line
+   so a five-cell Mass group fits comfortably in a single row even
+   on mid-width windows. The previous stacked layout pushed the
+   last value (Bruttogewicht) onto a second line on Thomas's screen. */
 .info-strip__cell {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
   min-width: 0;
+  white-space: nowrap;
 }
 
 .info-strip__cell-label {
@@ -1359,10 +1371,9 @@ button:disabled {
   font-family: "SF Mono", "Cascadia Code", "Source Code Pro", Menlo, Consolas,
     monospace;
   font-feature-settings: "tnum" 1;
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 500;
   color: var(--text);
-  white-space: nowrap;
 }
 
 .info-strip__cell--primary .info-strip__cell-value {
@@ -1370,16 +1381,18 @@ button:disabled {
   font-weight: 600;
 }
 
-/* On narrow widths the auto-fit drops groups onto new rows; remove
-   the left border on the first group of each row visually by keeping
-   it only when the group is *not* at the start of a row. */
-@media (max-width: 720px) {
+/* Below ~640px the three groups stack vertically. Drop the vertical
+   separator and replace with a thin top border so the visual
+   grouping survives the wrap. */
+@media (max-width: 640px) {
+  .info-strip {
+    gap: 8px;
+  }
   .info-strip__group + .info-strip__group {
     border-left: none;
     padding-left: 0;
     border-top: 1px solid var(--border);
-    padding-top: 10px;
-    margin-top: 4px;
+    padding-top: 8px;
   }
 }
 
