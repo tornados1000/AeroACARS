@@ -2736,9 +2736,31 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                 next_phase = FlightPhase::Climb;
             }
         }
-        FlightPhase::Climb | FlightPhase::Cruise => {
+        FlightPhase::Climb => {
+            // Top of climb → Cruise: aircraft has levelled off above
+            // a sane cruise floor. The previous code merged Climb and
+            // Cruise into the same match arm with no transition
+            // between them, so a flight that climbed once and stayed
+            // level was stuck in "Climb" forever — Cruise was
+            // unreachable until a Descent kicked in.
             if snap.vertical_speed_fpm < -300.0 {
                 next_phase = FlightPhase::Descent;
+            } else if snap.vertical_speed_fpm.abs() < 200.0
+                && snap.altitude_agl_ft > 5000.0
+            {
+                next_phase = FlightPhase::Cruise;
+            }
+        }
+        FlightPhase::Cruise => {
+            // Step climb (V/S > 300 fpm) flips us back into Climb so
+            // the timeline shows the rising arc again. Descent kicks
+            // in on a sustained negative V/S.
+            if snap.vertical_speed_fpm < -300.0 {
+                next_phase = FlightPhase::Descent;
+            } else if snap.vertical_speed_fpm > 300.0
+                && snap.altitude_agl_ft > 5000.0
+            {
+                next_phase = FlightPhase::Climb;
             }
         }
         FlightPhase::Descent => {
