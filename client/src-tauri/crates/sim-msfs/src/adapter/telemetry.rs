@@ -305,11 +305,19 @@ impl Touchdown {
         t
     }
 
-    /// `true` while the sim hasn't recorded a touchdown this session.
-    /// All six values stay at 0 until the first contact, so a clean
-    /// 0,0,0 across position + VS is the obvious sentinel.
+    /// `true` while no *real* touchdown has happened yet.
+    ///
+    /// MSFS populates the PLANE TOUCHDOWN * SimVars with the
+    /// aircraft's current state when it's spawned on the ground —
+    /// matching live position, heading, pitch — but with `vs_fps`
+    /// at exactly 0. That's not a useful "touchdown" for an ACARS
+    /// landing analyzer, only an actual descent ends with a
+    /// non-zero touchdown rate. Filtering on `vs_fps == 0` cleanly
+    /// rejects both the all-zero pre-spawn state and the
+    /// spawn-on-ground state, leaving real landings to come
+    /// through.
     pub fn is_uninitialised(&self) -> bool {
-        self.lat_rad == 0.0 && self.lon_rad == 0.0 && self.vs_fps == 0.0
+        self.vs_fps == 0.0
     }
 }
 
