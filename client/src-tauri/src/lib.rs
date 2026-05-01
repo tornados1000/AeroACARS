@@ -324,6 +324,16 @@ struct PersistedFlightStats {
     last_lat: Option<f64>,
     #[serde(default)]
     last_lon: Option<f64>,
+    #[serde(default)]
+    landing_peak_vs_fpm: Option<f32>,
+    #[serde(default)]
+    landing_peak_g_force: Option<f32>,
+    #[serde(default)]
+    bounce_count: u8,
+    #[serde(default)]
+    landing_score: Option<LandingScore>,
+    #[serde(default)]
+    landing_score_announced: bool,
 }
 
 impl PersistedFlightStats {
@@ -349,6 +359,11 @@ impl PersistedFlightStats {
             last_fuel_kg: stats.last_fuel_kg,
             last_lat: stats.last_lat,
             last_lon: stats.last_lon,
+            landing_peak_vs_fpm: stats.landing_peak_vs_fpm,
+            landing_peak_g_force: stats.landing_peak_g_force,
+            bounce_count: stats.bounce_count,
+            landing_score: stats.landing_score,
+            landing_score_announced: stats.landing_score_announced,
         }
     }
 
@@ -373,6 +388,11 @@ impl PersistedFlightStats {
         stats.last_fuel_kg = self.last_fuel_kg;
         stats.last_lat = self.last_lat;
         stats.last_lon = self.last_lon;
+        stats.landing_peak_vs_fpm = self.landing_peak_vs_fpm;
+        stats.landing_peak_g_force = self.landing_peak_g_force;
+        stats.bounce_count = self.bounce_count;
+        stats.landing_score = self.landing_score;
+        stats.landing_score_announced = self.landing_score_announced;
     }
 }
 
@@ -413,6 +433,26 @@ struct FlightStats {
     landing_heading_deg: Option<f32>,
     landing_fuel_kg: Option<f32>,
 
+    // ---- Landing analyzer (Phase I) ----
+    /// Most negative VS observed in the touchdown window. The first
+    /// on-ground snapshot already gives a good number, but the spike
+    /// often lands 1–2 ticks later — we keep refining for ~5 s after
+    /// touchdown so the score reflects the worst case.
+    landing_peak_vs_fpm: Option<f32>,
+    /// Highest G-force observed in the touchdown window.
+    landing_peak_g_force: Option<f32>,
+    /// How many bounces (on_ground → !on_ground → on_ground) we counted
+    /// within the touchdown window. >0 implies the pilot didn't put it
+    /// down clean.
+    bounce_count: u8,
+    /// Categorised score, computed once when the window closes. The
+    /// activity log emits this and we ship it in the PIREP custom fields.
+    landing_score: Option<LandingScore>,
+    /// True once the score has been announced to the activity log, so
+    /// repeated streamer ticks (or a Tauri restart that resumes after
+    /// touchdown) don't re-fire the entry.
+    landing_score_announced: bool,
+
     // ---- Fuel tracking ----
     block_fuel_kg: Option<f32>,
     last_fuel_kg: Option<f32>,
@@ -448,6 +488,99 @@ struct FlightStats {
     /// derived from `flaps_position * 5` and rounded). One log per real
     /// detent change rather than every 0.001 of jitter.
     last_logged_flaps_detent: Option<u8>,
+}
+
+/// Categorised assessment of a touchdown. Computed from peak descent
+/// rate, peak G-force and bounce count once the touchdown window
+/// closes. Stored on `FlightStats` and shipped both to the activity log
+/// and the PIREP custom-fields map for VA review.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum LandingScore {
+    /// |V/S| < 60 fpm, G < 1.2, no bounce — butter.
+    Smooth,
+    /// |V/S| < 240 fpm, G < 1.4 — typical good landing.
+    Acceptable,
+    /// |V/S| < 600 fpm or G < 1.8 — firm but not damaging.
+    Firm,
+    /// |V/S| < 1000 fpm or G < 1.8–2.5 — hard landing, inspection due.
+    Hard,
+    /// |V/S| ≥ 1000 fpm or extreme G — likely damaged.
+    Severe,
+}
+
+impl LandingScore {
+    fn classify(peak_vs_fpm: f32, peak_g: f32, bounces: u8) -> Self {
+        let vs = peak_vs_fpm.abs();
+        // Severity climbs with either V/S OR G — whichever is worse wins.
+        let by_vs = if vs >= TOUCHDOWN_VS_SEVERE_FPM {
+            Self::Severe
+        } else if vs >= TOUCHDOWN_VS_HARD_FPM {
+            Self::Hard
+        } else if vs >= TOUCHDOWN_VS_FIRM_FPM {
+            Self::Firm
+        } else if vs >= TOUCHDOWN_VS_SMOOTH_FPM {
+            Self::Acceptable
+        } else {
+            Self::Smooth
+        };
+        let by_g = if peak_g >= 2.5 {
+            Self::Severe
+        } else if peak_g >= TOUCHDOWN_G_HARD {
+            Self::Hard
+        } else if peak_g >= TOUCHDOWN_G_FIRM {
+            Self::Firm
+        } else if peak_g >= 1.2 {
+            Self::Acceptable
+        } else {
+            Self::Smooth
+        };
+        let mut score = by_vs.max(by_g);
+        // Bounces bump the score one step down (Smooth → Acceptable etc.)
+        // unless we're already at Severe.
+        if bounces > 0 && score < Self::Severe {
+            score = match score {
+                Self::Smooth => Self::Acceptable,
+                Self::Acceptable => Self::Firm,
+                Self::Firm => Self::Hard,
+                Self::Hard | Self::Severe => Self::Severe,
+            };
+        }
+        score
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Smooth => "smooth",
+            Self::Acceptable => "acceptable",
+            Self::Firm => "firm",
+            Self::Hard => "hard",
+            Self::Severe => "severe",
+        }
+    }
+
+    /// Severity ordering — for `max()` comparisons in `classify`.
+    fn severity(self) -> u8 {
+        match self {
+            Self::Smooth => 0,
+            Self::Acceptable => 1,
+            Self::Firm => 2,
+            Self::Hard => 3,
+            Self::Severe => 4,
+        }
+    }
+}
+
+impl PartialOrd for LandingScore {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for LandingScore {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.severity().cmp(&other.severity())
+    }
 }
 
 /// Snapshot of the six exterior lights we track. Compared as a whole so we
@@ -592,6 +725,25 @@ fn format_callsign(airline_icao: &str, flight_number: &str) -> String {
 /// the zeros we wrote at flight_start. 5 ticks ≈ every ~25–150 s
 /// depending on phase cadence — fine for the cost of a small JSON write.
 const STATS_PERSIST_EVERY_TICKS: u32 = 5;
+
+/// Touchdown analyzer window in seconds — how long after the first
+/// on-ground tick we keep refining peak G-force and peak descent rate
+/// before locking in the final score. 5 s is enough to catch the spike
+/// (which can lag the initial contact by a tick or two) without bleeding
+/// into the rollout.
+const TOUCHDOWN_WINDOW_SECS: i64 = 5;
+
+/// Hard-landing thresholds, ordered worst-first. The first row that the
+/// peak |V/S| or G-force breaches wins; combined with `bounce_count`
+/// this maps to a `LandingScore`. Numbers are typical VA-rule defaults
+/// — VAs that want their own thresholds can override later via
+/// `phpvms_get_settings` (Phase L).
+const TOUCHDOWN_VS_SEVERE_FPM: f32 = 1000.0;
+const TOUCHDOWN_VS_HARD_FPM: f32 = 600.0;
+const TOUCHDOWN_VS_FIRM_FPM: f32 = 240.0;
+const TOUCHDOWN_VS_SMOOTH_FPM: f32 = 60.0;
+const TOUCHDOWN_G_HARD: f32 = 1.8;
+const TOUCHDOWN_G_FIRM: f32 = 1.4;
 
 /// AP master toggles only emit a log entry once they've held for this
 /// many seconds. Stops a flickering / pulsed LVar (Fenix's momentary
@@ -2011,6 +2163,11 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
 
             // Update running stats AND step the flight-phase FSM.
             let phase_change = step_flight(&flight, &snap);
+            // Detect when the touchdown-analyzer window has just locked
+            // in a final score so we can emit the activity-log entry
+            // exactly once. `landing_score` flips from None to Some
+            // inside `step_flight` after TOUCHDOWN_WINDOW_SECS.
+            announce_landing_score(&app, &flight);
             // Diff cockpit knobs against last-seen values and log changes
             // to the activity feed. One entry per change, not per tick.
             detect_telemetry_changes(&app, &flight, &snap);
@@ -2191,6 +2348,13 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                 stats.landing_speed_kt = Some(snap.indicated_airspeed_kt);
                 stats.landing_heading_deg = Some(snap.heading_deg_magnetic);
                 stats.landing_fuel_kg = Some(snap.fuel_total_kg);
+                // Seed the landing-analyzer peaks with the initial
+                // touchdown sample. Subsequent ticks within the window
+                // (TOUCHDOWN_WINDOW_SECS) refine these to the worst
+                // observed value.
+                stats.landing_peak_vs_fpm = Some(snap.vertical_speed_fpm);
+                stats.landing_peak_g_force = Some(snap.g_force);
+                stats.bounce_count = 0;
                 let zfw = snap.zfw_kg.unwrap_or(0.0);
                 let weight = zfw as f64 + snap.fuel_total_kg as f64;
                 if weight > 0.0 {
@@ -2199,6 +2363,37 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
             }
         }
         FlightPhase::Landing => {
+            // Touchdown analyzer window: refine peak descent rate, peak G,
+            // and count bounces while the wheels are still settling.
+            if let Some(touchdown) = stats.landing_at {
+                let in_window = (now - touchdown).num_seconds() <= TOUCHDOWN_WINDOW_SECS;
+                if in_window {
+                    // Peak |V/S| — keep the most negative number we see.
+                    let peak_vs = stats.landing_peak_vs_fpm.unwrap_or(0.0);
+                    if snap.vertical_speed_fpm < peak_vs {
+                        stats.landing_peak_vs_fpm = Some(snap.vertical_speed_fpm);
+                    }
+                    // Peak G — highest reading wins.
+                    let peak_g = stats.landing_peak_g_force.unwrap_or(0.0);
+                    if snap.g_force > peak_g {
+                        stats.landing_peak_g_force = Some(snap.g_force);
+                    }
+                    // Bounce: lifted off the ground again before the
+                    // window closed — count it and (loosely) treat the
+                    // next contact as a fresh touchdown for peak
+                    // tracking. Phase stays Landing so we don't loop
+                    // through Final again.
+                    if was_on_ground && !snap.on_ground {
+                        stats.bounce_count = stats.bounce_count.saturating_add(1);
+                    }
+                } else if stats.landing_score.is_none() {
+                    // Window just closed — finalise the score once.
+                    let peak_vs = stats.landing_peak_vs_fpm.unwrap_or(0.0);
+                    let peak_g = stats.landing_peak_g_force.unwrap_or(0.0);
+                    let score = LandingScore::classify(peak_vs, peak_g, stats.bounce_count);
+                    stats.landing_score = Some(score);
+                }
+            }
             if snap.groundspeed_kt < 30.0 && snap.on_ground {
                 next_phase = FlightPhase::TaxiIn;
             }
@@ -2288,6 +2483,21 @@ fn build_pirep_fields(
         if b > c {
             f.insert("Fuel Used".into(), format!("{:.0} kg", b - c));
         }
+    }
+
+    // Landing analyzer (Phase I) — peak values are usually worse than the
+    // initial-touchdown sample, so include both for VA review.
+    if let Some(score) = stats.landing_score {
+        f.insert("Landing Score".into(), score.label().to_string());
+    }
+    if let Some(vs) = stats.landing_peak_vs_fpm {
+        f.insert("Peak Landing Rate".into(), format!("{:.0} fpm", vs));
+    }
+    if let Some(g) = stats.landing_peak_g_force {
+        f.insert("Peak Landing G".into(), format!("{:.2} G", g));
+    }
+    if stats.bounce_count > 0 {
+        f.insert("Bounces".into(), stats.bounce_count.to_string());
     }
 
     // Computed durations.
@@ -2384,6 +2594,49 @@ fn phase_to_status(phase: FlightPhase) -> Option<&'static str> {
         FlightPhase::Landing | FlightPhase::TaxiIn => Some("LAN"),
         FlightPhase::BlocksOn | FlightPhase::Arrived => Some("ARR"),
         FlightPhase::PirepSubmitted => None,
+    }
+}
+
+/// Emit the landing analyzer's verdict to the activity log exactly once,
+/// the first time `step_flight` finalises a score. Called every tick;
+/// idempotent by design — uses an extra "already announced" flag in
+/// `FlightStats` so resumed sessions that already filed don't re-emit.
+fn announce_landing_score(app: &AppHandle, flight: &ActiveFlight) {
+    let stats = flight.stats.lock().expect("flight stats");
+    if !stats.landing_score_announced {
+        if let Some(score) = stats.landing_score {
+            let peak_vs = stats.landing_peak_vs_fpm.unwrap_or(0.0);
+            let peak_g = stats.landing_peak_g_force.unwrap_or(0.0);
+            let bounces = stats.bounce_count;
+            let level = match score {
+                LandingScore::Smooth | LandingScore::Acceptable => ActivityLevel::Info,
+                LandingScore::Firm => ActivityLevel::Info,
+                LandingScore::Hard | LandingScore::Severe => ActivityLevel::Warn,
+            };
+            let bounce_part = if bounces > 0 {
+                format!(", {} bounce{}", bounces, if bounces == 1 { "" } else { "s" })
+            } else {
+                String::new()
+            };
+            // Drop the lock before logging so log_activity_handle can
+            // grab the activity_log mutex without deadlocking via
+            // re-entrant borrow.
+            drop(stats);
+            log_activity_handle(
+                app,
+                level,
+                format!("Touchdown: {}", score.label()),
+                Some(format!(
+                    "V/S {:.0} fpm, G {:.2}{}",
+                    peak_vs.abs(),
+                    peak_g,
+                    bounce_part,
+                )),
+            );
+            // Re-acquire to flag it as announced.
+            let mut stats = flight.stats.lock().expect("flight stats");
+            stats.landing_score_announced = true;
+        }
     }
 }
 
