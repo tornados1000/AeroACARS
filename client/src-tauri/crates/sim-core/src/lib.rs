@@ -69,6 +69,34 @@ pub struct SimSnapshot {
     pub aircraft_registration: Option<String>,
     pub simulator: Simulator,
     pub sim_version: Option<String>,
+
+    // ---- Avionics (Phase H.1) ----
+    /// 4-digit transponder / squawk code, e.g. 7000.
+    pub transponder_code: Option<u16>,
+    /// Active COM1 frequency in MHz (e.g. 121.500).
+    pub com1_mhz: Option<f32>,
+    pub com2_mhz: Option<f32>,
+    pub nav1_mhz: Option<f32>,
+    pub nav2_mhz: Option<f32>,
+
+    // ---- Exterior lights ----
+    pub light_landing: Option<bool>,
+    pub light_beacon: Option<bool>,
+    pub light_strobe: Option<bool>,
+    pub light_taxi: Option<bool>,
+    pub light_nav: Option<bool>,
+    pub light_logo: Option<bool>,
+
+    // ---- Autopilot ----
+    pub autopilot_master: Option<bool>,
+    pub autopilot_heading: Option<bool>,
+    pub autopilot_altitude: Option<bool>,
+    pub autopilot_nav: Option<bool>,
+    pub autopilot_approach: Option<bool>,
+
+    // ---- Powerplant (totals — per-engine arrays land later) ----
+    /// Total fuel-flow across all running engines, kg/h.
+    pub fuel_flow_kg_per_h: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

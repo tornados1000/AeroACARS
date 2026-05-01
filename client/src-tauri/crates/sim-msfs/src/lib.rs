@@ -70,12 +70,122 @@ mod adapter {
         g_force: f64,
         #[simconnect(name = "SIM ON GROUND", unit = "bool")]
         on_ground: bool,
+
+        // ---- Aircraft state (Phase H.1) ----
+        #[simconnect(name = "BRAKE PARKING POSITION", unit = "bool")]
+        parking_brake: bool,
+        #[simconnect(name = "STALL WARNING", unit = "bool")]
+        stall_warning: bool,
+        #[simconnect(name = "OVERSPEED WARNING", unit = "bool")]
+        overspeed_warning: bool,
+        /// 0.0–1.0: 0 = up, 1 = fully down (averaged across gear).
+        #[simconnect(name = "GEAR POSITION", unit = "percent over 100")]
+        gear_position: f64,
+        /// 0.0–1.0: position of the flaps handle.
+        #[simconnect(name = "FLAPS HANDLE PERCENT", unit = "percent over 100")]
+        flaps_position: f64,
+        /// Number of engines currently combusting (≤ NUMBER OF ENGINES).
+        #[simconnect(name = "GENERAL ENG COMBUSTION:1", unit = "bool")]
+        eng1_firing: bool,
+        #[simconnect(name = "GENERAL ENG COMBUSTION:2", unit = "bool")]
+        eng2_firing: bool,
+        #[simconnect(name = "GENERAL ENG COMBUSTION:3", unit = "bool")]
+        eng3_firing: bool,
+        #[simconnect(name = "GENERAL ENG COMBUSTION:4", unit = "bool")]
+        eng4_firing: bool,
+
+        // ---- Fuel & weight ----
+        /// Total fuel on board, pounds. Converted to kg in the snapshot.
+        #[simconnect(name = "FUEL TOTAL QUANTITY WEIGHT", unit = "pounds")]
+        fuel_total_lb: f64,
+        /// Sum of per-engine fuel-flow, pounds/hour. Converted to kg/h.
+        #[simconnect(name = "ENG FUEL FLOW PPH:1", unit = "pounds per hour")]
+        eng1_ff_pph: f64,
+        #[simconnect(name = "ENG FUEL FLOW PPH:2", unit = "pounds per hour")]
+        eng2_ff_pph: f64,
+        #[simconnect(name = "ENG FUEL FLOW PPH:3", unit = "pounds per hour")]
+        eng3_ff_pph: f64,
+        #[simconnect(name = "ENG FUEL FLOW PPH:4", unit = "pounds per hour")]
+        eng4_ff_pph: f64,
+
+        // ---- Environment ----
+        #[simconnect(name = "AMBIENT WIND DIRECTION", unit = "degrees")]
+        wind_direction_deg: f64,
+        #[simconnect(name = "AMBIENT WIND VELOCITY", unit = "knots")]
+        wind_speed_kt: f64,
+        #[simconnect(name = "KOHLSMAN SETTING MB", unit = "millibars")]
+        qnh_hpa: f64,
+        #[simconnect(name = "AMBIENT TEMPERATURE", unit = "celsius")]
+        oat_c: f64,
+
+        // ---- Avionics ----
+        /// BCD-encoded squawk (e.g. 0x1234 = 1234). SDK only supports f64
+        /// for numerics, so we cast back to u32 in `squawk_from_bcd`.
+        #[simconnect(name = "TRANSPONDER CODE:1", unit = "BCO16")]
+        transponder_bcd: f64,
+        #[simconnect(name = "COM ACTIVE FREQUENCY:1", unit = "MHz")]
+        com1_mhz: f64,
+        #[simconnect(name = "COM ACTIVE FREQUENCY:2", unit = "MHz")]
+        com2_mhz: f64,
+        #[simconnect(name = "NAV ACTIVE FREQUENCY:1", unit = "MHz")]
+        nav1_mhz: f64,
+        #[simconnect(name = "NAV ACTIVE FREQUENCY:2", unit = "MHz")]
+        nav2_mhz: f64,
+
+        // ---- Exterior lights ----
+        #[simconnect(name = "LIGHT LANDING", unit = "bool")]
+        light_landing: bool,
+        #[simconnect(name = "LIGHT BEACON", unit = "bool")]
+        light_beacon: bool,
+        #[simconnect(name = "LIGHT STROBE", unit = "bool")]
+        light_strobe: bool,
+        #[simconnect(name = "LIGHT TAXI", unit = "bool")]
+        light_taxi: bool,
+        #[simconnect(name = "LIGHT NAV", unit = "bool")]
+        light_nav: bool,
+        #[simconnect(name = "LIGHT LOGO", unit = "bool")]
+        light_logo: bool,
+
+        // ---- Autopilot ----
+        #[simconnect(name = "AUTOPILOT MASTER", unit = "bool")]
+        ap_master: bool,
+        #[simconnect(name = "AUTOPILOT HEADING LOCK", unit = "bool")]
+        ap_heading: bool,
+        #[simconnect(name = "AUTOPILOT ALTITUDE LOCK", unit = "bool")]
+        ap_altitude: bool,
+        #[simconnect(name = "AUTOPILOT NAV1 LOCK", unit = "bool")]
+        ap_nav: bool,
+        #[simconnect(name = "AUTOPILOT APPROACH HOLD", unit = "bool")]
+        ap_approach: bool,
+    }
+
+    /// Pounds → kilograms (avoirdupois, 6-digit precision).
+    const LB_TO_KG: f64 = 0.45359237;
+
+    /// Decode a BCD-packed squawk from SimConnect (each nibble is a digit).
+    fn squawk_from_bcd(bcd: f64) -> u16 {
+        let bcd = bcd as u32;
+        let d3 = ((bcd >> 12) & 0xF) as u16;
+        let d2 = ((bcd >> 8) & 0xF) as u16;
+        let d1 = ((bcd >> 4) & 0xF) as u16;
+        let d0 = (bcd & 0xF) as u16;
+        d3 * 1000 + d2 * 100 + d1 * 10 + d0
     }
 
     /// Build a `SimSnapshot` from raw telemetry. The simulator field is tagged
     /// from the user-selected `SimKind` because SimConnect can't distinguish
     /// MSFS 2020 from MSFS 2024 at the API level.
     fn telemetry_to_snapshot(t: &Telemetry, kind: SimKind) -> SimSnapshot {
+        let total_ff_pph = t.eng1_ff_pph + t.eng2_ff_pph + t.eng3_ff_pph + t.eng4_ff_pph;
+        let engines_running = [
+            t.eng1_firing,
+            t.eng2_firing,
+            t.eng3_firing,
+            t.eng4_firing,
+        ]
+        .iter()
+        .filter(|x| **x)
+        .count() as u8;
         SimSnapshot {
             timestamp: Utc::now(),
             lat: t.lat,
@@ -92,29 +202,53 @@ mod adapter {
             true_airspeed_kt: t.true_airspeed_kt as f32,
             g_force: t.g_force as f32,
             on_ground: t.on_ground,
-            // Fields not yet pulled from SimConnect — populated in later phases.
-            parking_brake: false,
-            stall_warning: false,
-            overspeed_warning: false,
+            parking_brake: t.parking_brake,
+            stall_warning: t.stall_warning,
+            overspeed_warning: t.overspeed_warning,
+            // Pause/slew/sim-rate aren't read yet; safe defaults — they
+            // matter for replay-style validation, not in-flight telemetry.
             paused: false,
             slew_mode: false,
             simulation_rate: 1.0,
-            gear_position: 0.0,
-            flaps_position: 0.0,
-            engines_running: 0,
-            fuel_total_kg: 0.0,
+            gear_position: t.gear_position as f32,
+            flaps_position: t.flaps_position as f32,
+            engines_running,
+            fuel_total_kg: (t.fuel_total_lb * LB_TO_KG) as f32,
+            // Block→current diff is computed in the recorder; the per-tick
+            // snapshot only carries totals.
             fuel_used_kg: 0.0,
             zfw_kg: None,
             payload_kg: None,
-            wind_direction_deg: None,
-            wind_speed_kt: None,
-            qnh_hpa: None,
-            outside_air_temp_c: None,
+            wind_direction_deg: Some(t.wind_direction_deg as f32),
+            wind_speed_kt: Some(t.wind_speed_kt as f32),
+            qnh_hpa: Some(t.qnh_hpa as f32),
+            outside_air_temp_c: Some(t.oat_c as f32),
             aircraft_title: Some(t.title.clone()).filter(|s| !s.is_empty()),
             aircraft_icao: Some(t.atc_model.clone()).filter(|s| !s.is_empty()),
             aircraft_registration: Some(t.atc_id.clone()).filter(|s| !s.is_empty()),
             simulator: kind.as_simulator(),
             sim_version: None,
+            // Avionics
+            transponder_code: Some(squawk_from_bcd(t.transponder_bcd)),
+            com1_mhz: Some(t.com1_mhz as f32),
+            com2_mhz: Some(t.com2_mhz as f32),
+            nav1_mhz: Some(t.nav1_mhz as f32),
+            nav2_mhz: Some(t.nav2_mhz as f32),
+            // Lights
+            light_landing: Some(t.light_landing),
+            light_beacon: Some(t.light_beacon),
+            light_strobe: Some(t.light_strobe),
+            light_taxi: Some(t.light_taxi),
+            light_nav: Some(t.light_nav),
+            light_logo: Some(t.light_logo),
+            // Autopilot
+            autopilot_master: Some(t.ap_master),
+            autopilot_heading: Some(t.ap_heading),
+            autopilot_altitude: Some(t.ap_altitude),
+            autopilot_nav: Some(t.ap_nav),
+            autopilot_approach: Some(t.ap_approach),
+            // Powerplant totals
+            fuel_flow_kg_per_h: Some((total_ff_pph * LB_TO_KG) as f32),
         }
     }
 

@@ -73,6 +73,11 @@ fn position_interval(phase: FlightPhase) -> Duration {
 /// add it to the running total. Filters out GPS jitter while parked.
 const DISTANCE_EPSILON_M: f64 = 5.0;
 
+/// Kilograms → pounds. We collect fuel in kg internally because every
+/// SimConnect adapter normalises to SI, but phpVMS-Core's `acars` table
+/// and the PIREP `file` endpoint expect pounds — convert at the boundary.
+const KG_TO_LB: f64 = 2.20462262;
+
 /// How close (in nautical miles) the aircraft must be to the departure airport
 /// to start the flight. Generous enough to cover taxi positions and remote
 /// stands; tight enough to reject "I'm at EDDF instead of EDDP".
@@ -1223,8 +1228,9 @@ async fn flight_end(
             )
         };
 
+        // Block→remaining diff in kg, converted to pounds for phpVMS.
         let fuel_used = match (stats.block_fuel_kg, stats.last_fuel_kg) {
-            (Some(b), Some(c)) if b > c => Some((b - c) as f64),
+            (Some(b), Some(c)) if b > c => Some((b - c) as f64 * KG_TO_LB),
             _ => None,
         };
         let distance_nm = stats.distance_nm;
@@ -1338,8 +1344,9 @@ async fn flight_end_manual(
                     .collect(),
             )
         };
+        // Block→remaining diff in kg, converted to pounds for phpVMS.
         let fuel_used = match (stats.block_fuel_kg, stats.last_fuel_kg) {
-            (Some(b), Some(c)) if b > c => Some((b - c) as f64),
+            (Some(b), Some(c)) if b > c => Some((b - c) as f64 * KG_TO_LB),
             _ => None,
         };
         let distance_nm = stats.distance_nm;
@@ -1877,13 +1884,73 @@ fn snapshot_to_position(snap: &SimSnapshot) -> PositionEntry {
         lon: snap.lon,
         altitude: snap.altitude_msl_ft,
         altitude_agl: Some(snap.altitude_agl_ft),
+        altitude_msl: Some(snap.altitude_msl_ft),
         heading: Some(snap.heading_deg_magnetic),
         gs: Some(snap.groundspeed_kt),
         vs: Some(snap.vertical_speed_fpm),
         ias: Some(snap.indicated_airspeed_kt),
-        log: None,
+        // phpVMS expects pounds for both the on-board total and the flow.
+        fuel: Some((snap.fuel_total_kg as f64 * KG_TO_LB) as f32),
+        fuel_flow: snap
+            .fuel_flow_kg_per_h
+            .map(|kgph| (kgph as f64 * KG_TO_LB) as f32),
+        transponder: snap.transponder_code,
+        autopilot: snap.autopilot_master,
+        // distance-to-destination needs arrival airport coords; filled in
+        // by `step_flight` once the airports cache has them. Leave None
+        // for now so we don't send a misleading 0.
+        distance: None,
+        log: build_position_log(snap),
         sim_time: snap.timestamp.to_rfc3339(),
     }
+}
+
+/// Pack the telemetry that phpVMS doesn't have first-class columns for
+/// (exterior lights, COM/NAV frequencies, autopilot modes, parking brake,
+/// stall/overspeed warnings) into a compact JSON blob written to the
+/// position's `log` field. The PIREP detail page renders this verbatim,
+/// and Rules-Lua scripts on the server can parse it.
+fn build_position_log(snap: &SimSnapshot) -> Option<String> {
+    let payload = serde_json::json!({
+        "lights": {
+            "landing": snap.light_landing,
+            "beacon": snap.light_beacon,
+            "strobe": snap.light_strobe,
+            "taxi": snap.light_taxi,
+            "nav": snap.light_nav,
+            "logo": snap.light_logo,
+        },
+        "com": {
+            "com1": snap.com1_mhz,
+            "com2": snap.com2_mhz,
+        },
+        "nav": {
+            "nav1": snap.nav1_mhz,
+            "nav2": snap.nav2_mhz,
+        },
+        "ap": {
+            "master": snap.autopilot_master,
+            "hdg": snap.autopilot_heading,
+            "alt": snap.autopilot_altitude,
+            "nav": snap.autopilot_nav,
+            "apr": snap.autopilot_approach,
+        },
+        "state": {
+            "parking_brake": snap.parking_brake,
+            "stall": snap.stall_warning,
+            "overspeed": snap.overspeed_warning,
+            "gear": snap.gear_position,
+            "flaps": snap.flaps_position,
+            "engines_running": snap.engines_running,
+        },
+        "env": {
+            "wind_dir_deg": snap.wind_direction_deg,
+            "wind_kt": snap.wind_speed_kt,
+            "qnh_hpa": snap.qnh_hpa,
+            "oat_c": snap.outside_air_temp_c,
+        },
+    });
+    serde_json::to_string(&payload).ok()
 }
 
 // ---- Simulator selection + status ----

@@ -330,6 +330,13 @@ pub struct PrefileBody {
 
 /// Single position entry posted to `POST /api/pireps/{id}/acars/position`.
 /// We map our internal `SimSnapshot` to this on the way out.
+///
+/// Field set tracks the phpVMS-Core `acars` model (lat/lon/heading/altitude/
+/// altitude_agl/altitude_msl/gs/ias/vs/fuel/fuel_flow/transponder/autopilot/
+/// distance/log/sim_time/source). Anything outside that schema (lights,
+/// COM/NAV freqs, autopilot mode detail) goes into `log` as a compact JSON
+/// blob so the live map / PIREP detail page can surface it without a custom
+/// field per item.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct PositionEntry {
     pub lat: f64,
@@ -337,6 +344,8 @@ pub struct PositionEntry {
     pub altitude: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub altitude_agl: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub altitude_msl: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub heading: Option<f32>,
     /// Groundspeed in knots.
@@ -348,7 +357,24 @@ pub struct PositionEntry {
     /// Indicated airspeed in knots.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ias: Option<f32>,
-    /// Free-form log line shown on the live map.
+    /// Total fuel on board, kilograms (phpVMS-Core column).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fuel: Option<f32>,
+    /// Total fuel flow, kg/h (phpVMS-Core column).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fuel_flow: Option<f32>,
+    /// 4-digit transponder / squawk code (phpVMS-Core column).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transponder: Option<u16>,
+    /// Autopilot master on/off (phpVMS-Core column, stored as int 0/1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub autopilot: Option<bool>,
+    /// Distance to the destination in nautical miles (phpVMS-Core column).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distance: Option<f64>,
+    /// Free-form log line shown on the live map. We pack telemetry that
+    /// phpVMS doesn't have first-class columns for (lights, com/nav,
+    /// autopilot modes) here as compact JSON.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log: Option<String>,
     /// ISO-8601 UTC timestamp.
