@@ -1196,6 +1196,48 @@ button:disabled {
   box-shadow: inset 0 0 0 1px currentColor;
 }
 
+/* Warning state — APU spooling up, anything in transit. */
+.switch-pill--warn {
+  background: color-mix(in srgb, #f59e0b 20%, transparent);
+  color: #f59e0b;
+  border-color: color-mix(in srgb, #f59e0b 35%, transparent);
+}
+
+.value-badge {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface) 50%, transparent);
+  white-space: nowrap;
+  user-select: none;
+}
+
+.value-badge__label {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.value-badge__value {
+  font-family: "SF Mono", "Cascadia Code", "Source Code Pro", Menlo, Consolas,
+    monospace;
+  font-feature-settings: "tnum" 1;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.value-badge--unknown {
+  border-style: dashed;
+  opacity: 0.6;
+}
+
+.value-badge--unknown .value-badge__value {
+  color: var(--text-muted);
+}
+
 /* ----- SimVar / LVar Inspector (Settings → Debug) ----- */
 
 .inspector-add {

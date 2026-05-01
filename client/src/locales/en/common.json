@@ -218,11 +218,23 @@
       "ap_approach": "APR",
       "parking_brake": "Park brake",
       "stall_warning": "Stall",
-      "overspeed_warning": "Overspeed"
+      "overspeed_warning": "Overspeed",
+      "flaps": "Flaps",
+      "gear": "Gear",
+      "spoilers": "Spoilers",
+      "spoilers_armed": "GND-SPLR ARM",
+      "battery_master": "Battery",
+      "avionics_master": "Avionics",
+      "pitot_heat": "Pitot heat",
+      "eng_anti_ice": "Eng anti-ice",
+      "wing_anti_ice": "Wing anti-ice",
+      "apu": "APU"
     },
     "groups": {
       "lights": "Lights",
       "autopilot": "Autopilot",
+      "surfaces": "Surfaces",
+      "systems": "Systems",
       "aircraft": "Aircraft",
       "engines": "Engines"
     },

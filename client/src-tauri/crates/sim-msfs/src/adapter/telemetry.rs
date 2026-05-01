@@ -118,6 +118,31 @@ pub const TELEMETRY_FIELDS: &[TelemetryField] = &[
     F::f64("ENG FUEL FLOW PPH:3", "pounds per hour"),
     F::f64("ENG FUEL FLOW PPH:4", "pounds per hour"),
 
+    // ---- Surfaces ----
+    /// 0..1, position of the spoiler / speed-brake handle.
+    F::f64("SPOILERS HANDLE POSITION", "percent over 100"),
+    /// Auto-spoilers armed for landing (separate from physical handle).
+    F::bool("SPOILERS ARMED"),
+
+    // ---- Systems ----
+    /// APU master switch (0 = off, 1 = on).
+    F::bool("APU SWITCH"),
+    /// APU N (RPM) percentage 0..100. Useful to distinguish "starting"
+    /// from "running" — the switch is on long before the APU is up.
+    F::f64("APU PCT RPM", "percent"),
+    /// Battery #1 master. Most aircraft only have one battery exposed.
+    F::bool("ELECTRICAL MASTER BATTERY:1"),
+    F::bool("AVIONICS MASTER SWITCH"),
+    F::bool("PITOT HEAT"),
+    /// Engine anti-ice — sampled per engine, combined to "any-on" in
+    /// the snapshot mapping so the UI just shows one indicator.
+    F::bool("ENG ANTI ICE:1"),
+    F::bool("ENG ANTI ICE:2"),
+    F::bool("ENG ANTI ICE:3"),
+    F::bool("ENG ANTI ICE:4"),
+    /// Wing / structural deice (Airbus calls this WING ANTI ICE).
+    F::bool("STRUCTURAL DEICE SWITCH"),
+
     // ---- FBW A32NX LVars ----
     // LVars don't get rejected by SimConnect — non-FBW aircraft just
     // read 0 from them, so adding them universally is safe. The
@@ -240,6 +265,20 @@ pub struct Telemetry {
     pub eng2_ff_pph: f64,
     pub eng3_ff_pph: f64,
     pub eng4_ff_pph: f64,
+
+    pub spoilers_handle_position: f64,
+    pub spoilers_armed: bool,
+
+    pub apu_switch: bool,
+    pub apu_pct_rpm: f64,
+    pub battery_master: bool,
+    pub avionics_master: bool,
+    pub pitot_heat: bool,
+    pub eng1_anti_ice: bool,
+    pub eng2_anti_ice: bool,
+    pub eng3_anti_ice: bool,
+    pub eng4_anti_ice: bool,
+    pub structural_deice: bool,
 
     // FBW A32NX LVars
     pub fbw_xpdr: f64,
@@ -544,6 +583,20 @@ impl Telemetry {
         pull_f64!(t.eng3_ff_pph);
         pull_f64!(t.eng4_ff_pph);
 
+        pull_f64!(t.spoilers_handle_position);
+        pull_i32!(t.spoilers_armed);
+
+        pull_i32!(t.apu_switch);
+        pull_f64!(t.apu_pct_rpm);
+        pull_i32!(t.battery_master);
+        pull_i32!(t.avionics_master);
+        pull_i32!(t.pitot_heat);
+        pull_i32!(t.eng1_anti_ice);
+        pull_i32!(t.eng2_anti_ice);
+        pull_i32!(t.eng3_anti_ice);
+        pull_i32!(t.eng4_anti_ice);
+        pull_i32!(t.structural_deice);
+
         pull_f64!(t.fbw_xpdr);
         pull_f64!(t.fbw_ap_active);
         pull_f64!(t.fbw_ap_hdg);
@@ -772,6 +825,20 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
         autopilot_nav: Some(ap_nav),
         autopilot_approach: Some(ap_appr),
         fuel_flow_kg_per_h,
+        spoilers_handle_position: Some(t.spoilers_handle_position as f32),
+        spoilers_armed: Some(t.spoilers_armed),
+        apu_switch: Some(t.apu_switch),
+        apu_pct_rpm: Some(t.apu_pct_rpm as f32),
+        battery_master: Some(t.battery_master),
+        avionics_master: Some(t.avionics_master),
+        pitot_heat: Some(t.pitot_heat),
+        engine_anti_ice: Some(
+            t.eng1_anti_ice
+                || t.eng2_anti_ice
+                || t.eng3_anti_ice
+                || t.eng4_anti_ice,
+        ),
+        wing_anti_ice: Some(t.structural_deice),
         parking_name: None,
         parking_number: None,
         selected_runway: None,

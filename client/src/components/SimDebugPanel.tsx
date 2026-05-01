@@ -136,6 +136,29 @@ function SwitchStatePanel({ snap }: { snap: SimSnapshot }) {
           <Pill label={t("sim.fields.ap_nav")} value={snap.autopilot_nav} />
           <Pill label={t("sim.fields.ap_approach")} value={snap.autopilot_approach} />
         </SwitchGroup>
+        <SwitchGroup label={t("sim.groups.surfaces")}>
+          <ValueBadge
+            label={t("sim.fields.flaps")}
+            value={fmtPercentSurface(snap.flaps_position)}
+          />
+          <ValueBadge
+            label={t("sim.fields.gear")}
+            value={fmtGear(snap.gear_position)}
+          />
+          <ValueBadge
+            label={t("sim.fields.spoilers")}
+            value={fmtPercentSurface(snap.spoilers_handle_position)}
+          />
+          <Pill label={t("sim.fields.spoilers_armed")} value={snap.spoilers_armed} />
+        </SwitchGroup>
+        <SwitchGroup label={t("sim.groups.systems")}>
+          <Pill label={t("sim.fields.battery_master")} value={snap.battery_master} />
+          <Pill label={t("sim.fields.avionics_master")} value={snap.avionics_master} />
+          <Pill label={t("sim.fields.pitot_heat")} value={snap.pitot_heat} />
+          <Pill label={t("sim.fields.eng_anti_ice")} value={snap.engine_anti_ice} />
+          <Pill label={t("sim.fields.wing_anti_ice")} value={snap.wing_anti_ice} />
+          <ApuPill apuSwitch={snap.apu_switch} apuRpm={snap.apu_pct_rpm} />
+        </SwitchGroup>
         <SwitchGroup label={t("sim.groups.aircraft")}>
           <Pill label={t("sim.fields.parking_brake")} value={snap.parking_brake} />
           <Pill label={t("sim.fields.stall_warning")} value={snap.stall_warning} />
@@ -149,6 +172,84 @@ function SwitchStatePanel({ snap }: { snap: SimSnapshot }) {
       </div>
     </>
   );
+}
+
+/**
+ * Position indicator (flaps / gear / spoilers). Renders as a small
+ * badge with a numeric value rather than a bool pill — these are
+ * continuous values where "off" / "on" don't capture the meaning.
+ */
+function ValueBadge({
+  label,
+  value,
+}: {
+  label: string;
+  value: string | null;
+}) {
+  return (
+    <span
+      className={`value-badge ${
+        value === null ? "value-badge--unknown" : ""
+      }`}
+    >
+      <span className="value-badge__label">{label}</span>
+      <span className="value-badge__value">{value ?? "—"}</span>
+    </span>
+  );
+}
+
+/**
+ * APU status pill: APU is special because the switch can be on
+ * while the unit is still spooling up. Showing both gives a clearer
+ * picture than a plain bool ("APU starting" vs "APU running").
+ */
+function ApuPill({
+  apuSwitch,
+  apuRpm,
+}: {
+  apuSwitch: boolean | null;
+  apuRpm: number | null;
+}) {
+  const { t } = useTranslation();
+  if (apuSwitch === null) {
+    return (
+      <span className="switch-pill switch-pill--unknown">
+        <span className="switch-pill__dot" /> {t("sim.fields.apu")}
+      </span>
+    );
+  }
+  if (!apuSwitch) {
+    return (
+      <span className="switch-pill switch-pill--off">
+        <span className="switch-pill__dot" /> {t("sim.fields.apu")}
+      </span>
+    );
+  }
+  // Switch is on. RPM tells us whether it's running or just starting.
+  const rpm = apuRpm ?? 0;
+  const running = rpm >= 95;
+  const trailing = running ? "" : ` ${Math.round(rpm)}%`;
+  return (
+    <span
+      className={`switch-pill switch-pill--${running ? "on" : "warn"}`}
+    >
+      <span className="switch-pill__dot" /> {t("sim.fields.apu")}{trailing}
+    </span>
+  );
+}
+
+/** 0..1 → "12%" (two-digit, rounded). null → null. */
+function fmtPercentSurface(v: number | null | undefined): string | null {
+  if (v === null || v === undefined) return null;
+  return `${Math.round(v * 100)}%`;
+}
+
+/** Gear position: 0 = up, 1 = down, anything in between = transit. */
+function fmtGear(v: number | null | undefined): string | null {
+  if (v === null || v === undefined) return null;
+  if (v <= 0.02) return "UP";
+  if (v >= 0.98) return "DOWN";
+  return `${Math.round(v * 100)}%`;
 }
 
 /**

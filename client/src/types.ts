@@ -153,6 +153,19 @@ export interface SimSnapshot {
   autopilot_altitude: boolean | null;
   autopilot_nav: boolean | null;
   autopilot_approach: boolean | null;
+  /** Surfaces */
+  spoilers_handle_position: number | null;
+  spoilers_armed: boolean | null;
+  /** Systems */
+  apu_switch: boolean | null;
+  apu_pct_rpm: number | null;
+  battery_master: boolean | null;
+  avionics_master: boolean | null;
+  pitot_heat: boolean | null;
+  /** Combined "any engine has anti-ice on". */
+  engine_anti_ice: boolean | null;
+  /** Wing / structural deice. */
+  wing_anti_ice: boolean | null;
   /** Latched touchdown sample — populated by SimConnect at the moment
    *  the gear hits the ground. null until the first touchdown. */
   touchdown_vs_fpm: number | null;

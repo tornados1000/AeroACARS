@@ -116,6 +116,25 @@ pub struct SimSnapshot {
     /// Total fuel-flow across all running engines, kg/h.
     pub fuel_flow_kg_per_h: Option<f32>,
 
+    // ---- Surfaces ----
+    /// 0.0..1.0, current position of the spoiler / speed-brake handle.
+    /// Drives both ground-spoiler and in-flight speed-brake feedback.
+    pub spoilers_handle_position: Option<f32>,
+    /// Auto-spoilers armed for landing.
+    pub spoilers_armed: Option<bool>,
+
+    // ---- Systems ----
+    pub apu_switch: Option<bool>,
+    /// 0..100. Useful to tell "starting" (rising) from "running" (~95).
+    pub apu_pct_rpm: Option<f32>,
+    pub battery_master: Option<bool>,
+    pub avionics_master: Option<bool>,
+    pub pitot_heat: Option<bool>,
+    /// "any engine has anti-ice on" — combined per-engine readings.
+    pub engine_anti_ice: Option<bool>,
+    /// Wing / structural deice (Airbus "WING ANTI ICE").
+    pub wing_anti_ice: Option<bool>,
+
     // ---- ATC / Gate info (from MSFS ATC system) ----
     /// Stand identifier from `ATC PARKING NAME` (e.g. "GATE_HEAVY").
     /// Only filled while the aircraft sits on a named stand; goes
