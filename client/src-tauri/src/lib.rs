@@ -1252,14 +1252,32 @@ pub struct ResumableFlight {
 /// the auto-detection banner on dashboard mount: if the answer is non-empty,
 /// the UI offers to adopt with a 10s countdown.
 ///
-/// Skipped (returns empty) if a flight is already attached locally.
+/// Skipped (returns empty) if a flight is already attached locally —
+/// either in memory (Disk-Resume already finished) OR still pending on
+/// disk (Disk-Resume hasn't finished its async backfill yet but will
+/// install the same PIREP shortly). Without the disk-file check, the
+/// frontend's mount-time discovery race could find a separate
+/// in-progress PIREP on phpVMS and offer it as a discovered flight,
+/// then `flight_adopt` would crash with "another flight is already
+/// active" the moment Disk-Resume committed.
 #[tauri::command]
 async fn flight_discover_resumable(
+    app: AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<ResumableFlight>, UiError> {
     {
         let guard = state.active_flight.lock().expect("active_flight lock");
         if guard.is_some() {
+            return Ok(Vec::new());
+        }
+    }
+    if let Some(persisted) = read_persisted_flight(&app) {
+        let age = Utc::now() - persisted.started_at;
+        if age <= chrono::Duration::hours(RESUME_MAX_AGE_HOURS) {
+            tracing::debug!(
+                pirep_id = %persisted.pirep_id,
+                "discover_resumable: disk-resume pending — returning empty so the disk flight wins"
+            );
             return Ok(Vec::new());
         }
     }
