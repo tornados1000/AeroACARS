@@ -9,8 +9,18 @@
   },
   "tabs": {
     "dashboard": "Dashboard",
+    "cockpit": "Cockpit",
+    "briefing": "Briefing",
     "log": "ACARS-Log",
     "settings": "Einstellungen"
+  },
+  "cockpit": {
+    "empty_title": "Kein aktiver Flug",
+    "empty_hint": "Wechseln Sie ins Briefing, um einen gebuchten Flug zu starten oder einen offenen PIREP zu adoptieren.",
+    "go_briefing": "Zum Briefing"
+  },
+  "briefing": {
+    "active_flight_hint": "{{callsign}} ist gerade aktiv — wechseln Sie in den Cockpit-Tab, um ihn zu beenden."
   },
   "weather": {
     "title": "Wetter-Briefing",

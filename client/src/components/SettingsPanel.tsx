@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useTranslation } from "react-i18next";
-import type { SimKind } from "../types";
+import type { SimKind, SimStatus } from "../types";
 import type { Theme } from "../theme";
+import { SimDebugPanel } from "./SimDebugPanel";
 
 const ALL_KINDS: SimKind[] = [
   "msfs2024",
@@ -17,6 +18,9 @@ interface Props {
   onDebugModeChange: (next: boolean) => void;
   theme: Theme;
   onThemeChange: (next: Theme) => void;
+  /** Latest sim telemetry — surfaced in the debug section when the
+   *  user has enabled debug mode. Polled centrally by `useSimSession`. */
+  simStatus: SimStatus | null;
 }
 
 export function SettingsPanel({
@@ -24,6 +28,7 @@ export function SettingsPanel({
   onDebugModeChange,
   theme,
   onThemeChange,
+  simStatus,
 }: Props) {
   const { t, i18n } = useTranslation();
   const [kind, setKind] = useState<SimKind | null>(null);
@@ -132,6 +137,12 @@ export function SettingsPanel({
             </span>
           </span>
         </label>
+
+        {debugMode && (
+          <div className="settings__debug-panel">
+            <SimDebugPanel status={simStatus} />
+          </div>
+        )}
       </div>
     </section>
   );

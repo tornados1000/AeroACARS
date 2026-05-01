@@ -9,8 +9,18 @@
   },
   "tabs": {
     "dashboard": "Dashboard",
+    "cockpit": "Cockpit",
+    "briefing": "Briefing",
     "log": "ACARS log",
     "settings": "Settings"
+  },
+  "cockpit": {
+    "empty_title": "No active flight",
+    "empty_hint": "Head to Briefing to start a booked flight or adopt an in-progress PIREP.",
+    "go_briefing": "Open briefing"
+  },
+  "briefing": {
+    "active_flight_hint": "{{callsign}} is in progress — switch to the Cockpit tab to manage it."
   },
   "weather": {
     "title": "Weather briefing",

@@ -1,0 +1,64 @@
+import { useState } from "react";
+import { useTranslation } from "react-i18next";
+import type {
+  ActiveFlightInfo,
+  Bid,
+  LoginResult,
+  SimConnectionState,
+  SimSnapshot,
+} from "../types";
+import { BidsList } from "./BidsList";
+import { PilotHeader } from "./PilotHeader";
+
+interface Props {
+  session: LoginResult;
+  activeFlight: ActiveFlightInfo | null;
+  setActiveFlight: (info: ActiveFlightInfo | null) => void;
+  onLogout: () => void;
+  simState: SimConnectionState;
+  simSnapshot: SimSnapshot | null;
+}
+
+/**
+ * Briefing tab — the pre-flight pilot view. Pilot identity card up
+ * top (with the airline logo at a sensible size), then the booked-
+ * flights list. When a flight is already active, a short banner
+ * reminds the pilot to switch to the cockpit tab so they don't
+ * accidentally start a second one.
+ */
+export function BriefingView({
+  session,
+  activeFlight,
+  setActiveFlight,
+  onLogout,
+  simState,
+  simSnapshot,
+}: Props) {
+  const { t } = useTranslation();
+  const [, setSelectedBid] = useState<Bid | null>(null);
+
+  return (
+    <>
+      <PilotHeader profile={session.profile} onLogout={onLogout} />
+
+      {activeFlight && (
+        <div className="briefing-active-hint">
+          {t("briefing.active_flight_hint", {
+            callsign: activeFlight.airline_icao
+              ? `${activeFlight.airline_icao} ${activeFlight.flight_number}`
+              : activeFlight.flight_number,
+          })}
+        </div>
+      )}
+
+      <BidsList
+        baseUrl={session.base_url}
+        simState={simState}
+        simSnapshot={simSnapshot}
+        hasActiveFlight={activeFlight !== null}
+        onSelect={setSelectedBid}
+        onFlightStarted={setActiveFlight}
+      />
+    </>
+  );
+}

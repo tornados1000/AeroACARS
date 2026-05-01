@@ -60,31 +60,89 @@ body {
   display: flex;
   flex-direction: row;
   justify-content: space-between;
-  align-items: baseline;
+  align-items: center;
   gap: 16px;
   flex-wrap: wrap;
   padding-bottom: 4px;
 }
 
-.app__header h1 {
+.app__brand {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.app__brand h1 {
   margin: 0;
   font-size: 20px;
   font-weight: 600;
   letter-spacing: -0.01em;
-  display: inline-block;
 }
 
 .tagline {
-  margin: 0 0 0 12px;
+  margin: 0;
   color: var(--text-muted);
   font-size: 12px;
-  display: inline-block;
 }
 
-.app__header > div {
+/* Connection-status pills (right side of the app header) — replaced
+   the old big Status-Grid cards. Two compact dots tell the pilot at a
+   glance whether phpVMS and the simulator are connected; full status
+   text shows on hover via the title attribute. */
+.app__status-pills {
   display: flex;
-  align-items: baseline;
-  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  background: var(--surface);
+}
+
+.status-pill__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: 0 0 auto;
+}
+
+.status-pill--online {
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 40%, var(--border));
+  background: color-mix(in srgb, var(--success) 10%, var(--surface));
+}
+
+.status-pill--offline {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
+  background: color-mix(in srgb, var(--danger) 8%, var(--surface));
+}
+
+.status-pill--connecting {
+  color: var(--warning, orange);
+  border-color: color-mix(in srgb, var(--warning, orange) 40%, var(--border));
+  background: color-mix(in srgb, var(--warning, orange) 10%, var(--surface));
+}
+
+.status-pill--connecting .status-pill__dot {
+  animation: status-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes status-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
 }
 
 button {
@@ -147,6 +205,197 @@ button:disabled {
 
 .status-card--connecting .status-card__value {
   color: var(--warning);
+}
+
+/* ===== Pilot header (Briefing tab) ===== */
+
+.pilot-header {
+  display: grid;
+  grid-template-columns: auto 1fr auto auto;
+  gap: 24px;
+  align-items: center;
+  padding: 16px 22px;
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--accent) 10%, var(--surface)) 0%,
+    var(--surface) 60%
+  );
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
+  border-radius: 14px;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+@media (max-width: 720px) {
+  .pilot-header {
+    grid-template-columns: auto 1fr;
+    grid-template-rows: auto auto auto;
+  }
+  .pilot-header__locations,
+  .pilot-header__logout {
+    grid-column: 1 / -1;
+  }
+}
+
+.pilot-header__logo {
+  width: 96px;
+  height: 96px;
+  border-radius: 16px;
+  background: var(--surface-2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+
+.pilot-header__logo img {
+  max-width: 84px;
+  max-height: 84px;
+  object-fit: contain;
+}
+
+.pilot-header__logo-fallback {
+  font-size: 32px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+}
+
+.pilot-header__identity {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.pilot-header__name {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.pilot-header__chips {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.pilot-header__chip {
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 18%, var(--surface-2));
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.pilot-header__chip--muted {
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.pilot-header__locations {
+  display: flex;
+  gap: 18px;
+  align-items: center;
+}
+
+.pilot-header__loc {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: right;
+}
+
+.pilot-header__loc-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+.pilot-header__loc-value {
+  font-size: 18px;
+  font-weight: 700;
+  font-family: "SF Mono", "Cascadia Code", "Source Code Pro", Menlo, Consolas,
+    monospace;
+}
+
+.pilot-header__logout {
+  font-size: 12px;
+  padding: 6px 12px;
+}
+
+/* ===== Briefing tab — active-flight reminder ===== */
+
+.briefing-active-hint {
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
+  border-radius: 10px;
+  padding: 10px 14px;
+  font-size: 13px;
+  color: var(--accent);
+  font-weight: 500;
+}
+
+/* ===== Cockpit tab — empty state ===== */
+
+.cockpit-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 60px 20px;
+  background: var(--surface);
+  border: 1px dashed var(--border);
+  border-radius: 14px;
+  text-align: center;
+}
+
+.cockpit-empty__icon {
+  font-size: 56px;
+  color: var(--accent);
+  opacity: 0.6;
+}
+
+.cockpit-empty__title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.cockpit-empty__hint {
+  margin: 0 0 8px;
+  font-size: 14px;
+  color: var(--text-muted);
+  max-width: 420px;
+  line-height: 1.5;
+}
+
+/* ===== Settings — debug panel inline ===== */
+
+.settings__debug-panel {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+/* ===== Tab badge (active-flight indicator) ===== */
+
+.tab__badge {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  margin-left: 6px;
+  vertical-align: middle;
+  animation: status-pulse 1.5s ease-in-out infinite;
 }
 
 /* ===== Tabs ===== */
