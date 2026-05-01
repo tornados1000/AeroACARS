@@ -380,7 +380,14 @@ impl PersistedFlightStats {
     fn apply_to(self, stats: &mut FlightStats) {
         stats.distance_nm = self.distance_nm;
         stats.position_count = self.position_count;
-        stats.phase = self.phase;
+        // Don't clobber the freshly-initialised Boarding phase with the
+        // serde-default Preflight when the persisted JSON predates the
+        // stats sidecar (no `phase` field → FlightPhase::default() →
+        // Preflight, which has no matching arm in step_flight, so the
+        // FSM would freeze and never advance past it).
+        if self.phase != FlightPhase::Preflight {
+            stats.phase = self.phase;
+        }
         stats.block_off_at = self.block_off_at;
         stats.takeoff_at = self.takeoff_at;
         stats.landing_at = self.landing_at;
