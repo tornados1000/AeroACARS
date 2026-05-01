@@ -8,6 +8,25 @@ interface AirportInfo {
   lon: number;
 }
 
+const EARTH_RADIUS_NM = 3440.065; // nautical miles
+
+/** Great-circle distance in nautical miles between two lat/lon points. */
+function haversineNm(
+  lat1: number,
+  lon1: number,
+  lat2: number,
+  lon2: number,
+): number {
+  const toRad = (deg: number) => (deg * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return EARTH_RADIUS_NM * c;
+}
+
 interface Props {
   dptIcao: string;
   arrIcao: string;
@@ -66,17 +85,22 @@ export function RouteMap({
     return null;
   }
 
-  // Project lat/lon onto a 0..1 axis between the two endpoints.
-  // Clamped so taxi positions and post-touchdown rollout keep the
-  // plane on the route instead of overshooting.
-  const dx = arr.lon - dpt.lon;
-  const dy = arr.lat - dpt.lat;
-  const lenSq = dx * dx + dy * dy;
+  // Progress = 1 − (distance_remaining / total_distance), great-circle.
+  // Linear lat/lon projection onto the dpt→arr axis fails for any
+  // SID/STAR routing (e.g. EDDP→EDDF westbound, but the SID first
+  // takes you south-east — projection goes negative and the plane
+  // sticks at 0%). Distance-based progress instead just asks "how
+  // much closer to the destination am I", which is what the pilot
+  // actually wants to see.
+  const totalNm = haversineNm(dpt.lat, dpt.lon, arr.lat, arr.lon);
   let progress = 0;
-  if (lenSq > 0 && currentLat != null && currentLon != null) {
-    const px = currentLon - dpt.lon;
-    const py = currentLat - dpt.lat;
-    progress = (px * dx + py * dy) / lenSq;
+  if (totalNm > 0 && currentLat != null && currentLon != null) {
+    const remainingNm = haversineNm(currentLat, currentLon, arr.lat, arr.lon);
+    progress = 1 - remainingNm / totalNm;
+    // Clamp to 0..1 — long SIDs that pull you further from the
+    // destination than the direct distance shouldn't drive the bar
+    // negative, and an overshoot past the airport (rollout, taxi-in
+    // past the threshold) shouldn't go > 100%.
     progress = Math.max(0, Math.min(1, progress));
   }
 
