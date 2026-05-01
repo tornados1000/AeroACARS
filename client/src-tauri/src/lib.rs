@@ -434,6 +434,22 @@ impl PersistedFlightStats {
     }
 }
 
+/// One entry in the touchdown ring buffer (see `FlightStats::snapshot_buffer`).
+#[derive(Debug, Clone, Copy)]
+struct TelemetrySample {
+    at: DateTime<Utc>,
+    vs_fpm: f32,
+    g_force: f32,
+    on_ground: bool,
+}
+
+/// Maximum age of any entry in the touchdown ring buffer. 5 s gives
+/// us roughly the last final-approach segment plus the touchdown
+/// itself. Longer than ~6 s and we'd start picking up Cruise data;
+/// shorter than ~3 s and we'd miss the descent rate moments before
+/// flare.
+const TOUCHDOWN_BUFFER_SECS: i64 = 5;
+
 #[derive(Default)]
 struct FlightStats {
     // Position tracking.
@@ -519,6 +535,15 @@ struct FlightStats {
     /// as "Flt.Level". Updated on every snapshot during Climb /
     /// Cruise / Descent.
     peak_altitude_ft: Option<f32>,
+
+    /// Rolling 5-second ring buffer of (timestamp, V/S, G, on-ground)
+    /// for recovering the *true* touchdown values. The single-tick
+    /// "first on_ground=true" snapshot routinely caught a bounce
+    /// rebound (positive V/S, 1.0 G), missing the actual impact. The
+    /// buffer lets us scan the last few seconds and pick the worst
+    /// V/S / G that the aircraft actually saw — independent of the
+    /// snapshot rate or SimConnect's PLANE TOUCHDOWN * latching.
+    snapshot_buffer: std::collections::VecDeque<TelemetrySample>,
 
     /// When the streamer last successfully posted a position to phpVMS.
     /// Drives the cockpit's LIVE / REC indicator — a long gap means
@@ -2818,6 +2843,28 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
     let alt = snap.altitude_msl_ft as f32;
     stats.peak_altitude_ft = Some(stats.peak_altitude_ft.map_or(alt, |p| p.max(alt)));
 
+    // Touchdown ring-buffer: append the current sample, then drop
+    // anything older than TOUCHDOWN_BUFFER_SECS. Cheap (memory-wise,
+    // 5 s × ~1 Hz = ~5 entries × 24 bytes each), and lets the
+    // Final → Landing transition reconstruct the actual touchdown
+    // V/S and G even when the on-ground tick already shows a
+    // bounce-up.
+    let now_ts = Utc::now();
+    stats.snapshot_buffer.push_back(TelemetrySample {
+        at: now_ts,
+        vs_fpm: snap.vertical_speed_fpm,
+        g_force: snap.g_force,
+        on_ground: snap.on_ground,
+    });
+    let cutoff = now_ts - chrono::Duration::seconds(TOUCHDOWN_BUFFER_SECS);
+    while stats
+        .snapshot_buffer
+        .front()
+        .is_some_and(|s| s.at < cutoff)
+    {
+        stats.snapshot_buffer.pop_front();
+    }
+
     let now = Utc::now();
     let prev_phase = stats.phase;
     let mut next_phase = prev_phase;
@@ -2982,31 +3029,70 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
             if !was_on_ground && snap.on_ground {
                 next_phase = FlightPhase::Landing;
                 stats.landing_at = Some(now);
-                // Prefer the sim-latched touchdown sample over our own
-                // tick-rate sample. SimConnect's `PLANE TOUCHDOWN *`
-                // SimVars are filled by the simulation core at the
-                // exact subframe the gear hits the ground — orders of
-                // magnitude more accurate than catching the right
-                // 200ms tick. Falls back to the live snapshot when the
-                // touchdown values aren't ready yet (e.g. immediately
-                // after teleport / slew).
-                stats.landing_rate_fpm =
-                    Some(snap.touchdown_vs_fpm.unwrap_or(snap.vertical_speed_fpm));
+
+                // V/S capture priority:
+                //   1. SimConnect's PLANE TOUCHDOWN NORMAL VELOCITY,
+                //      latched by the sim itself at the actual frame
+                //      of contact. This is the cleanest signal *if*
+                //      Fenix / FBW / etc. update it (some don't).
+                //   2. Most-negative VS in the ring buffer's airborne
+                //      samples — handles the common case where the
+                //      single on-ground tick already shows a positive
+                //      bounce-up VS while the buffer still remembers
+                //      the actual descent rate.
+                //   3. The current snapshot's live VS (last resort).
+                //
+                // We ALWAYS take the worst of (1) and (2) to be safe
+                // against either source returning a partial value.
+                let buffered_vs_min: f32 = stats
+                    .snapshot_buffer
+                    .iter()
+                    .filter(|s| !s.on_ground)
+                    .map(|s| s.vs_fpm)
+                    .fold(f32::INFINITY, f32::min);
+                let candidates = [
+                    snap.touchdown_vs_fpm.unwrap_or(f32::INFINITY),
+                    if buffered_vs_min.is_finite() {
+                        buffered_vs_min
+                    } else {
+                        f32::INFINITY
+                    },
+                    snap.vertical_speed_fpm,
+                ];
+                let touchdown_vs = candidates
+                    .iter()
+                    .copied()
+                    .filter(|v| v.is_finite())
+                    .fold(f32::INFINITY, f32::min);
+                let touchdown_vs = if touchdown_vs.is_finite() {
+                    touchdown_vs
+                } else {
+                    snap.vertical_speed_fpm
+                };
+                stats.landing_rate_fpm = Some(touchdown_vs);
+                stats.landing_peak_vs_fpm = Some(touchdown_vs);
+
+                // G capture priority:
+                //   1. Highest G in the ring buffer (catches the impact
+                //      spike even when the on-ground tick already shows
+                //      G≈1.0 because the bounce is already in the air).
+                //   2. Current snapshot G (in case the spike happens
+                //      exactly on this tick).
+                let buffered_g_peak: f32 = stats
+                    .snapshot_buffer
+                    .iter()
+                    .map(|s| s.g_force)
+                    .fold(0.0, f32::max);
+                let touchdown_g = buffered_g_peak.max(snap.g_force);
+                stats.landing_g_force = Some(touchdown_g);
+                stats.landing_peak_g_force = Some(touchdown_g);
+
                 stats.landing_pitch_deg =
                     Some(snap.touchdown_pitch_deg.unwrap_or(snap.pitch_deg));
                 stats.landing_heading_deg =
                     Some(snap.touchdown_heading_mag_deg.unwrap_or(snap.heading_deg_magnetic));
-                // G is *not* latched by the sim — sample it live, the
-                // touchdown-window refinement loop will improve it.
-                stats.landing_g_force = Some(snap.g_force);
                 stats.landing_speed_kt = Some(snap.indicated_airspeed_kt);
                 stats.landing_fuel_kg = Some(snap.fuel_total_kg);
-                // Seed the landing-analyzer peaks with the initial
-                // touchdown sample. Subsequent ticks within the window
-                // (TOUCHDOWN_WINDOW_SECS) refine these to the worst
-                // observed value.
-                stats.landing_peak_vs_fpm = stats.landing_rate_fpm;
-                stats.landing_peak_g_force = Some(snap.g_force);
                 stats.bounce_count = 0;
                 // Prefer TOTAL WEIGHT (fuel + payload + empty); only
                 // fall back to ZFW + fuel if the SimVar is missing.
