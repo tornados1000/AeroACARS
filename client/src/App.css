@@ -1300,14 +1300,15 @@ button:disabled {
 }
 
 /* ----- Compact InfoStrip (Cockpit tab) ----- */
-/* Replaces the old MassPanel + FlightInfoPanel + stats grid trio
-   with a single dense band split into three logical groups. */
+/* Three-row layout: each group (Mass / Flight / Trip) is its own
+   horizontal band with a small uppercase label pinned on the left.
+   Predictable rhythm, no wrap surprises across groups. */
 
 .info-strip {
   display: flex;
-  flex-wrap: wrap;
-  gap: 8px 14px;
-  padding: 8px 12px;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 14px;
   margin-top: 8px;
   background: var(--surface);
   border: 1px solid var(--border);
@@ -1315,47 +1316,41 @@ button:disabled {
 }
 
 .info-strip__group {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
+  display: grid;
+  grid-template-columns: 64px 1fr;
+  align-items: baseline;
+  column-gap: 12px;
   min-width: 0;
-  flex: 1 1 auto;
 }
 
-/* Subtle vertical separator between groups, drawn on the left of
-   every group except the first. CSS adjacent-sibling means once a
-   group wraps to a new row the separator visually still hangs left,
-   but flex-wrap aligns rows so it stays at the row's left edge —
-   acceptable in practice, and we keep the markup simple. */
 .info-strip__group + .info-strip__group {
-  border-left: 1px solid var(--border);
-  padding-left: 14px;
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
 }
 
 .info-strip__group-label {
   margin: 0;
-  font-size: 9px;
+  font-size: 10px;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.06em;
   color: var(--text-muted);
 }
 
 .info-strip__cells {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px 12px;
+  gap: 4px 18px;
   align-items: baseline;
+  min-width: 0;
 }
 
-/* Inline label/value: keeps each cell on a single horizontal line
-   so a five-cell Mass group fits comfortably in a single row even
-   on mid-width windows. The previous stacked layout pushed the
-   last value (Bruttogewicht) onto a second line on Thomas's screen. */
+/* Inline label/value cell: "DOW 42.700 kg" in a single row. Wrapping
+   only happens between cells, never inside one. */
 .info-strip__cell {
   display: inline-flex;
   align-items: baseline;
-  gap: 5px;
+  gap: 6px;
   min-width: 0;
   white-space: nowrap;
 }
@@ -1381,18 +1376,14 @@ button:disabled {
   font-weight: 600;
 }
 
-/* Below ~640px the three groups stack vertically. Drop the vertical
-   separator and replace with a thin top border so the visual
-   grouping survives the wrap. */
-@media (max-width: 640px) {
-  .info-strip {
-    gap: 8px;
-  }
-  .info-strip__group + .info-strip__group {
-    border-left: none;
-    padding-left: 0;
-    border-top: 1px solid var(--border);
-    padding-top: 8px;
+/* On narrow widths the group label becomes its own line above the
+   cells so we keep the cells legible instead of cramming a two-
+   column grid. */
+@media (max-width: 520px) {
+  .info-strip__group {
+    grid-template-columns: 1fr;
+    column-gap: 0;
+    row-gap: 4px;
   }
 }
 
