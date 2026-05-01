@@ -42,6 +42,22 @@ mod adapter {
         /// Tail number / registration set in MSFS (e.g. "D-AILU").
         #[simconnect(name = "ATC ID")]
         atc_id: String,
+        /// Stand identifier from `ATC PARKING NAME` — e.g.
+        /// "GATE_HEAVY", "RAMP_GA_LARGE". MSFS only fills this when
+        /// the aircraft was spawned on a named stand and is still
+        /// parked there; goes empty after pushback. We snapshot it at
+        /// the start of a flight (departure gate) and again when the
+        /// pilot reaches BlocksOn (arrival gate).
+        #[simconnect(name = "ATC PARKING NAME")]
+        atc_parking_name: String,
+        /// Stand number (e.g. "12", "A 8"). Combined with the name
+        /// gives the human-readable label.
+        #[simconnect(name = "ATC PARKING NUMBER")]
+        atc_parking_number: String,
+        /// Selected ATC runway at the active airport (e.g. "07L").
+        /// Useful as the arrival approach runway.
+        #[simconnect(name = "ATC RUNWAY SELECTED")]
+        atc_runway_selected: String,
         #[simconnect(name = "PLANE LATITUDE", unit = "degrees")]
         lat: f64,
         #[simconnect(name = "PLANE LONGITUDE", unit = "degrees")]

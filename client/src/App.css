@@ -462,13 +462,13 @@ button:disabled {
   border-color: var(--accent);
 }
 
-/* The current-phase dot only gets a thin halo, not the giant ring it
-   had before — the pulsing badge above the timeline already signals
-   "this is where we are", we don't need a second dominant marker. */
+/* Current phase dot is the "you are here" marker. Filled accent
+   colour with a soft halo so it stands out from past/future dots
+   without dominating the layout. */
 .phase-timeline__node--current .phase-timeline__dot {
   background: var(--accent);
   border-color: var(--accent);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 30%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent);
 }
 
 .phase-timeline__label {
@@ -494,22 +494,9 @@ button:disabled {
 /* The plane glyph — sits on the current checkpoint and rides the
    track as phases advance. Smooth left-transition gives it the "the
    aircraft is moving forward" feel rather than a teleport. */
-.phase-timeline__plane {
-  position: absolute;
-  left: 0;
-  top: -16px;
-  /* Rotate 90° so the nose points along the track toward the gate
-     instead of straight up. translateX is the position adjustment;
-     the rotation tilts the SVG path itself. */
-  transform: translateX(-50%) rotate(90deg);
-  color: var(--accent);
-  filter: drop-shadow(0 2px 6px color-mix(in srgb, var(--accent) 50%, transparent));
-  transition: left 0.8s cubic-bezier(0.22, 1, 0.36, 1);
-  pointer-events: none;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
+/* (phase-timeline plane glyph removed — the route map already shows a
+   plane on a track and having two stacked stacked plane icons looked
+   redundant. The phase timeline keeps just the dots + labels now.) */
 
 @media (max-width: 600px) {
   .phase-timeline__label {

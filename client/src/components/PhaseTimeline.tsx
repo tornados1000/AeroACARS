@@ -72,34 +72,7 @@ export function PhaseTimeline({ phase }: Props) {
             </div>
           );
         })}
-        <div
-          className="phase-timeline__plane"
-          style={{ left: `${progress * 100}%` }}
-          aria-hidden="true"
-        >
-          <PlaneIcon />
-        </div>
       </div>
     </div>
-  );
-}
-
-function PlaneIcon() {
-  // Inline SVG so we can colour it via currentColor and don't need an
-  // asset round-trip. Rotated 0° because the timeline is horizontal —
-  // the silhouette already reads "moving right".
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      width="22"
-      height="22"
-      xmlns="http://www.w3.org/2000/svg"
-      aria-hidden="true"
-    >
-      <path
-        fill="currentColor"
-        d="M21 16v-2l-8-5V3.5a1.5 1.5 0 0 0-3 0V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5z"
-      />
-    </svg>
   );
 }
