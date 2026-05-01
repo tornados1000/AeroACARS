@@ -337,7 +337,7 @@ pub struct PrefileBody {
 /// COM/NAV freqs, autopilot mode detail) goes into `log` as a compact JSON
 /// blob so the live map / PIREP detail page can surface it without a custom
 /// field per item.
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PositionEntry {
     pub lat: f64,
     pub lon: f64,

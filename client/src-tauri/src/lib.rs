@@ -18,6 +18,7 @@ use api_client::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use metar::{MetarError, MetarSnapshot};
+use storage::{PositionQueue, QueuedPosition};
 use sim_core::{FlightPhase, SimKind, SimSnapshot};
 use tauri::{AppHandle, Manager};
 use tracing_subscriber::EnvFilter;
@@ -1087,6 +1088,20 @@ fn read_persisted_flight(app: &AppHandle) -> Option<PersistedFlight> {
     serde_json::from_slice::<PersistedFlight>(&bytes).ok()
 }
 
+/// Drop any queued positions for the given PIREP. Called when the user
+/// cancels or forgets a flight — replaying those rows would attach
+/// them to a PIREP that's already gone or moved on, so we clear them
+/// out cleanly. Other flights' queued rows stay put.
+fn discard_queued_positions_for(app: &AppHandle, pirep_id: &str) {
+    let Some(q) = open_position_queue(app) else { return; };
+    let items = match q.read_all() {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let kept: Vec<_> = items.into_iter().filter(|i| i.pirep_id != pirep_id).collect();
+    let _ = q.replace(&kept);
+}
+
 fn clear_persisted_flight(app: &AppHandle) {
     let Ok(path) = active_flight_path(app) else { return };
     if path.exists() {
@@ -1785,6 +1800,65 @@ fn validate_for_filing(
     missing
 }
 
+/// Open (or create) the offline position queue under the OS-appropriate
+/// app data directory. None when we can't resolve the dir — caller
+/// treats that as "no queue available, drop the offline-resilience
+/// feature for this tick" rather than blowing up the streamer.
+fn open_position_queue(app: &AppHandle) -> Option<PositionQueue> {
+    let dir = app.path().app_data_dir().ok()?;
+    PositionQueue::open(dir).ok()
+}
+
+/// Drain queued positions for `pirep_id` by replaying each one through
+/// the live phpVMS client. Stops at the first failure and writes the
+/// remaining rows back to the queue file so the next tick can retry.
+/// Older rows for *other* PIREPs are kept in place (so they replay
+/// once the matching flight resumes); only matching rows are touched.
+async fn drain_position_queue(queue: &PositionQueue, client: &Client, pirep_id: &str) {
+    let items = match queue.read_all() {
+        Ok(v) if !v.is_empty() => v,
+        _ => return,
+    };
+    let mut still_pending: Vec<QueuedPosition> = Vec::new();
+    let mut drained_now: usize = 0;
+    let mut hit_failure = false;
+    for q in items {
+        if hit_failure || q.pirep_id != pirep_id {
+            still_pending.push(q);
+            continue;
+        }
+        // Round-trip through PositionEntry so we use the same client
+        // helper — keeps the wire format identical to fresh posts.
+        let position: PositionEntry = match serde_json::from_value(q.position.clone()) {
+            Ok(p) => p,
+            Err(e) => {
+                // Bad row — drop it so we don't block forever.
+                tracing::warn!(error = %e, "discarding malformed queued position");
+                continue;
+            }
+        };
+        match client.post_positions(&q.pirep_id, &[position]).await {
+            Ok(()) => {
+                drained_now += 1;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    pending = still_pending.len(),
+                    "queue drain failed; will retry next tick"
+                );
+                still_pending.push(q);
+                hit_failure = true;
+            }
+        }
+    }
+    if let Err(e) = queue.replace(&still_pending) {
+        tracing::warn!(error = ?e, "could not rewrite position queue");
+    } else if drained_now > 0 {
+        tracing::info!(drained_now, remaining = still_pending.len(), "drained queued positions");
+    }
+}
+
 /// `GET /metar/{icao}` — fetch the current METAR for an airport.
 /// Cached per-flight in `FlightStats` (departure + arrival), so the
 /// dashboard / future briefing panel can reuse it without round-trips.
@@ -2157,6 +2231,7 @@ async fn flight_cancel(
     let result = client.cancel_pirep(&flight.pirep_id).await;
     // Clear local persistence regardless — the user wants this gone.
     clear_persisted_flight(&app);
+    discard_queued_positions_for(&app, &flight.pirep_id);
     result?;
     log_activity(
         &state,
@@ -2211,6 +2286,7 @@ async fn flight_forget(
     {
         flight.stop.store(true, Ordering::Relaxed);
         tracing::info!(pirep_id = %flight.pirep_id, "active flight forgotten (no phpVMS call)");
+        discard_queued_positions_for(&app, &flight.pirep_id);
     }
     clear_persisted_flight(&app);
     Ok(())
@@ -2273,8 +2349,16 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
             detect_telemetry_changes(&app, &flight, &snap);
             let position = snapshot_to_position(&snap);
 
+            // Try to drain any positions we couldn't ship in earlier
+            // ticks before sending the new one — keeps phpVMS's row
+            // ordering chronological even after a network gap.
+            let queue = open_position_queue(&app);
+            if let Some(q) = &queue {
+                drain_position_queue(q, &client, &flight.pirep_id).await;
+            }
+
             match client
-                .post_positions(&flight.pirep_id, &[position])
+                .post_positions(&flight.pirep_id, &[position.clone()])
                 .await
             {
                 Ok(()) => {
@@ -2291,8 +2375,23 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                     tracing::warn!(
                         pirep_id = %flight.pirep_id,
                         error = %e,
-                        "position post failed; will retry on next tick"
+                        "position post failed; queueing for later replay"
                     );
+                    if let Some(q) = &queue {
+                        let queued = QueuedPosition {
+                            pirep_id: flight.pirep_id.clone(),
+                            position: serde_json::to_value(&position).unwrap_or_default(),
+                        };
+                        match q.enqueue(queued) {
+                            Ok(len) => log_activity_handle(
+                                &app,
+                                ActivityLevel::Warn,
+                                "Position queued (offline)".to_string(),
+                                Some(format!("{} pending", len)),
+                            ),
+                            Err(qe) => tracing::warn!(error = ?qe, "could not enqueue position"),
+                        }
+                    }
                 }
             }
 
