@@ -59,9 +59,13 @@ export function CockpitView({
     void (async () => {
       try {
         await invoke("flight_end");
-        // Success → backend takes the flight out of state, the
-        // 2 s App-level poll will set activeFlight to null and the
-        // empty-state takes over. No UI work here.
+        // Clear the active flight in the React tree *immediately*
+        // instead of waiting for the next 2 s status poll to notice.
+        // Without this, pilots reported the cockpit panel sticking
+        // around after the auto-file completed; the polling-only
+        // path had a race window where a stale poll could overwrite
+        // a "no flight" reading and bring it back briefly.
+        setActiveFlight(null);
       } catch {
         // Validation failure (e.g. distance to airport > MAX, fuel
         // missing) — leave activeFlight alone so the manual "End"

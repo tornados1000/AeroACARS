@@ -384,14 +384,33 @@ pub struct PositionEntry {
 /// Body for `POST /api/pireps/{id}/file` — final flight stats at submission.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct FileBody {
-    /// Total flight time in minutes.
+    /// Total flight time in minutes (takeoff → landing).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flight_time: Option<i32>,
-    /// Fuel used (units configured site-side).
+    /// Fuel used (units configured site-side; phpVMS default is pounds).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fuel_used: Option<f64>,
+    /// Total fuel on board at block-off, same unit as `fuel_used`.
+    /// Without this phpVMS shows "Verbleibender Treibstoff = -fuel_used"
+    /// because it derives remaining = block_fuel - fuel_used and the
+    /// missing field defaults to 0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_fuel: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub distance: Option<f64>,
+    /// Cruise level in feet (e.g. 36000). Native phpVMS column on the
+    /// PIREP details page (`Flt.Level`); we report the highest steady
+    /// altitude the aircraft held during the flight.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<i32>,
+    /// Touchdown vertical speed in fpm (negative on a real landing).
+    /// phpVMS displays this as "Landing Rate" on the PIREP overview.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub landing_rate: Option<f64>,
+    /// Numeric landing score 0..100 (phpVMS convention; we map our
+    /// LandingScore enum into roughly equivalent ranges).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

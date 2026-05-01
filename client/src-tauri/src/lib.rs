@@ -353,6 +353,8 @@ struct PersistedFlightStats {
     approach_runway: Option<String>,
     #[serde(default)]
     cruise_peak_msl: Option<f32>,
+    #[serde(default)]
+    peak_altitude_ft: Option<f32>,
 }
 
 impl PersistedFlightStats {
@@ -387,6 +389,7 @@ impl PersistedFlightStats {
             arr_gate: stats.arr_gate.clone(),
             approach_runway: stats.approach_runway.clone(),
             cruise_peak_msl: stats.cruise_peak_msl,
+            peak_altitude_ft: stats.peak_altitude_ft,
         }
     }
 
@@ -427,6 +430,7 @@ impl PersistedFlightStats {
         stats.arr_gate = self.arr_gate;
         stats.approach_runway = self.approach_runway;
         stats.cruise_peak_msl = self.cruise_peak_msl;
+        stats.peak_altitude_ft = self.peak_altitude_ft;
     }
 }
 
@@ -510,6 +514,11 @@ struct FlightStats {
     /// Descent — only a real TOD drop of >5000 ft from this peak
     /// counts.
     cruise_peak_msl: Option<f32>,
+    /// Peak MSL altitude across the entire flight, regardless of
+    /// phase. Reported as the PIREP `level` field — phpVMS shows it
+    /// as "Flt.Level". Updated on every snapshot during Climb /
+    /// Cruise / Descent.
+    peak_altitude_ft: Option<f32>,
 
     /// When the streamer last successfully posted a position to phpVMS.
     /// Drives the cockpit's LIVE / REC indicator — a long gap means
@@ -664,6 +673,20 @@ impl LandingScore {
             Self::Firm => 2,
             Self::Hard => 3,
             Self::Severe => 4,
+        }
+    }
+
+    /// Numeric score 0..100 for the phpVMS `score` field. Higher is
+    /// better. Calibrated so a perfectly butter-smooth touchdown
+    /// scores 100 and a structural-damage event scores ~0 — VAs that
+    /// publish leaderboards then sort by score in the obvious way.
+    fn numeric(self) -> i32 {
+        match self {
+            Self::Smooth => 100,
+            Self::Acceptable => 80,
+            Self::Firm => 60,
+            Self::Hard => 30,
+            Self::Severe => 0,
         }
     }
 }
@@ -2142,7 +2165,16 @@ async fn flight_end(
     // the Mutex across an `await`.
     let body = {
         let stats = flight.stats.lock().expect("flight stats");
-        let elapsed_minutes = (Utc::now() - flight.started_at).num_minutes() as i32;
+        // Flight time = takeoff → landing (when both timestamps were
+        // captured by the FSM). Falls back to the started_at → now
+        // window only if takeoff/landing weren't observed (e.g.
+        // manual file before the FSM advanced through Takeoff). The
+        // takeoff→landing range matches what phpVMS expects in its
+        // native Flt.Time column.
+        let flight_time = match (stats.takeoff_at, stats.landing_at) {
+            (Some(t), Some(l)) if l > t => Some((l - t).num_minutes() as i32),
+            _ => Some(((Utc::now() - flight.started_at).num_minutes() as i32).max(0)),
+        };
 
         let fares = if flight.fares.is_empty() {
             None
@@ -2164,14 +2196,38 @@ async fn flight_end(
             (Some(b), Some(c)) if b > c => Some((b - c) as f64 * KG_TO_LB),
             _ => None,
         };
+        // Block fuel sent natively so phpVMS computes "Verbleibender
+        // Treibstoff" correctly (= block_fuel - fuel_used). Without
+        // this the dashboard shows "-fuel_used kg" because the
+        // missing block_fuel defaults to 0. Same unit as fuel_used.
+        let block_fuel = stats
+            .block_fuel_kg
+            .filter(|kg| *kg > 0.0)
+            .map(|kg| (kg as f64) * KG_TO_LB);
+        // Cruise level = peak MSL altitude observed. phpVMS column
+        // `Flt.Level`. Rounded to the nearest 100 ft so the value
+        // matches the conventional FL display.
+        let level = stats.peak_altitude_ft.map(|ft| {
+            let rounded = ((ft / 100.0).round() * 100.0) as i32;
+            rounded.max(0)
+        });
+        // Native landing rate field — same value as the custom field
+        // but on the native column phpVMS shows on the PIREP
+        // overview.
+        let landing_rate = stats.landing_rate_fpm.map(|v| v as f64);
+        let score = stats.landing_score.map(|s| s.numeric());
         let distance_nm = stats.distance_nm;
         let fields = build_pirep_fields(&flight, &stats);
         let notes = build_pirep_notes(&flight, &stats);
 
         FileBody {
-            flight_time: Some(elapsed_minutes.max(0)),
+            flight_time,
             fuel_used,
+            block_fuel,
             distance: Some(distance_nm),
+            level,
+            landing_rate,
+            score,
             source_name: Some(format!("CloudeAcars/{}", env!("CARGO_PKG_VERSION"))),
             notes: Some(notes),
             fares,
@@ -2288,7 +2344,15 @@ async fn flight_end_manual(
 
     let body = {
         let stats = flight.stats.lock().expect("flight stats");
-        let elapsed_minutes = (Utc::now() - flight.started_at).num_minutes() as i32;
+        // Same flight-time / block-fuel / level / landing-rate / score
+        // mapping as the regular file path in `flight_end`. Manual
+        // filing intentionally still ships these even if some are
+        // None — phpVMS skips missing values cleanly thanks to
+        // `skip_serializing_if`.
+        let flight_time = match (stats.takeoff_at, stats.landing_at) {
+            (Some(t), Some(l)) if l > t => Some((l - t).num_minutes() as i32),
+            _ => Some(((Utc::now() - flight.started_at).num_minutes() as i32).max(0)),
+        };
         let fares = if flight.fares.is_empty() {
             None
         } else {
@@ -2308,6 +2372,16 @@ async fn flight_end_manual(
             (Some(b), Some(c)) if b > c => Some((b - c) as f64 * KG_TO_LB),
             _ => None,
         };
+        let block_fuel = stats
+            .block_fuel_kg
+            .filter(|kg| *kg > 0.0)
+            .map(|kg| (kg as f64) * KG_TO_LB);
+        let level = stats.peak_altitude_ft.map(|ft| {
+            let rounded = ((ft / 100.0).round() * 100.0) as i32;
+            rounded.max(0)
+        });
+        let landing_rate = stats.landing_rate_fpm.map(|v| v as f64);
+        let score = stats.landing_score.map(|s| s.numeric());
         let distance_nm = stats.distance_nm;
         let fields = build_pirep_fields(&flight, &stats);
         let mut notes = build_pirep_notes(&flight, &stats);
@@ -2340,9 +2414,13 @@ async fn flight_end_manual(
             notes.push_str(extra);
         }
         FileBody {
-            flight_time: Some(elapsed_minutes.max(0)),
+            flight_time,
             fuel_used,
+            block_fuel,
             distance: Some(distance_nm),
+            level,
+            landing_rate,
+            score,
             source_name: Some(format!(
                 "CloudeAcars/{} (manual)",
                 env!("CARGO_PKG_VERSION")
@@ -2734,6 +2812,11 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
     if stats.block_fuel_kg.is_none() {
         stats.block_fuel_kg = Some(snap.fuel_total_kg);
     }
+
+    // Peak altitude tracker — every tick, take the max with the live
+    // MSL altitude. Reported as the PIREP `level` field.
+    let alt = snap.altitude_msl_ft as f32;
+    stats.peak_altitude_ft = Some(stats.peak_altitude_ft.map_or(alt, |p| p.max(alt)));
 
     let now = Utc::now();
     let prev_phase = stats.phase;
