@@ -207,60 +207,98 @@ button:disabled {
   color: var(--warning);
 }
 
-/* ===== Route map (Cockpit) — pin → pin with live position glyph ===== */
+/* ===== Route map (Cockpit) — HTML-laid-out pin → pin with live plane ===== */
 
 .route-map {
   width: 100%;
-  padding: 8px 0 4px;
-}
-
-.route-map svg {
-  width: 100%;
-  height: 80px;
-  display: block;
+  padding: 28px 0 12px;
 }
 
 .route-map__track {
-  stroke: var(--surface-2);
-  stroke-width: 3;
-  stroke-linecap: round;
+  position: relative;
+  height: 4px;
+  margin: 0 56px;
+  background: transparent;
 }
 
-.route-map__track-fill {
-  stroke: var(--accent);
-  stroke-width: 3;
-  stroke-linecap: round;
-  transition: x2 0.8s cubic-bezier(0.22, 1, 0.36, 1);
+.route-map__line {
+  position: absolute;
+  inset: 0;
+  background: var(--surface-2);
+  border-radius: 2px;
+}
+
+.route-map__line-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  background: linear-gradient(
+    90deg,
+    var(--accent),
+    color-mix(in srgb, var(--accent) 70%, var(--success, #22c55e))
+  );
+  border-radius: 2px;
+  transition: width 0.8s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 .route-map__pin {
-  fill: var(--accent);
-  stroke: var(--surface);
-  stroke-width: 2;
+  position: absolute;
+  top: 50%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+
+.route-map__pin--dpt {
+  left: 0;
+  transform: translate(-50%, -50%);
+}
+
+.route-map__pin--arr {
+  right: 0;
+  transform: translate(50%, -50%);
 }
 
 .route-map__icao {
-  fill: var(--text);
+  position: absolute;
+  bottom: 14px;
+  font-family: "SF Mono", "Cascadia Code", "Source Code Pro", Menlo, Consolas,
+    monospace;
   font-size: 13px;
   font-weight: 700;
   letter-spacing: 0.05em;
-  font-family: "SF Mono", "Cascadia Code", "Source Code Pro", Menlo, Consolas,
-    monospace;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.route-map__dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--surface);
+  box-shadow: 0 0 0 2px var(--accent);
+  flex: 0 0 auto;
 }
 
 .route-map__plane {
-  transition: transform 0.8s cubic-bezier(0.22, 1, 0.36, 1);
-}
-
-.route-map__plane-bg {
-  fill: var(--surface);
-  stroke: var(--accent);
-  stroke-width: 2;
-  filter: drop-shadow(0 0 4px color-mix(in srgb, var(--accent) 60%, transparent));
-}
-
-.route-map__plane-shape {
-  fill: var(--accent);
+  position: absolute;
+  top: 50%;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--surface);
+  border: 2px solid var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent);
+  transform: translate(-50%, -50%);
+  transition: left 0.8s cubic-bezier(0.22, 1, 0.36, 1);
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--accent) 40%, transparent);
+  pointer-events: none;
 }
 
 /* ===== Live tapes (Cockpit) — IAS, GS, altitude, V/S, heading ===== */
@@ -277,8 +315,8 @@ button:disabled {
 }
 
 .live-tape {
-  background: color-mix(in srgb, var(--surface-2) 60%, transparent);
-  border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
   border-radius: 10px;
   padding: 10px 14px;
   display: flex;
@@ -358,7 +396,7 @@ button:disabled {
 
 .phase-timeline {
   width: 100%;
-  padding: 16px 8px 28px;
+  padding: 22px 12px 38px;
 }
 
 .phase-timeline__track {
@@ -366,7 +404,7 @@ button:disabled {
   height: 4px;
   background: var(--surface-2);
   border-radius: 2px;
-  margin: 0 18px;
+  margin: 0 32px;
 }
 
 /* Filled portion of the track — grows with progress, smooth anim. */
@@ -423,7 +461,7 @@ button:disabled {
   color: var(--text-muted);
   white-space: nowrap;
   position: absolute;
-  top: 18px;
+  top: 22px;
 }
 
 .phase-timeline__node--reached .phase-timeline__label {
@@ -1769,18 +1807,14 @@ input:disabled {
 /* ===== Active flight ===== */
 
 .active-flight {
-  background: linear-gradient(
-    180deg,
-    color-mix(in srgb, var(--accent) 8%, var(--surface)) 0%,
-    var(--surface) 60%
-  );
-  border: 1px solid color-mix(in srgb, var(--accent) 55%, var(--border));
+  background: var(--surface);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
   border-radius: 12px;
   padding: 18px 22px;
   display: flex;
   flex-direction: column;
   gap: 16px;
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 10%, transparent);
+  box-shadow: 0 1px 0 color-mix(in srgb, var(--accent) 6%, transparent);
 }
 
 .active-flight__header {
@@ -1997,8 +2031,8 @@ input:disabled {
 }
 
 .active-flight__stat {
-  background: color-mix(in srgb, var(--surface-2) 60%, transparent);
-  border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
   border-radius: 8px;
   padding: 10px 14px;
   display: flex;
