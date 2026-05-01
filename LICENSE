@@ -1,0 +1,71 @@
+CloudeAcars — License Notice
+============================
+
+Copyright (c) 2026 CloudeAcars Project. All rights reserved.
+
+This software is proprietary and closed-source. The source code is not
+publicly distributed. Only built, code-signed binaries are released.
+
+PREVIEW LICENSE — Effective until the full End-User License Agreement (EULA)
+is published for the first public release:
+
+  - Use of pre-release builds (if any) is permitted free of charge for
+    personal and virtual-airline use only.
+  - Redistribution of the source code, binaries, or any portion thereof is
+    NOT permitted.
+  - Reverse engineering, decompilation, or disassembly of binaries is NOT
+    permitted, except to the extent expressly required by applicable law.
+  - Modification of the software is NOT permitted.
+  - The software is provided "AS IS", without warranty of any kind, express
+    or implied. To the maximum extent permitted by applicable law, the
+    authors and copyright holders shall not be liable for any claim,
+    damages, or other liability arising from the use of the software.
+
+A full End-User License Agreement (EULA) will replace this notice prior to
+the first public release. The EULA will preserve the principle of
+"free of charge for end users, source not published".
+
+Reference assets in `reference/` (notably `vmsacars-win-x64-stable-Setup.exe`
+and `vmsacars-web-stable.zip` / `VMSAcars/`) are NOT part of this project's
+code base. They are third-party material from the vmsACARS project, included
+here read-only for documentation and API-compatibility reference. Their
+respective licenses and terms of use apply to those assets exclusively.
+
+
+CloudeAcars — Lizenzhinweis (Deutsch)
+=====================================
+
+Copyright (c) 2026 CloudeAcars-Projekt. Alle Rechte vorbehalten.
+
+Diese Software ist proprietär und nicht-quelloffen. Der Quellcode wird nicht
+öffentlich verteilt. Es werden ausschließlich gebaute, code-signierte
+Binaries veröffentlicht.
+
+VORLÄUFIGE LIZENZ — gültig bis zur Veröffentlichung der vollständigen
+Endnutzer-Lizenzvereinbarung (EULA) für das erste öffentliche Release:
+
+  - Die Nutzung von Vorab-Versionen (sofern verfügbar) ist für die
+    persönliche Nutzung und für virtuelle Airlines kostenfrei gestattet.
+  - Die Weiterverbreitung des Quellcodes, der Binaries oder von Teilen
+    davon ist NICHT gestattet.
+  - Reverse Engineering, Dekompilierung oder Disassemblierung der Binaries
+    ist NICHT gestattet, außer in dem Umfang, den geltendes Recht
+    zwingend einräumt.
+  - Modifikation der Software ist NICHT gestattet.
+  - Die Software wird "WIE BESEHEN" zur Verfügung gestellt, ohne jegliche
+    ausdrückliche oder konkludente Gewährleistung. Soweit gesetzlich
+    zulässig, übernehmen die Autoren und Rechteinhaber keinerlei Haftung
+    für Ansprüche, Schäden oder sonstige Verbindlichkeiten, die aus der
+    Nutzung der Software entstehen.
+
+Eine vollständige EULA wird diesen Hinweis vor dem ersten öffentlichen
+Release ersetzen. Die EULA wahrt das Prinzip "kostenfrei für Endnutzer,
+Quellcode nicht öffentlich".
+
+Die in `reference/` abgelegten Materialien (insbesondere
+`vmsacars-win-x64-stable-Setup.exe` sowie `vmsacars-web-stable.zip` /
+`VMSAcars/`) sind NICHT Teil dieses Projekt-Codes. Es handelt sich um
+Drittmaterial aus dem vmsACARS-Projekt, das hier ausschließlich
+read-only zu Dokumentations- und API-Kompatibilitätszwecken liegt. Für
+diese Materialien gelten ausschließlich deren eigene Lizenz- und
+Nutzungsbedingungen.

@@ -1,0 +1,32 @@
+{
+    "name": "phpvms/vmsacars-module",
+    "type": "laravel-module",
+    "description": "The vmsACARS API interface",
+    "license": "proprietary",
+    "version": "1.1.0",
+    "authors": [
+        {
+            "name": "Nabeel Shahzad",
+            "email": "nabeel@phpvms.net"
+        }
+    ],
+    "require": {
+        "joshbrw/laravel-module-installer": "0.1.x"
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Modules\\VMSAcars\\Providers\\VMSAcarsServiceProvider",
+                "Modules\\VMSAcars\\Providers\\EventServiceProvider"
+            ],
+            "aliases": {
+
+            }
+        }
+    },
+    "autoload": {
+        "psr-4": {
+            "Modules\\VMSAcars\\": ""
+        }
+    }
+}

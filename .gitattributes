@@ -1,0 +1,44 @@
+* text=auto eol=lf
+
+# Force LF on text files even on Windows checkouts (consistent across OSes)
+*.md       text eol=lf
+*.json     text eol=lf
+*.toml     text eol=lf
+*.yaml     text eol=lf
+*.yml      text eol=lf
+*.rs       text eol=lf
+*.ts       text eol=lf
+*.tsx      text eol=lf
+*.js       text eol=lf
+*.jsx      text eol=lf
+*.html     text eol=lf
+*.css      text eol=lf
+*.scss     text eol=lf
+*.php      text eol=lf
+*.blade.php text eol=lf
+*.sh       text eol=lf
+*.gitignore text eol=lf
+*.gitattributes text eol=lf
+
+# Windows-only scripts keep CRLF
+*.ps1      text eol=crlf
+*.bat      text eol=crlf
+*.cmd      text eol=crlf
+
+# Binary
+*.png      binary
+*.jpg      binary
+*.jpeg     binary
+*.gif      binary
+*.ico      binary
+*.icns     binary
+*.zip      binary
+*.exe      binary
+*.dll      binary
+*.lib      binary
+*.dylib    binary
+*.so       binary
+*.xpl      binary
+*.dmg      binary
+*.msi      binary
+*.pdf      binary

@@ -1,0 +1,241 @@
+
+vmsacars_rules:
+  ignore_on_update:
+    - parameter
+    - points
+    - enabled
+    - repeatable
+    - delay
+    - cooldown
+  data:
+    - id: BEACON_LIGHTS_ON_ENGINE_RUNNING
+      name: Beacon lights on while engine(s) are running
+      description: Beacon lights on while engine(s) are running
+      parameter:
+      points: 0
+      has_parameter: false
+      repeatable: true
+      delay: 10
+      cooldown: 60
+      enabled: true
+      order: 0
+    - id: STROBES_ON_IN_FLIGHT
+      name: Strobes On
+      description: Strobes on in-flight
+      parameter:
+      points: 0
+      has_parameter: false
+      repeatable: true
+      delay: 10
+      cooldown: 60
+      enabled: true
+      order: 5
+    - id: STROBES_ON_TAXI
+      name: Strobes On (Taxiing)
+      description: Strobes on while taxiing
+      parameter:
+      points: 0
+      has_parameter: false
+      repeatable: true
+      delay: 30
+      cooldown: 60
+      enabled: true
+      order: 10
+    - id: LAND_LIGHTS_OVER_10K
+      name: Landing lights off over 10k
+      description: Altitude that landing lights need to be off above (will have a 500' margin)
+      parameter: 10000
+      points: 0
+      has_parameter: true
+      repeatable: true
+      delay: 10
+      cooldown: 60
+      enabled: true
+      order: 15
+    - id: LAND_LIGHTS_UNDER_10K
+      name: Landing lights on under 10k
+      description: Altitude that landing lights need to be on below (will have a 500' margin)
+      parameter: 10000
+      points: 0
+      has_parameter: true
+      repeatable: true
+      delay: 10
+      cooldown: 60
+      enabled: true
+      order: 20
+    - id: LAND_LIGHTS_OFF_TAXI
+      name: Landing lights off while taxiing
+      description: Landing lights should be off while taxiing
+      parameter:
+      points: 0
+      has_parameter: false
+      repeatable: true
+      delay: 30
+      cooldown: 60
+      enabled: true
+      order: 25
+    - id: EXCESS_TAXI_SPEED
+      name: Excess Taxi Speed
+      description: If an aircraft exceeds this speed while taxiing (knots)
+      parameter: 30
+      points: 5
+      has_parameter: true
+      repeatable: true
+      delay: 30
+      cooldown: 60
+      enabled: true
+      order: 30
+    - id: EXCESS_GFORCE
+      name: Excess G-Forces
+      description: If an aircraft exceeds the max gforce turning flight
+      parameter: 1.5
+      points: 5
+      has_parameter: true
+      repeatable: true
+      delay: 10
+      cooldown: 60
+      enabled: true
+      order: 35
+    - id: FUEL_REFILLED
+      name: Fuel Refilled
+      description:
+      parameter:
+      points: 10
+      has_parameter: false
+      repeatable: true
+      delay: 10
+      cooldown: 60
+      enabled: true
+      order: 40
+    - id: OVERSPEED_WARNING
+      name: Overspeed
+      description: If the overspeed warning comes up
+      parameter:
+      points: 2
+      has_parameter: false
+      repeatable: true
+      delay: 10
+      cooldown: 60
+      enabled: true
+      order: 45
+    - id: EXCESS_BANK
+      name: Excesss Bank (degrees)
+      description:
+      parameter: 60
+      points: 2
+      has_parameter: true
+      repeatable: true
+      delay: 10
+      cooldown: 60
+      enabled: true
+      order: 50
+    - id: EXCESS_PITCH
+      name: Excesss Pitch (degrees)
+      description:
+      parameter: 30
+      points: 2
+      has_parameter: true
+      repeatable: true
+      delay: 10
+      cooldown: 60
+      enabled: true
+      order: 55
+    - id: RUNWAY_OVERRUN
+      name: Runway Overrun
+      description: If the aircraft overruns the runway or taxirun
+      parameter:
+      points: 10
+      has_parameter: false
+      repeatable: false
+      delay: 0
+      cooldown: 0
+      enabled: true
+      order: 60
+    - id: SIMRATE_INCREASED
+      name: Simulation Rate Increased
+      description:
+      parameter: 1
+      points: 2
+      has_parameter: true
+      repeatable: true
+      delay: 10
+      cooldown: 60
+      enabled: true
+      order: 65
+    - id: SLEW_ACTIVATED
+      name: Slew Activated
+      description:
+      parameter:
+      points: 2
+      has_parameter: false
+      repeatable: true
+      delay: 10
+      cooldown: 60
+      enabled: true
+      order: 70
+    - id: SPEED_UNDER_10K
+      name: Overspeed under 10k
+      description: "Speed of 250kts under 10,000' is exceeded"
+      parameter:
+      points: 2
+      has_parameter: false
+      repeatable: true
+      delay: 10
+      cooldown: 60
+      enabled: true
+      order: 75
+    - id: STABILIZED_APPROACH
+      name: Stabilized Approach
+      description: AGL where gear and flaps must be configured
+      parameter: 1500
+      points: 5
+      has_parameter: true
+      repeatable: false
+      delay: 0
+      cooldown: 0
+      enabled: true
+      order: 80
+    - id: STALL_WARNING
+      name: Stall Warning
+      description:
+      parameter:
+      points: 5
+      has_parameter: false
+      repeatable: true
+      delay: 10
+      cooldown: 60
+      enabled: true
+      order: 85
+    - id: THRUST_REVERSERS_INFLIGHT
+      name: Thrust reversers enabled in flight
+      description:
+      parameter:
+      points: 2
+      has_parameter: false
+      repeatable: true
+      delay: 10
+      cooldown: 60
+      enabled: true
+      order: 90
+    - id: THRUST_REVERSERS_SPEED
+      name: Thrust reverser speed
+      description: Speed by which thrust reversers must be deactivated (knots)
+      parameter: 60
+      points: 10
+      has_parameter: true
+      repeatable: false
+      delay: 10
+      cooldown: 60
+      enabled: true
+      order: 95
+    - id: HARD_LANDING
+      name: Hard Landing
+      description: If there if a hard landing
+      parameter: 500
+      points: 20
+      has_parameter: true
+      repeatable: false
+      delay: 0
+      cooldown: 0
+      enabled: true
+      order: 100
