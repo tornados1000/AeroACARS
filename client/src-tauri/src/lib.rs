@@ -2715,7 +2715,15 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
             }
         }
         FlightPhase::TaxiOut => {
-            if snap.groundspeed_kt > 40.0 && snap.on_ground {
+            // Threshold lowered from 40 → 30 kt so GA aircraft (Cessna,
+            // Diamond) which rotate around 50 kt enter TakeoffRoll well
+            // before liftoff. Plus the engine-running guard means a
+            // pilot dragging the parking brake at high taxi speed
+            // doesn't accidentally trigger TakeoffRoll without throttle.
+            if snap.on_ground
+                && snap.groundspeed_kt > 30.0
+                && snap.engines_running > 0
+            {
                 next_phase = FlightPhase::TakeoffRoll;
             }
         }
@@ -2764,7 +2772,13 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
             }
         }
         FlightPhase::Descent => {
-            if snap.altitude_agl_ft < 5000.0 {
+            // Approach starts when we're both low *and* still
+            // descending. Without the V/S guard a brief AGL dip
+            // during a mountain overflight (Alps, Rockies) wrongly
+            // triggered Approach mid-cruise. The aircraft is on
+            // approach when it's actually heading down toward the
+            // destination, not when it happened to skim a peak.
+            if snap.altitude_agl_ft < 5000.0 && snap.vertical_speed_fpm < 0.0 {
                 next_phase = FlightPhase::Approach;
             }
         }
@@ -2858,8 +2872,25 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                 }
             }
         }
-        FlightPhase::BlocksOn
-        | FlightPhase::Arrived
+        FlightPhase::BlocksOn => {
+            // BlocksOn → Arrived once the pilot has actually shut
+            // down: engines off + parking brake set + at least 30 s
+            // since the wheels stopped. Real pilots routinely leave
+            // engines running a minute or two after blocks-on for
+            // cool-down / APU transition, so we don't flip to Arrived
+            // the instant they hit the brake.
+            if let Some(block_on) = stats.block_on_at {
+                let settled_secs = (now - block_on).num_seconds();
+                if settled_secs >= 30
+                    && snap.engines_running == 0
+                    && snap.parking_brake
+                    && snap.on_ground
+                {
+                    next_phase = FlightPhase::Arrived;
+                }
+            }
+        }
+        FlightPhase::Arrived
         | FlightPhase::PirepSubmitted
         | FlightPhase::Preflight => {}
     }
