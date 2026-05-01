@@ -7,11 +7,32 @@
     "title": "Phase 1 — Grundgerüst",
     "description": "Das Tauri-Skeleton steht. Login, Simulator-Anbindung und PIREP-Übermittlung folgen als Nächstes."
   },
+  "tabs": {
+    "dashboard": "Dashboard",
+    "settings": "Einstellungen"
+  },
+  "settings": {
+    "title": "Einstellungen",
+    "description": "Allgemeine Einstellungen für CloudeAcars.",
+    "appearance_section": "Sprache & Darstellung",
+    "language_label": "Sprache",
+    "theme_label": "Design",
+    "theme_dark": "Dunkel",
+    "theme_light": "Hell",
+    "simulator_section": "Simulator",
+    "simulator_label": "Aktiver Simulator",
+    "simulator_hint": "Wählen Sie Ihren Simulator. CloudeAcars verbindet sich automatisch, sobald der Simulator gestartet wird.",
+    "developer_section": "Entwickleroptionen",
+    "debug_mode_label": "Debug-Modus",
+    "debug_mode_hint": "Zeigt im Dashboard die vollständige Telemetrie (Position, Höhe, Speeds, Lage, G-Belastung). Im normalen Betrieb nicht nötig."
+  },
   "status": {
     "phpvms": "phpVMS",
     "phpvms_connected": "Verbunden",
     "phpvms_disconnected": "Nicht verbunden",
     "simulator": "Simulator",
+    "simulator_connected": "Verbunden",
+    "simulator_connecting": "Verbinde…",
     "simulator_disconnected": "Nicht verbunden",
     "checking_session": "Sitzung wird wiederhergestellt…"
   },
@@ -61,7 +82,52 @@
     "airline": "Airline",
     "current_airport": "Aktueller Flughafen",
     "home_airport": "Heimatflughafen",
+    "current_short": "Aktuell",
+    "home_short": "Zuhause",
     "site": "Seite"
+  },
+  "sim": {
+    "title": "Simulator",
+    "choose": "Sim",
+    "loading": "Status wird geladen…",
+    "off_hint": "Simulator-Anbindung ist deaktiviert.",
+    "idle_hint": "Warte auf den Simulator…",
+    "connecting_hint": "Warte auf den Simulator… der Adapter verbindet sich automatisch, sobald er läuft.",
+    "xplane_phase2": "X-Plane-Unterstützung kommt in Phase 2 — die Auswahl ist gespeichert, aber noch keine Verbindung möglich.",
+    "kinds": {
+      "off": "Aus",
+      "msfs2024": "MSFS 2024",
+      "msfs2020": "MSFS 2020",
+      "xplane11": "X-Plane 11 (Phase 2)",
+      "xplane12": "X-Plane 12 (Phase 2)"
+    },
+    "yes": "Ja",
+    "no": "Nein",
+    "last_error_prefix": "Letzter Fehler",
+    "debug_section": "Telemetrie (Debug)",
+    "aircraft_unknown": "(unbekanntes Flugzeug)",
+    "state": {
+      "disconnected": "Getrennt",
+      "connecting": "Warte auf Sim",
+      "connected": "Verbunden"
+    },
+    "fields": {
+      "aircraft": "Flugzeug",
+      "position": "Position",
+      "altitude_msl": "Höhe (MSL)",
+      "altitude_agl": "Höhe (AGL)",
+      "heading": "Heading",
+      "heading_mag": "magn.",
+      "heading_true": "true",
+      "groundspeed": "Groundspeed",
+      "airspeed": "Airspeed",
+      "vertical_speed": "Steig-/Sinkrate",
+      "attitude": "Lage",
+      "pitch": "Pitch",
+      "bank": "Bank",
+      "g_force": "G-Belastung",
+      "on_ground": "Am Boden"
+    }
   },
   "bids": {
     "title": "Meine gebuchten Flüge",

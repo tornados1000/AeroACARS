@@ -78,6 +78,45 @@ pub enum Simulator {
     Other,
 }
 
+/// User-selected simulator kind, persisted across app restarts.
+/// Drives which adapter the app boots after login.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SimKind {
+    Off,
+    Msfs2020,
+    Msfs2024,
+    XPlane11,
+    XPlane12,
+}
+
+impl Default for SimKind {
+    fn default() -> Self {
+        SimKind::Msfs2024
+    }
+}
+
+impl SimKind {
+    pub fn is_msfs(self) -> bool {
+        matches!(self, SimKind::Msfs2020 | SimKind::Msfs2024)
+    }
+
+    pub fn is_xplane(self) -> bool {
+        matches!(self, SimKind::XPlane11 | SimKind::XPlane12)
+    }
+
+    /// Map to the `Simulator` enum used inside `SimSnapshot`.
+    pub fn as_simulator(self) -> Simulator {
+        match self {
+            SimKind::Off => Simulator::Other,
+            SimKind::Msfs2020 => Simulator::Msfs2020,
+            SimKind::Msfs2024 => Simulator::Msfs2024,
+            SimKind::XPlane11 => Simulator::XPlane11,
+            SimKind::XPlane12 => Simulator::XPlane12,
+        }
+    }
+}
+
 /// Flight phases as required by spec §9.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FlightPhase {

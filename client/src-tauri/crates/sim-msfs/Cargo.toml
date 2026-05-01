@@ -6,7 +6,9 @@ authors.workspace = true
 license.workspace = true
 description = "MSFS 2020/2024 simulator adapter via SimConnect SDK (Windows only). Never FSUIPC."
 
-# Windows-only crate: leave the lib empty on non-Windows targets so the workspace still builds on macOS/Linux.
+# Windows-only crate: on non-Windows targets the lib has only a placeholder
+# struct so the workspace still builds on macOS/Linux for ports of unrelated
+# crates. The SimConnect dependency itself is gated to target_os = "windows".
 
 [dependencies]
 sim-core.workspace = true
@@ -14,14 +16,15 @@ serde.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
 
-# SimConnect bindings — to be added in Phase 1 implementation step.
-# Choices to evaluate:
-#   * `simconnect-sdk` — fairly complete, MIT.
-#   * Hand-rolled `bindgen` against the official SimConnect.h shipped with MSFS.
-# The crate stays empty until that decision is made.
-# [target.'cfg(target_os = "windows")'.dependencies]
-# simconnect-sdk = "..."
+[target.'cfg(target_os = "windows")'.dependencies]
+# Community Rust bindings for the official MSFS SimConnect SDK.
+# Requires the MSFS SDK installed locally; the crate's build pulls
+# SimConnect.h / SimConnect.lib from the path advertised by the
+# MSFS_SDK environment variable, which our build.rs sets up
+# (see this crate's build.rs).
+simconnect-sdk = { version = "0.2", features = ["derive"] }
 
 [lints]
 workspace = true

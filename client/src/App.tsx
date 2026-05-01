@@ -4,17 +4,33 @@ import { invoke } from "@tauri-apps/api/core";
 import { applyTheme, getInitialTheme, type Theme } from "./theme";
 import { LoginPage } from "./components/LoginPage";
 import { Dashboard } from "./components/Dashboard";
-import type { LoginResult } from "./types";
+import { SettingsPanel } from "./components/SettingsPanel";
+import type { LoginResult, SimConnectionState } from "./types";
 
 type SessionStatus =
   | { kind: "loading" }
   | { kind: "loggedOut" }
   | { kind: "loggedIn"; session: LoginResult };
 
+type Tab = "dashboard" | "settings";
+
+const DEBUG_STORAGE_KEY = "cloudeacars.debug";
+
+function loadDebugMode(): boolean {
+  return localStorage.getItem(DEBUG_STORAGE_KEY) === "1";
+}
+
+function saveDebugMode(value: boolean) {
+  localStorage.setItem(DEBUG_STORAGE_KEY, value ? "1" : "0");
+}
+
 function App() {
-  const { t, i18n } = useTranslation();
+  const { t } = useTranslation();
   const [theme, setTheme] = useState<Theme>(() => getInitialTheme());
   const [status, setStatus] = useState<SessionStatus>({ kind: "loading" });
+  const [tab, setTab] = useState<Tab>("dashboard");
+  const [debugMode, setDebugMode] = useState<boolean>(() => loadDebugMode());
+  const [simState, setSimState] = useState<SimConnectionState>("disconnected");
 
   useEffect(() => {
     applyTheme(theme);
@@ -30,7 +46,6 @@ function App() {
           result ? { kind: "loggedIn", session: result } : { kind: "loggedOut" },
         );
       } catch {
-        // If session restore fails for any reason, fall back to login.
         if (!cancelled) setStatus({ kind: "loggedOut" });
       }
     })();
@@ -39,20 +54,25 @@ function App() {
     };
   }, []);
 
-  function toggleTheme() {
-    setTheme((prev) => (prev === "dark" ? "light" : "dark"));
-  }
-
   async function handleLogout() {
     try {
       await invoke("phpvms_logout");
     } catch {
-      // Even if the keyring call fails, drop in-memory session.
+      // Drop in-memory session even if the keyring call fails.
     }
     setStatus({ kind: "loggedOut" });
+    setTab("dashboard");
+  }
+
+  function handleDebugModeChange(next: boolean) {
+    setDebugMode(next);
+    saveDebugMode(next);
   }
 
   const phpvmsConnected = status.kind === "loggedIn";
+  const simConnected = simState === "connected";
+  const simConnecting = simState === "connecting";
+  const showTabs = status.kind === "loggedIn";
 
   return (
     <main className="app">
@@ -60,28 +80,6 @@ function App() {
         <div>
           <h1>{t("app.name")}</h1>
           <p className="tagline">{t("app.tagline")}</p>
-        </div>
-
-        <div className="header-actions">
-          <button
-            type="button"
-            onClick={() => i18n.changeLanguage("de")}
-            disabled={i18n.resolvedLanguage === "de"}
-          >
-            {t("actions.language_de")}
-          </button>
-          <button
-            type="button"
-            onClick={() => i18n.changeLanguage("en")}
-            disabled={i18n.resolvedLanguage === "en"}
-          >
-            {t("actions.language_en")}
-          </button>
-          <button type="button" onClick={toggleTheme}>
-            {theme === "dark"
-              ? t("actions.toggle_theme_light")
-              : t("actions.toggle_theme_dark")}
-          </button>
         </div>
       </header>
 
@@ -98,13 +96,44 @@ function App() {
               : t("status.phpvms_disconnected")}
           </span>
         </div>
-        <div className="status-card status-card--offline">
+        <div
+          className={`status-card status-card--${
+            simConnected ? "online" : simConnecting ? "connecting" : "offline"
+          }`}
+        >
           <span className="status-card__label">{t("status.simulator")}</span>
           <span className="status-card__value">
-            {t("status.simulator_disconnected")}
+            {simConnected
+              ? t("status.simulator_connected")
+              : simConnecting
+                ? t("status.simulator_connecting")
+                : t("status.simulator_disconnected")}
           </span>
         </div>
       </section>
+
+      {showTabs && (
+        <nav className="tabs" role="tablist">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === "dashboard"}
+            className={`tab ${tab === "dashboard" ? "tab--active" : ""}`}
+            onClick={() => setTab("dashboard")}
+          >
+            {t("tabs.dashboard")}
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === "settings"}
+            className={`tab ${tab === "settings" ? "tab--active" : ""}`}
+            onClick={() => setTab("settings")}
+          >
+            {t("tabs.settings")}
+          </button>
+        </nav>
+      )}
 
       {status.kind === "loading" && (
         <section className="phase">
@@ -112,10 +141,28 @@ function App() {
         </section>
       )}
 
-      {status.kind === "loggedOut" && <LoginPage onSuccess={(s) => setStatus({ kind: "loggedIn", session: s })} />}
+      {status.kind === "loggedOut" && (
+        <LoginPage
+          onSuccess={(s) => setStatus({ kind: "loggedIn", session: s })}
+        />
+      )}
 
-      {status.kind === "loggedIn" && (
-        <Dashboard session={status.session} onLogout={handleLogout} />
+      {status.kind === "loggedIn" && tab === "dashboard" && (
+        <Dashboard
+          session={status.session}
+          onLogout={handleLogout}
+          onSimStateChange={setSimState}
+          debugMode={debugMode}
+        />
+      )}
+
+      {status.kind === "loggedIn" && tab === "settings" && (
+        <SettingsPanel
+          debugMode={debugMode}
+          onDebugModeChange={handleDebugModeChange}
+          theme={theme}
+          onThemeChange={setTheme}
+        />
       )}
     </main>
   );

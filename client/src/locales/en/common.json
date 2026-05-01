@@ -7,11 +7,32 @@
     "title": "Phase 1 — Foundation",
     "description": "The Tauri scaffold is in place. Login, simulator integration, and PIREP submission arrive next."
   },
+  "tabs": {
+    "dashboard": "Dashboard",
+    "settings": "Settings"
+  },
+  "settings": {
+    "title": "Settings",
+    "description": "General CloudeAcars preferences.",
+    "appearance_section": "Language & appearance",
+    "language_label": "Language",
+    "theme_label": "Theme",
+    "theme_dark": "Dark",
+    "theme_light": "Light",
+    "simulator_section": "Simulator",
+    "simulator_label": "Active simulator",
+    "simulator_hint": "Pick your simulator. CloudeAcars connects automatically as soon as the sim is running.",
+    "developer_section": "Developer options",
+    "debug_mode_label": "Debug mode",
+    "debug_mode_hint": "Shows the full telemetry grid (position, altitude, speeds, attitude, G-load) on the dashboard. Not needed for normal use."
+  },
   "status": {
     "phpvms": "phpVMS",
     "phpvms_connected": "Connected",
     "phpvms_disconnected": "Not connected",
     "simulator": "Simulator",
+    "simulator_connected": "Connected",
+    "simulator_connecting": "Connecting…",
     "simulator_disconnected": "Not connected",
     "checking_session": "Restoring session…"
   },
@@ -61,7 +82,52 @@
     "airline": "Airline",
     "current_airport": "Current airport",
     "home_airport": "Home airport",
+    "current_short": "Now",
+    "home_short": "Home",
     "site": "Site"
+  },
+  "sim": {
+    "title": "Simulator",
+    "choose": "Sim",
+    "loading": "Loading status…",
+    "off_hint": "Simulator integration is disabled.",
+    "idle_hint": "Waiting for the simulator…",
+    "connecting_hint": "Waiting for the simulator… the adapter will connect automatically once it starts.",
+    "xplane_phase2": "X-Plane support arrives in Phase 2 — your choice is saved, but no connection yet.",
+    "kinds": {
+      "off": "Off",
+      "msfs2024": "MSFS 2024",
+      "msfs2020": "MSFS 2020",
+      "xplane11": "X-Plane 11 (Phase 2)",
+      "xplane12": "X-Plane 12 (Phase 2)"
+    },
+    "yes": "Yes",
+    "no": "No",
+    "last_error_prefix": "Last error",
+    "debug_section": "Telemetry (debug)",
+    "aircraft_unknown": "(unknown aircraft)",
+    "state": {
+      "disconnected": "Disconnected",
+      "connecting": "Waiting for sim",
+      "connected": "Connected"
+    },
+    "fields": {
+      "aircraft": "Aircraft",
+      "position": "Position",
+      "altitude_msl": "Altitude (MSL)",
+      "altitude_agl": "Altitude (AGL)",
+      "heading": "Heading",
+      "heading_mag": "mag",
+      "heading_true": "true",
+      "groundspeed": "Groundspeed",
+      "airspeed": "Airspeed",
+      "vertical_speed": "Vertical speed",
+      "attitude": "Attitude",
+      "pitch": "Pitch",
+      "bank": "Bank",
+      "g_force": "G-load",
+      "on_ground": "On ground"
+    }
   },
   "bids": {
     "title": "My booked flights",

@@ -90,3 +90,68 @@ export interface Bid {
   flight_id: string;
   flight: Flight;
 }
+
+// ---- Simulator telemetry (mirrors sim-core::SimSnapshot) ----
+
+export type Simulator =
+  | "Msfs2020"
+  | "Msfs2024"
+  | "XPlane11"
+  | "XPlane12"
+  | "Other";
+
+export interface SimSnapshot {
+  timestamp: string; // ISO-8601 UTC
+  lat: number;
+  lon: number;
+  altitude_msl_ft: number;
+  altitude_agl_ft: number;
+  heading_deg_true: number;
+  heading_deg_magnetic: number;
+  pitch_deg: number;
+  bank_deg: number;
+  vertical_speed_fpm: number;
+  groundspeed_kt: number;
+  indicated_airspeed_kt: number;
+  true_airspeed_kt: number;
+  g_force: number;
+  on_ground: boolean;
+  parking_brake: boolean;
+  stall_warning: boolean;
+  overspeed_warning: boolean;
+  paused: boolean;
+  slew_mode: boolean;
+  simulation_rate: number;
+  gear_position: number;
+  flaps_position: number;
+  engines_running: number;
+  fuel_total_kg: number;
+  fuel_used_kg: number;
+  zfw_kg: number | null;
+  payload_kg: number | null;
+  wind_direction_deg: number | null;
+  wind_speed_kt: number | null;
+  qnh_hpa: number | null;
+  outside_air_temp_c: number | null;
+  aircraft_title: string | null;
+  aircraft_icao: string | null;
+  simulator: Simulator;
+  sim_version: string | null;
+}
+
+export type SimConnectionState = "disconnected" | "connecting" | "connected";
+
+export type SimKind =
+  | "off"
+  | "msfs2020"
+  | "msfs2024"
+  | "xplane11"
+  | "xplane12";
+
+export interface SimStatus {
+  state: SimConnectionState;
+  kind: SimKind;
+  snapshot: SimSnapshot | null;
+  last_error: string | null;
+  available: boolean;
+}
