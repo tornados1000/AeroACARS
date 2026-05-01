@@ -2785,13 +2785,12 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
             }
         }
         FlightPhase::Climb => {
-            // Top of climb → Cruise: aircraft has levelled off above
-            // a sane cruise floor. The previous code merged Climb and
-            // Cruise into the same match arm with no transition
-            // between them, so a flight that climbed once and stayed
-            // level was stuck in "Climb" forever — Cruise was
-            // unreachable until a Descent kicked in.
-            if snap.vertical_speed_fpm < -300.0 {
+            // Descent threshold raised to −500 fpm (was −300). Real
+            // top-of-descent rates are −1500..−2500 fpm; −300 was
+            // tripping on level-off corrections, autopilot trims and
+            // light turbulence and pushing the dashboard into
+            // Descent prematurely.
+            if snap.vertical_speed_fpm < -500.0 {
                 next_phase = FlightPhase::Descent;
             } else if snap.vertical_speed_fpm.abs() < 200.0
                 && snap.altitude_agl_ft > 5000.0
@@ -2800,10 +2799,12 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
             }
         }
         FlightPhase::Cruise => {
-            // Step climb (V/S > 300 fpm) flips us back into Climb so
-            // the timeline shows the rising arc again. Descent kicks
-            // in on a sustained negative V/S.
-            if snap.vertical_speed_fpm < -300.0 {
+            // Same −500 fpm rule for Cruise → Descent (was −300).
+            // A short step-down (e.g. ATC FL380 → FL360 over a
+            // minute) used to flip the phase to Descent and never
+            // came back; with −500 a real TOD still triggers within
+            // a tick, while a brief −400 fpm dip stays in Cruise.
+            if snap.vertical_speed_fpm < -500.0 {
                 next_phase = FlightPhase::Descent;
             } else if snap.vertical_speed_fpm > 300.0
                 && snap.altitude_agl_ft > 5000.0
