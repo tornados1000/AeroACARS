@@ -351,6 +351,8 @@ struct PersistedFlightStats {
     arr_gate: Option<String>,
     #[serde(default)]
     approach_runway: Option<String>,
+    #[serde(default)]
+    cruise_peak_msl: Option<f32>,
 }
 
 impl PersistedFlightStats {
@@ -384,6 +386,7 @@ impl PersistedFlightStats {
             dep_gate: stats.dep_gate.clone(),
             arr_gate: stats.arr_gate.clone(),
             approach_runway: stats.approach_runway.clone(),
+            cruise_peak_msl: stats.cruise_peak_msl,
         }
     }
 
@@ -423,6 +426,7 @@ impl PersistedFlightStats {
         stats.dep_gate = self.dep_gate;
         stats.arr_gate = self.arr_gate;
         stats.approach_runway = self.approach_runway;
+        stats.cruise_peak_msl = self.cruise_peak_msl;
     }
 }
 
@@ -499,6 +503,13 @@ struct FlightStats {
     // ---- Fuel tracking ----
     block_fuel_kg: Option<f32>,
     last_fuel_kg: Option<f32>,
+
+    /// Highest MSL altitude we've seen while in Cruise (or any step
+    /// climb during Cruise). Drives the Cruise → Descent guard so
+    /// short ATC step-downs (FL380 → FL360) don't flip the phase to
+    /// Descent — only a real TOD drop of >5000 ft from this peak
+    /// counts.
+    cruise_peak_msl: Option<f32>,
 
     /// When the streamer last successfully posted a position to phpVMS.
     /// Drives the cockpit's LIVE / REC indicator — a long gap means
@@ -2799,17 +2810,29 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
             }
         }
         FlightPhase::Cruise => {
-            // Same −500 fpm rule for Cruise → Descent (was −300).
-            // A short step-down (e.g. ATC FL380 → FL360 over a
-            // minute) used to flip the phase to Descent and never
-            // came back; with −500 a real TOD still triggers within
-            // a tick, while a brief −400 fpm dip stays in Cruise.
-            if snap.vertical_speed_fpm < -500.0 {
+            // Track the highest altitude we've seen at this cruise
+            // — used as the reference point for "did we really
+            // descend, or is this just an ATC step-down?".
+            let peak = stats.cruise_peak_msl.unwrap_or(0.0);
+            if (snap.altitude_msl_ft as f32) > peak {
+                stats.cruise_peak_msl = Some(snap.altitude_msl_ft as f32);
+            }
+
+            // Cruise → Descent only when BOTH conditions hold:
+            //   * Sustained sink rate (< −500 fpm — filters
+            //     turbulence and autopilot trim noise)
+            //   * Lost > 5000 ft from the cruise peak (a real TOD
+            //     drops you many thousand feet; an ATC step-down
+            //     FL380 → FL360 is only 2000 ft and stays in Cruise)
+            //
+            // Step-climbs and short step-downs are *not* phase
+            // changes — they're routine cruise activity. Flipping
+            // back to Climb / forward to Descent for every new
+            // assigned level would ping-pong the timeline.
+            let lost_alt =
+                stats.cruise_peak_msl.unwrap_or(0.0) - snap.altitude_msl_ft as f32;
+            if snap.vertical_speed_fpm < -500.0 && lost_alt > 5000.0 {
                 next_phase = FlightPhase::Descent;
-            } else if snap.vertical_speed_fpm > 300.0
-                && snap.altitude_agl_ft > 5000.0
-            {
-                next_phase = FlightPhase::Climb;
             }
         }
         FlightPhase::Descent => {
