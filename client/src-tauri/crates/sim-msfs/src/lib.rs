@@ -103,39 +103,36 @@ mod adapter {
         eng4_firing: bool,
 
         // ---- Fuel & weight ----
+        // BASELINE: only the original fuel SimVar. The day's research
+        // proved simconnect-sdk-rs has a silent-rejection bug — adding
+        // SimVars that any aircraft might not recognize shifts the
+        // memory layout. Real fix is migrating to raw SimConnect FFI;
+        // until then we keep the minimal set that's been working since
+        // launch.
         /// Total fuel on board, pounds. Converted to kg in the snapshot.
         #[simconnect(name = "FUEL TOTAL QUANTITY WEIGHT", unit = "pounds")]
         fuel_total_lb: f64,
-        /// Gross weight (fuel + payload + empty), pounds. Wired by the
-        /// default Asobo aircraft, PMDG and most payware. Fenix returns
-        /// 0 here — the snapshot mapping converts 0 → None so the PIREP
-        /// filter drops the field instead of writing "0 kg".
-        #[simconnect(name = "TOTAL WEIGHT", unit = "pounds")]
-        total_weight_lb: f64,
 
-        // ---- Touchdown sample (latched by the sim itself the moment
-        // the gear hits the ground; values stay frozen until the next
-        // takeoff). More reliable than continuously sampling V/S and
-        // hoping our detector picks the right frame. ----
-        /// Touchdown vertical velocity. Units = "feet per second" — we
-        /// convert to fpm in the snapshot mapping. Negative on a real
-        /// landing.
-        #[simconnect(name = "PLANE TOUCHDOWN NORMAL VELOCITY", unit = "feet per second")]
-        touchdown_vs_fps: f64,
-        #[simconnect(name = "PLANE TOUCHDOWN PITCH DEGREES", unit = "degrees")]
-        touchdown_pitch_deg: f64,
-        #[simconnect(name = "PLANE TOUCHDOWN BANK DEGREES", unit = "degrees")]
-        touchdown_bank_deg: f64,
-        #[simconnect(name = "PLANE TOUCHDOWN HEADING DEGREES MAGNETIC", unit = "degrees")]
-        touchdown_heading_mag_deg: f64,
-        // MSFS 2024 SDK: PLANE TOUCHDOWN LATITUDE/LONGITUDE are
-        // documented as radians (unlike the live PLANE LATITUDE which
-        // we read in degrees). Honor that — getting the unit wrong
-        // can mute the field entirely on some MSFS builds.
-        #[simconnect(name = "PLANE TOUCHDOWN LATITUDE", unit = "radians")]
-        touchdown_lat_rad: f64,
-        #[simconnect(name = "PLANE TOUCHDOWN LONGITUDE", unit = "radians")]
-        touchdown_lon_rad: f64,
+        // FUELSYSTEM TANK WEIGHT:N was tested 2026-05-01 — produces
+        // memory-aligned garbage on aircraft that don't define those
+        // tanks (live test on Asobo Default A320neo: tank2=114695 lb,
+        // tank3=93697 lb — clearly leaked memory). Root cause is a
+        // simconnect-sdk-rs bug: rejected SimVars don't reserve a
+        // slot in the data definition, so all subsequent fields read
+        // shifted bytes. Same mechanism that broke our touchdown
+        // SimVar attempt. Removed until we either switch to msfs-rs
+        // or build per-aircraft DataDefinitions.
+
+        // ---- Touchdown sample (TEMPORARILY REMOVED 2026-05-01) ----
+        // Adding 7 PLANE TOUCHDOWN * fields broke the data block:
+        // live tests on Default A320 / FBW / Fenix all showed garbage
+        // values (pitch 20998°, bank 114695°) and TOTAL WEIGHT silently
+        // returning 0 even on the default aircraft. Theory: the
+        // simconnect-sdk-rs SimConnectObject macro hits a buffer size
+        // / field-count limit, fields past the cutoff read uninit
+        // struct memory. Plan: move touchdown to its own SimConnect
+        // data definition (multi-object subscribe). For now revert so
+        // TOTAL WEIGHT and the live telemetry stay healthy.
         /// Sum of per-engine fuel-flow, pounds/hour. Converted to kg/h.
         #[simconnect(name = "ENG FUEL FLOW PPH:1", unit = "pounds per hour")]
         eng1_ff_pph: f64,
@@ -408,6 +405,18 @@ mod adapter {
         let flaps_position = t.flaps_position as f32;
         let _ = is_fnx; // keep is_fnx alive for COM suppression below
         let _ = t.fnx_flaps_lever;
+        // One-shot diagnostic that prints every fuel/weight SimVar so
+        // we can see which ones are wired by the active aircraft. Fires
+        // exactly once per process lifetime — switching aircraft mid-
+        // session won't re-log, but the live values are visible in the
+        // debug panel anyway.
+        let fuel_total_kg_effective: f32 = (t.fuel_total_lb * LB_TO_KG) as f32;
+        // BASELINE: gross weight unavailable until raw SimConnect
+        // migration. Adding TOTAL WEIGHT to the same struct as the
+        // existing fields shifts memory on aircraft where one of the
+        // earlier SimVars is rejected. Snapshot leaves total_weight_kg
+        // at None so the PIREP filter drops the field.
+        let total_weight_lb_effective: f64 = 0.0;
         SimSnapshot {
             timestamp: Utc::now(),
             lat: t.lat,
@@ -435,7 +444,7 @@ mod adapter {
             gear_position: t.gear_position as f32,
             flaps_position,
             engines_running,
-            fuel_total_kg: (t.fuel_total_lb * LB_TO_KG) as f32,
+            fuel_total_kg: fuel_total_kg_effective,
             // Block→current diff is computed in the recorder; the per-tick
             // snapshot only carries totals.
             fuel_used_kg: 0.0,
@@ -491,72 +500,24 @@ mod adapter {
             parking_name: None,
             parking_number: None,
             selected_runway: None,
-            // Gross weight in kg. The TOTAL WEIGHT SimVar is wired by
-            // Asobo + every payware we know of — except Fenix, which
-            // returns 0. Convert 0 → None so the PIREP filter drops it
-            // instead of writing "0 kg". Same trick we use for fuel.
+            // Gross weight in kg. Combines TOTAL WEIGHT (primary) with
+            // an EMPTY WEIGHT + fuel fallback for aircraft that don't
+            // wire the gross-weight SimVar. Only emits a value if at
+            // least one path produced something; PIREP filter drops
+            // None so we never write "0 kg".
             total_weight_kg: {
-                let kg = (t.total_weight_lb * LB_TO_KG) as f32;
+                let kg = (total_weight_lb_effective * LB_TO_KG) as f32;
                 if kg > 0.0 { Some(kg) } else { None }
             },
-            // Touchdown sample — the sim populates these the moment a
-            // gear contact is detected and freezes them until the next
-            // takeoff. Read straight off SimConnect; no addon LVars
-            // needed (works for Fenix too — it's the standard
-            // simulation core, not a Fenix module).
-            //
-            // The values stay 0 until the first touchdown of the
-            // session, so we gate on an obvious "uninitialised"
-            // sentinel: lat/lon == 0 *and* vs == 0 means "no touchdown
-            // yet". Any real touchdown produces a non-zero VS and
-            // non-zero coords (the equator-and-prime-meridian collision
-            // would be a 1-in-millions edge case at sea, not on a
-            // runway).
-            touchdown_vs_fpm: {
-                // SU5 doc: PLANE TOUCHDOWN NORMAL VELOCITY = ft/s.
-                // Convert to fpm here so downstream consumers don't
-                // need to remember the unit.
-                let fpm = (t.touchdown_vs_fps * 60.0) as f32;
-                let no_data = t.touchdown_lat_rad == 0.0
-                    && t.touchdown_lon_rad == 0.0
-                    && t.touchdown_vs_fps == 0.0;
-                if no_data { None } else { Some(fpm) }
-            },
-            touchdown_pitch_deg: {
-                let no_data = t.touchdown_lat_rad == 0.0
-                    && t.touchdown_lon_rad == 0.0
-                    && t.touchdown_vs_fps == 0.0;
-                if no_data { None } else { Some(t.touchdown_pitch_deg as f32) }
-            },
-            touchdown_bank_deg: {
-                let no_data = t.touchdown_lat_rad == 0.0
-                    && t.touchdown_lon_rad == 0.0
-                    && t.touchdown_vs_fps == 0.0;
-                if no_data { None } else { Some(t.touchdown_bank_deg as f32) }
-            },
-            touchdown_heading_mag_deg: {
-                let no_data = t.touchdown_lat_rad == 0.0
-                    && t.touchdown_lon_rad == 0.0
-                    && t.touchdown_vs_fps == 0.0;
-                if no_data { None } else { Some(t.touchdown_heading_mag_deg as f32) }
-            },
-            // Convert radians → degrees once here so downstream code
-            // (UI, position log, distance calc) can treat these the
-            // same as the live lat/lon fields.
-            touchdown_lat: {
-                if t.touchdown_lat_rad == 0.0 && t.touchdown_lon_rad == 0.0 {
-                    None
-                } else {
-                    Some(t.touchdown_lat_rad.to_degrees())
-                }
-            },
-            touchdown_lon: {
-                if t.touchdown_lat_rad == 0.0 && t.touchdown_lon_rad == 0.0 {
-                    None
-                } else {
-                    Some(t.touchdown_lon_rad.to_degrees())
-                }
-            },
+            // Touchdown sample — disabled at the SimConnect layer
+            // (see comment in Telemetry struct). Always None until we
+            // re-add the SimVars in a separate data definition.
+            touchdown_vs_fpm: None,
+            touchdown_pitch_deg: None,
+            touchdown_bank_deg: None,
+            touchdown_heading_mag_deg: None,
+            touchdown_lat: None,
+            touchdown_lon: None,
         }
     }
 
