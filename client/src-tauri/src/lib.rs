@@ -17,6 +17,7 @@ use api_client::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use metar::{MetarError, MetarSnapshot};
 use sim_core::{FlightPhase, SimKind, SimSnapshot};
 use tauri::{AppHandle, Manager};
 use tracing_subscriber::EnvFilter;
@@ -459,6 +460,19 @@ struct FlightStats {
     /// repeated streamer ticks (or a Tauri restart that resumes after
     /// touchdown) don't re-fire the entry.
     landing_score_announced: bool,
+
+    // ---- METAR snapshots (Phase J.2) ----
+    /// Raw METAR text captured at takeoff for the departure airport.
+    /// Filled by a fire-and-forget async fetch from the streamer when
+    /// `step_flight` transitions into `Takeoff`. None until the fetch
+    /// returns (and stays None if the airport isn't in NOAA's set).
+    dep_metar_raw: Option<String>,
+    /// Same for the arrival airport at touchdown (Final → Landing).
+    arr_metar_raw: Option<String>,
+    /// Markers so the streamer only kicks off one fetch per direction
+    /// per flight. Set immediately when the spawn fires; cleared never.
+    dep_metar_requested: bool,
+    arr_metar_requested: bool,
 
     // ---- Fuel tracking ----
     block_fuel_kg: Option<f32>,
@@ -1771,6 +1785,21 @@ fn validate_for_filing(
     missing
 }
 
+/// `GET /metar/{icao}` — fetch the current METAR for an airport.
+/// Cached per-flight in `FlightStats` (departure + arrival), so the
+/// dashboard / future briefing panel can reuse it without round-trips.
+/// Errors map to a serializable `UiError` so the frontend can show a
+/// localized message instead of a Rust enum.
+#[tauri::command]
+async fn metar_get(icao: String) -> Result<MetarSnapshot, UiError> {
+    metar::fetch_metar(&icao).await.map_err(|e| match e {
+        MetarError::NotFound(_) => UiError::new("metar_not_found", e.to_string()),
+        MetarError::Network(_) => UiError::new("metar_network", e.to_string()),
+        MetarError::Status(_) => UiError::new("metar_upstream", e.to_string()),
+        MetarError::Parse(_) => UiError::new("metar_parse", e.to_string()),
+    })
+}
+
 /// Compute the great-circle distance (nm) from the live sim position to
 /// the airport with the given ICAO. Returns `None` when we don't have
 /// a sim snapshot yet, can't resolve the airport, or the airport
@@ -2292,6 +2321,12 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                         snap.altitude_msl_ft, snap.groundspeed_kt, snap.altitude_agl_ft
                     )),
                 );
+                // METAR snapshot at the two phase transitions where it
+                // matters most: just after takeoff for the departure
+                // weather, and just before/at touchdown for the arrival
+                // weather. Spawned async so a flaky aviationweather.gov
+                // doesn't stall the streamer.
+                maybe_spawn_metar_fetch(&app, &flight, new_phase);
                 if let Some(status) = phase_to_status(new_phase) {
                     tracing::info!(
                         pirep_id = %flight.pirep_id,
@@ -2571,6 +2606,14 @@ fn build_pirep_fields(
         f.insert("Bounces".into(), stats.bounce_count.to_string());
     }
 
+    // METAR snapshots (Phase J.2) — captured at takeoff / touchdown.
+    if let Some(raw) = stats.dep_metar_raw.as_ref().filter(|s| !s.is_empty()) {
+        f.insert("Departure METAR".into(), raw.clone());
+    }
+    if let Some(raw) = stats.arr_metar_raw.as_ref().filter(|s| !s.is_empty()) {
+        f.insert("Arrival METAR".into(), raw.clone());
+    }
+
     // Computed durations.
     if let (Some(off), Some(on)) = (stats.block_off_at, stats.block_on_at) {
         f.insert(
@@ -2666,6 +2709,80 @@ fn phase_to_status(phase: FlightPhase) -> Option<&'static str> {
         FlightPhase::BlocksOn | FlightPhase::Arrived => Some("ARR"),
         FlightPhase::PirepSubmitted => None,
     }
+}
+
+/// Trigger one-shot METAR fetches for departure (at takeoff) and arrival
+/// (at touchdown). Each side fires only once per flight — the
+/// `dep_metar_requested` / `arr_metar_requested` flags on FlightStats
+/// gate it. Fetch runs on the Tauri async runtime so the streamer
+/// keeps ticking even if aviationweather.gov is slow.
+fn maybe_spawn_metar_fetch(app: &AppHandle, flight: &Arc<ActiveFlight>, new_phase: FlightPhase) {
+    let kind = match new_phase {
+        FlightPhase::Takeoff => MetarKind::Departure,
+        // Trigger at Final so the arrival weather is in the activity
+        // log *before* the touchdown line, not after — pilots want the
+        // wind for the approach, not for the rollout.
+        FlightPhase::Final => MetarKind::Arrival,
+        _ => return,
+    };
+    let icao = match kind {
+        MetarKind::Departure => flight.dpt_airport.clone(),
+        MetarKind::Arrival => flight.arr_airport.clone(),
+    };
+    {
+        let mut stats = flight.stats.lock().expect("flight stats");
+        let already = match kind {
+            MetarKind::Departure => stats.dep_metar_requested,
+            MetarKind::Arrival => stats.arr_metar_requested,
+        };
+        if already {
+            return;
+        }
+        match kind {
+            MetarKind::Departure => stats.dep_metar_requested = true,
+            MetarKind::Arrival => stats.arr_metar_requested = true,
+        }
+    }
+    let app = app.clone();
+    let flight = Arc::clone(flight);
+    tauri::async_runtime::spawn(async move {
+        match metar::fetch_metar(&icao).await {
+            Ok(snap) => {
+                let raw = snap.raw.clone();
+                {
+                    let mut stats = flight.stats.lock().expect("flight stats");
+                    match kind {
+                        MetarKind::Departure => stats.dep_metar_raw = Some(raw.clone()),
+                        MetarKind::Arrival => stats.arr_metar_raw = Some(raw.clone()),
+                    }
+                }
+                let label = match kind {
+                    MetarKind::Departure => "Departure METAR",
+                    MetarKind::Arrival => "Arrival METAR",
+                };
+                log_activity_handle(
+                    &app,
+                    ActivityLevel::Info,
+                    format!("{label}: {icao}"),
+                    Some(if raw.is_empty() {
+                        "(empty)".to_string()
+                    } else {
+                        raw
+                    }),
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, %icao, "metar fetch failed");
+            }
+        }
+    });
+}
+
+/// Internal discriminator for the two METAR fetch directions.
+#[derive(Debug, Clone, Copy)]
+enum MetarKind {
+    Departure,
+    Arrival,
 }
 
 /// Emit the landing analyzer's verdict to the activity log exactly once,
@@ -3445,6 +3562,7 @@ pub fn run() {
             flight_cancel,
             activity_log_get,
             activity_log_clear,
+            metar_get,
             flight_forget,
             flight_discover_resumable,
             flight_adopt,
