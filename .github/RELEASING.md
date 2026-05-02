@@ -39,11 +39,38 @@ npm run tauri build -- --bundles nsis
 plugin-updater build hook reads `TAURI_SIGNING_PRIVATE_KEY` as the
 literal key text.)
 
-This produces three files in `client/src-tauri/target/release/bundle/nsis/`:
+This produces two files in `client/src-tauri/target/release/bundle/nsis/`:
 
 - `AeroACARS_X.Y.Z_x64-setup.exe`         ← the installer
 - `AeroACARS_X.Y.Z_x64-setup.exe.sig`     ← Ed25519 signature
-- `latest.json`                           ← updater manifest
+
+You then assemble `latest.json` manually (Tauri 2 doesn't auto-
+generate it). PowerShell:
+
+```powershell
+$sig = Get-Content "client\src-tauri\target\release\bundle\nsis\AeroACARS_X.Y.Z_x64-setup.exe.sig" -Raw
+$date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+$json = @"
+{
+  "version": "X.Y.Z",
+  "notes": "<one-line changelog goes here>",
+  "pub_date": "$date",
+  "platforms": {
+    "windows-x86_64": {
+      "signature": "$($sig.Trim())",
+      "url": "https://github.com/MANFahrer-GF/AeroACARS/releases/download/vX.Y.Z/AeroACARS_X.Y.Z_x64-setup.exe"
+    }
+  }
+}
+"@
+$json | Set-Content "client\src-tauri\target\release\bundle\nsis\latest.json"
+```
+
+Final 3 files for upload:
+
+- `AeroACARS_X.Y.Z_x64-setup.exe`
+- `AeroACARS_X.Y.Z_x64-setup.exe.sig`
+- `latest.json`
 
 ## Step 3 — Create the GitHub release
 
