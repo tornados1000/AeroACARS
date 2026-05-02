@@ -3035,28 +3035,45 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
     stats.last_lat = Some(snap.lat);
     stats.last_lon = Some(snap.lon);
     stats.position_count = stats.position_count.saturating_add(1);
+    let prev_fuel_kg = stats.last_fuel_kg;
     stats.last_fuel_kg = Some(snap.fuel_total_kg);
 
-    // Block fuel = peak fuel observed across the entire flight,
-    // not a single moment-in-time capture. Reasons:
-    //   * Capturing at flight_start (first tick) misses the
-    //     EFB-driven SimBrief refuel that lands ~5 s later (Fenix
-    //     loads fuel async).
-    //   * Capturing at Pushback misses APU burn during boarding
-    //     (APU eats ~150 kg/h, so 10 min boarding = 25 kg already
-    //     burned before "block-off").
-    //   * Tracking the peak naturally captures whatever value the
-    //     pilot actually loaded: as long as fuel only ever
-    //     decreases after refuelling completes, the max equals the
-    //     loaded amount. Defuelling is an unusual edge case we
-    //     accept as imperfect.
+    // Block fuel = peak fuel observed across the flight, with a
+    // defuel guard. Rationale:
+    //   * Tracking the peak captures the loaded amount no matter
+    //     when refuelling completes — Fenix's async EFB load,
+    //     APU burn during boarding, etc. all become non-issues
+    //     because the peak naturally settles on the loaded value.
+    //   * BUT pure peak doesn't handle defuelling: pilot loads
+    //     4000 kg, realises overload, removes 1000 kg → peak
+    //     stays at 4000, Used Fuel = 4000 − landing reads ~1000
+    //     kg too high. So we detect a sudden large drop (well
+    //     above any realistic engine burn over a tick interval)
+    //     and reset the peak to the current value. Threshold
+    //     200 kg covers even A380 at takeoff thrust over a 30 s
+    //     cruise tick (~210 kg max), so no false positives from
+    //     normal operations.
     let live_fuel = snap.fuel_total_kg;
     if live_fuel > 0.0 {
-        stats.block_fuel_kg = Some(
-            stats
-                .block_fuel_kg
-                .map_or(live_fuel, |peak| peak.max(live_fuel)),
-        );
+        const DEFUEL_THRESHOLD_KG: f32 = 200.0;
+        let is_defuel = prev_fuel_kg
+            .map(|prev| prev - live_fuel > DEFUEL_THRESHOLD_KG)
+            .unwrap_or(false);
+        if is_defuel {
+            tracing::info!(
+                prev = prev_fuel_kg,
+                live = live_fuel,
+                drop = prev_fuel_kg.unwrap_or(0.0) - live_fuel,
+                "defuel detected — resetting block_fuel peak baseline"
+            );
+            stats.block_fuel_kg = Some(live_fuel);
+        } else {
+            stats.block_fuel_kg = Some(
+                stats
+                    .block_fuel_kg
+                    .map_or(live_fuel, |peak| peak.max(live_fuel)),
+            );
+        }
     }
 
     // Peak altitude tracker — every tick, take the max with the live
