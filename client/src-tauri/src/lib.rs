@@ -4708,9 +4708,30 @@ pub fn run() {
     init_tracing();
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "CloudeAcars starting");
 
+    // Eagerly seed the activity log with a clear "App started"
+    // banner before the Tauri runtime even comes up — pilots
+    // restarting the app see this immediately, rather than the
+    // login-conditional "Session restored" line as their only
+    // signal. Differentiates "log cleared by the user" from "app
+    // was closed and re-opened".
+    let app_state = AppState::default();
+    {
+        let entry = ActivityEntry {
+            timestamp: Utc::now(),
+            level: ActivityLevel::Info,
+            message: format!("CloudeAcars v{} gestartet", env!("CARGO_PKG_VERSION")),
+            detail: Some(
+                "Aktivitätsprotokoll wurde nach App-Neustart zurückgesetzt".into(),
+            ),
+        };
+        tracing::info!(message = %entry.message, detail = ?entry.detail, "activity");
+        let mut log = app_state.activity_log.lock().expect("activity_log lock");
+        log.push_back(entry);
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .manage(AppState::default())
+        .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             app_info,
             phpvms_login,
