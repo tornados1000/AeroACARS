@@ -171,6 +171,10 @@ struct AppState {
     client: Mutex<Option<Client>>,
     #[cfg(target_os = "windows")]
     msfs: Mutex<MsfsAdapter>,
+    /// X-Plane adapter — cross-platform (UDP). Co-exists with the
+    /// MSFS adapter; only one is `started` at a time, dictated by
+    /// the persisted `SimKind`.
+    xplane: Mutex<sim_xplane::XPlaneAdapter>,
     active_flight: Mutex<Option<Arc<ActiveFlight>>>,
     /// Ring buffer of pilot-visible activity events. Surfaced via the
     /// `activity_log_get` Tauri command; the dashboard renders them in
@@ -3390,15 +3394,24 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
     });
 }
 
-#[cfg(target_os = "windows")]
+/// Read a snapshot from whichever adapter is currently active per
+/// the persisted `SimKind`. We try the active adapter first; if it
+/// hasn't seen any data yet (e.g. just after startup), we still
+/// return None — caller is expected to handle "no snapshot yet".
 fn current_snapshot(app: &AppHandle) -> Option<SimSnapshot> {
     let state = app.state::<AppState>();
-    let adapter = state.msfs.lock().expect("msfs lock");
-    adapter.snapshot()
-}
-
-#[cfg(not(target_os = "windows"))]
-fn current_snapshot(_app: &AppHandle) -> Option<SimSnapshot> {
+    let kind = read_sim_config(app).kind;
+    if kind.is_xplane() {
+        let adapter = state.xplane.lock().expect("xplane lock");
+        return adapter.snapshot();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if kind.is_msfs() {
+            let adapter = state.msfs.lock().expect("msfs lock");
+            return adapter.snapshot();
+        }
+    }
     None
 }
 
@@ -5315,20 +5328,32 @@ fn write_sim_config(app: &AppHandle, cfg: &SimConfig) -> Result<(), UiError> {
     std::fs::write(&path, json).map_err(|e| UiError::new("config_write", e.to_string()))
 }
 
-/// Apply the selected kind to the MSFS adapter (start / stop / no-op).
-/// X-Plane kinds are accepted as a setting but the X-Plane adapter is Phase 2;
-/// for now we just stop the MSFS adapter and let the UI display the "coming
-/// soon" state.
-fn apply_sim_kind(_state: &tauri::State<'_, AppState>, _kind: SimKind) {
+/// Apply the selected kind to whichever adapter handles it. Always
+/// stops the inactive adapter so we never have both listening
+/// simultaneously (= duplicate snapshots in `current_snapshot`).
+fn apply_sim_kind(state: &tauri::State<'_, AppState>, kind: SimKind) {
+    // Stop both adapters first; we'll start exactly one (or none) below.
     #[cfg(target_os = "windows")]
     {
-        let mut adapter = _state.msfs.lock().expect("msfs lock");
-        if _kind.is_msfs() {
-            adapter.start(_kind);
-        } else {
-            adapter.stop();
-        }
+        let mut msfs = state.msfs.lock().expect("msfs lock");
+        msfs.stop();
     }
+    {
+        let mut xp = state.xplane.lock().expect("xplane lock");
+        xp.stop();
+    }
+
+    if kind.is_msfs() {
+        #[cfg(target_os = "windows")]
+        {
+            let mut msfs = state.msfs.lock().expect("msfs lock");
+            msfs.start(kind);
+        }
+    } else if kind.is_xplane() {
+        let mut xp = state.xplane.lock().expect("xplane lock");
+        xp.start(kind);
+    }
+    // SimKind::Off → both stay stopped.
 }
 
 #[derive(Serialize, Default)]
@@ -5382,42 +5407,60 @@ fn sim_set_kind(
 }
 
 #[tauri::command]
-fn sim_status(app: AppHandle, _state: tauri::State<'_, AppState>) -> SimStatus {
+fn sim_status(app: AppHandle, state: tauri::State<'_, AppState>) -> SimStatus {
     let kind = read_sim_config(&app).kind;
+
+    // X-Plane path is available on every platform (UDP, no platform-
+    // specific deps).
+    if kind.is_xplane() {
+        let adapter = state.xplane.lock().expect("xplane lock");
+        let s = match adapter.state() {
+            sim_xplane::ConnectionState::Disconnected => "disconnected",
+            sim_xplane::ConnectionState::Connecting => "connecting",
+            sim_xplane::ConnectionState::Connected => "connected",
+        };
+        return SimStatus {
+            state: s.into(),
+            kind: kind_str(kind).into(),
+            snapshot: adapter.snapshot(),
+            last_error: adapter.last_error(),
+            available: true,
+        };
+    }
+
+    // MSFS path is Windows-only.
     #[cfg(target_os = "windows")]
     {
-        let adapter = _state.msfs.lock().expect("msfs lock");
-        let (state_str, last_error) = if kind.is_msfs() {
+        let adapter = state.msfs.lock().expect("msfs lock");
+        if kind.is_msfs() {
             let s = match adapter.state() {
                 sim_msfs::ConnectionState::Disconnected => "disconnected",
                 sim_msfs::ConnectionState::Connecting => "connecting",
                 sim_msfs::ConnectionState::Connected => "connected",
             };
-            (s, adapter.last_error())
-        } else if kind.is_xplane() {
-            ("disconnected", Some("X-Plane support arrives in Phase 2".into()))
-        } else {
-            ("disconnected", None)
-        };
-        let snapshot = if kind.is_msfs() {
-            adapter.snapshot()
-        } else {
-            None
-        };
-        SimStatus {
-            state: state_str.into(),
-            kind: kind_str(kind).into(),
-            snapshot,
-            last_error,
-            available: kind.is_msfs() || kind == SimKind::Off,
+            return SimStatus {
+                state: s.into(),
+                kind: kind_str(kind).into(),
+                snapshot: adapter.snapshot(),
+                last_error: adapter.last_error(),
+                available: true,
+            };
         }
+        // SimKind::Off
+        return SimStatus {
+            state: "disconnected".into(),
+            kind: kind_str(kind).into(),
+            snapshot: None,
+            last_error: None,
+            available: kind == SimKind::Off,
+        };
     }
+
     #[cfg(not(target_os = "windows"))]
     {
+        let _ = state;
         let last_error = if kind.is_msfs() {
             Some("MSFS adapter is Windows-only".into())
-        } else if kind.is_xplane() {
-            Some("X-Plane support arrives in Phase 2".into())
         } else {
             None
         };
@@ -5515,6 +5558,22 @@ fn inspector_list(_state: tauri::State<'_, AppState>) -> Vec<serde_json::Value> 
     {
         Vec::new()
     }
+}
+
+/// X-Plane DataRef inspector: returns the static catalog with the
+/// most recent received value per entry. Unlike the MSFS Inspector
+/// (where the user adds names manually) the X-Plane catalog is
+/// fixed at compile time — every DataRef we subscribe is shown.
+/// Pilots use this to verify the UDP feed is alive and the Sim is
+/// responding to RREF subscriptions.
+#[tauri::command]
+fn xplane_inspector_list(state: tauri::State<'_, AppState>) -> Vec<serde_json::Value> {
+    let adapter = state.xplane.lock().expect("xplane lock");
+    adapter
+        .subscribed_datarefs()
+        .into_iter()
+        .map(|s| serde_json::to_value(s).unwrap_or(serde_json::Value::Null))
+        .collect()
 }
 
 /// On login or session restore, check the on-disk active-flight file. If it's

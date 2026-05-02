@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useTranslation } from "react-i18next";
-import type { AppInfo, SimKind, SimStatus } from "../types";
+import type { SimKind, SimStatus } from "../types";
 import type { Theme } from "../theme";
 import { SimDebugPanel } from "./SimDebugPanel";
 
@@ -45,7 +45,6 @@ export function SettingsPanel({
   const { t, i18n } = useTranslation();
   const [kind, setKind] = useState<SimKind | null>(null);
   const [busy, setBusy] = useState(false);
-  const [info, setInfo] = useState<AppInfo | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -55,12 +54,6 @@ export function SettingsPanel({
         if (!cancelled) setKind(k as SimKind);
       } catch {
         if (!cancelled) setKind("off");
-      }
-      try {
-        const ai = await invoke<AppInfo>("app_info");
-        if (!cancelled) setInfo(ai);
-      } catch {
-        // ignore — credit footer is non-critical
       }
     })();
     return () => {
@@ -195,16 +188,6 @@ export function SettingsPanel({
           </div>
         )}
       </div>
-
-      {info && (
-        <footer className="settings__credit">
-          <span>
-            {info.name} v{info.version}
-            {info.commit ? ` · ${info.commit.slice(0, 7)}` : ""}
-          </span>
-          <span>{info.credit}</span>
-        </footer>
-      )}
     </section>
   );
 }

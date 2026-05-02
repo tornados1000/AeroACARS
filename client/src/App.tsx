@@ -7,6 +7,7 @@ import { CockpitView } from "./components/CockpitView";
 import { BriefingView } from "./components/BriefingView";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { ActivityLogPanel } from "./components/ActivityLogPanel";
+import { AboutPanel } from "./components/AboutPanel";
 import { LiveRecordingIndicator } from "./components/LiveRecordingIndicator";
 import { useSimSession } from "./hooks/useSimSession";
 import type { ActiveFlightInfo, LoginResult } from "./types";
@@ -16,7 +17,7 @@ type SessionStatus =
   | { kind: "loggedOut" }
   | { kind: "loggedIn"; session: LoginResult };
 
-type Tab = "cockpit" | "briefing" | "log" | "settings";
+type Tab = "cockpit" | "briefing" | "log" | "settings" | "about";
 
 const DEBUG_STORAGE_KEY = "aeroacars.debug";
 const AUTO_FILE_STORAGE_KEY = "aeroacars.autoFile";
@@ -258,6 +259,15 @@ function App() {
           >
             {t("tabs.settings")}
           </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === "about"}
+            className={`tab ${tab === "about" ? "tab--active" : ""}`}
+            onClick={() => setTab("about")}
+          >
+            {t("tabs.about")}
+          </button>
         </nav>
       )}
 
@@ -310,6 +320,8 @@ function App() {
           simStatus={simStatus}
         />
       )}
+
+      {status.kind === "loggedIn" && tab === "about" && <AboutPanel />}
     </main>
   );
 }
