@@ -1,22 +1,58 @@
-//! X-Plane 11 / X-Plane 12 adapter.
+//! X-Plane 11 / X-Plane 12 simulator adapter.
 //!
-//! Architecture (see ADR-0004): we ship our own XPLM plugin (`xplane-plugin/`) inside the
-//! installer. The plugin runs in-process inside X-Plane and pushes telemetry over UDP
-//! loopback to this adapter. Default port: 49021. Wire format: CBOR-encoded `SimSnapshot`.
+//! See ADR-0004 (revision: native UDP RREF, no plugin). This crate
+//! talks to X-Plane via the built-in UDP DataRef protocol — same as
+//! every other XPlane-aware ACARS / GA tool out there. No XPLM plugin
+//! to install, no third-party gateway. Pilot just runs X-Plane and
+//! AeroACARS picks it up from `localhost:49000`.
 //!
-//! Status: Phase 2 — only stubs and constants in Phase 1.
+//! ## Protocol summary
+//!
+//! - We bind a local UDP socket on any free port.
+//! - We send RREF subscription packets to `127.0.0.1:49000` (X-Plane's
+//!   listen port). Each request says "send DataRef #N at K Hz, with
+//!   index I in your responses".
+//! - X-Plane streams response packets back to the source port of our
+//!   subscription, each containing one or more `(index, float32)` pairs.
+//! - We translate each index back to its DataRef name → field on the
+//!   shared `SimSnapshot`.
+//!
+//! Reference docs:
+//!   * <https://xppython3.readthedocs.io/en/latest/development/udp/rref.html>
+//!   * <https://questions.x-plane.com/6880/where-can-find-the-complete-protocol-specification-dataref>
+//!   * <http://www.nuclearprojects.com/xplane/xplaneref.html>
+//!   * <https://forums.x-plane.org/forums/topic/110870-x-plane-11-udp-interface-rref/>
+//!
+//! ## Why all-floats
+//!
+//! RREF returns every DataRef as a `float32`, even for booleans or
+//! integers. We cast at the snapshot-mapping boundary so downstream
+//! code keeps using the same `SimSnapshot` types as the MSFS path.
+//!
+//! ## Status
+//!
+//! Phase 1: foundation — UDP bind, RREF encode/decode, the most
+//! important DataRefs (position, attitude, V/S, G, on-ground, fuel,
+//! gear, flaps), snapshot mapping. Connection state machine. Async
+//! listener task. Compiles cross-platform.
+//!
+//! Phase 2 (future): full DataRef coverage (lights, AP, body velocity
+//! for sideslip, wind components for head/crosswind), aircraft-
+//! identity probe, version detection.
 
 #![allow(dead_code)]
 
-/// Default UDP port the XPLM plugin sends snapshots to.
-pub const DEFAULT_UDP_PORT: u16 = 49021;
+mod adapter;
+mod dataref;
+mod rref;
 
-pub struct XPlaneAdapter {
-    _placeholder: (),
-}
+pub use adapter::{ConnectionState, XPlaneAdapter};
 
-impl XPlaneAdapter {
-    pub fn new() -> Self {
-        Self { _placeholder: () }
-    }
-}
+/// Default UDP port X-Plane listens on. Subscriptions get sent here.
+pub const XPLANE_LISTEN_PORT: u16 = 49000;
+
+/// Default subscription rate (Hz). Matches our 50 Hz touchdown
+/// sampling target. X-Plane caps the actual rate at the sim's
+/// rendered framerate, so on a slow PC we'll naturally fall to
+/// 30-40 Hz without protocol-level intervention.
+pub const SUBSCRIPTION_HZ: u32 = 50;

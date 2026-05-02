@@ -43,6 +43,8 @@ export interface AppInfo {
   name: string;
   version: string;
   commit: string | null;
+  /** Small credit line for the Settings footer. */
+  credit: string;
 }
 
 export interface Airport {

@@ -4,13 +4,13 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "X-Plane 11/12 adapter — UDP listener paired with the bundled XPLM plugin"
+description = "X-Plane 11/12 adapter — native UDP DataRef streaming (no plugin needed)"
 
 [dependencies]
 sim-core.workspace = true
-tokio = { workspace = true, features = ["net", "rt-multi-thread", "sync", "macros"] }
+tokio = { workspace = true, features = ["net", "rt", "rt-multi-thread", "sync", "time", "macros"] }
 serde.workspace = true
-serde_json.workspace = true
+chrono.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
