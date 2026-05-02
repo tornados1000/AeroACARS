@@ -180,34 +180,7 @@ async fn fetch_metar_once(icao: &str) -> Result<MetarSnapshot, MetarError> {
         Some(WindDir::Numeric(n)) => Some(n),
         _ => None,
     };
-    // CAVOK = "Ceiling And Visibility OK" = visibility ≥ 10 km AND
-    // no relevant clouds AND no significant weather. The aviation-
-    // weather API doesn't decode it into the structured `visib`
-    // field, so we string-match the raw METAR. 9999 m is the
-    // standard ICAO encoding for ≥ 10 km. Same fallback for "10SM"
-    // / "10+" which also mean "≥ 10 sm" (already handled in the
-    // Text branch but doubled here so addons / cleaner METAR
-    // sources don't regress).
-    let cavok = raw
-        .raw_ob
-        .as_deref()
-        .map(|s| s.contains("CAVOK"))
-        .unwrap_or(false);
-    let visibility_m = match raw.visib {
-        Some(Visibility::Numeric(n)) => Some((n * STATUTE_MILE_M) as u32),
-        Some(Visibility::Text(t)) => {
-            // "10+" → at least 10 sm. Treat as exactly 10 sm.
-            if t.starts_with("10") {
-                Some((10.0 * STATUTE_MILE_M) as u32)
-            } else if let Ok(n) = t.parse::<f32>() {
-                Some((n * STATUTE_MILE_M) as u32)
-            } else {
-                None
-            }
-        }
-        None if cavok => Some(9999),
-        None => None,
-    };
+    let visibility_m = decode_visibility(raw.visib.as_ref(), raw.raw_ob.as_deref());
 
     Ok(MetarSnapshot {
         icao: raw.icao_id.unwrap_or(icao),
@@ -221,4 +194,139 @@ async fn fetch_metar_once(icao: &str) -> Result<MetarSnapshot, MetarError> {
         dewpoint_c: raw.dewp,
         qnh_hpa: raw.altim,
     })
+}
+
+/// Decode the aviationweather.gov `visib` field (and the raw METAR
+/// fallback) into metres. Pure helper, extracted so we can regression-
+/// test CAVOK parsing without going through the network.
+///
+/// The API is inconsistent about how it surfaces CAVOK:
+///   * sometimes `visib` is omitted entirely (None)
+///   * sometimes it comes through as the literal string `"CAVOK"`
+///   * sometimes as `"10+"` or just the number `10` (statute miles)
+///
+/// We string-match the raw METAR for `CAVOK` as the source of truth and
+/// use it as a fallback whenever the structured field can't be decoded.
+/// Returns `9999 m` (the canonical ICAO ≥10 km marker) for any CAVOK
+/// case so the UI can render it as `≥ 10 km`.
+fn decode_visibility(visib: Option<&Visibility>, raw_ob: Option<&str>) -> Option<u32> {
+    let cavok = raw_ob.map(|s| s.contains("CAVOK")).unwrap_or(false);
+    match visib {
+        Some(Visibility::Numeric(n)) => {
+            // 10+ sm reports often come through as exactly 10.0 — clamp
+            // to the canonical ≥10 km marker so the UI shows the same
+            // string regardless of which branch we came down.
+            if *n >= 10.0 {
+                Some(9999)
+            } else {
+                Some((*n * STATUTE_MILE_M) as u32)
+            }
+        }
+        Some(Visibility::Text(t)) => {
+            let trimmed = t.trim();
+            if trimmed.starts_with("10") {
+                Some(9999)
+            } else if trimmed.eq_ignore_ascii_case("CAVOK") {
+                Some(9999)
+            } else if let Ok(n) = trimmed.parse::<f32>() {
+                Some((n * STATUTE_MILE_M) as u32)
+            } else if cavok {
+                // Unknown text token (e.g. "P6SM", "M1/4SM") — but the
+                // raw METAR says CAVOK, so we know visibility is fine.
+                Some(9999)
+            } else {
+                None
+            }
+        }
+        None if cavok => Some(9999),
+        None => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Real EDDW METAR observed 2026-05-02: visibility column was
+    /// rendering "—" in the UI because CAVOK wasn't being decoded.
+    #[test]
+    fn cavok_eddw_visibility_is_at_least_10km() {
+        let raw_ob =
+            "METAR EDDW 021520Z AUTO 23015KT CAVOK 25/09 Q1015 TEMPO 23015G25KT";
+        // No structured visib field returned by upstream.
+        let v = decode_visibility(None, Some(raw_ob));
+        assert_eq!(v, Some(9999), "CAVOK without structured visib must map to ≥10 km");
+    }
+
+    /// Same EDDM CAVOK report — checks the same fallback path holds.
+    #[test]
+    fn cavok_eddm_visibility() {
+        let raw_ob =
+            "METAR EDDM 021520Z AUTO 09004KT 050V150 CAVOK 24/03 Q1019 NOSIG";
+        let v = decode_visibility(None, Some(raw_ob));
+        assert_eq!(v, Some(9999));
+    }
+
+    /// API sometimes echoes CAVOK as the literal text in the visib
+    /// field — we must not let that fall through to None.
+    #[test]
+    fn cavok_as_text_field() {
+        let v = decode_visibility(
+            Some(&Visibility::Text("CAVOK".into())),
+            Some("METAR LFPG 011200Z 24010KT CAVOK 18/05 Q1018"),
+        );
+        assert_eq!(v, Some(9999));
+    }
+
+    /// "10+" — at least 10 sm — gets the same ≥10 km treatment as CAVOK.
+    #[test]
+    fn ten_plus_sm_text_is_ge_10km() {
+        let v = decode_visibility(
+            Some(&Visibility::Text("10+".into())),
+            Some("METAR KORD 011200Z 24010KT 10SM CLR 18/05 A2992"),
+        );
+        assert_eq!(v, Some(9999));
+    }
+
+    /// Numeric 10 sm exactly — also ≥10 km.
+    #[test]
+    fn numeric_10sm_is_ge_10km() {
+        let v = decode_visibility(Some(&Visibility::Numeric(10.0)), Some("METAR KJFK ..."));
+        assert_eq!(v, Some(9999));
+    }
+
+    /// Sub-10 sm value should still convert to metres normally.
+    #[test]
+    fn numeric_3sm_converts_to_metres() {
+        let v = decode_visibility(Some(&Visibility::Numeric(3.0)), Some("METAR KJFK ... 3SM ..."));
+        // 3 * 1609.344 = 4828.032 → 4828 as u32
+        assert_eq!(v, Some(4828));
+    }
+
+    /// No info at all → None.
+    #[test]
+    fn missing_visibility_is_none() {
+        let v = decode_visibility(None, Some("METAR KXYZ 011200Z AUTO 24010KT"));
+        assert_eq!(v, None);
+    }
+
+    /// Unknown text + no CAVOK → None (don't fabricate values).
+    #[test]
+    fn unparseable_text_without_cavok_is_none() {
+        let v = decode_visibility(
+            Some(&Visibility::Text("P6SM".into())),
+            Some("METAR KORD 011200Z 24010KT P6SM CLR 18/05 A2992"),
+        );
+        assert_eq!(v, None);
+    }
+
+    /// Unknown text + CAVOK in raw → fallback to 9999.
+    #[test]
+    fn unparseable_text_with_cavok_falls_back() {
+        let v = decode_visibility(
+            Some(&Visibility::Text("?weird?".into())),
+            Some("METAR EDDF 011200Z 24010KT CAVOK 18/05 Q1018"),
+        );
+        assert_eq!(v, Some(9999));
+    }
 }

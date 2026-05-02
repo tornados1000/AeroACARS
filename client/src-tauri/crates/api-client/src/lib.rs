@@ -255,6 +255,35 @@ pub struct SimBrief {
     pub subfleet: Option<SimBriefSubfleet>,
 }
 
+/// Parsed SimBrief OFP weights + fuel plan, fetched from the
+/// public XML endpoint. All weights / fuel quantities normalised
+/// to KG regardless of the OFP's `units.wt_unit` setting.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct SimBriefOfp {
+    /// Block fuel (= ramp fuel, what the pilot loads at the gate).
+    /// `<fuel><plan_ramp>` in the OFP.
+    pub planned_block_fuel_kg: f32,
+    /// Estimated trip burn — the dispatcher's planned fuel consumed
+    /// from takeoff to touchdown. `<fuel><est_burn>`.
+    pub planned_burn_kg: f32,
+    /// Reserve fuel set aside for the alternate + holding pattern.
+    /// `<fuel><reserve>`.
+    pub planned_reserve_kg: f32,
+    /// Zero-fuel weight as planned by the dispatcher. Used to detect
+    /// over-loading at takeoff.
+    pub planned_zfw_kg: f32,
+    /// Takeoff weight (block fuel + ZFW − taxi fuel) per OFP.
+    pub planned_tow_kg: f32,
+    /// Landing weight (TOW − burn) per OFP.
+    pub planned_ldw_kg: f32,
+    /// ICAO-coded route string from the flight plan, e.g.
+    /// `"DENUT5L DENUT M624 SUSAN ..."`. None when the OFP didn't
+    /// include a route (rare).
+    pub route: Option<String>,
+    /// Alternate airport ICAO, if planned.
+    pub alternate: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SimBriefSubfleet {
     #[serde(default)]
@@ -733,6 +762,50 @@ impl Client {
         self.post_data("/api/pireps/prefile", body).await
     }
 
+    /// Fetch the public SimBrief OFP XML for a given OFP id and
+    /// extract the weights + fuel plan we care about. The endpoint
+    /// is `https://www.simbrief.com/ofp/flightplans/xml/{id}.xml` —
+    /// no auth needed; SimBrief OFPs are public-by-id.
+    ///
+    /// Weights / fuel are normalised to KG regardless of the OFP's
+    /// `<units><wt_unit>` setting (kgs vs lbs).
+    ///
+    /// Returns `Ok(None)` when the OFP is missing or malformed —
+    /// flight_start should treat that as "no plan, no comparison"
+    /// rather than refusing to start.
+    pub async fn fetch_simbrief_ofp(
+        &self,
+        ofp_id: &str,
+    ) -> Result<Option<SimBriefOfp>, ApiError> {
+        let url = format!(
+            "https://www.simbrief.com/ofp/flightplans/xml/{}.xml",
+            urlencoding_escape(ofp_id)
+        );
+        let response = match self.http.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, ofp_id, "SimBrief OFP fetch failed (network)");
+                return Ok(None);
+            }
+        };
+        if !response.status().is_success() {
+            tracing::warn!(
+                status = %response.status(),
+                ofp_id,
+                "SimBrief OFP fetch returned non-2xx",
+            );
+            return Ok(None);
+        }
+        let xml = match response.text().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "SimBrief OFP body read failed");
+                return Ok(None);
+            }
+        };
+        Ok(parse_simbrief_ofp(&xml))
+    }
+
     /// `POST /api/pireps/{pirep_id}/acars/position` — push a batch of positions.
     pub async fn post_positions(
         &self,
@@ -811,6 +884,81 @@ async fn check_status(response: Response, path: &str) -> Result<Response, ApiErr
             })
         }
     }
+}
+
+// ---- SimBrief OFP XML parser ----
+
+/// Lazy URL-encode helper for the OFP id. SimBrief ids are
+/// `[A-Za-z0-9_-]` so we technically don't need to encode anything,
+/// but we'll be defensive in case they ever change format.
+fn urlencoding_escape(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{:02X}", b),
+        })
+        .collect()
+}
+
+/// Pull the inner text of the FIRST `<tag>...</tag>` occurrence.
+/// Naive but adequate for SimBrief's well-formed OFP XML — every
+/// field we want is a leaf scalar, no nested duplicates.
+fn extract_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let rest = &xml[start..];
+    let end = rest.find(&close)?;
+    Some(&rest[..end])
+}
+
+/// Parse the SimBrief OFP XML into our `SimBriefOfp` struct. All
+/// weights returned in KG; if the OFP was generated in lbs we
+/// convert. Returns None when the document is too malformed to be
+/// useful (no weights block at all).
+fn parse_simbrief_ofp(xml: &str) -> Option<SimBriefOfp> {
+    // Conversion factor: SimBrief reports either kgs or lbs.
+    let unit_is_lb = matches!(extract_tag(xml, "wt_unit"), Some("lbs"));
+    let to_kg = |v: f32| -> f32 {
+        if unit_is_lb { v * 0.453_592_37 } else { v }
+    };
+
+    let parse_f = |tag: &str| -> Option<f32> {
+        extract_tag(xml, tag)
+            .and_then(|s| s.trim().parse::<f32>().ok())
+    };
+
+    // Required: at least one weight field has to be present, else
+    // the OFP is too broken to use.
+    let zfw = parse_f("est_zfw").map(to_kg).unwrap_or(0.0);
+    let tow = parse_f("est_tow").map(to_kg).unwrap_or(0.0);
+    let ldw = parse_f("est_ldw").map(to_kg).unwrap_or(0.0);
+    if zfw == 0.0 && tow == 0.0 && ldw == 0.0 {
+        return None;
+    }
+    let plan_ramp = parse_f("plan_ramp").map(to_kg).unwrap_or(0.0);
+    let est_burn = parse_f("est_burn").map(to_kg).unwrap_or(0.0);
+    let reserve = parse_f("reserve").map(to_kg).unwrap_or(0.0);
+    let route = extract_tag(xml, "route")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let alternate = extract_tag(xml, "alternate")
+        .or_else(|| extract_tag(xml, "icao_code"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    Some(SimBriefOfp {
+        planned_block_fuel_kg: plan_ramp,
+        planned_burn_kg: est_burn,
+        planned_reserve_kg: reserve,
+        planned_zfw_kg: zfw,
+        planned_tow_kg: tow,
+        planned_ldw_kg: ldw,
+        route,
+        alternate,
+    })
 }
 
 #[cfg(test)]

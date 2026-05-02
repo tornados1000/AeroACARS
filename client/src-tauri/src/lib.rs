@@ -21,7 +21,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use metar::{MetarError, MetarSnapshot};
 use recorder::{FlightLogEvent, FlightOutcome, FlightRecorder};
-use storage::{PositionQueue, QueuedPosition};
+use storage::{
+    LandingProfilePoint, LandingRecord, LandingRunwayMatch, LandingStore, PositionQueue,
+    QueuedPosition,
+};
 use sim_core::{FlightPhase, SimKind, SimSnapshot};
 use tauri::{AppHandle, Manager};
 use tracing_subscriber::EnvFilter;
@@ -411,6 +414,23 @@ struct PersistedFlightStats {
     approach_bank_stddev_deg: Option<f32>,
     #[serde(default)]
     rollout_distance_m: Option<f64>,
+    // ---- Landing Analyzer (Stage 2): SimBrief OFP plan ----
+    #[serde(default)]
+    planned_block_fuel_kg: Option<f32>,
+    #[serde(default)]
+    planned_burn_kg: Option<f32>,
+    #[serde(default)]
+    planned_reserve_kg: Option<f32>,
+    #[serde(default)]
+    planned_zfw_kg: Option<f32>,
+    #[serde(default)]
+    planned_tow_kg: Option<f32>,
+    #[serde(default)]
+    planned_ldw_kg: Option<f32>,
+    #[serde(default)]
+    planned_route: Option<String>,
+    #[serde(default)]
+    planned_alternate: Option<String>,
 }
 
 impl PersistedFlightStats {
@@ -458,6 +478,14 @@ impl PersistedFlightStats {
             approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
             approach_bank_stddev_deg: stats.approach_bank_stddev_deg,
             rollout_distance_m: stats.rollout_distance_m,
+            planned_block_fuel_kg: stats.planned_block_fuel_kg,
+            planned_burn_kg: stats.planned_burn_kg,
+            planned_reserve_kg: stats.planned_reserve_kg,
+            planned_zfw_kg: stats.planned_zfw_kg,
+            planned_tow_kg: stats.planned_tow_kg,
+            planned_ldw_kg: stats.planned_ldw_kg,
+            planned_route: stats.planned_route.clone(),
+            planned_alternate: stats.planned_alternate.clone(),
         }
     }
 
@@ -511,6 +539,14 @@ impl PersistedFlightStats {
         stats.approach_vs_stddev_fpm = self.approach_vs_stddev_fpm;
         stats.approach_bank_stddev_deg = self.approach_bank_stddev_deg;
         stats.rollout_distance_m = self.rollout_distance_m;
+        stats.planned_block_fuel_kg = self.planned_block_fuel_kg;
+        stats.planned_burn_kg = self.planned_burn_kg;
+        stats.planned_reserve_kg = self.planned_reserve_kg;
+        stats.planned_zfw_kg = self.planned_zfw_kg;
+        stats.planned_tow_kg = self.planned_tow_kg;
+        stats.planned_ldw_kg = self.planned_ldw_kg;
+        stats.planned_route = self.planned_route;
+        stats.planned_alternate = self.planned_alternate;
     }
 }
 
@@ -605,6 +641,14 @@ struct FlightStats {
     takeoff_at: Option<DateTime<Utc>>,
     landing_at: Option<DateTime<Utc>>,
     block_on_at: Option<DateTime<Utc>>,
+
+    /// Wann das Flugzeug zum ersten Mal nach `tug_done` zum Stehen
+    /// kam (gs < 0.5 kt). Triggert das 10-Sekunden-Dwell-Fenster
+    /// bevor die Phase auf TaxiOut wechselt — entspricht dem echten
+    /// Workflow "Tug ab, Park-Bremse, Funk, dann anrollen". Reset
+    /// auf None sobald die Phase auf TaxiOut springt; nicht
+    /// persistiert (Pushback überlebt keinen Restart).
+    pushback_stopped_at: Option<DateTime<Utc>>,
 
     // ---- Capture at takeoff ----
     takeoff_weight_kg: Option<f64>,
@@ -708,6 +752,27 @@ struct FlightStats {
     /// Used to compute the great-circle delta to the next position.
     rollout_last_lat: Option<f64>,
     rollout_last_lon: Option<f64>,
+
+    // ---- Landing Analyzer (Stage 2): SimBrief OFP plan ----
+    /// Planned block (= ramp) fuel from the SimBrief OFP, in kg.
+    /// None when the bid had no SimBrief OFP attached or the fetch
+    /// failed. Captured once at flight_start; never updated mid-flight.
+    planned_block_fuel_kg: Option<f32>,
+    /// Planned trip burn (takeoff → touchdown) from the OFP. Used at
+    /// PIREP build to compute fuel-efficiency vs the actual burn.
+    planned_burn_kg: Option<f32>,
+    /// Planned reserve fuel (alternate + holding).
+    planned_reserve_kg: Option<f32>,
+    /// Planned zero-fuel weight (kg).
+    planned_zfw_kg: Option<f32>,
+    /// Planned takeoff weight (kg).
+    planned_tow_kg: Option<f32>,
+    /// Planned landing weight (kg).
+    planned_ldw_kg: Option<f32>,
+    /// Planned route string from the OFP.
+    planned_route: Option<String>,
+    /// Planned alternate ICAO from the OFP.
+    planned_alternate: Option<String>,
 
     // ---- METAR snapshots (Phase J.2) ----
     /// Raw METAR text captured at takeoff for the departure airport.
@@ -1542,6 +1607,80 @@ fn activity_log_clear(state: tauri::State<'_, AppState>) {
     // Also persist the cleared state — otherwise a restart would
     // restore the pre-clear contents from disk.
     save_activity_log(&log);
+}
+
+// ---- Landing-history commands (Landing tab) ----
+
+/// List every persisted landing record, newest first. Used by the
+/// Landing tab's list view.
+#[tauri::command]
+fn landing_list(app: AppHandle) -> Vec<LandingRecord> {
+    open_landing_store(&app)
+        .and_then(|s| s.list().ok())
+        .unwrap_or_default()
+}
+
+/// Fetch a single landing record by PIREP id.
+#[tauri::command]
+fn landing_get(app: AppHandle, pirep_id: String) -> Option<LandingRecord> {
+    open_landing_store(&app)
+        .and_then(|s| s.get(&pirep_id).ok())
+        .flatten()
+}
+
+/// Build a *preview* landing record from the currently-active flight.
+/// Used by the Landing tab during the rollout / before file: shows the
+/// pilot what their landing looks like *right now* without having to
+/// wait for the PIREP to be filed. Returns None when there is no
+/// active flight or when the touchdown hasn't happened yet.
+#[tauri::command]
+fn landing_get_current(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Option<LandingRecord> {
+    let flight = {
+        let guard = state.active_flight.lock().expect("active_flight lock");
+        guard.as_ref().cloned()
+    }?;
+    let stats = flight.stats.lock().expect("flight stats");
+    let snapshot = current_snapshot(&app);
+    let sim_kind = read_sim_config(&app).kind;
+    let sim_label = match sim_kind {
+        SimKind::Off => None,
+        SimKind::Msfs2020 | SimKind::Msfs2024 => Some("MSFS"),
+        SimKind::XPlane11 | SimKind::XPlane12 => Some("X-PLANE"),
+    };
+    let aircraft_icao = snapshot.as_ref().and_then(|s| s.aircraft_icao.as_deref());
+    let aircraft_title = snapshot.as_ref().and_then(|s| s.aircraft_title.as_deref());
+    build_landing_record(&flight, &stats, sim_label, aircraft_icao, aircraft_title)
+}
+
+/// Delete a landing record. Lets the user clean up bad/test entries
+/// from the Landing tab. Best-effort — returns Ok(()) even if the
+/// record didn't exist.
+#[tauri::command]
+fn landing_delete(app: AppHandle, pirep_id: String) -> Result<(), UiError> {
+    let Some(store) = open_landing_store(&app) else {
+        return Err(UiError::new("landing_store", "could not open landing store"));
+    };
+    let mut all = store
+        .list()
+        .map_err(|e| UiError::new("landing_read", format!("{e}")))?;
+    let before = all.len();
+    all.retain(|r| r.pirep_id != pirep_id);
+    if all.len() == before {
+        return Ok(());
+    }
+    // upsert one-by-one isn't quite right (it appends); easier: rewrite
+    // the file via a private helper. We don't have one — fall back to
+    // upserting each remaining row in order. Since LandingStore::upsert
+    // dedupes by pirep_id, an upsert chain produces the same set.
+    // BUT it doesn't drop rows. Hack: write empty first, then re-add.
+    // The store doesn't expose a clear/replace yet — we add one.
+    if let Err(e) = store.replace_all(&all) {
+        return Err(UiError::new("landing_write", format!("{e}")));
+    }
+    Ok(())
 }
 
 // ---- Site config persistence ----
@@ -2534,6 +2673,37 @@ async fn flight_start(
         .trim()
         .to_string();
 
+    // ---- Stage 2: SimBrief OFP fetch for planned-fuel comparison ----
+    // The bid carries a SimBrief id when the pilot has prepared an OFP.
+    // We fetch the OFP XML now (best-effort, never blocks the flight) so
+    // the PIREP can compare actual fuel burn against the dispatcher's
+    // plan. Fetch errors are logged and ignored — a missing plan just
+    // means no fuel-efficiency line in the PIREP.
+    let planned_ofp = if let Some(sb) = bid.flight.simbrief.as_ref() {
+        match client.fetch_simbrief_ofp(&sb.id).await {
+            Ok(Some(ofp)) => {
+                tracing::info!(
+                    sb_id = %sb.id,
+                    plan_burn_kg = ofp.planned_burn_kg,
+                    plan_block_kg = ofp.planned_block_fuel_kg,
+                    plan_tow_kg = ofp.planned_tow_kg,
+                    "SimBrief OFP fetched"
+                );
+                Some(ofp)
+            }
+            Ok(None) => {
+                tracing::warn!(sb_id = %sb.id, "SimBrief OFP fetch returned no usable data");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(sb_id = %sb.id, error = %e, "SimBrief OFP fetch failed");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let flight = Arc::new(ActiveFlight {
         pirep_id: pirep.id.clone(),
         bid_id,
@@ -2564,6 +2734,26 @@ async fn flight_start(
     }
     // ActiveFlight is committed; release the setup-in-progress flag.
     setup_guard.disarm();
+
+    // Stage 2: write the SimBrief OFP plan into FlightStats so the
+    // streamer + PIREP builder can read it later. Done after commit
+    // so stats already exists; the lock is short-held and never
+    // crosses an await.
+    if let Some(ofp) = planned_ofp {
+        let mut stats = flight.stats.lock().expect("flight stats lock");
+        stats.planned_block_fuel_kg = Some(ofp.planned_block_fuel_kg).filter(|&v| v > 0.0);
+        stats.planned_burn_kg = Some(ofp.planned_burn_kg).filter(|&v| v > 0.0);
+        stats.planned_reserve_kg = Some(ofp.planned_reserve_kg).filter(|&v| v > 0.0);
+        stats.planned_zfw_kg = Some(ofp.planned_zfw_kg).filter(|&v| v > 0.0);
+        stats.planned_tow_kg = Some(ofp.planned_tow_kg).filter(|&v| v > 0.0);
+        stats.planned_ldw_kg = Some(ofp.planned_ldw_kg).filter(|&v| v > 0.0);
+        stats.planned_route = ofp.route;
+        stats.planned_alternate = ofp.alternate;
+        drop(stats);
+        // Persist immediately so a Tauri restart mid-flight doesn't
+        // lose the plan.
+        save_active_flight(&app, &flight);
+    }
 
     spawn_position_streamer(app.clone(), Arc::clone(&flight), client);
     spawn_touchdown_sampler(app.clone(), Arc::clone(&flight));
@@ -2678,6 +2868,175 @@ fn open_position_queue(app: &AppHandle) -> Option<PositionQueue> {
 fn open_flight_recorder(app: &AppHandle, pirep_id: &str) -> Option<FlightRecorder> {
     let dir = app.path().app_data_dir().ok()?;
     FlightRecorder::open(dir, pirep_id).ok()
+}
+
+/// Open the landing-history store. None when the app data dir can't be
+/// resolved — caller treats that as "skip recording, history is best-
+/// effort" rather than failing the PIREP file.
+fn open_landing_store(app: &AppHandle) -> Option<LandingStore> {
+    let dir = app.path().app_data_dir().ok()?;
+    LandingStore::open(dir).ok()
+}
+
+/// Build a `LandingRecord` from the current flight + stats. Returns None
+/// when there's no usable touchdown captured (e.g. PIREP filed before
+/// landing — synthetic / bug). The record is the immutable snapshot we
+/// show in the Landing tab; once written it never changes.
+fn build_landing_record(
+    flight: &ActiveFlight,
+    stats: &FlightStats,
+    sim_kind_label: Option<&str>,
+    aircraft_icao: Option<&str>,
+    aircraft_title: Option<&str>,
+) -> Option<LandingRecord> {
+    let touchdown_at = stats.landing_at?;
+    let landing_rate_fpm = stats.landing_rate_fpm?;
+    let score = stats.landing_score?;
+    let grade = letter_grade(score.numeric());
+
+    // Compute fuel-efficiency once so the Landing tab doesn't have to
+    // redo the formula. Same shape as build_pirep_fields.
+    let actual_burn = match (stats.takeoff_fuel_kg, stats.landing_fuel_kg) {
+        (Some(toff), Some(land)) if toff > land && toff > 0.0 && land >= 0.0 => Some(toff - land),
+        _ => None,
+    };
+    let (fuel_diff_kg, fuel_pct) = match (stats.planned_burn_kg, actual_burn) {
+        (Some(plan), Some(actual)) if plan > 0.0 => {
+            let d = actual - plan;
+            (Some(d), Some((d / plan) * 100.0))
+        }
+        _ => (None, None),
+    };
+
+    let runway_match = stats.runway_match.as_ref().map(|m| LandingRunwayMatch {
+        airport_ident: m.airport_ident.clone(),
+        runway_ident: m.runway_ident.clone(),
+        surface: m.surface.clone(),
+        length_ft: m.length_ft as f64,
+        centerline_distance_m: m.centerline_distance_m,
+        centerline_distance_abs_ft: m.centerline_distance_abs_ft,
+        side: m.side.clone(),
+        touchdown_distance_from_threshold_ft: m.touchdown_distance_from_threshold_ft,
+    });
+
+    let touchdown_profile = stats
+        .touchdown_profile
+        .iter()
+        .map(|p| LandingProfilePoint {
+            t_ms: p.t_ms,
+            vs_fpm: p.vs_fpm,
+            g_force: p.g_force,
+            agl_ft: p.agl_ft,
+            on_ground: p.on_ground,
+            heading_true_deg: p.heading_true_deg,
+            groundspeed_kt: p.groundspeed_kt,
+            indicated_airspeed_kt: p.indicated_airspeed_kt,
+            pitch_deg: p.pitch_deg,
+            bank_deg: p.bank_deg,
+        })
+        .collect();
+
+    Some(LandingRecord {
+        pirep_id: flight.pirep_id.clone(),
+        touchdown_at,
+        recorded_at: Utc::now(),
+        flight_number: flight.flight_number.clone(),
+        airline_icao: flight.airline_icao.clone(),
+        dpt_airport: flight.dpt_airport.clone(),
+        arr_airport: flight.arr_airport.clone(),
+        aircraft_registration: Some(flight.planned_registration.clone())
+            .filter(|s| !s.is_empty()),
+        aircraft_icao: aircraft_icao.map(|s| s.to_string()).filter(|s| !s.is_empty()),
+        aircraft_title: aircraft_title.map(|s| s.to_string()).filter(|s| !s.is_empty()),
+        sim_kind: sim_kind_label.map(|s| s.to_string()),
+
+        score_numeric: score.numeric(),
+        score_label: score.label().to_string(),
+        grade_letter: grade.to_string(),
+
+        landing_rate_fpm,
+        landing_peak_vs_fpm: stats.landing_peak_vs_fpm,
+        landing_g_force: stats.landing_g_force,
+        landing_peak_g_force: stats.landing_peak_g_force,
+        landing_pitch_deg: stats.landing_pitch_deg,
+        // Bank at touchdown isn't a top-level FlightStats field; pull
+        // the sample closest to t=0 from the touchdown profile.
+        landing_bank_deg: stats
+            .touchdown_profile
+            .iter()
+            .min_by_key(|p| p.t_ms.abs())
+            .map(|p| p.bank_deg),
+        landing_speed_kt: stats.landing_speed_kt,
+        landing_heading_deg: stats.landing_heading_deg,
+        landing_weight_kg: stats.landing_weight_kg,
+        touchdown_sideslip_deg: stats.touchdown_sideslip_deg,
+        bounce_count: stats.bounce_count,
+
+        headwind_kt: stats.landing_headwind_kt,
+        crosswind_kt: stats.landing_crosswind_kt,
+
+        approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
+        approach_bank_stddev_deg: stats.approach_bank_stddev_deg,
+        rollout_distance_m: stats.rollout_distance_m,
+
+        planned_block_fuel_kg: stats.planned_block_fuel_kg,
+        planned_burn_kg: stats.planned_burn_kg,
+        planned_tow_kg: stats.planned_tow_kg,
+        planned_ldw_kg: stats.planned_ldw_kg,
+        planned_zfw_kg: stats.planned_zfw_kg,
+        actual_trip_burn_kg: actual_burn,
+        fuel_efficiency_kg_diff: fuel_diff_kg,
+        fuel_efficiency_pct: fuel_pct,
+        takeoff_weight_kg: stats.takeoff_weight_kg,
+        takeoff_fuel_kg: stats.takeoff_fuel_kg,
+        landing_fuel_kg: stats.landing_fuel_kg,
+        block_fuel_kg: stats.block_fuel_kg,
+
+        runway_match,
+        touchdown_profile,
+    })
+}
+
+/// Persist a landing record from a flight that just filed its PIREP.
+/// Best-effort — failure is logged and ignored so the file path
+/// doesn't fail because the history disk write blew up.
+fn record_landing_for_filed_flight(
+    app: &AppHandle,
+    flight: &ActiveFlight,
+    stats: &FlightStats,
+) {
+    let snapshot = current_snapshot(app);
+    let sim_kind_label = read_sim_config(app).kind;
+    let sim_label = match sim_kind_label {
+        SimKind::Off => None,
+        SimKind::Msfs2020 | SimKind::Msfs2024 => Some("MSFS"),
+        SimKind::XPlane11 | SimKind::XPlane12 => Some("X-PLANE"),
+    };
+    let aircraft_icao = snapshot.as_ref().and_then(|s| s.aircraft_icao.as_deref());
+    let aircraft_title = snapshot.as_ref().and_then(|s| s.aircraft_title.as_deref());
+
+    let Some(record) = build_landing_record(
+        flight,
+        stats,
+        sim_label,
+        aircraft_icao,
+        aircraft_title,
+    ) else {
+        tracing::debug!(
+            pirep_id = %flight.pirep_id,
+            "no touchdown captured — skipping landing-history record"
+        );
+        return;
+    };
+    let Some(store) = open_landing_store(app) else {
+        tracing::warn!("landing store unavailable — landing not recorded");
+        return;
+    };
+    if let Err(e) = store.upsert(record) {
+        tracing::warn!(error = ?e, "could not persist landing record");
+    } else {
+        tracing::info!(pirep_id = %flight.pirep_id, "landing record persisted");
+    }
 }
 
 /// Best-effort append to the flight log. Swallows errors so a missing
@@ -2948,6 +3307,14 @@ async fn flight_end(
     );
     match client.file_pirep(&flight.pirep_id, &body).await {
         Ok(()) => {
+            // Snapshot the landing into the local history file BEFORE
+            // we drop the persisted flight — gives the new "Landung"
+            // tab something to render even after the PIREP is filed
+            // and the in-memory FlightStats goes out of scope.
+            {
+                let stats = flight.stats.lock().expect("flight stats");
+                record_landing_for_filed_flight(&app, &flight, &stats);
+            }
             clear_persisted_flight(&app);
             log_activity(
                 &state,
@@ -3136,6 +3503,11 @@ async fn flight_end_manual(
     tracing::info!(pirep_id = %flight.pirep_id, "filing PIREP (manual)");
     match client.file_pirep(&flight.pirep_id, &body).await {
         Ok(()) => {
+            // Same landing-history snapshot as the regular file path.
+            {
+                let stats = flight.stats.lock().expect("flight stats");
+                record_landing_for_filed_flight(&app, &flight, &stats);
+            }
             clear_persisted_flight(&app);
             log_activity(
                 &state,
@@ -3696,34 +4068,49 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
             }
         }
         FlightPhase::Pushback => {
-            // Pushback → TaxiOut handoff. Three signals, in priority
-            // order, all checked together:
+            // Pushback → TaxiOut Übergang. Echter Ablauf am Gate:
+            //   1. Tug schiebt zurück
+            //   2. Tug-Crew koppelt ab (PUSHBACK STATE = 3)
+            //   3. Pilot steht ~10 s mit gesetzter Bremse, hat Funk,
+            //      checkt Freigabe
+            //   4. Pilot löst Bremse + Schub → Flugzeug rollt an
+            // Erst dann ist es "Taxi". Vorher würde der Tug-Schub bei
+            // > 3 kt fälschlicherweise schon TaxiOut triggern.
             //
-            // 1. `PUSHBACK STATE == 3` from MSFS — the sim itself
-            //    reporting "no pushback" (tug disconnected, or the
-            //    pilot used Ctrl+P to stop). This is the
-            //    authoritative signal regardless of whether the
-            //    push was straight, left, right, or even a pull-
-            //    forward maneuver.
-            // 2. Engines running AND ground speed >3 kt — fallback
-            //    for situations where PUSHBACK STATE never reports
-            //    (e.g. pilot pushed by hand without using the tug
-            //    feature). Same trigger as before.
+            // Implementierung als 3-Stufen-Gate:
+            //   * `tug_done` = MSFS meldet PUSHBACK STATE == 3
+            //   * `stopped`  = Flugzeug ist nach tug_done zum Stillstand
+            //                  gekommen (gs < 0.5 kt). Wir merken uns
+            //                  den Zeitpunkt in `pushback_stopped_at`.
+            //   * `dwell_ok` = Stillstand mind. 10 s gehalten.
+            //   * `powered_taxi` = Triebwerke + gs > 3 kt
+            // Nur wenn alles stimmt, springt die Phase auf TaxiOut.
             //
-            // The PUSHBACK STATE field on the snapshot is Option<u8>;
-            // a value of Some(3) means "tug done", Some(0..=2) means
-            // "still pushing", None means "MSFS hasn't told us".
+            // Sims ohne PUSHBACK STATE (X-Plane / manche Add-ons) fallen
+            // auf die alte Heuristik zurück — sonst würden sie für immer
+            // in Pushback stecken bleiben.
+            const PUSHBACK_DWELL_SECS: i64 = 10;
             let tug_done = snap.pushback_state == Some(3);
             let powered_taxi = snap.on_ground
                 && snap.engines_running > 0
                 && snap.groundspeed_kt > 3.0;
-            if tug_done && powered_taxi {
-                next_phase = FlightPhase::TaxiOut;
+
+            if tug_done {
+                // Stillstand nach Tug-Ab: Timestamp setzen (einmal).
+                if snap.groundspeed_kt < 0.5 && stats.pushback_stopped_at.is_none() {
+                    stats.pushback_stopped_at = Some(now);
+                }
+                let dwell_ok = stats
+                    .pushback_stopped_at
+                    .map(|t| (now - t).num_seconds() >= PUSHBACK_DWELL_SECS)
+                    .unwrap_or(false);
+                if dwell_ok && powered_taxi {
+                    stats.pushback_stopped_at = None;
+                    next_phase = FlightPhase::TaxiOut;
+                }
             } else if snap.pushback_state.is_none() && powered_taxi {
-                // No pushback-state info from the sim — fall back
-                // to the legacy "moving + engines on" trigger so
-                // we don't get stuck in Pushback indefinitely on
-                // sims / aircraft that don't expose the field.
+                // Kein PUSHBACK STATE vom Sim verfügbar — alte
+                // Fallback-Logik: bewegt sich + Triebwerke an = TaxiOut.
                 next_phase = FlightPhase::TaxiOut;
             }
         }
@@ -4348,6 +4735,64 @@ fn build_pirep_fields(
         f.insert("rollout_distance_m".into(), format!("{:.0}", meters));
     }
 
+    // ---- SimBrief OFP plan + fuel-efficiency (Landing Analyzer Stage 2) ----
+    // Surface the dispatcher's plan alongside the actuals, and compute
+    // a fuel-efficiency delta so the VA can grade burn discipline.
+    if let Some(b) = stats.planned_block_fuel_kg {
+        f.insert("Plan Block Fuel".into(), format!("{:.0} kg", b));
+        f.insert("planned_block_fuel_kg".into(), format!("{:.0}", b));
+    }
+    if let Some(b) = stats.planned_burn_kg {
+        f.insert("Plan Trip Burn".into(), format!("{:.0} kg", b));
+        f.insert("planned_burn_kg".into(), format!("{:.0}", b));
+    }
+    if let Some(r) = stats.planned_reserve_kg {
+        f.insert("Plan Reserve Fuel".into(), format!("{:.0} kg", r));
+        f.insert("planned_reserve_kg".into(), format!("{:.0}", r));
+    }
+    if let Some(z) = stats.planned_zfw_kg {
+        f.insert("Plan ZFW".into(), format!("{:.0} kg", z));
+        f.insert("planned_zfw_kg".into(), format!("{:.0}", z));
+    }
+    if let Some(t) = stats.planned_tow_kg {
+        f.insert("Plan TOW".into(), format!("{:.0} kg", t));
+        f.insert("planned_tow_kg".into(), format!("{:.0}", t));
+    }
+    if let Some(l) = stats.planned_ldw_kg {
+        f.insert("Plan LDW".into(), format!("{:.0} kg", l));
+        f.insert("planned_ldw_kg".into(), format!("{:.0}", l));
+    }
+    if let Some(route) = stats.planned_route.as_deref().filter(|s| !s.is_empty()) {
+        f.insert("Plan Route".into(), route.to_string());
+        f.insert("planned_route".into(), route.to_string());
+    }
+    if let Some(alt) = stats.planned_alternate.as_deref().filter(|s| !s.is_empty()) {
+        f.insert("Plan Alternate".into(), alt.to_string());
+        f.insert("planned_alternate".into(), alt.to_string());
+    }
+    // Fuel efficiency: compare actual trip burn to the planned trip
+    // burn. Use takeoff_fuel_kg − landing_fuel_kg as the actual trip
+    // burn (excludes taxi out/in, matching SimBrief's est_burn).
+    if let (Some(plan_burn), Some(toff), Some(land)) = (
+        stats.planned_burn_kg,
+        stats.takeoff_fuel_kg,
+        stats.landing_fuel_kg,
+    ) {
+        if plan_burn > 0.0 && toff > 0.0 && land >= 0.0 && toff > land {
+            let actual_burn = toff - land;
+            let diff = actual_burn - plan_burn; // +ve = burned more than planned
+            let pct = (diff / plan_burn) * 100.0;
+            let sign = if diff >= 0.0 { "+" } else { "" };
+            f.insert(
+                "Fuel Efficiency".into(),
+                format!("{sign}{:.0} kg ({sign}{:.1}%)", diff, pct),
+            );
+            f.insert("actual_trip_burn_kg".into(), format!("{:.0}", actual_burn));
+            f.insert("fuel_efficiency_kg_diff".into(), format!("{:.1}", diff));
+            f.insert("fuel_efficiency_pct".into(), format!("{:.2}", pct));
+        }
+    }
+
     // ---- Runway correlation (Tier 2) ----
     if let Some(rw) = &stats.runway_match {
         f.insert(
@@ -4611,6 +5056,36 @@ fn build_pirep_notes(flight: &ActiveFlight, stats: &FlightStats) -> String {
         }
         if let Some(w) = stats.landing_weight_kg.filter(|v| *v > 0.0) {
             let _ = writeln!(s, "  LDW           {:.0} kg", w);
+        }
+        // Stage 2: SimBrief plan + efficiency delta.
+        if let Some(b) = stats.planned_burn_kg {
+            let _ = writeln!(s, "  Plan burn     {:.0} kg", b);
+        }
+        if let Some(b) = stats.planned_block_fuel_kg {
+            let _ = writeln!(s, "  Plan block    {:.0} kg", b);
+        }
+        if let Some(t) = stats.planned_tow_kg {
+            let _ = writeln!(s, "  Plan TOW      {:.0} kg", t);
+        }
+        if let Some(l) = stats.planned_ldw_kg {
+            let _ = writeln!(s, "  Plan LDW      {:.0} kg", l);
+        }
+        if let (Some(plan_burn), Some(toff), Some(land)) = (
+            stats.planned_burn_kg,
+            stats.takeoff_fuel_kg,
+            stats.landing_fuel_kg,
+        ) {
+            if plan_burn > 0.0 && toff > land && toff > 0.0 && land >= 0.0 {
+                let actual = toff - land;
+                let diff = actual - plan_burn;
+                let pct = (diff / plan_burn) * 100.0;
+                let sign = if diff >= 0.0 { "+" } else { "" };
+                let _ = writeln!(
+                    s,
+                    "  Efficiency    {sign}{:.0} kg ({sign}{:.1}%)",
+                    diff, pct
+                );
+            }
         }
     }
 
@@ -6253,6 +6728,10 @@ pub fn run() {
             flight_cancel,
             activity_log_get,
             activity_log_clear,
+            landing_list,
+            landing_get,
+            landing_get_current,
+            landing_delete,
             metar_get,
             flight_forget,
             flight_discover_resumable,

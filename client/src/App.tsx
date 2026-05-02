@@ -8,6 +8,7 @@ import { BriefingView } from "./components/BriefingView";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { ActivityLogPanel } from "./components/ActivityLogPanel";
 import { AboutPanel } from "./components/AboutPanel";
+import { LandingPanel } from "./components/LandingPanel";
 import { UpdateButton } from "./components/UpdateButton";
 import { LiveRecordingIndicator } from "./components/LiveRecordingIndicator";
 import { useSimSession } from "./hooks/useSimSession";
@@ -18,7 +19,7 @@ type SessionStatus =
   | { kind: "loggedOut" }
   | { kind: "loggedIn"; session: LoginResult };
 
-type Tab = "cockpit" | "briefing" | "log" | "settings" | "about";
+type Tab = "cockpit" | "briefing" | "landing" | "log" | "settings" | "about";
 
 const DEBUG_STORAGE_KEY = "aeroacars.debug";
 const AUTO_FILE_STORAGE_KEY = "aeroacars.autoFile";
@@ -267,6 +268,15 @@ function App() {
           <button
             type="button"
             role="tab"
+            aria-selected={tab === "landing"}
+            className={`tab ${tab === "landing" ? "tab--active" : ""}`}
+            onClick={() => setTab("landing")}
+          >
+            {t("tabs.landing")}
+          </button>
+          <button
+            type="button"
+            role="tab"
             aria-selected={tab === "log"}
             className={`tab ${tab === "log" ? "tab--active" : ""}`}
             onClick={() => setTab("log")}
@@ -327,6 +337,8 @@ function App() {
           simSnapshot={simSnapshot}
         />
       )}
+
+      {status.kind === "loggedIn" && tab === "landing" && <LandingPanel />}
 
       {status.kind === "loggedIn" && tab === "log" && <ActivityLogPanel />}
 
