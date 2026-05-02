@@ -689,42 +689,43 @@ impl Client {
     /// installs without forcing the VA admin to reconfigure their
     /// server.
     pub async fn delete_bid(&self, bid_id: i64) -> Result<(), ApiError> {
-        // CORRECT path is `/api/bids/{id}`, NOT `/api/user/bids/{id}`!
-        // The latter is only the LIST endpoint (GET only). DELETE on
-        // an individual bid lives at `/api/bids/{id}`. Verified
-        // against vmsACARS 2.1's binary, which is the authoritative
-        // reference for phpVMS API usage.
-        let path = format!("/api/bids/{bid_id}");
-        match self.delete_void(&path).await {
-            Ok(()) => Ok(()),
-            Err(ApiError::Server { status: 405, .. }) => {
-                // Laravel's `_method` form-spoof requires the body to be
-                // `application/x-www-form-urlencoded` — sending JSON
-                // doesn't work because Laravel only inspects form
-                // params for the override field. Plus we send the
-                // `X-HTTP-Method-Override: DELETE` header which some
-                // routers / middlewares honour even without form data.
-                // Either path that succeeds wins.
-                tracing::info!(
-                    bid_id,
-                    "DELETE returned 405 — falling back to POST with _method=DELETE form override"
-                );
-                let url = self.endpoint(&path)?;
-                let response = self
-                    .http
-                    .post(url)
-                    .header("X-API-Key", &self.conn.api_key)
-                    .header(header::ACCEPT, "application/json")
-                    .header("X-HTTP-Method-Override", "DELETE")
-                    .form(&[("_method", "DELETE")])
-                    .send()
-                    .await
-                    .map_err(ApiError::from)?;
-                let _ = check_status(response, &path).await?;
-                Ok(())
-            }
-            Err(other) => Err(other),
+        // phpVMS routes ALL bid CRUD through `/api/user/bids` — there
+        // is NO `/api/user/bids/{id}` or `/api/bids/{id}` route, despite
+        // what previous reverse-engineering of vmsACARS' binary
+        // suggested (the strings we saw there are likely alternative
+        // routes added by VA installs, or just unused).
+        //
+        // Verified against the canonical phpVMS source at
+        // github.com/nabeelio/phpvms (`Api/UserController::bids`):
+        //
+        //     if ($request->isMethod('DELETE')) {
+        //         if ($request->filled('bid_id')) {
+        //             $bid = Bid::findOrFail($request->input('bid_id'));
+        //             ...
+        //             $this->bidSvc->removeBid($flight, $user);
+        //         }
+        //     }
+        //
+        // → bid_id travels in the request body. JSON is fine because
+        // Laravel's `$request->input(...)` reads from JSON body, form
+        // body, AND query string transparently.
+        let path = "/api/user/bids";
+        let url = self.endpoint(path)?;
+        #[derive(serde::Serialize)]
+        struct Body {
+            bid_id: i64,
         }
+        let response = self
+            .http
+            .delete(url)
+            .header("X-API-Key", &self.conn.api_key)
+            .header(header::ACCEPT, "application/json")
+            .json(&Body { bid_id })
+            .send()
+            .await
+            .map_err(ApiError::from)?;
+        let _ = check_status(response, path).await?;
+        Ok(())
     }
 
     /// `POST /api/pireps/prefile` — create an in-flight PIREP.

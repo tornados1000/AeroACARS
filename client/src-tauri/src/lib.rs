@@ -3929,49 +3929,225 @@ fn build_pirep_fields(
     _flight: &ActiveFlight,
     stats: &FlightStats,
 ) -> HashMap<String, String> {
-    // SLIM custom-fields set: only the values that need to be sortable
-    // / filterable in phpVMS for VA leaderboards. Everything else
-    // (times, weights, fuel, runway info, METARs, gates, durations)
-    // lives in the human-readable Notes block — same pirep, same data,
-    // far more readable as a paragraph than as a 30-row alphabetical
-    // dump.
+    // FULL custom-fields set, in two parallel forms:
     //
-    // Field names are snake_case so they're visually distinct from
-    // any Title Case fields VAs might add manually for their own
-    // workflows. All values are plain numbers / short strings, no
-    // formatting suffixes — VAs can write SQL ORDER BY directly.
+    //   * Title Case (e.g. "Landing Rate") — formatted with units,
+    //     readable in default phpVMS themes.
+    //   * snake_case (e.g. "landing_peak_vs_fpm") — plain numbers
+    //     for SQL-sortable VA leaderboards.
+    //
+    // The Notes block (separate field on the PIREP) carries the
+    // human prose summary; THIS map carries the structured
+    // values for evaluation. We previously slimmed this to ~6
+    // fields after a UX complaint, but the VA admin needs every
+    // value here to grade flights, so we restore the broad set.
     let mut f: HashMap<String, String> = HashMap::new();
 
-    // Provenance — useful for debugging "which client filed this".
     f.insert(
         "Source".into(),
         format!("AeroACARS/{}", env!("CARGO_PKG_VERSION")),
     );
 
-    // Touchdown firmness — the canonical landing-grade fields, all
-    // numeric so phpVMS can sort/filter for "best landing" awards.
+    // ---- Times (HH:MM:SS UTC, glanceable) + durations ----
+    fn fmt_time(t: &DateTime<Utc>) -> String {
+        t.format("%H:%M:%S UTC").to_string()
+    }
+    if let Some(t) = stats.block_off_at {
+        f.insert("Blocks Off Time".into(), fmt_time(&t));
+    }
+    if let Some(t) = stats.takeoff_at {
+        f.insert("Takeoff Time".into(), fmt_time(&t));
+    }
+    if let Some(t) = stats.landing_at {
+        f.insert("Landing Time".into(), fmt_time(&t));
+    }
+    if let Some(t) = stats.block_on_at {
+        f.insert("Blocks On Time".into(), fmt_time(&t));
+    }
+    if let (Some(off), Some(on)) = (stats.block_off_at, stats.block_on_at) {
+        f.insert(
+            "Total Block Time".into(),
+            humanize_duration_minutes((on - off).num_minutes()),
+        );
+    }
+    if let (Some(takeoff), Some(landing)) = (stats.takeoff_at, stats.landing_at) {
+        f.insert(
+            "Total Flight Time".into(),
+            humanize_duration_minutes((landing - takeoff).num_minutes()),
+        );
+    }
+    if let (Some(off), Some(takeoff)) = (stats.block_off_at, stats.takeoff_at) {
+        f.insert(
+            "Taxi Out Time".into(),
+            humanize_duration_minutes((takeoff - off).num_minutes()),
+        );
+    }
+    if let (Some(land), Some(blocks_on)) = (stats.landing_at, stats.block_on_at) {
+        f.insert(
+            "Taxi In Time".into(),
+            humanize_duration_minutes((blocks_on - land).num_minutes()),
+        );
+    }
+
+    // ---- Weights & fuel (skip 0-value to avoid Fenix-bogus garbage) ----
+    if let Some(w) = stats.takeoff_weight_kg.filter(|v| *v > 0.0) {
+        f.insert("Takeoff Weight".into(), format!("{:.0} kg", w));
+        f.insert("takeoff_weight_kg".into(), format!("{:.0}", w));
+    }
+    if let Some(w) = stats.landing_weight_kg.filter(|v| *v > 0.0) {
+        f.insert("Landing Weight".into(), format!("{:.0} kg", w));
+        f.insert("landing_weight_kg".into(), format!("{:.0}", w));
+    }
+    if let Some(b) = stats.block_fuel_kg.filter(|v| *v > 0.0) {
+        f.insert("Block Fuel".into(), format!("{:.0} kg", b));
+        f.insert("block_fuel_kg".into(), format!("{:.0}", b));
+    }
+    if let Some(fuel) = stats.landing_fuel_kg.filter(|v| *v > 0.0) {
+        f.insert("Landing Fuel".into(), format!("{:.0} kg", fuel));
+        f.insert("landing_fuel_kg".into(), format!("{:.0}", fuel));
+    }
+    if let (Some(b), Some(c)) = (stats.block_fuel_kg, stats.last_fuel_kg) {
+        if b > 0.0 && b > c {
+            f.insert("Fuel Used".into(), format!("{:.0} kg", b - c));
+            f.insert("fuel_used_kg".into(), format!("{:.0}", b - c));
+        }
+    }
+
+    // ---- Touchdown analysis ----
     if let Some(score) = stats.landing_score {
+        f.insert("Landing Score".into(), score.label().to_string());
         f.insert("landing_score".into(), score.numeric().to_string());
         f.insert("landing_score_label".into(), score.label().to_string());
     }
+    if let Some(rate) = stats.landing_rate_fpm {
+        // SIGNED — negative on descent. Matches both LandingToast and
+        // the latched SimVar reading. Pilots want to see the minus.
+        f.insert("Landing Rate".into(), format!("{:.0} fpm", rate));
+        f.insert("landing_rate_fpm".into(), format!("{:.1}", rate));
+    }
     if let Some(vs) = stats.landing_peak_vs_fpm {
+        f.insert("Peak Landing Rate".into(), format!("{:.0} fpm", vs));
         f.insert("landing_peak_vs_fpm".into(), format!("{:.1}", vs));
     }
+    if let Some(g) = stats.landing_g_force {
+        f.insert("Landing G-Force".into(), format!("{:.2} G", g));
+        f.insert("landing_g_force".into(), format!("{:.3}", g));
+    }
     if let Some(g) = stats.landing_peak_g_force {
+        f.insert("Peak Landing G".into(), format!("{:.2} G", g));
         f.insert("landing_peak_g".into(), format!("{:.3}", g));
     }
+    if let Some(p) = stats.landing_pitch_deg {
+        f.insert("Landing Pitch".into(), format!("{:+.1}°", p));
+        f.insert("landing_pitch_deg".into(), format!("{:.2}", p));
+    }
+    if let Some(s) = stats.landing_speed_kt.filter(|v| *v > 0.0) {
+        f.insert("Landing Speed".into(), format!("{:.0} kt", s));
+        f.insert("landing_speed_kt".into(), format!("{:.0}", s));
+    }
+    if let Some(h) = stats.landing_heading_deg {
+        f.insert("Landing Heading".into(), format!("{:03.0}°", h));
+        f.insert("landing_heading_deg".into(), format!("{:.0}", h));
+    }
+    if let Some(slip) = stats.touchdown_sideslip_deg {
+        f.insert("Touchdown Sideslip".into(), format!("{:+.1}°", slip));
+        f.insert("touchdown_sideslip_deg".into(), format!("{:.2}", slip));
+    }
+    if let Some(hw) = stats.landing_headwind_kt {
+        if hw >= 0.0 {
+            f.insert("Touchdown Headwind".into(), format!("{:.0} kt", hw));
+        } else {
+            f.insert("Touchdown Tailwind".into(), format!("{:.0} kt", -hw));
+        }
+        f.insert("touchdown_headwind_kt".into(), format!("{:.1}", hw));
+    }
+    if let Some(xw) = stats.landing_crosswind_kt {
+        let side = if xw >= 0.0 { "from right" } else { "from left" };
+        f.insert(
+            "Touchdown Crosswind".into(),
+            format!("{:.0} kt {}", xw.abs(), side),
+        );
+        f.insert("touchdown_crosswind_kt".into(), format!("{:.1}", xw));
+    }
+    f.insert("Bounces".into(), stats.bounce_count.to_string());
     f.insert("bounce_count".into(), stats.bounce_count.to_string());
 
-    // Runway-precision fields — for VAs running "spot-landing" leagues.
+    // ---- Runway correlation (Tier 2) ----
     if let Some(rw) = &stats.runway_match {
+        f.insert(
+            "Touchdown Runway".into(),
+            format!("{}/{}", rw.airport_ident, rw.runway_ident),
+        );
+        f.insert(
+            "Centerline Offset".into(),
+            format!(
+                "{:.1} m {} (= {:.0} ft)",
+                rw.centerline_distance_m.abs(),
+                rw.side,
+                rw.centerline_distance_abs_ft
+            ),
+        );
+        f.insert(
+            "Touchdown Past Threshold".into(),
+            format!(
+                "{:.0} ft (runway {:.0} ft long)",
+                rw.touchdown_distance_from_threshold_ft, rw.length_ft
+            ),
+        );
+        f.insert(
+            "touchdown_runway_airport".into(),
+            rw.airport_ident.clone(),
+        );
+        f.insert("touchdown_runway_ident".into(), rw.runway_ident.clone());
+        f.insert(
+            "touchdown_runway_length_ft".into(),
+            format!("{:.0}", rw.length_ft),
+        );
         f.insert(
             "touchdown_centerline_m".into(),
             format!("{:.2}", rw.centerline_distance_m),
         );
+        f.insert("touchdown_centerline_side".into(), rw.side.clone());
         f.insert(
             "touchdown_past_threshold_ft".into(),
             format!("{:.0}", rw.touchdown_distance_from_threshold_ft),
         );
+        f.insert("touchdown_runway_surface".into(), rw.surface.clone());
+    }
+
+    // ---- ATC-derived gates and approach runway (from MSFS SimVars) ----
+    if let Some(g) = stats.dep_gate.as_ref().filter(|s| !s.is_empty()) {
+        f.insert("Departure Gate".into(), g.clone());
+    }
+    if let Some(g) = stats.arr_gate.as_ref().filter(|s| !s.is_empty()) {
+        f.insert("Arrival Gate".into(), g.clone());
+    }
+    if let Some(rw) = stats.approach_runway.as_ref().filter(|s| !s.is_empty()) {
+        f.insert("Approach Runway (ATC)".into(), rw.clone());
+    }
+
+    // ---- Distance / cruise level ----
+    if stats.distance_nm > 0.0 {
+        f.insert(
+            "Flown Distance".into(),
+            format!("{:.1} nm", stats.distance_nm),
+        );
+        f.insert(
+            "flown_distance_nm".into(),
+            format!("{:.1}", stats.distance_nm),
+        );
+    }
+    if let Some(fl) = stats.peak_altitude_ft {
+        f.insert("Cruise Level".into(), format!("FL{:.0}", fl / 100.0));
+        f.insert("cruise_level_ft".into(), format!("{:.0}", fl));
+    }
+
+    // ---- METAR snapshots ----
+    if let Some(raw) = stats.dep_metar_raw.as_ref().filter(|s| !s.is_empty()) {
+        f.insert("Departure METAR".into(), raw.clone());
+    }
+    if let Some(raw) = stats.arr_metar_raw.as_ref().filter(|s| !s.is_empty()) {
+        f.insert("Arrival METAR".into(), raw.clone());
     }
 
     f
@@ -4329,7 +4505,7 @@ fn announce_landing_score(app: &AppHandle, flight: &ActiveFlight) {
                 format!("Touchdown: {}", score.label()),
                 Some(format!(
                     "V/S {:.0} fpm, G {:.2}{}",
-                    peak_vs.abs(),
+                    peak_vs,  // signed: negative = descent, matches the PIREP
                     peak_g,
                     bounce_part,
                 )),
