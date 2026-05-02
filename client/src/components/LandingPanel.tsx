@@ -386,56 +386,100 @@ function WindCompass({
   const totalKt = Math.sqrt(hw * hw + xw * xw);
   // atan2(xw, hw) — xw > 0 = from right, hw > 0 = from front
   const angleRad = Math.atan2(xw, hw);
-  const r = 38;
-  const cx = 50;
-  const cy = 50;
+  // Wider viewBox so the labels under the dial don't get clipped at small sizes.
+  const w = 200;
+  const h = 220;
+  const cx = w / 2;
+  const cy = 90;
+  const r = 60;
   const ax = cx + Math.sin(angleRad) * r;
   const ay = cy - Math.cos(angleRad) * r;
 
   return (
     <svg
       className="landing-wind"
-      viewBox="0 0 100 100"
+      viewBox={`0 0 ${w} ${h}`}
       preserveAspectRatio="xMidYMid meet"
       role="img"
       aria-label={t("landing.wind")}
     >
-      <circle
-        cx={cx}
-        cy={cy}
-        r={r + 4}
-        fill="rgba(255,255,255,0.04)"
-        stroke="rgba(255,255,255,0.2)"
-      />
-      {/* Aircraft nose pointing up */}
-      <polygon points={`${cx},${cy - 6} ${cx - 4},${cy + 6} ${cx + 4},${cy + 6}`} fill="#a3a3a3" />
-      {/* Wind arrow */}
-      <line
-        x1={ax}
-        y1={ay}
-        x2={cx}
-        y2={cy}
-        stroke="#38bdf8"
-        strokeWidth="2"
-        markerEnd="url(#wind-arrow)"
-      />
       <defs>
         <marker
           id="wind-arrow"
-          markerWidth="6"
-          markerHeight="6"
-          refX="3"
-          refY="3"
+          markerWidth="8"
+          markerHeight="8"
+          refX="4"
+          refY="4"
           orient="auto"
         >
-          <path d="M0,0 L6,3 L0,6 z" fill="#38bdf8" />
+          <path d="M0,0 L8,4 L0,8 z" fill="#38bdf8" />
         </marker>
       </defs>
-      <text x={cx} y={cy + r + 14} textAnchor="middle" fontSize="9" fill="currentColor">
+      {/* Compass face */}
+      <circle
+        cx={cx}
+        cy={cy}
+        r={r + 8}
+        fill="rgba(255,255,255,0.04)"
+        stroke="rgba(255,255,255,0.25)"
+      />
+      {/* Cardinal ticks */}
+      {[0, 90, 180, 270].map((deg) => {
+        const a = (deg * Math.PI) / 180;
+        const x1 = cx + Math.sin(a) * (r + 8);
+        const y1 = cy - Math.cos(a) * (r + 8);
+        const x2 = cx + Math.sin(a) * (r + 2);
+        const y2 = cy - Math.cos(a) * (r + 2);
+        return (
+          <line
+            key={deg}
+            x1={x1}
+            y1={y1}
+            x2={x2}
+            y2={y2}
+            stroke="rgba(255,255,255,0.35)"
+            strokeWidth="1.5"
+          />
+        );
+      })}
+      {/* Aircraft silhouette pointing up */}
+      <polygon
+        points={`${cx},${cy - 14} ${cx - 9},${cy + 12} ${cx + 9},${cy + 12}`}
+        fill="#a3a3a3"
+      />
+      {/* Wind arrow — points TOWARD the aircraft (from where wind originates) */}
+      <line
+        x1={ax}
+        y1={ay}
+        x2={cx + Math.sin(angleRad) * 14}
+        y2={cy - Math.cos(angleRad) * 14}
+        stroke="#38bdf8"
+        strokeWidth="3"
+        markerEnd="url(#wind-arrow)"
+        strokeLinecap="round"
+      />
+      {/* Total speed below the dial */}
+      <text
+        x={cx}
+        y={cy + r + 28}
+        textAnchor="middle"
+        fontSize="18"
+        fontWeight="600"
+        fill="currentColor"
+      >
         {totalKt.toFixed(0)} kt
       </text>
-      <text x={cx} y={cy + r + 24} textAnchor="middle" fontSize="8" fill="currentColor">
-        H {hw.toFixed(0)} · X {xw.toFixed(0)}
+      {/* Component breakdown */}
+      <text
+        x={cx}
+        y={cy + r + 48}
+        textAnchor="middle"
+        fontSize="11"
+        fill="var(--text-muted, #888)"
+      >
+        H {hw >= 0 ? "+" : ""}
+        {hw.toFixed(0)} · X {xw >= 0 ? "+" : ""}
+        {xw.toFixed(0)} kt
       </text>
     </svg>
   );
