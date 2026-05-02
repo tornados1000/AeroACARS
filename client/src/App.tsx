@@ -20,6 +20,7 @@ type Tab = "cockpit" | "briefing" | "log" | "settings";
 
 const DEBUG_STORAGE_KEY = "aeroacars.debug";
 const AUTO_FILE_STORAGE_KEY = "aeroacars.autoFile";
+const AUTO_START_STORAGE_KEY = "aeroacars.autoStart";
 
 function loadDebugMode(): boolean {
   return localStorage.getItem(DEBUG_STORAGE_KEY) === "1";
@@ -43,6 +44,17 @@ function saveAutoFile(value: boolean) {
   localStorage.setItem(AUTO_FILE_STORAGE_KEY, value ? "1" : "0");
 }
 
+/** Auto-start a flight when the aircraft is parked at the departure
+ *  airport of one of the user's bids. Default OFF — opt-in feature.
+ *  Backend watcher polls every 3 s while enabled. */
+function loadAutoStart(): boolean {
+  return localStorage.getItem(AUTO_START_STORAGE_KEY) === "1";
+}
+
+function saveAutoStart(value: boolean) {
+  localStorage.setItem(AUTO_START_STORAGE_KEY, value ? "1" : "0");
+}
+
 function App() {
   const { t } = useTranslation();
   const [theme, setTheme] = useState<Theme>(() => getInitialTheme());
@@ -50,7 +62,16 @@ function App() {
   const [tab, setTab] = useState<Tab>("briefing");
   const [debugMode, setDebugMode] = useState<boolean>(() => loadDebugMode());
   const [autoFile, setAutoFile] = useState<boolean>(() => loadAutoFile());
+  const [autoStart, setAutoStart] = useState<boolean>(() => loadAutoStart());
   const { status: simStatus, snapshot: simSnapshot } = useSimSession();
+
+  // Sync the persisted auto-start flag to the Rust backend on every
+  // mount/change. Backend default is OFF; localStorage is the source
+  // of truth. Without this sync, the watcher wouldn't run after a
+  // restart even though the toggle is enabled in the UI.
+  useEffect(() => {
+    void invoke("auto_start_set_enabled", { enabled: autoStart }).catch(() => {});
+  }, [autoStart]);
   const simState = simStatus?.state ?? "disconnected";
   const [activeFlight, setActiveFlight] = useState<ActiveFlightInfo | null>(
     null,
@@ -136,6 +157,15 @@ function App() {
   function handleAutoFileChange(next: boolean) {
     setAutoFile(next);
     saveAutoFile(next);
+  }
+
+  function handleAutoStartChange(next: boolean) {
+    setAutoStart(next);
+    saveAutoStart(next);
+    // The useEffect on autoStart will sync the toggle to the Rust
+    // watcher. setState alone won't fire it (React batches), so we
+    // also pre-emptively call here for snappier UX.
+    void invoke("auto_start_set_enabled", { enabled: next }).catch(() => {});
   }
 
   const phpvmsConnected = status.kind === "loggedIn";
@@ -273,6 +303,8 @@ function App() {
           onDebugModeChange={handleDebugModeChange}
           autoFile={autoFile}
           onAutoFileChange={handleAutoFileChange}
+          autoStart={autoStart}
+          onAutoStartChange={handleAutoStartChange}
           theme={theme}
           onThemeChange={setTheme}
           simStatus={simStatus}

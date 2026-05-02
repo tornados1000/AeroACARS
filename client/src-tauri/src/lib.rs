@@ -189,6 +189,19 @@ struct AppState {
     /// In-process airport-coords cache. Keyed by ICAO uppercase. Populated on
     /// first lookup so we don't re-fetch on every snapshot tick.
     airports: Mutex<HashMap<String, Airport>>,
+    /// Auto-start watcher state. When true, a background task polls
+    /// `current_snapshot()` and the user's bids; if the aircraft is
+    /// parked at one of the bid's departure airports AND the loaded
+    /// aircraft matches the bid's planned aircraft, it auto-fires
+    /// `flight_start` for that bid. Persisted via the same
+    /// `aeroacars.autoStart` localStorage key the React side reads.
+    auto_start_enabled: AtomicBool,
+    /// Marker so the watcher doesn't re-trigger after a successful
+    /// auto-start while the resulting flight is still active. Set to
+    /// the Bid ID we last fired for; cleared when the flight ends.
+    /// Without this, a user that cancels the auto-started flight
+    /// while still parked at the gate would get an instant re-trigger.
+    auto_start_last_bid_id: Mutex<Option<i64>>,
 }
 
 /// RAII guard for `AppState::flight_setup_in_progress`. Acquire it at the
@@ -4840,49 +4853,14 @@ fn detect_telemetry_changes(app: &AppHandle, flight: &ActiveFlight, snap: &SimSn
         }
     }
 
-    // ---- FCU selected values (debounced 2 s).
-    // Reborrow `stats` as an explicit `&mut FlightStats` so the
-    // borrow checker can split-borrow disjoint fields when we
-    // pass two `&mut self.field` arguments to the helper. Without
-    // this it sees the MutexGuard's deref and refuses.
-    let now_ts = Utc::now();
-    let stats: &mut FlightStats = &mut stats;
-    fcu_debounce(
-        app,
-        snap.fcu_selected_altitude_ft,
-        &mut stats.last_logged_fcu_alt,
-        &mut stats.pending_fcu_alt,
-        now_ts,
-        "Selected ALT",
-        "ft",
-    );
-    fcu_debounce(
-        app,
-        snap.fcu_selected_heading_deg,
-        &mut stats.last_logged_fcu_hdg,
-        &mut stats.pending_fcu_hdg,
-        now_ts,
-        "Selected HDG",
-        "°",
-    );
-    fcu_debounce(
-        app,
-        snap.fcu_selected_speed_kt,
-        &mut stats.last_logged_fcu_spd,
-        &mut stats.pending_fcu_spd,
-        now_ts,
-        "Selected SPD",
-        "kt",
-    );
-    fcu_debounce(
-        app,
-        snap.fcu_selected_vs_fpm,
-        &mut stats.last_logged_fcu_vs,
-        &mut stats.pending_fcu_vs,
-        now_ts,
-        "Selected V/S",
-        "fpm",
-    );
+    // FCU encoder values (Selected ALT/HDG/SPD/V/S) intentionally
+    // NOT logged. The Fenix LVars (`L:E_FCU_*`) are encoder click
+    // counters, not real engineering values — Selected ALT 23 means
+    // 23 clicks, not FL230 — so the log entries were misleading.
+    // The standard `AUTOPILOT * VAR` SimVars give us the real values
+    // already, but those don't update via LVar anyway. User feedback
+    // (2026-05-02): "die brauchen wir doch nicht bekommen wir doch
+    // eh schon aus dem standart" → drop entirely.
 }
 
 /// Activity-log helper for 3-state cabin signs (OFF / AUTO / ON).
@@ -5454,6 +5432,178 @@ async fn try_resume_flight(
 
 // ---- Bootstrap ----
 
+// ---- Auto-start watcher ----
+//
+// Polls every AUTO_START_INTERVAL_SECS while enabled. When the
+// aircraft is parked at the departure airport of one of the user's
+// bids AND the loaded aircraft type/registration matches the bid,
+// it fires `flight_start` for that bid. Stops re-firing for the
+// same bid until the resulting flight ends (tracked via
+// `AppState::auto_start_last_bid_id`).
+const AUTO_START_INTERVAL_SECS: u64 = 3;
+/// How close to the departure airport (in meters) the aircraft must
+/// be to trigger auto-start. 5 km is generous enough for any major
+/// airport's stand area; tighter and we'd miss bids where the pilot
+/// spawns at a distant gate.
+const AUTO_START_PROXIMITY_M: f64 = 5_000.0;
+
+#[tauri::command]
+fn auto_start_get_enabled(state: tauri::State<'_, AppState>) -> bool {
+    state.auto_start_enabled.load(Ordering::Relaxed)
+}
+
+#[tauri::command]
+fn auto_start_set_enabled(
+    enabled: bool,
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), UiError> {
+    let was = state.auto_start_enabled.swap(enabled, Ordering::Relaxed);
+    if enabled && !was {
+        spawn_auto_start_watcher(app.clone());
+        log_activity_handle(
+            &app,
+            ActivityLevel::Info,
+            "Auto-Start aktiviert".to_string(),
+            Some("Watcher prüft alle 3 s ob ein Bid + Departure-Airport zueinander passen".to_string()),
+        );
+    } else if !enabled && was {
+        log_activity_handle(
+            &app,
+            ActivityLevel::Info,
+            "Auto-Start deaktiviert".to_string(),
+            None,
+        );
+    }
+    Ok(())
+}
+
+/// Spawn the auto-start watcher task. Idempotent in practice:
+/// the body checks `auto_start_enabled` on every tick and returns
+/// when false, so spawning twice just means one drops out quickly.
+fn spawn_auto_start_watcher(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        tracing::info!("auto-start watcher started");
+        loop {
+            tokio::time::sleep(Duration::from_secs(AUTO_START_INTERVAL_SECS)).await;
+            let state = app.state::<AppState>();
+            if !state.auto_start_enabled.load(Ordering::Relaxed) {
+                tracing::info!("auto-start watcher exiting (disabled)");
+                break;
+            }
+            // Skip if a flight is already active.
+            {
+                let guard = state.active_flight.lock().expect("active_flight lock");
+                if guard.is_some() {
+                    continue;
+                }
+            }
+            // Skip if no sim snapshot yet, or the aircraft is moving /
+            // engines on (= already taxiing or rolling, not "ready to
+            // fire" anymore).
+            let Some(snap) = current_snapshot(&app) else {
+                continue;
+            };
+            if !snap.on_ground
+                || snap.groundspeed_kt > 5.0
+                || snap.engines_running > 0
+            {
+                continue;
+            }
+            // Fetch the user's bids to find a match.
+            let client = match {
+                let g = state.client.lock().expect("client lock");
+                g.clone()
+            } {
+                Some(c) => c,
+                None => continue, // not logged in
+            };
+            let bids = match client.get_bids().await {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            // Don't re-fire for the same bid within the same parked
+            // session. Cleared in `flight_end` via the active_flight
+            // guard above resetting on the next tick.
+            let last_bid = {
+                let g = state.auto_start_last_bid_id.lock().unwrap();
+                *g
+            };
+            for bid in &bids {
+                if Some(bid.id) == last_bid {
+                    continue;
+                }
+                if !bid_matches_current_state(bid, &snap) {
+                    continue;
+                }
+                // Match — fire flight_start.
+                tracing::info!(
+                    bid_id = bid.id,
+                    flight = %bid.flight.flight_number,
+                    "auto-start triggering flight_start"
+                );
+                log_activity_handle(
+                    &app,
+                    ActivityLevel::Info,
+                    format!(
+                        "Auto-Start: {} {} → {}",
+                        bid.flight.flight_number,
+                        bid.flight.dpt_airport_id,
+                        bid.flight.arr_airport_id
+                    ),
+                    Some(format!(
+                        "Aircraft {} matched bid {}",
+                        snap.aircraft_title.as_deref().unwrap_or("(unknown)"),
+                        bid.id
+                    )),
+                );
+                {
+                    let mut g = state.auto_start_last_bid_id.lock().unwrap();
+                    *g = Some(bid.id);
+                }
+                let app_for_call = app.clone();
+                let bid_id = bid.id;
+                tauri::async_runtime::spawn(async move {
+                    let state_ref = app_for_call.state::<AppState>();
+                    if let Err(e) =
+                        flight_start(app_for_call.clone(), state_ref, bid_id).await
+                    {
+                        tracing::warn!(
+                            ?e,
+                            bid_id,
+                            "auto-start: flight_start command failed"
+                        );
+                        // Clear the last_bid_id so the user can retry
+                        // by toggling auto-start off/on or fixing the
+                        // condition (e.g. wrong aircraft).
+                        let s = app_for_call.state::<AppState>();
+                        let mut g = s.auto_start_last_bid_id.lock().unwrap();
+                        *g = None;
+                    }
+                });
+                break;
+            }
+        }
+    });
+}
+
+/// Does the loaded aircraft + position match this bid's expectations?
+///
+/// MVP version: airport-proximity match only — pilot must be parked
+/// within `AUTO_START_PROXIMITY_M` of the bid's departure airport.
+/// Aircraft-type matching is not required because resolving the
+/// bid's planned aircraft requires an extra `get_aircraft` API call,
+/// and shipping that on every 3 s tick is too much. If multiple bids
+/// match the same airport, the first one wins; pilot can cancel
+/// the auto-started flight to fall through to the next.
+fn bid_matches_current_state(bid: &Bid, snap: &SimSnapshot) -> bool {
+    let Some((apt_lat, apt_lon)) = runway::airport_position(&bid.flight.dpt_airport_id) else {
+        return false;
+    };
+    let dist = runway::distance_m(snap.lat, snap.lon, apt_lat, apt_lon);
+    dist <= AUTO_START_PROXIMITY_M
+}
+
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,aeroacars=debug"));
@@ -5537,6 +5687,8 @@ pub fn run() {
             inspector_add,
             inspector_remove,
             inspector_list,
+            auto_start_set_enabled,
+            auto_start_get_enabled,
         ])
         .run(tauri::generate_context!())
         .expect("error while running AeroACARS");

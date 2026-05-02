@@ -167,6 +167,43 @@ fn parse_f32(s: Option<&str>) -> Option<f32> {
     s.and_then(|v| if v.is_empty() { None } else { v.parse().ok() })
 }
 
+/// Resolve an airport ICAO/ident to an approximate position by
+/// averaging all runway thresholds belonging to that airport. Used by
+/// the auto-start watcher to check "is the aircraft parked at the
+/// departure airport". The returned point is somewhere on the
+/// airport — usually the geometric centre of the runway layout, give
+/// or take a few hundred meters.
+///
+/// Returns `None` when the ident isn't in the OurAirports table
+/// (uncommon strips, military closed fields, etc.).
+pub fn airport_position(icao: &str) -> Option<(f64, f64)> {
+    let table = runways();
+    let needle = icao.trim().to_uppercase();
+    let mut sum_lat = 0.0_f64;
+    let mut sum_lon = 0.0_f64;
+    let mut count = 0_u32;
+    for row in table.iter() {
+        if row.airport_ident.eq_ignore_ascii_case(&needle) {
+            sum_lat += (row.le_lat + row.he_lat) / 2.0;
+            sum_lon += (row.le_lon + row.he_lon) / 2.0;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        None
+    } else {
+        Some((sum_lat / count as f64, sum_lon / count as f64))
+    }
+}
+
+/// Great-circle distance in meters between two WGS84 points.
+/// Exposed so the auto-start watcher can compute "how close is the
+/// aircraft to the departure airport" without re-implementing the
+/// haversine formula.
+pub fn distance_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    haversine_m(lat1, lon1, lat2, lon2)
+}
+
 /// Look up the runway for a touchdown coordinate.
 ///
 /// `aircraft_heading_true_deg` is used to disambiguate between the two

@@ -20,6 +20,10 @@ interface Props {
    *  via the App.tsx storage helpers. */
   autoFile: boolean;
   onAutoFileChange: (next: boolean) => void;
+  /** Auto-start a flight when the aircraft is parked at one of the
+   *  bid's departure airports. Persisted via App.tsx storage helpers. */
+  autoStart: boolean;
+  onAutoStartChange: (next: boolean) => void;
   theme: Theme;
   onThemeChange: (next: Theme) => void;
   /** Latest sim telemetry — surfaced in the debug section when the
@@ -32,6 +36,8 @@ export function SettingsPanel({
   onDebugModeChange,
   autoFile,
   onAutoFileChange,
+  autoStart,
+  onAutoStartChange,
   theme,
   onThemeChange,
   simStatus,
@@ -140,6 +146,21 @@ export function SettingsPanel({
             <strong>{t("settings.auto_file_label")}</strong>
             <span className="settings__row-hint">
               {t("settings.auto_file_hint")}
+            </span>
+          </span>
+        </label>
+        <label className="settings__checkbox">
+          <input
+            type="checkbox"
+            checked={autoStart}
+            onChange={(e) => onAutoStartChange(e.target.checked)}
+          />
+          <span>
+            <strong>Auto-Start aufzeichnen</strong>
+            <span className="settings__row-hint">
+              Startet einen Flug automatisch, sobald das Flugzeug am
+              Departure-Airport eines deiner Bids steht (≤ 5 km, On-Ground,
+              Engines aus). Watcher tickt alle 3 s.
             </span>
           </span>
         </label>
