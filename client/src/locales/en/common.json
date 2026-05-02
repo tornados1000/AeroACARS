@@ -14,7 +14,7 @@
   "about": {
     "tagline": "Modern ACARS for phpVMS 7 — MSFS 2020/2024 + X-Plane 11/12",
     "purpose_title": "What is AeroACARS?",
-    "purpose_body": "An open-source successor to the classic vmsACARS — Tauri-based, Rust + React, cross-platform. Captures telemetry from the sim, scores landings with industry-grounded thresholds, correlates touchdowns to runway-centerline precision, and ships clean PIREPs to phpVMS.",
+    "purpose_body": "A modern open-source ACARS client — Tauri-based, Rust + React, cross-platform. Captures telemetry from the sim, scores landings with industry-grounded thresholds, correlates touchdowns to runway-centerline precision, and ships clean PIREPs to phpVMS.",
     "acknowledgements_title": "Shoulders AeroACARS stands on",
     "acknowledgements_intro": "These projects were studied, measured, or referenced extensively:",
     "thresholds_title": "Score thresholds — verified sources",
