@@ -689,7 +689,12 @@ impl Client {
     /// installs without forcing the VA admin to reconfigure their
     /// server.
     pub async fn delete_bid(&self, bid_id: i64) -> Result<(), ApiError> {
-        let path = format!("/api/user/bids/{bid_id}");
+        // CORRECT path is `/api/bids/{id}`, NOT `/api/user/bids/{id}`!
+        // The latter is only the LIST endpoint (GET only). DELETE on
+        // an individual bid lives at `/api/bids/{id}`. Verified
+        // against vmsACARS 2.1's binary, which is the authoritative
+        // reference for phpVMS API usage.
+        let path = format!("/api/bids/{bid_id}");
         match self.delete_void(&path).await {
             Ok(()) => Ok(()),
             Err(ApiError::Server { status: 405, .. }) => {

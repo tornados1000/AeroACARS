@@ -1227,10 +1227,14 @@ const TOUCHDOWN_WINDOW_SECS: i64 = 5;
 const TOUCHDOWN_VS_WINDOW_MS: i64 = 500;
 
 /// Peak-G search window, in milliseconds AFTER the on-ground edge.
-/// G spike often lags the contact frame by 100–300 ms (gear strut
-/// compression takes a beat). 1500 ms matches BeatMyLanding's
-/// `MaxGWindowMs`.
-const TOUCHDOWN_G_WINDOW_MS: i64 = 1500;
+/// G spike from gear strut compression typically peaks 100–300 ms
+/// after first contact and is over within ~600 ms. We use 800 ms —
+/// tighter than BeatMyLanding's `MaxGWindowMs` (1500) because the
+/// later ms reach into strut REBOUND territory which inflates G with
+/// pseudo-impact spikes, hurting the score on otherwise-clean
+/// landings (the 1.24 G "acceptable" downgrade we kept seeing on
+/// pilot reports of butter touchdowns).
+const TOUCHDOWN_G_WINDOW_MS: i64 = 800;
 
 /// Maximum window in seconds during which we still count subsequent
 /// liftoffs as bounces of the original touchdown (rather than a fresh
@@ -3905,220 +3909,51 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
 /// names follow the de-facto vmsACARS convention so VAs that already configured
 /// fields for vmsACARS see them populate without any work.
 fn build_pirep_fields(
-    flight: &ActiveFlight,
+    _flight: &ActiveFlight,
     stats: &FlightStats,
 ) -> HashMap<String, String> {
+    // SLIM custom-fields set: only the values that need to be sortable
+    // / filterable in phpVMS for VA leaderboards. Everything else
+    // (times, weights, fuel, runway info, METARs, gates, durations)
+    // lives in the human-readable Notes block — same pirep, same data,
+    // far more readable as a paragraph than as a 30-row alphabetical
+    // dump.
+    //
+    // Field names are snake_case so they're visually distinct from
+    // any Title Case fields VAs might add manually for their own
+    // workflows. All values are plain numbers / short strings, no
+    // formatting suffixes — VAs can write SQL ORDER BY directly.
     let mut f: HashMap<String, String> = HashMap::new();
 
+    // Provenance — useful for debugging "which client filed this".
     f.insert(
         "Source".into(),
         format!("AeroACARS/{}", env!("CARGO_PKG_VERSION")),
     );
-    f.insert("Departure Airport".into(), flight.dpt_airport.clone());
-    f.insert("Arrival Airport".into(), flight.arr_airport.clone());
 
-    // Times: render as readable UTC `HH:MM:SS UTC` instead of full
-    // ISO 8601 with microseconds. The PIREP custom-field column on
-    // phpVMS is narrow and pilots reading it want a glanceable
-    // timestamp, not a 30-character mil-spec timestamp. The full
-    // ISO string is still available in the FlightStarted / Landing
-    // events written to the JSONL flight log on disk.
-    fn fmt_time(t: &DateTime<Utc>) -> String {
-        t.format("%H:%M:%S UTC").to_string()
-    }
-    if let Some(t) = stats.block_off_at {
-        f.insert("Blocks Off Time".into(), fmt_time(&t));
-    }
-    if let Some(t) = stats.takeoff_at {
-        f.insert("Takeoff Time".into(), fmt_time(&t));
-    }
-    if let Some(t) = stats.landing_at {
-        f.insert("Landing Time".into(), fmt_time(&t));
-    }
-    if let Some(t) = stats.block_on_at {
-        f.insert("Blocks On Time".into(), fmt_time(&t));
-    }
-
-    // Skip 0-value weight/fuel fields — Fenix and some addons don't wire the
-    // SimVars reliably and we'd otherwise spam phpVMS custom fields with
-    // "0 kg" placeholders that look broken to dispatchers.
-    if let Some(w) = stats.takeoff_weight_kg.filter(|v| *v > 0.0) {
-        f.insert("Takeoff Weight".into(), format!("{:.0} kg", w));
-    }
-    if let Some(rate) = stats.landing_rate_fpm {
-        // Negative on touchdown — preserve sign so VAs see e.g. -221 fpm.
-        f.insert("Landing Rate".into(), format!("{:.0} fpm", rate));
-    }
-    if let Some(g) = stats.landing_g_force {
-        f.insert("Landing G-Force".into(), format!("{:.2} G", g));
-    }
-    if let Some(p) = stats.landing_pitch_deg {
-        f.insert("Landing Pitch".into(), format!("{:.1}°", p));
-    }
-    if let Some(s) = stats.landing_speed_kt.filter(|v| *v > 0.0) {
-        f.insert("Landing Speed".into(), format!("{:.0} kt", s));
-    }
-    if let Some(h) = stats.landing_heading_deg {
-        f.insert("Landing Heading".into(), format!("{:03.0}°", h));
-    }
-    if let Some(w) = stats.landing_weight_kg.filter(|v| *v > 0.0) {
-        f.insert("Landing Weight".into(), format!("{:.0} kg", w));
-    }
-    if let Some(fuel) = stats.landing_fuel_kg.filter(|v| *v > 0.0) {
-        f.insert("Landing Fuel".into(), format!("{:.0} kg", fuel));
-    }
-    if let Some(b) = stats.block_fuel_kg.filter(|v| *v > 0.0) {
-        f.insert("Block Fuel".into(), format!("{:.0} kg", b));
-    }
-    if let (Some(b), Some(c)) = (stats.block_fuel_kg, stats.last_fuel_kg) {
-        if b > 0.0 && b > c {
-            f.insert("Fuel Used".into(), format!("{:.0} kg", b - c));
-        }
-    }
-
-    // ---- Landing report (Phase I + Tier 1/2/3) ----
-    //
-    // Two parallel surface forms, both derived from the same Rust state:
-    //
-    //   * **Human-readable Title Case** ("Landing Score", "Centerline
-    //     Offset") — for default phpVMS themes that just dump custom
-    //     fields as a key:value table. Always with units in the value.
-    //
-    //   * **Raw machine-readable snake_case** ("landing_score_numeric",
-    //     "touchdown_centerline_m") — separate, plain numbers/strings,
-    //     no formatting. Lets VAs sort/filter PIREPs and build leader-
-    //     boards without regex-parsing the human strings.
-    //
-    // PLUS a single JSON blob field (`touchdown_analysis_json`) with
-    // EVERYTHING including the per-ms touchdown profile. Theme plugins
-    // that want to render charts / runway diagrams parse that one
-    // field instead of stitching ten flat ones together.
-    //
-    // This mirrors BeatMyLanding's "one rich JSON, two render targets"
-    // architecture — only difference is our two targets are phpVMS
-    // (default theme = flat fields, custom theme = JSON) instead of
-    // their in-sim toast + own website.
+    // Touchdown firmness — the canonical landing-grade fields, all
+    // numeric so phpVMS can sort/filter for "best landing" awards.
     if let Some(score) = stats.landing_score {
-        f.insert("Landing Score".into(), score.label().to_string());
+        f.insert("landing_score".into(), score.numeric().to_string());
         f.insert("landing_score_label".into(), score.label().to_string());
-        f.insert("landing_score_numeric".into(), score.numeric().to_string());
     }
     if let Some(vs) = stats.landing_peak_vs_fpm {
-        f.insert("Peak Landing Rate".into(), format!("{:.0} fpm", vs));
         f.insert("landing_peak_vs_fpm".into(), format!("{:.1}", vs));
     }
     if let Some(g) = stats.landing_peak_g_force {
-        f.insert("Peak Landing G".into(), format!("{:.2} G", g));
         f.insert("landing_peak_g".into(), format!("{:.3}", g));
     }
-    if stats.bounce_count > 0 {
-        f.insert("Bounces".into(), stats.bounce_count.to_string());
-    }
     f.insert("bounce_count".into(), stats.bounce_count.to_string());
-    if let Some(slip) = stats.touchdown_sideslip_deg {
-        // Sideslip / crab angle at touchdown — positive = nose right
-        // of track (right-crosswind crab). Useful for VAs grading
-        // crosswind technique.
-        f.insert("Touchdown Sideslip".into(), format!("{:+.1}°", slip));
-        f.insert("touchdown_sideslip_deg".into(), format!("{:.2}", slip));
-    }
 
-    // Runway correlation (Tier 2) — derived from the OurAirports table
-    // by haversine + cross-track math from the touchdown coordinate.
-    // Sits next to `Approach Runway` (which is `ATC RUNWAY SELECTED`
-    // — the *cleared* runway). When they differ, the pilot landed
-    // somewhere they shouldn't have or the ATC SimVar wasn't refreshed.
+    // Runway-precision fields — for VAs running "spot-landing" leagues.
     if let Some(rw) = &stats.runway_match {
-        // Human-readable
-        f.insert(
-            "Touchdown Runway".into(),
-            format!("{}/{}", rw.airport_ident, rw.runway_ident),
-        );
-        f.insert(
-            "Centerline Offset".into(),
-            format!(
-                "{:.1} m {} (= {:.0} ft)",
-                rw.centerline_distance_m.abs(),
-                rw.side,
-                rw.centerline_distance_abs_ft
-            ),
-        );
-        f.insert(
-            "Touchdown Past Threshold".into(),
-            format!(
-                "{:.0} ft (runway {:.0} ft long)",
-                rw.touchdown_distance_from_threshold_ft, rw.length_ft
-            ),
-        );
-        // Raw machine-readable
-        f.insert(
-            "touchdown_runway_airport".into(),
-            rw.airport_ident.clone(),
-        );
-        f.insert("touchdown_runway_ident".into(), rw.runway_ident.clone());
-        f.insert(
-            "touchdown_runway_length_ft".into(),
-            format!("{:.0}", rw.length_ft),
-        );
-        f.insert(
-            "touchdown_runway_heading_true_deg".into(),
-            format!("{:.1}", rw.heading_true_deg),
-        );
         f.insert(
             "touchdown_centerline_m".into(),
             format!("{:.2}", rw.centerline_distance_m),
         );
-        f.insert("touchdown_centerline_side".into(), rw.side.clone());
         f.insert(
             "touchdown_past_threshold_ft".into(),
             format!("{:.0}", rw.touchdown_distance_from_threshold_ft),
-        );
-        f.insert("touchdown_runway_surface".into(), rw.surface.clone());
-    }
-
-    // (No JSON blob field — the flat raw snake_case fields above
-    // already cover sortable leaderboards and per-PIREP display in
-    // any phpVMS theme. If a future widget needs the per-ms V/S
-    // curve we'll add a focused `touchdown_profile_json` field then;
-    // shipping the full analysis blob now would just bloat every
-    // PIREP's custom-fields table without a consumer.)
-
-    // METAR snapshots (Phase J.2) — captured at takeoff / touchdown.
-    if let Some(raw) = stats.dep_metar_raw.as_ref().filter(|s| !s.is_empty()) {
-        f.insert("Departure METAR".into(), raw.clone());
-    }
-    if let Some(raw) = stats.arr_metar_raw.as_ref().filter(|s| !s.is_empty()) {
-        f.insert("Arrival METAR".into(), raw.clone());
-    }
-
-    // ATC-derived gates and approach runway (from MSFS SimVars).
-    if let Some(g) = stats.dep_gate.as_ref().filter(|s| !s.is_empty()) {
-        f.insert("Departure Gate".into(), g.clone());
-    }
-    if let Some(g) = stats.arr_gate.as_ref().filter(|s| !s.is_empty()) {
-        f.insert("Arrival Gate".into(), g.clone());
-    }
-    if let Some(rw) = stats.approach_runway.as_ref().filter(|s| !s.is_empty()) {
-        f.insert("Approach Runway".into(), rw.clone());
-    }
-
-    // Computed durations.
-    if let (Some(off), Some(on)) = (stats.block_off_at, stats.block_on_at) {
-        f.insert(
-            "Total Block Time".into(),
-            humanize_duration_minutes((on - off).num_minutes()),
-        );
-    }
-    if let (Some(takeoff), Some(landing)) = (stats.takeoff_at, stats.landing_at) {
-        f.insert(
-            "Total Flight Time".into(),
-            humanize_duration_minutes((landing - takeoff).num_minutes()),
-        );
-    }
-    if let (Some(land), Some(blocks_on)) = (stats.landing_at, stats.block_on_at) {
-        f.insert(
-            "Taxi In Time".into(),
-            humanize_duration_minutes((blocks_on - land).num_minutes()),
         );
     }
 
@@ -4140,44 +3975,203 @@ fn humanize_duration_minutes(minutes: i64) -> String {
 /// a concise multi-line text that's always visible regardless of how the VA
 /// configured custom fields.
 fn build_pirep_notes(flight: &ActiveFlight, stats: &FlightStats) -> String {
-    let mut lines = Vec::new();
-    lines.push(format!(
-        "{} {} → {}",
+    use std::fmt::Write;
+    let mut s = String::new();
+
+    // Header — flight number + route + (when known) callsign airline.
+    let _ = write!(
+        s,
+        "{} · {} → {}",
         flight.flight_number, flight.dpt_airport, flight.arr_airport
-    ));
-    if let Some(t) = stats.block_off_at {
-        lines.push(format!("Blocks off: {}", t.to_rfc3339()));
-    }
-    if let Some(t) = stats.takeoff_at {
-        lines.push(format!("Takeoff: {}", t.to_rfc3339()));
-    }
-    if let Some(t) = stats.landing_at {
-        lines.push(format!("Landing: {}", t.to_rfc3339()));
-    }
-    if let Some(t) = stats.block_on_at {
-        lines.push(format!("Blocks on: {}", t.to_rfc3339()));
-    }
-    if let Some(rate) = stats.landing_rate_fpm {
-        lines.push(format!(
-            "Touchdown: {:.0} fpm, {:.2} G, {:.1}° pitch, {:.0} kt",
-            rate,
-            stats.landing_g_force.unwrap_or(0.0),
-            stats.landing_pitch_deg.unwrap_or(0.0),
-            stats.landing_speed_kt.unwrap_or(0.0),
-        ));
-    }
-    if let (Some(b), Some(c)) = (stats.block_fuel_kg, stats.last_fuel_kg) {
-        if b > c {
-            lines.push(format!("Fuel: {:.0} kg block / {:.0} kg used", b, b - c));
+    );
+
+    // ---- Times ----
+    let mut wrote_section = false;
+    let start_section = |s: &mut String, title: &str| {
+        s.push_str("\n\n");
+        s.push_str(title);
+        s.push('\n');
+    };
+    let any_time = stats.block_off_at.is_some()
+        || stats.takeoff_at.is_some()
+        || stats.landing_at.is_some()
+        || stats.block_on_at.is_some();
+    if any_time {
+        start_section(&mut s, "TIMES (UTC)");
+        wrote_section = true;
+        if let Some(t) = stats.block_off_at {
+            let _ = writeln!(s, "  Blocks off    {}", t.format("%H:%M:%S"));
+        }
+        if let Some(t) = stats.takeoff_at {
+            let _ = writeln!(s, "  Takeoff       {}", t.format("%H:%M:%S"));
+        }
+        if let Some(t) = stats.landing_at {
+            let _ = writeln!(s, "  Landing       {}", t.format("%H:%M:%S"));
+        }
+        if let Some(t) = stats.block_on_at {
+            let _ = writeln!(s, "  Blocks on     {}", t.format("%H:%M:%S"));
+        }
+        if let (Some(off), Some(on)) = (stats.block_off_at, stats.block_on_at) {
+            let _ = writeln!(
+                s,
+                "  Block time    {}",
+                humanize_duration_minutes((on - off).num_minutes())
+            );
+        }
+        if let (Some(t1), Some(t2)) = (stats.takeoff_at, stats.landing_at) {
+            let _ = writeln!(
+                s,
+                "  Flight time   {}",
+                humanize_duration_minutes((t2 - t1).num_minutes())
+            );
+        }
+        if let (Some(off), Some(takeoff)) = (stats.block_off_at, stats.takeoff_at) {
+            let _ = writeln!(
+                s,
+                "  Taxi out      {}",
+                humanize_duration_minutes((takeoff - off).num_minutes())
+            );
+        }
+        if let (Some(land), Some(on)) = (stats.landing_at, stats.block_on_at) {
+            let _ = writeln!(
+                s,
+                "  Taxi in       {}",
+                humanize_duration_minutes((on - land).num_minutes())
+            );
         }
     }
-    lines.push(format!(
-        "AeroACARS {} ({} positions, {:.1} nm)",
-        env!("CARGO_PKG_VERSION"),
-        stats.position_count,
-        stats.distance_nm
-    ));
-    lines.join("\n")
+
+    // ---- Touchdown ----
+    if stats.landing_at.is_some() {
+        start_section(&mut s, "TOUCHDOWN");
+        wrote_section = true;
+        if let Some(rate) = stats.landing_rate_fpm {
+            let _ = writeln!(s, "  Landing rate  {:.0} fpm", rate);
+        }
+        if let Some(g) = stats.landing_g_force {
+            let _ = writeln!(s, "  G-force       {:.2} G", g);
+        }
+        if let Some(p) = stats.landing_pitch_deg {
+            let _ = writeln!(s, "  Pitch         {:+.1}°", p);
+        }
+        if let Some(kt) = stats.landing_speed_kt.filter(|v| *v > 0.0) {
+            let _ = writeln!(s, "  Speed         {:.0} kt", kt);
+        }
+        if let Some(slip) = stats.touchdown_sideslip_deg {
+            let _ = writeln!(s, "  Sideslip      {:+.1}°", slip);
+        }
+        let _ = writeln!(s, "  Bounces       {}", stats.bounce_count);
+        if let Some(score) = stats.landing_score {
+            let _ = writeln!(
+                s,
+                "  Score         {} ({})",
+                score.label().to_uppercase(),
+                score.numeric()
+            );
+        }
+    }
+
+    // ---- Runway ----
+    if let Some(rw) = &stats.runway_match {
+        start_section(&mut s, "RUNWAY");
+        wrote_section = true;
+        let _ = writeln!(
+            s,
+            "  Touchdown     {}/{}  ({}, {:.0} ft long)",
+            rw.airport_ident, rw.runway_ident, rw.surface, rw.length_ft
+        );
+        let _ = writeln!(
+            s,
+            "  Centerline    {:.1} m  ({})",
+            rw.centerline_distance_m.abs(),
+            rw.side
+        );
+        let _ = writeln!(
+            s,
+            "  Past thresh   {:.0} ft",
+            rw.touchdown_distance_from_threshold_ft
+        );
+    }
+
+    // ---- Fuel & Weight ----
+    let any_fuel = stats.block_fuel_kg.filter(|v| *v > 0.0).is_some()
+        || stats.takeoff_weight_kg.filter(|v| *v > 0.0).is_some()
+        || stats.landing_weight_kg.filter(|v| *v > 0.0).is_some()
+        || stats.landing_fuel_kg.filter(|v| *v > 0.0).is_some();
+    if any_fuel {
+        start_section(&mut s, "FUEL & WEIGHT");
+        wrote_section = true;
+        if let Some(b) = stats.block_fuel_kg.filter(|v| *v > 0.0) {
+            let _ = writeln!(s, "  Block fuel    {:.0} kg", b);
+        }
+        if let (Some(b), Some(c)) = (stats.block_fuel_kg, stats.last_fuel_kg) {
+            if b > 0.0 && b > c {
+                let _ = writeln!(s, "  Fuel used     {:.0} kg", b - c);
+            }
+        }
+        if let Some(f) = stats.landing_fuel_kg.filter(|v| *v > 0.0) {
+            let _ = writeln!(s, "  Landing fuel  {:.0} kg", f);
+        }
+        if let Some(w) = stats.takeoff_weight_kg.filter(|v| *v > 0.0) {
+            let _ = writeln!(s, "  TOW           {:.0} kg", w);
+        }
+        if let Some(w) = stats.landing_weight_kg.filter(|v| *v > 0.0) {
+            let _ = writeln!(s, "  LDW           {:.0} kg", w);
+        }
+    }
+
+    // ---- Stand / Runway (ATC-cleared) ----
+    let any_atc = stats.dep_gate.as_ref().is_some_and(|v| !v.is_empty())
+        || stats.arr_gate.as_ref().is_some_and(|v| !v.is_empty())
+        || stats.approach_runway.as_ref().is_some_and(|v| !v.is_empty());
+    if any_atc {
+        start_section(&mut s, "GATES & ATC");
+        wrote_section = true;
+        if let Some(g) = stats.dep_gate.as_ref().filter(|v| !v.is_empty()) {
+            let _ = writeln!(s, "  Departure gate  {}", g);
+        }
+        if let Some(g) = stats.arr_gate.as_ref().filter(|v| !v.is_empty()) {
+            let _ = writeln!(s, "  Arrival gate    {}", g);
+        }
+        if let Some(rw) = stats.approach_runway.as_ref().filter(|v| !v.is_empty()) {
+            let _ = writeln!(s, "  Approach rwy    {}", rw);
+        }
+    }
+
+    // ---- Distance ----
+    if stats.distance_nm > 0.0 || stats.peak_altitude_ft.is_some() {
+        start_section(&mut s, "DISTANCE & LEVEL");
+        wrote_section = true;
+        let _ = writeln!(s, "  Flown         {:.1} nm", stats.distance_nm);
+        if let Some(fl) = stats.peak_altitude_ft {
+            let _ = writeln!(s, "  Cruise level  FL{:.0}", fl / 100.0);
+        }
+        let _ = writeln!(s, "  Positions     {}", stats.position_count);
+    }
+
+    // ---- METAR ----
+    let dep_metar = stats.dep_metar_raw.as_ref().filter(|v| !v.is_empty());
+    let arr_metar = stats.arr_metar_raw.as_ref().filter(|v| !v.is_empty());
+    if dep_metar.is_some() || arr_metar.is_some() {
+        start_section(&mut s, "METAR");
+        wrote_section = true;
+        if let Some(m) = dep_metar {
+            let _ = writeln!(s, "  Departure  {}", m);
+        }
+        if let Some(m) = arr_metar {
+            let _ = writeln!(s, "  Arrival    {}", m);
+        }
+    }
+
+    // Footer
+    if wrote_section {
+        s.push('\n');
+    } else {
+        s.push_str("\n\n");
+    }
+    let _ = write!(s, "AeroACARS {}", env!("CARGO_PKG_VERSION"));
+
+    s
 }
 
 /// Map our internal `FlightPhase` to the phpVMS PirepStatus code we POST in
