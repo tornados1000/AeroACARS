@@ -3037,15 +3037,27 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
     stats.position_count = stats.position_count.saturating_add(1);
     stats.last_fuel_kg = Some(snap.fuel_total_kg);
 
-    // Block fuel is captured at the Pushback / TaxiOut transition
-    // (block-off moment) below in `step_flight`. Capturing it on
-    // the very first snapshot was unreliable: Fenix doesn't load
-    // EFB-managed fuel until ~5 s after flight_start, so the first
-    // tick saw a stale default (typically 3000 kg / 6600 lb) and
-    // we ended up reporting Used Fuel = 0 because the diff against
-    // the higher real value at landing went negative. The field
-    // stays None until block-off — that's both technically and
-    // operationally correct.
+    // Block fuel = peak fuel observed across the entire flight,
+    // not a single moment-in-time capture. Reasons:
+    //   * Capturing at flight_start (first tick) misses the
+    //     EFB-driven SimBrief refuel that lands ~5 s later (Fenix
+    //     loads fuel async).
+    //   * Capturing at Pushback misses APU burn during boarding
+    //     (APU eats ~150 kg/h, so 10 min boarding = 25 kg already
+    //     burned before "block-off").
+    //   * Tracking the peak naturally captures whatever value the
+    //     pilot actually loaded: as long as fuel only ever
+    //     decreases after refuelling completes, the max equals the
+    //     loaded amount. Defuelling is an unusual edge case we
+    //     accept as imperfect.
+    let live_fuel = snap.fuel_total_kg;
+    if live_fuel > 0.0 {
+        stats.block_fuel_kg = Some(
+            stats
+                .block_fuel_kg
+                .map_or(live_fuel, |peak| peak.max(live_fuel)),
+        );
+    }
 
     // Peak altitude tracker — every tick, take the max with the live
     // MSL altitude. Reported as the PIREP `level` field.
@@ -3103,15 +3115,10 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
             // / hand-flown push (brake released first, then truck).
             if snap.on_ground && snap.groundspeed_kt > 0.5 {
                 stats.block_off_at = Some(now);
-                // Block fuel = fuel on board at the block-off moment.
-                // Capturing here (instead of on the very first
-                // snapshot) survives the typical Fenix-EFB load
-                // sequence: pilot opens EFB during Boarding, sets
-                // fuel via SimBrief import, the LVar settles a few
-                // seconds later. By the time the aircraft actually
-                // moves we're guaranteed to read the final value —
-                // matches what airline ops calls "block fuel".
-                stats.block_fuel_kg = Some(snap.fuel_total_kg);
+                // Note: block_fuel_kg is tracked as a running peak
+                // (see top of step_flight), not captured here. APU
+                // burn during boarding would otherwise eat into the
+                // captured value before block-off ever fires.
                 next_phase = if snap.engines_running == 0 {
                     FlightPhase::Pushback
                 } else {
