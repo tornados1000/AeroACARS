@@ -843,6 +843,27 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
         _ => None,
     };
 
+    // OEW (operating empty weight). Reject implausibly small values —
+    // the Asobo A320neo default reports ~1422 kg which is clearly bogus
+    // (real OEW is ~42 t). Smallest realistic transport-cat empty
+    // weight is a King Air at ~3.5 t / 7700 lb, so we'd ideally clamp
+    // there, but for now we just drop literal-zero readings and trust
+    // the value otherwise (lets GA addons through).
+    let empty_weight_kg: Option<f32> = {
+        let kg = (t.empty_weight_lb * KG_PER_LB) as f32;
+        if kg > 0.0 { Some(kg) } else { None }
+    };
+
+    // Payload = ZFW − OEW. No MSFS SimVar exposes payload directly
+    // (Fenix and most addons leave `PAYLOAD WEIGHT` unwired) but the
+    // arithmetic is exact: ZFW = OEW + Payload by definition. Skip
+    // when either input is missing or the result would be negative
+    // (= bogus OEW > ZFW combination).
+    let payload_kg: Option<f32> = match (zfw_kg, empty_weight_kg) {
+        (Some(z), Some(o)) if z > o => Some(z - o),
+        _ => None,
+    };
+
     // Total fuel flow across all running engines, kg/h. Sum the
     // per-engine PPH SimVars and convert.
     let total_ff_pph = t.eng1_ff_pph + t.eng2_ff_pph + t.eng3_ff_pph + t.eng4_ff_pph;
@@ -1075,7 +1096,7 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
         fuel_total_kg,
         fuel_used_kg: 0.0,
         zfw_kg,
-        payload_kg: None,
+        payload_kg,
         total_weight_kg,
         // Touchdown sample: not yet wired in raw mode; stays None
         // until we add a second data definition for them. The legacy
@@ -1092,17 +1113,7 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
         outside_air_temp_c: Some(t.oat_c as f32),
         total_air_temp_c: Some(t.tat_c as f32),
         mach: Some(t.mach as f32),
-        // Reject implausibly small EMPTY WEIGHT values (the Asobo
-        // A320neo default reports ~1422 kg, way under any plausible
-        // OEW). Smallest realistic transport-cat empty weight is the
-        // Beech King Air at ~3.5 t / 7700 lb; anything under that is
-        // either a GA aircraft (still plausible) or addon CFG bug.
-        // We err on showing the value and let the pilot judge — but
-        // if it's literally 0, drop it.
-        empty_weight_kg: {
-            let kg = (t.empty_weight_lb * KG_PER_LB) as f32;
-            if kg > 0.0 { Some(kg) } else { None }
-        },
+        empty_weight_kg,
         aircraft_title: Some(t.title).filter(|s| !s.is_empty()),
         aircraft_icao: Some(t.atc_model).filter(|s| !s.is_empty()),
         aircraft_registration: Some(t.atc_id).filter(|s| !s.is_empty()),
