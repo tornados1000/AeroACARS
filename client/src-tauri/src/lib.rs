@@ -33,6 +33,10 @@ const SIM_CONFIG_FILE: &str = "sim.json";
 /// File holding the current in-progress flight, written on flight_start and
 /// removed on flight_end / flight_cancel. Lets us resume after a client crash.
 const ACTIVE_FLIGHT_FILE: &str = "active_flight.json";
+/// Persisted activity-log dump — survives app restarts so the pilot
+/// sees the full flight history when they re-open Tauri mid-flight.
+/// Capped at `ACTIVITY_LOG_CAPACITY` entries (same as in-memory).
+const ACTIVITY_LOG_FILE: &str = "activity_log.json";
 
 /// Anything older than this is considered stale and discarded on resume.
 const RESUME_MAX_AGE_HOURS: i64 = 12;
@@ -139,7 +143,7 @@ fn title_mentions_icao(title: &str, icao: &str) -> bool {
 const ACTIVITY_LOG_CAPACITY: usize = 1000;
 
 /// Severity of an activity-log entry. Drives the frontend's icon/colour.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum ActivityLevel {
     Info,
@@ -147,7 +151,7 @@ enum ActivityLevel {
     Error,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ActivityEntry {
     timestamp: DateTime<Utc>,
     level: ActivityLevel,
@@ -993,6 +997,7 @@ fn log_activity(
     while log.len() > ACTIVITY_LOG_CAPACITY {
         log.pop_front();
     }
+    save_activity_log(&log);
 }
 
 /// Same as `log_activity` but takes an `AppHandle` for use inside the
@@ -1034,6 +1039,7 @@ fn log_activity_handle(
     while log.len() > ACTIVITY_LOG_CAPACITY {
         log.pop_front();
     }
+    save_activity_log(&log);
 }
 
 /// `GET` the entire activity log. Frontend polls this every couple of
@@ -1050,6 +1056,9 @@ fn activity_log_get(state: tauri::State<'_, AppState>) -> Vec<ActivityEntry> {
 fn activity_log_clear(state: tauri::State<'_, AppState>) {
     let mut log = state.activity_log.lock().expect("activity_log lock");
     log.clear();
+    // Also persist the cleared state — otherwise a restart would
+    // restore the pre-clear contents from disk.
+    save_activity_log(&log);
 }
 
 // ---- Site config persistence ----
@@ -1264,6 +1273,93 @@ fn read_persisted_flight(app: &AppHandle) -> Option<PersistedFlight> {
     }
     let bytes = std::fs::read(&path).ok()?;
     serde_json::from_slice::<PersistedFlight>(&bytes).ok()
+}
+
+// ---- Activity-log persistence ----
+//
+// Dump the in-memory activity log to disk after every mutation so
+// an app restart mid-flight doesn't lose the running event history.
+// Read once at boot to pre-populate AppState. Cheap: 1000-entry log
+// is roughly 100–200 KB, well within "instant" sync write cost.
+//
+// The path is resolved once on the first call (with the AppHandle
+// available there) and cached in a OnceLock so the lock-free
+// log_activity helper that doesn't have an AppHandle can still
+// persist without re-resolving on every call.
+
+use std::sync::OnceLock;
+static ACTIVITY_LOG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Resolve and cache the activity-log path on first use. Called once
+/// from the Tauri setup hook with the AppHandle, then read from the
+/// OnceLock everywhere afterwards.
+fn init_activity_log_path(app: &AppHandle) {
+    let path = app
+        .path()
+        .app_config_dir()
+        .ok()
+        .map(|dir| dir.join(ACTIVITY_LOG_FILE));
+    let _ = ACTIVITY_LOG_PATH.set(path);
+}
+
+/// Best-effort persist of the entire activity-log VecDeque to disk.
+/// Failures are logged at warn level but never propagated — the
+/// activity log is informational, not safety-critical, and we'd
+/// rather drop a write than crash the streamer.
+fn save_activity_log(log: &VecDeque<ActivityEntry>) {
+    let Some(Some(path)) = ACTIVITY_LOG_PATH.get() else { return };
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::warn!(error = %e, "could not ensure activity-log parent dir");
+            return;
+        }
+    }
+    let entries: Vec<&ActivityEntry> = log.iter().collect();
+    match serde_json::to_vec_pretty(&entries) {
+        Ok(bytes) => {
+            if let Err(e) = std::fs::write(path, bytes) {
+                tracing::warn!(error = %e, "could not write activity log");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "could not serialize activity log"),
+    }
+}
+
+/// Read the persisted activity log on first boot — used to seed the
+/// AppState's VecDeque before Tauri's setup hook runs. We don't have
+/// an AppHandle yet at this point, so we resolve the standard Tauri
+/// config-dir layout manually via APPDATA. Stays best-effort: any
+/// failure just yields an empty log.
+fn load_activity_log_at_boot() -> VecDeque<ActivityEntry> {
+    let appdata = match std::env::var_os("APPDATA") {
+        Some(v) => v,
+        None => return VecDeque::new(),
+    };
+    // Tauri's identifier-based default for app_config_dir on Windows.
+    // Identifier is set in `tauri.conf.json` as `com.cloudeacars.app`.
+    let path = std::path::Path::new(&appdata)
+        .join("com.cloudeacars.app")
+        .join(ACTIVITY_LOG_FILE);
+    if !path.exists() {
+        return VecDeque::new();
+    }
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not read persisted activity log");
+            return VecDeque::new();
+        }
+    };
+    match serde_json::from_slice::<Vec<ActivityEntry>>(&bytes) {
+        Ok(entries) => {
+            tracing::info!(restored = entries.len(), "activity log restored from disk");
+            entries.into_iter().collect()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "could not parse persisted activity log");
+            VecDeque::new()
+        }
+    }
 }
 
 /// Drop any queued positions for the given PIREP. Called when the user
@@ -4719,30 +4815,53 @@ pub fn run() {
     init_tracing();
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "CloudeAcars starting");
 
-    // Eagerly seed the activity log with a clear "App started"
-    // banner before the Tauri runtime even comes up — pilots
-    // restarting the app see this immediately, rather than the
-    // login-conditional "Session restored" line as their only
-    // signal. Differentiates "log cleared by the user" from "app
-    // was closed and re-opened".
+    // Restore the activity log from disk before anything else uses
+    // AppState. Pre-populates the in-memory VecDeque so the pilot
+    // sees the entire flight history (phase changes, lights, METAR
+    // fetches, etc.) when they re-open Tauri mid-flight, instead of
+    // an empty log every time.
     let app_state = AppState::default();
     {
-        let entry = ActivityEntry {
+        let restored = load_activity_log_at_boot();
+        let mut log = app_state.activity_log.lock().expect("activity_log lock");
+        for entry in restored {
+            log.push_back(entry);
+            while log.len() > ACTIVITY_LOG_CAPACITY {
+                log.pop_front();
+            }
+        }
+        // Then append the new "App started" banner on top of the
+        // restored history, so the pilot sees both the past flight
+        // events AND a clear marker for "this is a fresh boot".
+        let banner = ActivityEntry {
             timestamp: Utc::now(),
             level: ActivityLevel::Info,
             message: format!("CloudeAcars v{} gestartet", env!("CARGO_PKG_VERSION")),
-            detail: Some(
-                "Aktivitätsprotokoll wurde nach App-Neustart zurückgesetzt".into(),
-            ),
+            detail: None,
         };
-        tracing::info!(message = %entry.message, detail = ?entry.detail, "activity");
-        let mut log = app_state.activity_log.lock().expect("activity_log lock");
-        log.push_back(entry);
+        tracing::info!(message = %banner.message, "activity");
+        log.push_back(banner);
+        while log.len() > ACTIVITY_LOG_CAPACITY {
+            log.pop_front();
+        }
     }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(app_state)
+        .setup(|app| {
+            // Resolve the activity-log persistence path now that we
+            // have an AppHandle. After this, save_activity_log() can
+            // run without a handle (uses the OnceLock cache).
+            init_activity_log_path(&app.handle());
+            // Persist the boot-time state (restored log + banner)
+            // immediately so a crash before any activity event still
+            // keeps the banner visible on next launch.
+            let state = app.state::<AppState>();
+            let log = state.activity_log.lock().expect("activity_log lock");
+            save_activity_log(&log);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             app_info,
             phpvms_login,
