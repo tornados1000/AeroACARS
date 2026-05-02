@@ -79,7 +79,204 @@ export interface LandingRecord {
 
   runway_match: LandingRunwayMatch | null;
   touchdown_profile: LandingProfilePoint[];
+  approach_samples: ApproachSample[];
 }
+
+export interface ApproachSample {
+  vs_fpm: number;
+  bank_deg: number;
+}
+
+// ---- Score breakdown ---------------------------------------------------
+//
+// We split the overall touchdown score into 6 sub-categories so the pilot
+// can see *which* aspect of the landing pulled the grade down. Each is a
+// 0-100 score with a short rationale. Thresholds are calibrated against
+// FOQA-style guidelines and the existing primary score table.
+
+export interface SubScore {
+  key: string;
+  points: number;
+  /** Pre-formatted value to show on the card ("379 fpm", "1.10 G", …). */
+  value: string;
+  /** "good" | "ok" | "bad" — drives the colour band. */
+  band: "good" | "ok" | "bad";
+  /** Why we awarded this score (one short sentence). */
+  rationale: string;
+}
+
+function band(points: number): "good" | "ok" | "bad" {
+  if (points >= 85) return "good";
+  if (points >= 65) return "ok";
+  return "bad";
+}
+
+function scoreLandingRate(fpm: number): { points: number; rationale: string } {
+  const abs = Math.abs(fpm);
+  if (abs <= 100) return { points: 100, rationale: "smooth_touchdown" };
+  if (abs <= 240) return { points: 90, rationale: "firm_but_clean" };
+  if (abs <= 360) return { points: 75, rationale: "above_target" };
+  if (abs <= 600) return { points: 50, rationale: "hard_landing" };
+  if (abs <= 1000) return { points: 25, rationale: "very_hard" };
+  return { points: 0, rationale: "severe_inspection" };
+}
+
+function scoreGForce(g: number): { points: number; rationale: string } {
+  if (g <= 1.2) return { points: 100, rationale: "smooth_g" };
+  if (g <= 1.4) return { points: 95, rationale: "comfortable_g" };
+  if (g <= 1.7) return { points: 80, rationale: "noticeable_g" };
+  if (g <= 2.0) return { points: 60, rationale: "firm_g" };
+  if (g <= 2.6) return { points: 30, rationale: "hard_g" };
+  return { points: 0, rationale: "severe_g" };
+}
+
+function scoreBounces(n: number): { points: number; rationale: string } {
+  if (n === 0) return { points: 100, rationale: "clean_set" };
+  if (n === 1) return { points: 65, rationale: "one_bounce" };
+  if (n === 2) return { points: 35, rationale: "two_bounces" };
+  return { points: 0, rationale: "many_bounces" };
+}
+
+function scoreStability(vsStd: number): { points: number; rationale: string } {
+  if (vsStd <= 100) return { points: 100, rationale: "very_stable" };
+  if (vsStd <= 200) return { points: 85, rationale: "stable" };
+  if (vsStd <= 300) return { points: 65, rationale: "average_stability" };
+  if (vsStd <= 400) return { points: 45, rationale: "unstable_approach" };
+  return { points: 25, rationale: "very_unstable" };
+}
+
+function scoreRollout(usedPct: number): { points: number; rationale: string } {
+  if (usedPct <= 50) return { points: 100, rationale: "excellent_stop" };
+  if (usedPct <= 70) return { points: 85, rationale: "good_stop" };
+  if (usedPct <= 85) return { points: 65, rationale: "long_rollout" };
+  if (usedPct <= 95) return { points: 40, rationale: "very_long_rollout" };
+  return { points: 20, rationale: "marginal_runway" };
+}
+
+function scoreFuel(absPct: number): { points: number; rationale: string } {
+  if (absPct <= 5) return { points: 100, rationale: "on_plan" };
+  if (absPct <= 10) return { points: 85, rationale: "near_plan" };
+  if (absPct <= 20) return { points: 65, rationale: "off_plan" };
+  if (absPct <= 30) return { points: 45, rationale: "very_off_plan" };
+  return { points: 25, rationale: "way_off_plan" };
+}
+
+function computeSubScores(r: LandingRecord): SubScore[] {
+  const out: SubScore[] = [];
+
+  const rate = scoreLandingRate(r.landing_rate_fpm);
+  out.push({
+    key: "landing_rate",
+    points: rate.points,
+    value: `${r.landing_rate_fpm.toFixed(0)} fpm`,
+    band: band(rate.points),
+    rationale: rate.rationale,
+  });
+
+  if (r.landing_peak_g_force != null) {
+    const g = scoreGForce(r.landing_peak_g_force);
+    out.push({
+      key: "g_force",
+      points: g.points,
+      value: `${r.landing_peak_g_force.toFixed(2)} G`,
+      band: band(g.points),
+      rationale: g.rationale,
+    });
+  }
+
+  const b = scoreBounces(r.bounce_count);
+  out.push({
+    key: "bounces",
+    points: b.points,
+    value: `${r.bounce_count}`,
+    band: band(b.points),
+    rationale: b.rationale,
+  });
+
+  if (r.approach_vs_stddev_fpm != null) {
+    const s = scoreStability(r.approach_vs_stddev_fpm);
+    out.push({
+      key: "stability",
+      points: s.points,
+      value: `${r.approach_vs_stddev_fpm.toFixed(0)} fpm σ`,
+      band: band(s.points),
+      rationale: s.rationale,
+    });
+  }
+
+  if (
+    r.runway_match &&
+    r.runway_match.length_ft > 0 &&
+    r.rollout_distance_m != null
+  ) {
+    const rolloutFt = r.rollout_distance_m * 3.28084;
+    const usedPct = (rolloutFt / r.runway_match.length_ft) * 100;
+    const ro = scoreRollout(usedPct);
+    out.push({
+      key: "rollout",
+      points: ro.points,
+      value: `${usedPct.toFixed(0)}% (${rolloutFt.toFixed(0)} ft)`,
+      band: band(ro.points),
+      rationale: ro.rationale,
+    });
+  }
+
+  if (r.fuel_efficiency_pct != null) {
+    const f = scoreFuel(Math.abs(r.fuel_efficiency_pct));
+    const sign = r.fuel_efficiency_pct >= 0 ? "+" : "";
+    out.push({
+      key: "fuel",
+      points: f.points,
+      value: `${sign}${r.fuel_efficiency_pct.toFixed(1)}%`,
+      band: band(f.points),
+      rationale: f.rationale,
+    });
+  }
+
+  return out;
+}
+
+/** Rationale → coach-tip mapping. The detail-view shows the tip for the
+ *  WORST sub-score so the pilot has one concrete thing to work on next. */
+const COACH_TIPS: Record<string, string> = {
+  // Landing rate
+  smooth_touchdown: "tip.smooth_touchdown",
+  firm_but_clean: "tip.firm_but_clean",
+  above_target: "tip.above_target",
+  hard_landing: "tip.hard_landing",
+  very_hard: "tip.very_hard",
+  severe_inspection: "tip.severe_inspection",
+  // G-force
+  smooth_g: "tip.smooth_g",
+  comfortable_g: "tip.comfortable_g",
+  noticeable_g: "tip.noticeable_g",
+  firm_g: "tip.firm_g",
+  hard_g: "tip.hard_g",
+  severe_g: "tip.severe_g",
+  // Bounces
+  clean_set: "tip.clean_set",
+  one_bounce: "tip.one_bounce",
+  two_bounces: "tip.two_bounces",
+  many_bounces: "tip.many_bounces",
+  // Stability
+  very_stable: "tip.very_stable",
+  stable: "tip.stable",
+  average_stability: "tip.average_stability",
+  unstable_approach: "tip.unstable_approach",
+  very_unstable: "tip.very_unstable",
+  // Rollout
+  excellent_stop: "tip.excellent_stop",
+  good_stop: "tip.good_stop",
+  long_rollout: "tip.long_rollout",
+  very_long_rollout: "tip.very_long_rollout",
+  marginal_runway: "tip.marginal_runway",
+  // Fuel
+  on_plan: "tip.on_plan",
+  near_plan: "tip.near_plan",
+  off_plan: "tip.off_plan",
+  very_off_plan: "tip.very_off_plan",
+  way_off_plan: "tip.way_off_plan",
+};
 
 // ---- Helpers ------------------------------------------------------------
 
@@ -382,18 +579,38 @@ function WindCompass({
   const hw = headwindKt ?? 0;
   const xw = crosswindKt ?? 0;
 
-  // Direction relative to runway: angle from nose
   const totalKt = Math.sqrt(hw * hw + xw * xw);
-  // atan2(xw, hw) — xw > 0 = from right, hw > 0 = from front
+  // atan2(xw, hw) — xw > 0 = from right, hw > 0 = from front. This is
+  // the direction the wind COMES FROM relative to the aircraft nose.
   const angleRad = Math.atan2(xw, hw);
-  // Wider viewBox so the labels under the dial don't get clipped at small sizes.
   const w = 200;
   const h = 220;
   const cx = w / 2;
   const cy = 90;
   const r = 60;
-  const ax = cx + Math.sin(angleRad) * r;
-  const ay = cy - Math.cos(angleRad) * r;
+
+  // Pilot convention: wind is described by the direction it comes FROM.
+  // Render as a wind-vane needle pointing AT that source. Tail starts
+  // near the centre (just outside the aircraft silhouette), head sits
+  // on the rim in the direction the wind is coming from.
+  const tailX = cx + Math.sin(angleRad) * 16;
+  const tailY = cy - Math.cos(angleRad) * 16;
+  const headX = cx + Math.sin(angleRad) * (r - 4);
+  const headY = cy - Math.cos(angleRad) * (r - 4);
+
+  // Pulled from the labels' "from-quadrant" so the user reads it as
+  // "wind aus 5 Uhr" / "from front".
+  const cardinalLabel = (() => {
+    const deg = ((angleRad * 180) / Math.PI + 360) % 360;
+    if (deg < 22.5 || deg >= 337.5) return t("landing.wind_from_front");
+    if (deg < 67.5) return t("landing.wind_from_front_right");
+    if (deg < 112.5) return t("landing.wind_from_right");
+    if (deg < 157.5) return t("landing.wind_from_rear_right");
+    if (deg < 202.5) return t("landing.wind_from_rear");
+    if (deg < 247.5) return t("landing.wind_from_rear_left");
+    if (deg < 292.5) return t("landing.wind_from_left");
+    return t("landing.wind_from_front_left");
+  })();
 
   return (
     <svg
@@ -406,13 +623,13 @@ function WindCompass({
       <defs>
         <marker
           id="wind-arrow"
-          markerWidth="8"
-          markerHeight="8"
-          refX="4"
-          refY="4"
+          markerWidth="10"
+          markerHeight="10"
+          refX="5"
+          refY="5"
           orient="auto"
         >
-          <path d="M0,0 L8,4 L0,8 z" fill="#38bdf8" />
+          <path d="M0,0 L10,5 L0,10 z" fill="#38bdf8" />
         </marker>
       </defs>
       {/* Compass face */}
@@ -442,23 +659,23 @@ function WindCompass({
           />
         );
       })}
-      {/* Aircraft silhouette pointing up */}
+      {/* Aircraft silhouette pointing up (north on dial = nose) */}
       <polygon
         points={`${cx},${cy - 14} ${cx - 9},${cy + 12} ${cx + 9},${cy + 12}`}
         fill="#a3a3a3"
       />
-      {/* Wind arrow — points TOWARD the aircraft (from where wind originates) */}
+      {/* Wind needle — points OUTWARD toward the source (windvane convention). */}
       <line
-        x1={ax}
-        y1={ay}
-        x2={cx + Math.sin(angleRad) * 14}
-        y2={cy - Math.cos(angleRad) * 14}
+        x1={tailX}
+        y1={tailY}
+        x2={headX}
+        y2={headY}
         stroke="#38bdf8"
         strokeWidth="3"
         markerEnd="url(#wind-arrow)"
         strokeLinecap="round"
       />
-      {/* Total speed below the dial */}
+      {/* Total speed */}
       <text
         x={cx}
         y={cy + r + 28}
@@ -469,12 +686,22 @@ function WindCompass({
       >
         {totalKt.toFixed(0)} kt
       </text>
+      {/* "Wind aus vorn", "Wind aus links", … */}
+      <text
+        x={cx}
+        y={cy + r + 46}
+        textAnchor="middle"
+        fontSize="11"
+        fill="var(--text-muted, #888)"
+      >
+        {cardinalLabel}
+      </text>
       {/* Component breakdown */}
       <text
         x={cx}
-        y={cy + r + 48}
+        y={cy + r + 60}
         textAnchor="middle"
-        fontSize="11"
+        fontSize="10"
         fill="var(--text-muted, #888)"
       >
         H {hw >= 0 ? "+" : ""}
@@ -482,6 +709,180 @@ function WindCompass({
         {xw.toFixed(0)} kt
       </text>
     </svg>
+  );
+}
+
+// ---- Approach stability time-series chart ------------------------------
+
+function ApproachChart({ samples }: { samples: ApproachSample[] }) {
+  const { t } = useTranslation();
+  if (samples.length < 3) return null;
+  const w = 600;
+  const h = 140;
+  const pad = { top: 12, right: 12, bottom: 22, left: 40 };
+  const innerW = w - pad.left - pad.right;
+  const innerH = h - pad.top - pad.bottom;
+  const vss = samples.map((s) => s.vs_fpm);
+  const vMin = Math.min(0, ...vss, -1500);
+  const vMax = Math.max(0, ...vss, 100);
+  const vRange = Math.max(1, vMax - vMin);
+  const xStep = innerW / Math.max(1, samples.length - 1);
+  const y = (vs: number) => pad.top + innerH - ((vs - vMin) / vRange) * innerH;
+  const path = samples
+    .map((s, i) => `${i === 0 ? "M" : "L"} ${(pad.left + i * xStep).toFixed(1)} ${y(s.vs_fpm).toFixed(1)}`)
+    .join(" ");
+  // Stable-target band: -1000 to -500 fpm is the typical glide-slope V/S range
+  const bandTop = y(-500);
+  const bandBottom = y(-1000);
+  return (
+    <svg
+      className="landing-chart"
+      viewBox={`0 0 ${w} ${h}`}
+      preserveAspectRatio="xMidYMid meet"
+      role="img"
+      aria-label={t("landing.approach_chart")}
+    >
+      <rect
+        x={pad.left}
+        y={pad.top}
+        width={innerW}
+        height={innerH}
+        fill="rgba(255,255,255,0.02)"
+        stroke="rgba(255,255,255,0.15)"
+      />
+      {/* Stable target band */}
+      <rect
+        x={pad.left}
+        y={bandTop}
+        width={innerW}
+        height={Math.max(0, bandBottom - bandTop)}
+        fill="rgba(34,197,94,0.08)"
+      />
+      <path d={path} fill="none" stroke="#38bdf8" strokeWidth="1.6" />
+      <text x={pad.left - 4} y={y(vMax) + 4} textAnchor="end" fontSize="10" fill="currentColor">
+        {vMax.toFixed(0)}
+      </text>
+      <text x={pad.left - 4} y={y(vMin) + 4} textAnchor="end" fontSize="10" fill="currentColor">
+        {vMin.toFixed(0)}
+      </text>
+      <text x={pad.left} y={h - 6} fontSize="10" fill="currentColor">
+        {t("landing.approach_start")}
+      </text>
+      <text x={pad.left + innerW} y={h - 6} textAnchor="end" fontSize="10" fill="currentColor">
+        {t("landing.touchdown")}
+      </text>
+    </svg>
+  );
+}
+
+// ---- Score breakdown card grid -----------------------------------------
+
+function ScoreBreakdown({ subs }: { subs: SubScore[] }) {
+  const { t } = useTranslation();
+  if (subs.length === 0) return null;
+  return (
+    <div className="landing-subscores">
+      {subs.map((s) => (
+        <div
+          key={s.key}
+          className={`landing-subscore landing-subscore--${s.band}`}
+        >
+          <div className="landing-subscore__head">
+            <span className="landing-subscore__label">
+              {t(`landing.sub.${s.key}`)}
+            </span>
+            <span className="landing-subscore__points">{s.points} PTS</span>
+          </div>
+          <div className="landing-subscore__value">{s.value}</div>
+          <div className="landing-subscore__bar">
+            <div
+              className="landing-subscore__fill"
+              style={{ width: `${s.points}%` }}
+            />
+          </div>
+          <div className="landing-subscore__rationale">
+            {t(`landing.rat.${s.rationale}`)}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ---- Coach tip — focuses on the worst sub-score ------------------------
+
+function CoachTip({ subs }: { subs: SubScore[] }) {
+  const { t } = useTranslation();
+  if (subs.length === 0) return null;
+  // Sort ascending, the lowest sub-score is the area to improve. If
+  // everything is ≥ 90, surface the genuine "good landing" message.
+  const sorted = [...subs].sort((a, b) => a.points - b.points);
+  const worst = sorted[0];
+  const tipKey = COACH_TIPS[worst.rationale] ?? "tip.fallback";
+  return (
+    <div
+      className={`landing-coach landing-coach--${
+        worst.points >= 85 ? "good" : worst.points >= 65 ? "ok" : "bad"
+      }`}
+    >
+      <div className="landing-coach__head">
+        {t("landing.coach_title")} ·{" "}
+        <strong>{t(`landing.sub.${worst.key}`)}</strong>
+      </div>
+      <p className="landing-coach__body">{t(tipKey)}</p>
+    </div>
+  );
+}
+
+// ---- Trend sparkline (last N landings) ---------------------------------
+
+function TrendSparkline({ records }: { records: LandingRecord[] }) {
+  const { t } = useTranslation();
+  if (records.length < 2) return null;
+  // Use newest-first list; chart wants oldest→newest left→right.
+  const latest = records.slice(0, 12).reverse();
+  const w = 360;
+  const h = 60;
+  const pad = 6;
+  const innerW = w - pad * 2;
+  const innerH = h - pad * 2;
+  const scores = latest.map((r) => r.score_numeric);
+  const sMin = Math.min(...scores, 50);
+  const sMax = Math.max(...scores, 100);
+  const range = Math.max(1, sMax - sMin);
+  const xStep = innerW / Math.max(1, latest.length - 1);
+  const y = (s: number) => pad + innerH - ((s - sMin) / range) * innerH;
+  const path = latest
+    .map((r, i) =>
+      `${i === 0 ? "M" : "L"} ${(pad + i * xStep).toFixed(1)} ${y(r.score_numeric).toFixed(1)}`,
+    )
+    .join(" ");
+  const last = latest[latest.length - 1];
+  return (
+    <div className="landing-trend">
+      <span className="landing-trend__label">{t("landing.trend")}</span>
+      <svg
+        className="landing-trend__svg"
+        viewBox={`0 0 ${w} ${h}`}
+        preserveAspectRatio="none"
+        role="img"
+        aria-label={t("landing.trend")}
+      >
+        <path d={path} fill="none" stroke="#38bdf8" strokeWidth="2" />
+        {latest.map((r, i) => (
+          <circle
+            key={r.pirep_id}
+            cx={pad + i * xStep}
+            cy={y(r.score_numeric)}
+            r={i === latest.length - 1 ? 4 : 2}
+            fill={i === latest.length - 1 ? gradeColor(r.grade_letter) : "#38bdf8"}
+          />
+        ))}
+      </svg>
+      <span className="landing-trend__last">
+        {last.score_numeric}/100 · {last.grade_letter}
+      </span>
+    </div>
   );
 }
 
@@ -577,11 +978,14 @@ function StabilityIndicator({
 
 function LandingDetail({
   record,
+  allRecords,
   onBack,
   onDelete,
   isPreview,
 }: {
   record: LandingRecord;
+  /** Full history — used to compute personal-best comparisons. */
+  allRecords: LandingRecord[];
   onBack: () => void;
   onDelete?: () => void;
   isPreview: boolean;
@@ -591,6 +995,24 @@ function LandingDetail({
   const callsign = record.airline_icao
     ? `${record.airline_icao}${record.flight_number}`
     : record.flight_number;
+
+  const subs = useMemo(() => computeSubScores(record), [record]);
+
+  // Personal-best comparison — best (closest to zero) landing rate
+  // across ALL filed PIREPs. None when this is the only record yet.
+  const personalBest = useMemo(() => {
+    const others = allRecords.filter((r) => r.pirep_id !== record.pirep_id);
+    if (others.length === 0) return null;
+    return others.reduce(
+      (best, r) =>
+        Math.abs(r.landing_rate_fpm) < Math.abs(best.landing_rate_fpm) ? r : best,
+      others[0],
+    );
+  }, [allRecords, record.pirep_id]);
+
+  const isNewBest =
+    personalBest != null &&
+    Math.abs(record.landing_rate_fpm) < Math.abs(personalBest.landing_rate_fpm);
 
   return (
     <div className="landing-detail">
@@ -627,6 +1049,9 @@ function LandingDetail({
             {isPreview && (
               <span className="landing-preview-badge">{t("landing.preview")}</span>
             )}
+            {isNewBest && (
+              <span className="landing-best-badge">★ {t("landing.new_best")}</span>
+            )}
           </div>
           {record.aircraft_title && (
             <div className="landing-headline__aircraft">
@@ -636,13 +1061,27 @@ function LandingDetail({
               {record.sim_kind ? ` · ${record.sim_kind}` : ""}
             </div>
           )}
+          {personalBest && !isNewBest && (
+            <div className="landing-headline__pb">
+              {t("landing.this_landing")}: {record.landing_rate_fpm.toFixed(0)} fpm ·{" "}
+              {t("landing.personal_best")}: {personalBest.landing_rate_fpm.toFixed(0)}{" "}
+              fpm ({personalBest.dpt_airport} → {personalBest.arr_airport})
+            </div>
+          )}
         </div>
       </div>
 
-      {/* Top row: V/S curve + key metrics */}
+      {/* Score breakdown — most important new section */}
+      <section className="landing-section">
+        <h3>{t("landing.score_breakdown")}</h3>
+        <ScoreBreakdown subs={subs} />
+        <CoachTip subs={subs} />
+      </section>
+
+      {/* Touchdown: V/S curve + vitals + Wind compass (consolidated) */}
       <section className="landing-section">
         <h3>{t("landing.touchdown")}</h3>
-        <div className="landing-grid landing-grid--2">
+        <div className="landing-grid landing-grid--td">
           <VsCurveChart profile={record.touchdown_profile} />
           <dl className="landing-keyvals">
             <div>
@@ -686,22 +1125,27 @@ function LandingDetail({
               <dd>{fmtNumber(record.landing_heading_deg, 0, "°")}</dd>
             </div>
           </dl>
-        </div>
-      </section>
-
-      {/* Approach + Wind row */}
-      <section className="landing-section">
-        <h3>{t("landing.approach_stability")}</h3>
-        <div className="landing-grid landing-grid--2">
-          <StabilityIndicator
-            vsStd={record.approach_vs_stddev_fpm}
-            bankStd={record.approach_bank_stddev_deg}
-          />
           <WindCompass
             headwindKt={record.headwind_kt}
             crosswindKt={record.crosswind_kt}
           />
         </div>
+      </section>
+
+      {/* Approach stability — full-width, with chart underneath the bands */}
+      <section className="landing-section">
+        <h3>{t("landing.approach_stability")}</h3>
+        <div className="landing-stability-row">
+          <StabilityIndicator
+            vsStd={record.approach_vs_stddev_fpm}
+            bankStd={record.approach_bank_stddev_deg}
+          />
+        </div>
+        {record.approach_samples.length >= 3 && (
+          <div className="landing-stability-chart">
+            <ApproachChart samples={record.approach_samples} />
+          </div>
+        )}
       </section>
 
       {/* Runway */}
@@ -925,6 +1369,7 @@ export function LandingPanel() {
         <section className="phase landing-panel">
           <LandingDetail
             record={rec}
+            allRecords={records}
             onBack={() => setSelectedId(null)}
             onDelete={() => handleDelete(rec.pirep_id)}
             isPreview={false}
@@ -942,6 +1387,7 @@ export function LandingPanel() {
           <h3>{t("landing.live_preview")}</h3>
           <LandingDetail
             record={preview}
+            allRecords={records}
             onBack={() => setPreview(null)}
             isPreview={true}
           />
@@ -950,6 +1396,7 @@ export function LandingPanel() {
 
       <h2 className="landing-history-title">{t("landing.history")}</h2>
       <HistoryStats records={records} />
+      <TrendSparkline records={records} />
 
       {loading && records.length === 0 && (
         <p className="landing-empty">{t("landing.loading")}</p>

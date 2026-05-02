@@ -22,8 +22,8 @@ use serde::{Deserialize, Serialize};
 use metar::{MetarError, MetarSnapshot};
 use recorder::{FlightLogEvent, FlightOutcome, FlightRecorder};
 use storage::{
-    LandingProfilePoint, LandingRecord, LandingRunwayMatch, LandingStore, PositionQueue,
-    QueuedPosition,
+    ApproachSample, LandingProfilePoint, LandingRecord, LandingRunwayMatch, LandingStore,
+    PositionQueue, QueuedPosition,
 };
 use sim_core::{FlightPhase, SimKind, SimSnapshot};
 use tauri::{AppHandle, Manager};
@@ -2974,6 +2974,15 @@ fn build_landing_record(
         })
         .collect();
 
+    let approach_samples = stats
+        .approach_buffer
+        .iter()
+        .map(|(vs, bank)| ApproachSample {
+            vs_fpm: *vs,
+            bank_deg: *bank,
+        })
+        .collect();
+
     Some(LandingRecord {
         pirep_id: flight.pirep_id.clone(),
         touchdown_at,
@@ -3032,6 +3041,7 @@ fn build_landing_record(
 
         runway_match,
         touchdown_profile,
+        approach_samples,
     })
 }
 

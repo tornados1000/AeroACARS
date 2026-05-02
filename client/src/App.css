@@ -3578,3 +3578,219 @@ input:disabled {
   color: #f97316;
 }
 
+/* ---- Score breakdown ---- */
+
+.landing-subscores {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 0.75rem;
+}
+
+.landing-subscore {
+  background: var(--surface-2);
+  border-left: 4px solid var(--border);
+  border-radius: 10px;
+  padding: 0.75rem 0.9rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  min-width: 0;
+}
+
+.landing-subscore--good {
+  border-left-color: #22c55e;
+}
+.landing-subscore--ok {
+  border-left-color: #eab308;
+}
+.landing-subscore--bad {
+  border-left-color: #ef4444;
+}
+
+.landing-subscore__head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  gap: 0.5rem;
+}
+
+.landing-subscore__points {
+  font-weight: 600;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.landing-subscore__value {
+  font-size: 1.1rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.landing-subscore__bar {
+  height: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.landing-subscore__fill {
+  height: 100%;
+  border-radius: 3px;
+  background: currentColor;
+  opacity: 0.65;
+  transition: width 0.3s ease;
+}
+
+.landing-subscore--good .landing-subscore__fill {
+  background: #22c55e;
+}
+.landing-subscore--ok .landing-subscore__fill {
+  background: #eab308;
+}
+.landing-subscore--bad .landing-subscore__fill {
+  background: #ef4444;
+}
+
+.landing-subscore__rationale {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  line-height: 1.3;
+}
+
+/* ---- Coach tip ---- */
+
+.landing-coach {
+  margin-top: 1rem;
+  padding: 0.85rem 1rem;
+  border-radius: 10px;
+  border-left: 4px solid;
+  background: var(--surface-2);
+}
+
+.landing-coach--good {
+  border-left-color: #22c55e;
+  background: rgba(34, 197, 94, 0.06);
+}
+.landing-coach--ok {
+  border-left-color: #eab308;
+  background: rgba(234, 179, 8, 0.06);
+}
+.landing-coach--bad {
+  border-left-color: #ef4444;
+  background: rgba(239, 68, 68, 0.06);
+}
+
+.landing-coach__head {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  margin-bottom: 0.4rem;
+}
+
+.landing-coach__head strong {
+  color: var(--text);
+}
+
+.landing-coach__body {
+  margin: 0;
+  font-size: 0.95rem;
+  line-height: 1.4;
+}
+
+/* ---- New Touchdown grid: chart | keyvals | wind ---- */
+
+.landing-grid--td {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1.8fr) minmax(0, 1fr);
+  gap: 1.25rem;
+  align-items: start;
+}
+
+@media (max-width: 1100px) {
+  .landing-grid--td {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+  .landing-grid--td > .landing-wind {
+    grid-column: 1 / -1;
+    justify-self: center;
+  }
+}
+
+@media (max-width: 720px) {
+  .landing-grid--td {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ---- Stability section gets full width now that wind moved out ---- */
+
+.landing-stability-row {
+  max-width: 720px;
+}
+
+.landing-stability-chart {
+  margin-top: 1rem;
+}
+
+/* ---- Personal-best line in the headline ---- */
+
+.landing-headline__pb {
+  margin-top: 0.35rem;
+  font-size: 0.82rem;
+  color: var(--text-muted);
+}
+
+.landing-best-badge {
+  display: inline-block;
+  margin-left: 0.5rem;
+  padding: 0.1rem 0.55rem;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #facc15, #f59e0b);
+  color: #000;
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* ---- Trend sparkline above the table ---- */
+
+.landing-trend {
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.6rem 1rem;
+}
+
+.landing-trend__label {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.landing-trend__svg {
+  flex: 1;
+  height: 60px;
+  min-width: 0;
+}
+
+.landing-trend__last {
+  font-size: 0.85rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+

@@ -264,6 +264,21 @@ pub struct LandingRecord {
     // Touchdown profile (V/S + G curve, ~150 samples)
     #[serde(default)]
     pub touchdown_profile: Vec<LandingProfilePoint>,
+
+    /// Rolling buffer of (V/S, bank) samples captured during the
+    /// Approach + Final phases. ~120 entries at 5-8 s cadence.
+    /// Drives the approach-stability time-series chart in the Landing
+    /// tab. Indexed left-to-right oldest-to-newest.
+    #[serde(default)]
+    pub approach_samples: Vec<ApproachSample>,
+}
+
+/// One (V/S, bank) sample taken during Approach/Final, used by the
+/// approach-stability chart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApproachSample {
+    pub vs_fpm: f32,
+    pub bank_deg: f32,
 }
 
 /// File-backed JSON store of past landings.
