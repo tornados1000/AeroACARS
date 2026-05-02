@@ -5,6 +5,8 @@
 //! per-user config dir. The API key itself is stored via `secrets` (OS keyring),
 //! never on disk in plaintext.
 
+mod runway;
+
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -361,6 +363,19 @@ struct PersistedFlightStats {
     peak_altitude_ft: Option<f32>,
     #[serde(default)]
     aircraft_banner_logged: bool,
+    // ---- Tier 1/2/3 (BeatMyLanding-aligned) touchdown extras ----
+    #[serde(default)]
+    touchdown_sideslip_deg: Option<f32>,
+    #[serde(default)]
+    touchdown_profile: Vec<TouchdownProfilePoint>,
+    #[serde(default)]
+    runway_match: Option<runway::RunwayMatch>,
+    #[serde(default)]
+    landing_lat: Option<f64>,
+    #[serde(default)]
+    landing_lon: Option<f64>,
+    #[serde(default)]
+    landing_heading_true_deg: Option<f32>,
 }
 
 impl PersistedFlightStats {
@@ -397,6 +412,12 @@ impl PersistedFlightStats {
             cruise_peak_msl: stats.cruise_peak_msl,
             peak_altitude_ft: stats.peak_altitude_ft,
             aircraft_banner_logged: stats.aircraft_banner_logged,
+            touchdown_sideslip_deg: stats.touchdown_sideslip_deg,
+            touchdown_profile: stats.touchdown_profile.clone(),
+            runway_match: stats.runway_match.clone(),
+            landing_lat: stats.landing_lat,
+            landing_lon: stats.landing_lon,
+            landing_heading_true_deg: stats.landing_heading_true_deg,
         }
     }
 
@@ -439,16 +460,42 @@ impl PersistedFlightStats {
         stats.cruise_peak_msl = self.cruise_peak_msl;
         stats.peak_altitude_ft = self.peak_altitude_ft;
         stats.aircraft_banner_logged = self.aircraft_banner_logged;
+        stats.touchdown_sideslip_deg = self.touchdown_sideslip_deg;
+        stats.touchdown_profile = self.touchdown_profile;
+        stats.runway_match = self.runway_match;
+        stats.landing_lat = self.landing_lat;
+        stats.landing_lon = self.landing_lon;
+        stats.landing_heading_true_deg = self.landing_heading_true_deg;
     }
 }
 
 /// One entry in the touchdown ring buffer (see `FlightStats::snapshot_buffer`).
+///
+/// Carries enough fields for the post-touchdown analyzer (V/S, G,
+/// on-ground edge, AGL for bounce detection) and the touchdown profile
+/// reconstruction (heading, GS, IAS, lat/lon for sideslip + runway
+/// correlation). Sampled at ~30 Hz so a 5-second buffer holds ~150
+/// entries — cheap, but rich enough to produce a per-Touchdown-ms
+/// V/S curve identical to what BeatMyLanding ships.
 #[derive(Debug, Clone, Copy)]
 struct TelemetrySample {
     at: DateTime<Utc>,
     vs_fpm: f32,
     g_force: f32,
     on_ground: bool,
+    /// AGL altitude — drives bounce detection (35 ft up / 5 ft return,
+    /// BeatMyLanding-aligned). Sourced from `altitude_agl_ft` directly.
+    agl_ft: f32,
+    /// True heading at the moment of sample. Used at touchdown to
+    /// reconstruct ground track from successive lat/lon pairs and
+    /// derive sideslip / crab angle.
+    heading_true_deg: f32,
+    groundspeed_kt: f32,
+    indicated_airspeed_kt: f32,
+    lat: f64,
+    lon: f64,
+    pitch_deg: f32,
+    bank_deg: f32,
 }
 
 /// Maximum age of any entry in the touchdown ring buffer. 5 s gives
@@ -457,6 +504,27 @@ struct TelemetrySample {
 /// shorter than ~3 s and we'd miss the descent rate moments before
 /// flare.
 const TOUCHDOWN_BUFFER_SECS: i64 = 5;
+
+/// One frozen subsample around the touchdown moment, surfaced in the
+/// PIREP notes block as a tiny V/S / G curve. Modelled after
+/// BeatMyLanding's `LandingTouchdownProfilePoint`. Times are in ms
+/// relative to the on-ground edge — negative = before, positive =
+/// after.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct TouchdownProfilePoint {
+    /// Milliseconds relative to the touchdown edge. Range roughly
+    /// −5000..+0 in the captured slice (only the buffer's history).
+    t_ms: i32,
+    vs_fpm: f32,
+    g_force: f32,
+    agl_ft: f32,
+    on_ground: bool,
+    heading_true_deg: f32,
+    groundspeed_kt: f32,
+    indicated_airspeed_kt: f32,
+    pitch_deg: f32,
+    bank_deg: f32,
+}
 
 #[derive(Default)]
 struct FlightStats {
@@ -514,6 +582,42 @@ struct FlightStats {
     /// repeated streamer ticks (or a Tauri restart that resumes after
     /// touchdown) don't re-fire the entry.
     landing_score_announced: bool,
+
+    /// Edge-tracking flag for AGL-based bounce detection. Set to true
+    /// once the aircraft climbs above `BOUNCE_AGL_THRESHOLD_FT` after
+    /// the initial touchdown; a subsequent drop below
+    /// `BOUNCE_AGL_RETURN_FT` (within `BOUNCE_WINDOW_SECS`) increments
+    /// `bounce_count` and clears this flag, ready to arm again.
+    /// Replaces the noisy `was_on_ground && !on_ground` flicker we
+    /// used pre-Tier-1, which was tripping on gear-strut oscillation.
+    bounce_armed_above_threshold: bool,
+    /// Sideslip / crab angle at the moment of touchdown, in degrees.
+    /// Computed from `heading_true_deg − groundtrack` where the
+    /// ground track is reconstructed from the last few ring-buffer
+    /// samples just before touchdown. Positive = aircraft nose right
+    /// of track (right crosswind crab); negative = nose left.
+    /// `None` until we capture it; `None` also when the buffer can't
+    /// produce a track (e.g. taxi-speed touchdown after a roll-out).
+    touchdown_sideslip_deg: Option<f32>,
+    /// Frozen subsample of the ring buffer covering ±2 s around touchdown,
+    /// for V/S-curve reconstruction in the PIREP notes block. Captured
+    /// once when the on-ground edge fires; surviving across a Tauri
+    /// restart so a resumed flight still has the curve to ship.
+    touchdown_profile: Vec<TouchdownProfilePoint>,
+    /// Runway-correlation result from the OurAirports CSV lookup,
+    /// computed once at the touchdown edge from `(landing_lat,
+    /// landing_lon, landing_heading_true_deg)`. Drives the runway
+    /// distance / centerline-offset fields in the PIREP. None until
+    /// computed; None also when no runway is within ~3 km of the
+    /// touchdown coordinate.
+    runway_match: Option<runway::RunwayMatch>,
+    /// Latitude at the touchdown edge — captured separately from
+    /// `last_lat` so a resume mid-rollout doesn't overwrite it.
+    landing_lat: Option<f64>,
+    landing_lon: Option<f64>,
+    /// True heading at touchdown (used for runway-end disambiguation
+    /// in the runway lookup; `landing_heading_deg` is *magnetic*).
+    landing_heading_true_deg: Option<f32>,
 
     // ---- METAR snapshots (Phase J.2) ----
     /// Raw METAR text captured at takeoff for the departure airport.
@@ -905,6 +1009,63 @@ fn detent_label(detent: u8) -> &'static str {
     }
 }
 
+/// Compute sideslip / crab angle at touchdown by reconstructing the
+/// ground track from buffered samples and subtracting it from the
+/// reported true heading. Positive = aircraft nose right of track
+/// (right-crosswind crab), negative = nose left.
+///
+/// Returns `None` when the buffer doesn't have enough recent airborne
+/// samples spanning at least 200 ms — that happens on a resumed
+/// flight, on touch-and-go captures with already-on-ground samples,
+/// or when groundspeed is below 30 kt (vector noise dominates).
+///
+/// The track baseline is bounded to the last 500 ms of the buffer
+/// (`TOUCHDOWN_VS_WINDOW_MS`); a longer baseline is more stable but
+/// would average across the flare maneuver and bias the result.
+fn compute_sideslip_at_touchdown(
+    buffer: &std::collections::VecDeque<TelemetrySample>,
+    heading_true_deg: f32,
+    now: DateTime<Utc>,
+) -> Option<f32> {
+    let window_start = now - chrono::Duration::milliseconds(TOUCHDOWN_VS_WINDOW_MS);
+    // Use only airborne samples — once on the ground, "ground track"
+    // is just where the wheels point, so it'd cancel sideslip out.
+    let recent: Vec<&TelemetrySample> = buffer
+        .iter()
+        .filter(|s| s.at >= window_start && !s.on_ground)
+        .collect();
+    if recent.len() < 2 {
+        return None;
+    }
+    let first = recent.first()?;
+    let last = recent.last()?;
+    if (last.at - first.at).num_milliseconds() < 200 {
+        return None;
+    }
+    // Skip noise-dominated low-speed cases.
+    if last.groundspeed_kt < 30.0 {
+        return None;
+    }
+    // Initial bearing from `first` to `last` is the ground track
+    // direction over the window.
+    let lat1 = (first.lat).to_radians();
+    let lat2 = (last.lat).to_radians();
+    let dlon = (last.lon - first.lon).to_radians();
+    let y = dlon.sin() * lat2.cos();
+    let x = lat1.cos() * lat2.sin() - lat1.sin() * lat2.cos() * dlon.cos();
+    let track_deg = y.atan2(x).to_degrees();
+    let track_norm = ((track_deg % 360.0) + 360.0) % 360.0;
+    // Sideslip = heading − track, normalised to (−180..+180].
+    let mut diff = heading_true_deg as f64 - track_norm;
+    while diff > 180.0 {
+        diff -= 360.0;
+    }
+    while diff <= -180.0 {
+        diff += 360.0;
+    }
+    Some(diff as f32)
+}
+
 /// Render the full callsign as "DLH 155" (airline + space + number) when
 /// the airline ICAO is known, falling back to bare "155" otherwise.
 fn format_callsign(airline_icao: &str, flight_number: &str) -> String {
@@ -928,8 +1089,41 @@ const STATS_PERSIST_EVERY_TICKS: u32 = 5;
 /// on-ground tick we keep refining peak G-force and peak descent rate
 /// before locking in the final score. 5 s is enough to catch the spike
 /// (which can lag the initial contact by a tick or two) without bleeding
-/// into the rollout.
+/// into the rollout. Bounded above by `TOUCHDOWN_BUFFER_SECS` (the ring
+/// buffer's reach) and below by `TOUCHDOWN_G_WINDOW_MS`.
 const TOUCHDOWN_WINDOW_SECS: i64 = 5;
+
+/// V/S sampling window around the on-ground edge, in milliseconds.
+/// We pick the worst-case (most negative) V/S from buffered samples
+/// within ±`/2` of the touchdown timestamp instead of using a single
+/// tick. 500 ms matches BeatMyLanding's `TouchdownWindowMs` — large
+/// enough that the actual contact frame falls inside even when the
+/// edge detection is one tick late, small enough not to pull in
+/// pre-flare descent or post-bounce rebound values.
+const TOUCHDOWN_VS_WINDOW_MS: i64 = 500;
+
+/// Peak-G search window, in milliseconds AFTER the on-ground edge.
+/// G spike often lags the contact frame by 100–300 ms (gear strut
+/// compression takes a beat). 1500 ms matches BeatMyLanding's
+/// `MaxGWindowMs`.
+const TOUCHDOWN_G_WINDOW_MS: i64 = 1500;
+
+/// Maximum window in seconds during which we still count subsequent
+/// liftoffs as bounces of the original touchdown (rather than a fresh
+/// landing event). Matches BeatMyLanding's `BounceWindow`.
+const BOUNCE_WINDOW_SECS: i64 = 8;
+
+/// AGL altitude (ft) the aircraft must climb above before we can
+/// detect a bounce. Below this, on-ground flickers are noise (gear
+/// strut oscillation, sloppy SimVar updates). Matches BeatMyLanding's
+/// `BounceRadioAltThresholdFeet`. f64 to match `SimSnapshot::altitude_agl_ft`.
+const BOUNCE_AGL_THRESHOLD_FT: f64 = 35.0;
+
+/// AGL altitude (ft) the aircraft must come back below to count one
+/// bounce. The detector arms when AGL crosses up through THRESHOLD
+/// and fires when it crosses back down through RETURN. Matches
+/// BeatMyLanding's `BounceRadioAltReturnFeet`.
+const BOUNCE_AGL_RETURN_FT: f64 = 5.0;
 
 /// Hard-landing thresholds, ordered worst-first. The first row that the
 /// peak |V/S| or G-force breaches wins; combined with `bounce_count`
@@ -2788,6 +2982,14 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
                 vs_fpm: snap.vertical_speed_fpm,
                 g_force: snap.g_force,
                 on_ground: snap.on_ground,
+                agl_ft: snap.altitude_agl_ft as f32,
+                heading_true_deg: snap.heading_deg_true,
+                groundspeed_kt: snap.groundspeed_kt,
+                indicated_airspeed_kt: snap.indicated_airspeed_kt,
+                lat: snap.lat,
+                lon: snap.lon,
+                pitch_deg: snap.pitch_deg,
+                bank_deg: snap.bank_deg,
             });
             let cutoff = now - chrono::Duration::seconds(TOUCHDOWN_BUFFER_SECS);
             while stats
@@ -3283,23 +3485,23 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                 next_phase = FlightPhase::Landing;
                 stats.landing_at = Some(now);
 
-                // V/S capture priority:
-                //   1. SimConnect's PLANE TOUCHDOWN NORMAL VELOCITY,
-                //      latched by the sim itself at the actual frame
-                //      of contact. This is the cleanest signal *if*
-                //      Fenix / FBW / etc. update it (some don't).
-                //   2. Most-negative VS in the ring buffer's airborne
-                //      samples — handles the common case where the
-                //      single on-ground tick already shows a positive
-                //      bounce-up VS while the buffer still remembers
-                //      the actual descent rate.
-                //   3. The current snapshot's live VS (last resort).
-                //
-                // We ALWAYS take the worst of (1) and (2) to be safe
-                // against either source returning a partial value.
+                // V/S capture — BeatMyLanding-aligned (TouchdownWindowMs=500):
+                // pick the most-negative V/S from buffered samples within
+                // ±TOUCHDOWN_VS_WINDOW_MS/2 of the on-ground edge, filtered
+                // to airborne-only frames so we don't grab post-bounce
+                // positives. The latched SimVar `PLANE TOUCHDOWN NORMAL
+                // VELOCITY` is folded in alongside as a redundant signal —
+                // we take whichever is worst. Live snapshot VS is the
+                // last-resort fallback when the buffer is empty (resumed
+                // flight mid-rollout).
+                let half_window =
+                    chrono::Duration::milliseconds(TOUCHDOWN_VS_WINDOW_MS / 2);
+                let vs_window_start = now - half_window;
+                let vs_window_end = now + half_window;
                 let buffered_vs_min: f32 = stats
                     .snapshot_buffer
                     .iter()
+                    .filter(|s| s.at >= vs_window_start && s.at <= vs_window_end)
                     .filter(|s| !s.on_ground)
                     .map(|s| s.vs_fpm)
                     .fold(f32::INFINITY, f32::min);
@@ -3325,12 +3527,9 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                 stats.landing_rate_fpm = Some(touchdown_vs);
                 stats.landing_peak_vs_fpm = Some(touchdown_vs);
 
-                // G capture priority:
-                //   1. Highest G in the ring buffer (catches the impact
-                //      spike even when the on-ground tick already shows
-                //      G≈1.0 because the bounce is already in the air).
-                //   2. Current snapshot G (in case the spike happens
-                //      exactly on this tick).
+                // G capture: peak G from full buffer (5 s of pre-touchdown
+                // history). Subsequent ticks in the Landing arm refine
+                // this further until TOUCHDOWN_G_WINDOW_MS elapses.
                 let buffered_g_peak: f32 = stats
                     .snapshot_buffer
                     .iter()
@@ -3346,6 +3545,66 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                     Some(snap.touchdown_heading_mag_deg.unwrap_or(snap.heading_deg_magnetic));
                 stats.landing_speed_kt = Some(snap.indicated_airspeed_kt);
                 stats.landing_fuel_kg = Some(snap.fuel_total_kg);
+
+                // ---- Tier 2/3 BeatMyLanding-aligned extras ----
+
+                // Position + true heading at the touchdown edge — used
+                // for runway lookup and disambiguation between parallel
+                // runway pairs (08L/08R) via heading match.
+                stats.landing_lat = Some(snap.lat);
+                stats.landing_lon = Some(snap.lon);
+                stats.landing_heading_true_deg = Some(snap.heading_deg_true);
+
+                // Touchdown profile — full buffer reframed to ms-relative
+                // timestamps. PIREP renders this as a tiny V/S curve so
+                // the pilot can see the flare shape after the fact.
+                stats.touchdown_profile = stats
+                    .snapshot_buffer
+                    .iter()
+                    .map(|s| TouchdownProfilePoint {
+                        t_ms: (s.at - now).num_milliseconds() as i32,
+                        vs_fpm: s.vs_fpm,
+                        g_force: s.g_force,
+                        agl_ft: s.agl_ft,
+                        on_ground: s.on_ground,
+                        heading_true_deg: s.heading_true_deg,
+                        groundspeed_kt: s.groundspeed_kt,
+                        indicated_airspeed_kt: s.indicated_airspeed_kt,
+                        pitch_deg: s.pitch_deg,
+                        bank_deg: s.bank_deg,
+                    })
+                    .collect();
+
+                // Sideslip / crab angle at touchdown — heading_true minus
+                // ground track (computed from the last 500 ms of buffered
+                // lat/lon). Positive = aircraft nose right of track.
+                stats.touchdown_sideslip_deg = compute_sideslip_at_touchdown(
+                    &stats.snapshot_buffer,
+                    snap.heading_deg_true,
+                    now,
+                );
+
+                // Runway correlation. None when no runway lies within
+                // ~3 km of the touchdown coordinate. Sits next to
+                // `approach_runway` (from `ATC RUNWAY SELECTED`) — the
+                // runway_match value is the authoritative one because
+                // it's derived from where the wheels actually touched,
+                // not the ATC clearance.
+                stats.runway_match =
+                    runway::lookup_runway(snap.lat, snap.lon, snap.heading_deg_true);
+                if let Some(rw) = &stats.runway_match {
+                    tracing::info!(
+                        airport = %rw.airport_ident,
+                        runway = %rw.runway_ident,
+                        centerline_m = rw.centerline_distance_m,
+                        from_threshold_ft = rw.touchdown_distance_from_threshold_ft,
+                        side = %rw.side,
+                        "touchdown correlated to runway"
+                    );
+                }
+
+                // Reset bounce state for the new analyzer window.
+                stats.bounce_armed_above_threshold = false;
                 stats.bounce_count = 0;
                 // Prefer TOTAL WEIGHT (fuel + payload + empty); only
                 // fall back to ZFW + fuel if the SimVar is missing.
@@ -3364,31 +3623,65 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
             }
         }
         FlightPhase::Landing => {
-            // Touchdown analyzer window: refine peak descent rate, peak G,
-            // and count bounces while the wheels are still settling.
+            // Touchdown analyzer windows (BeatMyLanding-aligned):
+            //   * Peak G refined for TOUCHDOWN_G_WINDOW_MS (1500 ms)
+            //   * Peak |V/S| refined for TOUCHDOWN_WINDOW_SECS (5 s) —
+            //     wider to catch a hard secondary contact after a bounce.
+            //   * Bounces tracked via AGL-edge for BOUNCE_WINDOW_SECS (8 s).
+            //   * Score finalised once the bounce window closes.
             if let Some(touchdown) = stats.landing_at {
-                let in_window = (now - touchdown).num_seconds() <= TOUCHDOWN_WINDOW_SECS;
-                if in_window {
-                    // Peak |V/S| — keep the most negative number we see.
+                let elapsed_ms = (now - touchdown).num_milliseconds();
+                let elapsed_secs = elapsed_ms / 1_000;
+                let in_vs_window = elapsed_secs <= TOUCHDOWN_WINDOW_SECS;
+                let in_g_window = elapsed_ms <= TOUCHDOWN_G_WINDOW_MS;
+                let in_bounce_window = elapsed_secs <= BOUNCE_WINDOW_SECS;
+
+                if in_vs_window {
                     let peak_vs = stats.landing_peak_vs_fpm.unwrap_or(0.0);
                     if snap.vertical_speed_fpm < peak_vs {
                         stats.landing_peak_vs_fpm = Some(snap.vertical_speed_fpm);
                     }
-                    // Peak G — highest reading wins.
+                }
+                if in_g_window {
                     let peak_g = stats.landing_peak_g_force.unwrap_or(0.0);
                     if snap.g_force > peak_g {
                         stats.landing_peak_g_force = Some(snap.g_force);
                     }
-                    // Bounce: lifted off the ground again before the
-                    // window closed — count it and (loosely) treat the
-                    // next contact as a fresh touchdown for peak
-                    // tracking. Phase stays Landing so we don't loop
-                    // through Final again.
-                    if was_on_ground && !snap.on_ground {
+                }
+
+                // Bounce detection — AGL-edge state machine. Replaces
+                // the noisy on-ground flicker we used pre-Tier-1, which
+                // tripped on gear-strut oscillation and over-counted
+                // bounces on a clean landing.
+                //
+                // Arm: AGL crosses up through BOUNCE_AGL_THRESHOLD_FT
+                //      (35 ft, BeatMyLanding's `BounceRadioAltThresholdFeet`).
+                // Fire: AGL drops back below BOUNCE_AGL_RETURN_FT
+                //      (5 ft, `BounceRadioAltReturnFeet`).
+                // Both must happen inside BOUNCE_WINDOW_SECS for a bounce
+                // to count — past that we assume the pilot did a touch-
+                // and-go or got airborne again deliberately.
+                if in_bounce_window {
+                    if !stats.bounce_armed_above_threshold
+                        && snap.altitude_agl_ft > BOUNCE_AGL_THRESHOLD_FT
+                    {
+                        stats.bounce_armed_above_threshold = true;
+                    } else if stats.bounce_armed_above_threshold
+                        && snap.altitude_agl_ft < BOUNCE_AGL_RETURN_FT
+                    {
                         stats.bounce_count = stats.bounce_count.saturating_add(1);
+                        stats.bounce_armed_above_threshold = false;
+                        tracing::info!(
+                            count = stats.bounce_count,
+                            agl_ft = snap.altitude_agl_ft,
+                            elapsed_ms,
+                            "bounce counted (AGL re-entered ground band)"
+                        );
                     }
-                } else if stats.landing_score.is_none() {
-                    // Window just closed — finalise the score once.
+                }
+
+                if !in_bounce_window && stats.landing_score.is_none() {
+                    // All windows have closed — finalise the score once.
                     let peak_vs = stats.landing_peak_vs_fpm.unwrap_or(0.0);
                     let peak_g = stats.landing_peak_g_force.unwrap_or(0.0);
                     let score = LandingScore::classify(peak_vs, peak_g, stats.bounce_count);
@@ -3541,6 +3834,65 @@ fn build_pirep_fields(
     }
     if stats.bounce_count > 0 {
         f.insert("Bounces".into(), stats.bounce_count.to_string());
+    }
+    if let Some(slip) = stats.touchdown_sideslip_deg {
+        // Sideslip / crab angle at touchdown — useful for VAs grading
+        // crosswind technique. Sign: positive = nose right of track.
+        f.insert(
+            "Touchdown Sideslip".into(),
+            format!("{:+.1}°", slip),
+        );
+    }
+
+    // Runway correlation (Tier 2) — derived from the OurAirports table
+    // by haversine + cross-track math from the touchdown coordinate.
+    // Reported alongside `Approach Runway` (which is `ATC RUNWAY
+    // SELECTED` — the *cleared* runway, not necessarily the one that
+    // got the wheels). When they differ, the pilot landed somewhere
+    // they shouldn't have or the ATC SimVar wasn't refreshed.
+    if let Some(rw) = &stats.runway_match {
+        f.insert(
+            "Touchdown Runway".into(),
+            format!("{}/{}", rw.airport_ident, rw.runway_ident),
+        );
+        f.insert(
+            "Centerline Offset".into(),
+            format!(
+                "{:.1} m {} (= {:.0} ft)",
+                rw.centerline_distance_m.abs(),
+                rw.side,
+                rw.centerline_distance_abs_ft
+            ),
+        );
+        f.insert(
+            "Touchdown Past Threshold".into(),
+            format!(
+                "{:.0} ft (runway {:.0} ft long)",
+                rw.touchdown_distance_from_threshold_ft, rw.length_ft
+            ),
+        );
+    }
+    // Touchdown profile (Tier 3) — compact CSV-style line so the PIREP
+    // text view stays readable. Keep only every 3rd point (~10 Hz from
+    // the 30 Hz buffer) and clip to ±2 s around touchdown so the line
+    // stays under ~600 chars.
+    if !stats.touchdown_profile.is_empty() {
+        let line = stats
+            .touchdown_profile
+            .iter()
+            .filter(|p| p.t_ms.abs() <= 2_000)
+            .step_by(3)
+            .map(|p| {
+                format!(
+                    "[{}ms vs={:.0} g={:.2} agl={:.0}]",
+                    p.t_ms, p.vs_fpm, p.g_force, p.agl_ft
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !line.is_empty() {
+            f.insert("Touchdown Profile".into(), line);
+        }
     }
 
     // METAR snapshots (Phase J.2) — captured at takeoff / touchdown.

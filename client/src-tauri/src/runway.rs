@@ -1,0 +1,442 @@
+//! Runway lookup — given a touchdown lat/lon (and the aircraft's true
+//! heading at touchdown), figure out which runway the pilot landed on
+//! and where on it. Used by the PIREP report to surface "you landed on
+//! EDDP/26R, 1.4 m right of centerline, 1100 ft past the threshold".
+//!
+//! Why embedded CSV: the NSIS installer drops a single binary into
+//! `%LOCALAPPDATA%`. We don't want to ship a sidecar data file or wire
+//! up a `tauri::path` resolver for a 4 MB blob that never changes at
+//! runtime — `include_str!` keeps everything self-contained at the
+//! cost of ~4 MB of binary.
+//!
+//! Source: <https://ourairports.com/data/> — public domain.
+//!
+//! Coordinates are WGS84 decimal degrees. Distances in meters unless
+//! the field name says `_ft`; bearings are degrees true (0..360).
+
+use std::sync::OnceLock;
+
+/// Embedded snapshot of the ourairports runways table. Refreshed manually
+/// when the upstream CSV gets significant updates (new airports, closed
+/// runways) — this isn't a hot data source, the world's runway layout
+/// is essentially static on human timescales.
+const RUNWAYS_CSV: &str = include_str!("../data/ourairports-runways.csv");
+
+/// Mean Earth radius (meters) — same value used by the haversine formula
+/// throughout aviation tooling.
+const EARTH_RADIUS_M: f64 = 6_371_000.0;
+
+/// Bounding-box prefilter half-width in degrees. ~0.05° lat ≈ 5.5 km,
+/// which comfortably covers any landable runway plus rollout. Lon is
+/// deliberately treated the same — we'd have to scale by cos(lat) to be
+/// distance-true, but a slightly-wider window costs nothing here and
+/// keeps polar edge cases simple.
+const BBOX_HALF_DEG: f64 = 0.05;
+
+/// Default search radius. Anything farther than 3 km from the touchdown
+/// point is almost certainly a different airport — bail out rather than
+/// confidently mis-attribute the landing.
+const DEFAULT_MAX_DISTANCE_M: f64 = 3000.0;
+
+/// "On the centerline" tolerance for the side classification. 2 m matches
+/// what BeatMyLanding uses and roughly the precision of the SimConnect
+/// position fix at low altitude.
+const CENTERLINE_TOLERANCE_M: f64 = 2.0;
+
+/// One row of the parsed CSV. We only keep the fields we use, all already
+/// validated as non-empty during parse so downstream code can `.unwrap_or`
+/// safely on the optionals (length/width).
+#[derive(Debug, Clone)]
+struct RunwayRow {
+    airport_ident: String,
+    length_ft: f32,
+    width_ft: f32,
+    surface: String,
+    le_ident: String,
+    le_lat: f64,
+    le_lon: f64,
+    le_heading_true: f32,
+    he_ident: String,
+    he_lat: f64,
+    he_lon: f64,
+    he_heading_true: f32,
+}
+
+/// Result of resolving a touchdown coordinate to a runway.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RunwayMatch {
+    /// Airport ICAO/ident from CSV (e.g. "EDDP", "GB-0002").
+    pub airport_ident: String,
+    /// Resolved runway name as the pilot would say it ("26R", "08L").
+    pub runway_ident: String,
+    /// True heading of the runway centerline, in the landing direction.
+    pub heading_true_deg: f32,
+    /// Total runway length in ft.
+    pub length_ft: f32,
+    /// Runway width in ft.
+    pub width_ft: f32,
+    /// Surface code from CSV (e.g. "ASPH", "CON", "GRVL").
+    pub surface: String,
+    /// Threshold (= landing-direction start) lat/lon.
+    pub threshold_lat: f64,
+    pub threshold_lon: f64,
+    /// Far-end (departure-direction) lat/lon.
+    pub end_lat: f64,
+    pub end_lon: f64,
+    /// Signed perpendicular distance from runway centerline.
+    /// Positive = pilot was right of centerline, negative = left.
+    pub centerline_distance_m: f64,
+    /// |centerline_distance_m| converted to feet — easier for pilots.
+    pub centerline_distance_abs_ft: f64,
+    /// Distance from the threshold along the runway axis, in feet.
+    /// Negative would mean "before the threshold" (undershoot).
+    pub touchdown_distance_from_threshold_ft: f64,
+    /// "LEFT", "RIGHT", or "CENTER" (within 2 m of centerline).
+    pub side: String,
+}
+
+/// Parse the embedded CSV exactly once. The OnceLock means concurrent
+/// callers from a thread pool don't race on parsing — first one through
+/// the door does the work, everyone else waits on the lock and reads
+/// the cached `Vec`.
+fn runways() -> &'static Vec<RunwayRow> {
+    static CELL: OnceLock<Vec<RunwayRow>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(RUNWAYS_CSV.as_bytes());
+        let mut out = Vec::with_capacity(48_000);
+        for record in rdr.records().flatten() {
+            // Skip closed runways — pilots can't land on them and matching
+            // a touchdown to one would just be confusing.
+            if record.get(7).unwrap_or("0") == "1" {
+                continue;
+            }
+            // Both ends must have coordinates. Heliports, water "runways",
+            // and a handful of legacy entries have empty lat/lon — they're
+            // useless to us.
+            let le_lat = parse_f64(record.get(9));
+            let le_lon = parse_f64(record.get(10));
+            let he_lat = parse_f64(record.get(15));
+            let he_lon = parse_f64(record.get(16));
+            let (Some(le_lat), Some(le_lon), Some(he_lat), Some(he_lon)) =
+                (le_lat, le_lon, he_lat, he_lon)
+            else {
+                continue;
+            };
+
+            let airport_ident = record.get(2).unwrap_or("").to_string();
+            let length_ft = parse_f32(record.get(3)).unwrap_or(0.0);
+            let width_ft = parse_f32(record.get(4)).unwrap_or(0.0);
+            let surface = record.get(5).unwrap_or("").to_string();
+            let le_ident = record.get(8).unwrap_or("").to_string();
+            // The CSV occasionally omits headings — fall back to a computed
+            // bearing from the threshold to the far end. That's what real
+            // ATC charts use anyway.
+            let le_heading = parse_f32(record.get(12))
+                .unwrap_or_else(|| initial_bearing_deg(le_lat, le_lon, he_lat, he_lon) as f32);
+            let he_ident = record.get(14).unwrap_or("").to_string();
+            let he_heading = parse_f32(record.get(18))
+                .unwrap_or_else(|| initial_bearing_deg(he_lat, he_lon, le_lat, le_lon) as f32);
+
+            out.push(RunwayRow {
+                airport_ident,
+                length_ft,
+                width_ft,
+                surface,
+                le_ident,
+                le_lat,
+                le_lon,
+                le_heading_true: le_heading,
+                he_ident,
+                he_lat,
+                he_lon,
+                he_heading_true: he_heading,
+            });
+        }
+        tracing::debug!(count = out.len(), "runway table parsed");
+        out
+    })
+}
+
+fn parse_f64(s: Option<&str>) -> Option<f64> {
+    s.and_then(|v| if v.is_empty() { None } else { v.parse().ok() })
+}
+
+fn parse_f32(s: Option<&str>) -> Option<f32> {
+    s.and_then(|v| if v.is_empty() { None } else { v.parse().ok() })
+}
+
+/// Look up the runway for a touchdown coordinate.
+///
+/// `aircraft_heading_true_deg` is used to disambiguate between the two
+/// ends of a runway (08 vs 26 etc.) — the end whose published heading
+/// is closest to the aircraft heading wins.
+///
+/// Returns `None` when no runway is within ~3 km of the point.
+pub fn lookup_runway(
+    lat: f64,
+    lon: f64,
+    aircraft_heading_true_deg: f32,
+) -> Option<RunwayMatch> {
+    let table = runways();
+
+    // Bounding-box prefilter. With ~48k rows and a 0.1° square window
+    // we drop the candidate set to a handful (typically <10) before
+    // doing any trig.
+    let lat_min = lat - BBOX_HALF_DEG;
+    let lat_max = lat + BBOX_HALF_DEG;
+    let lon_min = lon - BBOX_HALF_DEG;
+    let lon_max = lon + BBOX_HALF_DEG;
+
+    let mut best: Option<(RunwayMatch, f64)> = None;
+
+    for row in table.iter() {
+        // Either end inside the bbox is enough — a long runway can
+        // straddle the box if the pilot landed near one end.
+        let le_in = row.le_lat >= lat_min
+            && row.le_lat <= lat_max
+            && row.le_lon >= lon_min
+            && row.le_lon <= lon_max;
+        let he_in = row.he_lat >= lat_min
+            && row.he_lat <= lat_max
+            && row.he_lon >= lon_min
+            && row.he_lon <= lon_max;
+        if !le_in && !he_in {
+            continue;
+        }
+
+        // Pick the threshold the pilot crossed: whichever end's published
+        // heading is closer to the aircraft heading at touchdown.
+        let le_diff = heading_diff(aircraft_heading_true_deg, row.le_heading_true);
+        let he_diff = heading_diff(aircraft_heading_true_deg, row.he_heading_true);
+        let (threshold_lat, threshold_lon, end_lat, end_lon, runway_ident, runway_heading) =
+            if le_diff <= he_diff {
+                (
+                    row.le_lat,
+                    row.le_lon,
+                    row.he_lat,
+                    row.he_lon,
+                    row.le_ident.clone(),
+                    row.le_heading_true,
+                )
+            } else {
+                (
+                    row.he_lat,
+                    row.he_lon,
+                    row.le_lat,
+                    row.le_lon,
+                    row.he_ident.clone(),
+                    row.he_heading_true,
+                )
+            };
+
+        // Cheap rejection: if the threshold itself is more than ~5 km
+        // away the pilot definitely didn't land here, regardless of
+        // bbox membership of the other end.
+        let d_threshold = haversine_m(threshold_lat, threshold_lon, lat, lon);
+        if d_threshold > DEFAULT_MAX_DISTANCE_M + (row.length_ft as f64 * 0.3048) {
+            continue;
+        }
+
+        // Centerline math (great-circle cross-track / along-track).
+        let theta_ab = initial_bearing_rad(threshold_lat, threshold_lon, end_lat, end_lon);
+        let theta_ac = initial_bearing_rad(threshold_lat, threshold_lon, lat, lon);
+        let d_ab = d_threshold; // m
+        // Cross-track distance: signed by the sin() of the bearing
+        // difference. Positive = right of track in the landing direction
+        // (because we measure from threshold toward the far end).
+        let xtd_m = (d_ab / EARTH_RADIUS_M).sin() * (theta_ac - theta_ab).sin();
+        let xtd_m = xtd_m.asin() * EARTH_RADIUS_M;
+        // Along-track distance: how far along the centerline the
+        // touchdown projects from the threshold.
+        let cos_arg = (d_ab / EARTH_RADIUS_M).cos() / (xtd_m / EARTH_RADIUS_M).cos();
+        // Clamp to [-1,1] — small floating-point drift can push it out
+        // of range when the pilot lands ~exactly on the threshold.
+        let cos_arg = cos_arg.clamp(-1.0, 1.0);
+        let along_m = cos_arg.acos() * EARTH_RADIUS_M;
+        let along_ft = along_m * 3.280_839_895;
+
+        let centerline_distance_abs_ft = xtd_m.abs() * 3.280_839_895;
+
+        let side = if xtd_m.abs() < CENTERLINE_TOLERANCE_M {
+            "CENTER"
+        } else if xtd_m > 0.0 {
+            "RIGHT"
+        } else {
+            "LEFT"
+        };
+
+        let candidate = RunwayMatch {
+            airport_ident: row.airport_ident.clone(),
+            runway_ident,
+            heading_true_deg: runway_heading,
+            length_ft: row.length_ft,
+            width_ft: row.width_ft,
+            surface: row.surface.clone(),
+            threshold_lat,
+            threshold_lon,
+            end_lat,
+            end_lon,
+            centerline_distance_m: xtd_m,
+            centerline_distance_abs_ft,
+            touchdown_distance_from_threshold_ft: along_ft,
+            side: side.to_string(),
+        };
+
+        // Pick the runway with the smallest perpendicular distance to
+        // the centerline. This is what disambiguates parallel runways
+        // (26L vs 26R) — the threshold-distance heuristic alone can't
+        // tell them apart because both thresholds are on the same end.
+        let score = xtd_m.abs();
+        match &best {
+            Some((_, best_score)) if *best_score <= score => {}
+            _ => best = Some((candidate, score)),
+        }
+    }
+
+    best.and_then(|(m, _)| {
+        // Final sanity check on the absolute distance — refuse to
+        // return something obviously wrong.
+        let d = haversine_m(m.threshold_lat, m.threshold_lon, lat, lon);
+        if d > DEFAULT_MAX_DISTANCE_M + (m.length_ft as f64 * 0.3048) {
+            None
+        } else {
+            Some(m)
+        }
+    })
+}
+
+/// Great-circle distance in meters.
+fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let phi1 = lat1.to_radians();
+    let phi2 = lat2.to_radians();
+    let dphi = (lat2 - lat1).to_radians();
+    let dlam = (lon2 - lon1).to_radians();
+    let a = (dphi / 2.0).sin().powi(2) + phi1.cos() * phi2.cos() * (dlam / 2.0).sin().powi(2);
+    2.0 * EARTH_RADIUS_M * a.sqrt().asin()
+}
+
+/// Initial bearing (forward azimuth) from point 1 → point 2, in radians,
+/// normalized to [0, 2π).
+fn initial_bearing_rad(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let phi1 = lat1.to_radians();
+    let phi2 = lat2.to_radians();
+    let dlam = (lon2 - lon1).to_radians();
+    let y = dlam.sin() * phi2.cos();
+    let x = phi1.cos() * phi2.sin() - phi1.sin() * phi2.cos() * dlam.cos();
+    let mut b = y.atan2(x);
+    if b < 0.0 {
+        b += std::f64::consts::TAU;
+    }
+    b
+}
+
+fn initial_bearing_deg(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    initial_bearing_rad(lat1, lon1, lat2, lon2).to_degrees()
+}
+
+/// Smallest unsigned angular difference between two bearings in degrees.
+/// Result is in [0, 180].
+fn heading_diff(a: f32, b: f32) -> f32 {
+    let mut d = (a - b).abs() % 360.0;
+    if d > 180.0 {
+        d = 360.0 - d;
+    }
+    d
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // EDDP/26R from the bundled CSV:
+    //   le="08L" 51.43119812011719, 12.215800285339355, hdg 85.7
+    //   he="26R" 51.43360137939453, 12.267399787902832, hdg 265.7
+    //   length 11811 ft
+    const EDDP_26R_THR_LAT: f64 = 51.433_601_379_392_15;
+    const EDDP_26R_THR_LON: f64 = 12.267_399_787_902_832;
+    const EDDP_26R_HEADING: f32 = 265.7;
+
+    #[test]
+    fn touchdown_at_eddp_26r_threshold() {
+        let m = lookup_runway(EDDP_26R_THR_LAT, EDDP_26R_THR_LON, EDDP_26R_HEADING)
+            .expect("should resolve to EDDP/26R");
+        assert_eq!(m.airport_ident, "EDDP");
+        assert_eq!(m.runway_ident, "26R");
+        // Centerline ≈ 0 (we sit exactly on the threshold which is on the
+        // centerline by definition).
+        assert!(
+            m.centerline_distance_m.abs() < 1.0,
+            "centerline_distance_m = {} (expected ≈0)",
+            m.centerline_distance_m
+        );
+        // Along-track ≈ 0 ft.
+        assert!(
+            m.touchdown_distance_from_threshold_ft.abs() < 5.0,
+            "along-track = {} ft (expected ≈0)",
+            m.touchdown_distance_from_threshold_ft
+        );
+        assert_eq!(m.side, "CENTER");
+    }
+
+    #[test]
+    fn touchdown_offset_right_and_down_runway() {
+        // Construct a synthetic touchdown 1000 m down the runway and 10 m
+        // right of centerline. We project from the threshold along the
+        // landing bearing for the along-track component, then 90° to the
+        // right (bearing + 90°) for the cross-track offset.
+        let landing_bearing = (EDDP_26R_HEADING as f64).to_radians();
+        let right_bearing = landing_bearing + std::f64::consts::FRAC_PI_2;
+
+        let (lat1, lon1) =
+            destination(EDDP_26R_THR_LAT, EDDP_26R_THR_LON, landing_bearing, 1000.0);
+        let (lat2, lon2) = destination(lat1, lon1, right_bearing, 10.0);
+
+        let m = lookup_runway(lat2, lon2, EDDP_26R_HEADING)
+            .expect("should resolve to EDDP/26R");
+        assert_eq!(m.airport_ident, "EDDP");
+        assert_eq!(m.runway_ident, "26R");
+        assert_eq!(m.side, "RIGHT");
+        // 10 m right (positive). Tolerance is ±1.5 m to absorb the
+        // spherical drift introduced by chaining two destination()
+        // calls (the second leg's "perpendicular" direction is taken
+        // at the displaced point, not the threshold, so the resulting
+        // cross-track from the original great circle ends up ~0.8 m
+        // shy of the leg length over 1 km of travel).
+        assert!(
+            (m.centerline_distance_m - 10.0).abs() < 1.5,
+            "centerline_distance_m = {} (expected ≈10)",
+            m.centerline_distance_m
+        );
+        // 1000 m → ~3280.84 ft. Allow ±5 ft.
+        assert!(
+            (m.touchdown_distance_from_threshold_ft - 3280.84).abs() < 5.0,
+            "along-track = {} ft (expected ≈3280.84)",
+            m.touchdown_distance_from_threshold_ft
+        );
+    }
+
+    /// Forward-geodesic helper for the synthetic test — given a starting
+    /// point, a true bearing in radians, and a distance in meters, return
+    /// the destination on the sphere. Inverse of `initial_bearing_rad`.
+    fn destination(lat: f64, lon: f64, bearing_rad: f64, dist_m: f64) -> (f64, f64) {
+        let phi1 = lat.to_radians();
+        let lam1 = lon.to_radians();
+        let delta = dist_m / EARTH_RADIUS_M;
+        let phi2 =
+            (phi1.sin() * delta.cos() + phi1.cos() * delta.sin() * bearing_rad.cos()).asin();
+        let lam2 = lam1
+            + (bearing_rad.sin() * delta.sin() * phi1.cos())
+                .atan2(delta.cos() - phi1.sin() * phi2.sin());
+        (phi2.to_degrees(), lam2.to_degrees())
+    }
+
+    #[test]
+    fn heading_diff_wraps_correctly() {
+        assert!((heading_diff(10.0, 350.0) - 20.0).abs() < 0.001);
+        assert!((heading_diff(350.0, 10.0) - 20.0).abs() < 0.001);
+        assert!((heading_diff(85.7, 265.7) - 180.0).abs() < 0.001);
+        assert!((heading_diff(266.0, 265.7) - 0.3).abs() < 0.001);
+    }
+}

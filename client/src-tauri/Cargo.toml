@@ -104,6 +104,10 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 
+# Bundled CSV parser for the embedded ourairports runway table
+# (used by `src/runway.rs` to map a touchdown coord → runway).
+csv = "1.3"
+
 # Internal crates — wired up for use as the project grows
 api-client.workspace = true
 sim-core.workspace = true

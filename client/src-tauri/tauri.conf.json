@@ -36,6 +36,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "resources": {
+      "crates/sim-msfs/ffi/lib/SimConnect.dll": "SimConnect.dll"
+    },
     "publisher": "CloudeAcars Project",
     "shortDescription": "Cross-platform ACARS client for phpVMS 7",
     "longDescription": "CloudeAcars connects phpVMS 7 with MSFS 2020/2024 and X-Plane 11/12, recording flights, streaming live position data, and submitting full PIREPs with detailed runway and landing analysis."
