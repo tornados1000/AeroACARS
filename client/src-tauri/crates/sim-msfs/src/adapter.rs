@@ -535,13 +535,20 @@ impl Connection {
     }
 
     fn request_touchdown_per_second(&mut self) -> Result<(), String> {
+        // Bumped from SECOND to VISUAL_FRAME (~30 Hz) for the same
+        // reason the main telemetry runs that fast: the FSM's
+        // Final → Landing tick can fire just before the next
+        // SECOND-period touchdown update has propagated the freshly
+        // latched values into shared.touchdown, leaving the V/S
+        // capture stale by up to 1 second. At ~30 Hz the latch is
+        // visible to the next snapshot within ~33 ms.
         let hr = unsafe {
             sys::SimConnect_RequestDataOnSimObject(
                 self.handle,
                 TOUCHDOWN_REQUEST_ID,
                 TOUCHDOWN_DEFINITION_ID,
                 sys::SIMCONNECT_OBJECT_ID_USER,
-                sys::SIMCONNECT_PERIOD_SECOND,
+                sys::SIMCONNECT_PERIOD_VISUAL_FRAME,
                 0,
                 0,
                 0,
