@@ -93,7 +93,6 @@ coverage/
 out/
 release/
 artifacts/
-!reference/vmsacars-win-x64-stable-Setup.exe
 
 # ===== SimConnect SDK / X-Plane SDK (do not commit, machine-local) =====
 sdk/
@@ -120,3 +119,6 @@ notarize-output.txt
 # Private key NEVER commits — needed to sign releases. Public key DOES commit (in tauri.conf.json).
 client/aeroacars-updater.key
 client/aeroacars-updater.key.pub
+
+# Local reverse-engineering / vendor reference assets — never push.
+reference/
