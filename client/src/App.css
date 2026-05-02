@@ -77,6 +77,29 @@ body {
   font-size: 20px;
   font-weight: 600;
   letter-spacing: -0.01em;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* Vertical red separator between the AeroACARS title and the
+   version label. 1px wide, slightly translucent so it doesn't
+   shout — but the red still picks up against the dark header. */
+.app__version-divider {
+  display: inline-block;
+  width: 2px;
+  height: 18px;
+  background: #d04545;
+  border-radius: 1px;
+  opacity: 0.85;
+}
+
+.app__version {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-muted);
+  letter-spacing: 0;
+  font-variant-numeric: tabular-nums;
 }
 
 .tagline {
