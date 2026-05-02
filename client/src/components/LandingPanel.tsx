@@ -278,6 +278,16 @@ function fmtDateTime(iso: string): string {
   }
 }
 
+/** Translate the runway-side enum from the backend ("RIGHT"/"LEFT"/
+ *  "CENTER") into the i18n key under `landing.side.*` so the UI
+ *  reads "rechts" / "links" / "Mitte" in German. */
+function sideKey(side: string): string {
+  const upper = side.toUpperCase();
+  if (upper === "RIGHT") return "landing.side.right";
+  if (upper === "LEFT") return "landing.side.left";
+  return "landing.side.center";
+}
+
 // ---- VS Curve chart -----------------------------------------------------
 
 function VsCurveChart({ profile }: { profile: LandingProfilePoint[] }) {
@@ -431,26 +441,47 @@ function VsCurveChart({ profile }: { profile: LandingProfilePoint[] }) {
 
 // ---- Runway diagram ----------------------------------------------------
 
-function RunwayDiagram({ rw }: { rw: LandingRunwayMatch }) {
+function RunwayDiagram({
+  rw,
+  rolloutDistanceM,
+}: {
+  rw: LandingRunwayMatch;
+  rolloutDistanceM: number | null;
+}) {
   const { t } = useTranslation();
   const w = 480;
-  const h = 120;
+  const h = 130;
   // Runway band
   const rwLeft = 30;
   const rwRight = w - 30;
-  const rwTop = h / 2 - 18;
-  const rwBottom = h / 2 + 18;
+  const rwTop = h / 2 - 16;
+  const rwBottom = h / 2 + 16;
   const lengthFt = rw.length_ft;
+  const lengthM = lengthFt * 0.3048;
   const tdFromThresh = rw.touchdown_distance_from_threshold_ft;
+  const tdFromThreshM = tdFromThresh * 0.3048;
   // Map threshold→far-end onto the rect.
   const tdFrac = Math.min(1, Math.max(0, tdFromThresh / Math.max(1, lengthFt)));
   const tdX = rwLeft + tdFrac * (rwRight - rwLeft);
 
-  // Centerline offset → vertical Y inside the strip (max ±1.5 widths)
+  // Centerline offset → vertical Y inside the strip
   const offsetM = rw.centerline_distance_m;
   const widthM = 45; // assume ~45 m runway width if not exposed
   const offFrac = Math.max(-1, Math.min(1, offsetM / widthM));
-  const tdY = (rwTop + rwBottom) / 2 + offFrac * 14;
+  const tdY = (rwTop + rwBottom) / 2 + offFrac * 12;
+
+  // Rollout band: from TD point along the runway centerline for the
+  // accumulated rollout distance (in m). End-X clamps to the far-end
+  // marker if the rollout extended past the runway end (rare —
+  // means the pilot exited beyond the threshold).
+  const rolloutEndFrac =
+    rolloutDistanceM != null && lengthM > 0
+      ? Math.min(1, (tdFromThreshM + rolloutDistanceM) / lengthM)
+      : null;
+  const rolloutEndX =
+    rolloutEndFrac != null
+      ? rwLeft + rolloutEndFrac * (rwRight - rwLeft)
+      : null;
 
   return (
     <svg
@@ -479,6 +510,29 @@ function RunwayDiagram({ rw }: { rw: LandingRunwayMatch }) {
         strokeWidth="1.4"
         strokeDasharray="10,8"
       />
+      {/* Rollout band — semi-transparent green strip from TD to exit */}
+      {rolloutEndX != null && (
+        <>
+          <rect
+            x={Math.min(tdX, rolloutEndX)}
+            y={rwTop + 4}
+            width={Math.abs(rolloutEndX - tdX)}
+            height={rwBottom - rwTop - 8}
+            fill="rgba(34,197,94,0.28)"
+            stroke="rgba(34,197,94,0.7)"
+            strokeWidth="1"
+          />
+          {/* Exit marker line */}
+          <line
+            x1={rolloutEndX}
+            x2={rolloutEndX}
+            y1={rwTop - 2}
+            y2={rwBottom + 2}
+            stroke="#22c55e"
+            strokeWidth="2"
+          />
+        </>
+      )}
       {/* Threshold marker */}
       <line
         x1={rwLeft + 4}
@@ -499,7 +553,7 @@ function RunwayDiagram({ rw }: { rw: LandingRunwayMatch }) {
       />
       {/* Touchdown dot */}
       <circle cx={tdX} cy={tdY} r="6" fill="#22d3ee" stroke="#000" strokeWidth="1" />
-      {/* Labels */}
+      {/* Labels above the runway */}
       <text x={rwLeft} y={rwTop - 6} fontSize="11" fill="currentColor">
         {rw.runway_ident} · {rw.airport_ident}
       </text>
@@ -510,8 +564,9 @@ function RunwayDiagram({ rw }: { rw: LandingRunwayMatch }) {
         fontSize="11"
         fill="currentColor"
       >
-        {(rw.length_ft * 0.3048).toFixed(0)} m
+        {lengthM.toFixed(0)} m
       </text>
+      {/* TD label below the dot */}
       <text
         x={tdX}
         y={rwBottom + 14}
@@ -519,17 +574,32 @@ function RunwayDiagram({ rw }: { rw: LandingRunwayMatch }) {
         fontSize="10"
         fill="#22d3ee"
       >
-        TD · {(tdFromThresh * 0.3048).toFixed(0)} m hinter Schwelle
+        TD · {tdFromThreshM.toFixed(0)} m {t("landing.past_threshold_short")}
       </text>
-      <text
-        x={tdX}
-        y={rwBottom + 26}
-        textAnchor="middle"
-        fontSize="10"
-        fill="currentColor"
-      >
-        {(Math.abs(rw.centerline_distance_m)).toFixed(1)} m {rw.side.toLowerCase()}
-      </text>
+      {/* Centerline-offset annotation, suppressed for CENTER (=0 m) */}
+      {Math.abs(rw.centerline_distance_m) >= 1 && (
+        <text
+          x={tdX}
+          y={rwBottom + 26}
+          textAnchor="middle"
+          fontSize="10"
+          fill="currentColor"
+        >
+          {Math.abs(rw.centerline_distance_m).toFixed(1)} m {t(sideKey(rw.side))}
+        </text>
+      )}
+      {/* Exit label — only when there's enough horizontal room */}
+      {rolloutEndX != null && Math.abs(rolloutEndX - tdX) > 60 && (
+        <text
+          x={rolloutEndX}
+          y={rwTop - 6}
+          textAnchor="middle"
+          fontSize="10"
+          fill="#22c55e"
+        >
+          {t("landing.exit")} · {(rolloutDistanceM ?? 0).toFixed(0)} m
+        </text>
+      )}
     </svg>
   );
 }
@@ -754,6 +824,11 @@ function ApproachChart({ samples }: { samples: ApproachSample[] }) {
 
 function InfoBadge({ explanation }: { explanation: string }) {
   const [open, setOpen] = useState(false);
+  // Whether to flip the popover to the LEFT side of the badge to keep
+  // it inside the viewport. Decided on click using getBoundingClientRect
+  // — popover is ~300 px wide; if the badge's right edge sits within
+  // 320 px of the viewport's right edge we flip.
+  const [flipLeft, setFlipLeft] = useState(false);
   return (
     <span className="info-badge-wrap">
       <button
@@ -761,6 +836,10 @@ function InfoBadge({ explanation }: { explanation: string }) {
         className={`info-badge ${open ? "info-badge--open" : ""}`}
         onClick={(e) => {
           e.stopPropagation();
+          if (!open) {
+            const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+            setFlipLeft(window.innerWidth - rect.right < 320);
+          }
           setOpen((v) => !v);
         }}
         aria-label="info"
@@ -768,7 +847,12 @@ function InfoBadge({ explanation }: { explanation: string }) {
         i
       </button>
       {open && (
-        <span className="info-badge__popover" role="tooltip">
+        <span
+          className={`info-badge__popover ${
+            flipLeft ? "info-badge__popover--flip-left" : ""
+          }`}
+          role="tooltip"
+        >
           {explanation}
           <button
             type="button"
@@ -1086,7 +1170,10 @@ function LandingDetail({
 
       {/* Score breakdown — most important new section */}
       <section className="landing-section">
-        <h3>{t("landing.score_breakdown")}</h3>
+        <h3>
+          {t("landing.score_breakdown")}
+          <InfoBadge explanation={t("landing.info.score_section")} />
+        </h3>
         <ScoreBreakdown subs={subs} />
         <CoachTip subs={subs} />
       </section>
@@ -1164,8 +1251,14 @@ function LandingDetail({
       {/* Runway */}
       {record.runway_match && (
         <section className="landing-section">
-          <h3>{t("landing.runway")}</h3>
-          <RunwayDiagram rw={record.runway_match} />
+          <h3>
+            {t("landing.runway")}
+            <InfoBadge explanation={t("landing.info.runway_section")} />
+          </h3>
+          <RunwayDiagram
+            rw={record.runway_match}
+            rolloutDistanceM={record.rollout_distance_m}
+          />
           <dl className="landing-keyvals landing-keyvals--inline">
             <div>
               <dt>{t("landing.runway_id")}</dt>
@@ -1184,7 +1277,7 @@ function LandingDetail({
               <dt>{t("landing.centerline_offset")}</dt>
               <dd>
                 {Math.abs(record.runway_match.centerline_distance_m).toFixed(1)} m{" "}
-                {record.runway_match.side.toLowerCase()}
+                {t(sideKey(record.runway_match.side))}
               </dd>
             </div>
             <div>
@@ -1217,10 +1310,21 @@ function LandingDetail({
         </section>
       )}
 
-      {/* Fuel + weights */}
-      {(record.planned_burn_kg != null || record.actual_trip_burn_kg != null) && (
+      {/* Fuel + weights — render whenever ANY fuel/weight value is
+          present, not just when there's a SimBrief plan. The previous
+          guard hid the whole section for flights without an OFP. */}
+      {(record.planned_burn_kg != null ||
+        record.actual_trip_burn_kg != null ||
+        record.block_fuel_kg != null ||
+        record.takeoff_fuel_kg != null ||
+        record.landing_fuel_kg != null ||
+        record.takeoff_weight_kg != null ||
+        record.landing_weight_kg != null) && (
         <section className="landing-section">
-          <h3>{t("landing.fuel")}</h3>
+          <h3>
+            {t("landing.fuel")}
+            <InfoBadge explanation={t("landing.info.fuel_section")} />
+          </h3>
           {record.planned_burn_kg != null && record.actual_trip_burn_kg != null && (
             <FuelComparisonBar
               plan={record.planned_burn_kg}

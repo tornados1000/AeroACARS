@@ -3736,6 +3736,19 @@ input:disabled {
   transform: rotate(45deg);
 }
 
+/* Flip variant: popover anchors to the right edge of the badge instead
+   of the left. Used when the badge sits close to the viewport's right
+   edge and the default placement would clip the popover off-screen. */
+.info-badge__popover--flip-left {
+  left: auto;
+  right: -8px;
+}
+
+.info-badge__popover--flip-left::before {
+  left: auto;
+  right: 12px;
+}
+
 .info-badge__close {
   position: absolute;
   top: 4px;

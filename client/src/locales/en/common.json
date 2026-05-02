@@ -57,6 +57,13 @@
     "past_threshold": "Past threshold",
     "rollout": "Rollout distance",
     "runway_used_pct": "Runway used",
+    "past_threshold_short": "past threshold",
+    "exit": "Runway exit",
+    "side": {
+      "left": "left",
+      "right": "right",
+      "center": "center"
+    },
     "fuel": "Fuel",
     "plan_burn": "Plan",
     "actual_burn": "Actual",
@@ -97,7 +104,10 @@
       "bounces": "How many times the aircraft climbed back above 35 ft AGL after the first touchdown and re-landed (BeatMyLanding algorithm). 0 = clean set; each bounce drops the score.",
       "stability": "Standard deviation (σ) of vertical speed over the last ~10 minutes of approach. Low = smooth, constant flying. < 100 fpm σ is 'very stable'; > 300 fpm σ warrants a stabilized-approach review.",
       "rollout": "Percent of available runway length used from touchdown until clearing the runway (high-speed exit below 40 kt or > 30° heading deviation). < 70 % is normal; > 85 % is tight, especially on wet runway.",
-      "fuel": "Deviation of actual trip burn from the SimBrief plan. Positive = burned more, negative = less. ±5 % means clean performance calc; > ±20 % suggests wrong cruise altitude or unaccounted wind."
+      "fuel": "Deviation of actual trip burn from the SimBrief plan. Positive = burned more, negative = less. ±5 % means clean performance calc; > ±20 % suggests wrong cruise altitude or unaccounted wind.",
+      "score_section": "Six sub-scores rated 0-100 each. Every card shows value, points, and a coloured bar (green/yellow/red). The weakest category becomes the focus of the coach tip below.",
+      "runway_section": "Visualisation of your touchdown on the runway. The cyan dot marks the touchdown point; the green band shows the rollout distance until you cleared the runway (high-speed exit or stop). Values below: total length, centerline offset, distance past threshold, runway used as a percentage.",
+      "fuel_section": "Block = fuel at chocks-off; TO Fuel = at takeoff position; LDG Fuel = at touchdown; TOW = takeoff weight (empty + payload + TO fuel); LDW = landing weight. Plan values come from the SimBrief OFP if available. Plan-vs-actual delta drives the fuel-efficiency score."
     },
     "rat": {
       "smooth_touchdown": "Butter-smooth touchdown",

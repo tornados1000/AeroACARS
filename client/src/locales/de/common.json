@@ -57,6 +57,13 @@
     "past_threshold": "Hinter Schwelle",
     "rollout": "Ausrollstrecke",
     "runway_used_pct": "Bahn-Auslastung",
+    "past_threshold_short": "hinter Schwelle",
+    "exit": "Bahn verlassen",
+    "side": {
+      "left": "links",
+      "right": "rechts",
+      "center": "Mitte"
+    },
     "fuel": "Treibstoff",
     "plan_burn": "Plan",
     "actual_burn": "Real",
@@ -97,7 +104,10 @@
       "bounces": "Wie oft das Flugzeug nach dem ersten Aufsetzen wieder über 35 ft AGL gestiegen und erneut gelandet ist (BeatMyLanding-Algorithmus). 0 = sauber gesetzt; jeder Bounce drückt den Score.",
       "stability": "Standardabweichung (σ) der Sinkrate über die letzten ~10 Minuten Anflug. Niedrig = ruhig und konstant geflogen, hoch = wackelig. < 100 fpm σ gilt als sehr stabil; > 300 fpm σ ist Anlass für Stabilized-Approach-Review.",
       "rollout": "Prozent der verfügbaren Bahnlänge die du vom Touchdown bis zum Verlassen (Highspeed-Exit < 40 kt oder > 30° Heading-Abweichung) genutzt hast. < 70 % ist normal; > 85 % heißt knapp — bei nasser Bahn riskant.",
-      "fuel": "Abweichung des tatsächlichen Trip-Burns vom SimBrief-Plan. Positiv = mehr verbraucht, negativ = weniger. ±5 % ist saubere Performance-Kalkulation; > ±20 % deutet auf falsche Cruise-Höhe oder Wind-Einfluss."
+      "fuel": "Abweichung des tatsächlichen Trip-Burns vom SimBrief-Plan. Positiv = mehr verbraucht, negativ = weniger. ±5 % ist saubere Performance-Kalkulation; > ±20 % deutet auf falsche Cruise-Höhe oder Wind-Einfluss.",
+      "score_section": "Sechs Sub-Scores à 0-100 Punkte. Jede Kachel zeigt Wert, Punktzahl und farbigen Balken (grün/gelb/rot). Die schwächste Kategorie wird als nächstes Verbesserungs-Ziel im Coach-Tipp aufgegriffen.",
+      "runway_section": "Visualisierung deines Touchdowns auf der Bahn. Das blaue Symbol markiert den Aufsetzpunkt, das grüne Band zeigt die Ausrollstrecke bis zum Verlassen der Bahn (Highspeed-Exit oder Stopp). Werte unten: Gesamtlänge, Centerline-Abweichung, Distanz hinter der Schwelle, genutzte Bahnlänge in Prozent.",
+      "fuel_section": "Block = Spritmenge beim Abblock; TO Fuel = nach dem Rollen am Startpunkt; LDG Fuel = bei Touchdown; TOW = Takeoff Weight (= Leergewicht + Last + TO Fuel); LDW = Landing Weight. Plan-Werte stammen aus dem SimBrief-OFP, falls vorhanden. Differenzen Plan-vs-Real ergeben den Fuel-Efficiency-Score."
     },
     "rat": {
       "smooth_touchdown": "Butterweich aufgesetzt",
