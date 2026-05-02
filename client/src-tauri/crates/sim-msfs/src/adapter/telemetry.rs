@@ -942,8 +942,20 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
     };
 
     // Cabin signs (Fenix only — no standard SimVar covers these).
+    //
+    // The AAO script reveals the value spaces are different between
+    // the two signs:
+    //   * `L:S_OH_SIGNS` (seat belts) is BINARY — its toggle uses
+    //     the logical-NOT operator `! (>L:S_OH_SIGNS)`, which only
+    //     makes sense for a 0/1 LVar. We clamp accordingly.
+    //   * `L:S_OH_SIGNS_SMOKING` (no smoking) is 3-state — the toggle
+    //     branches `0 == if{ 2 } els{ 0 }` and other scripts touch
+    //     value 1, confirming OFF/AUTO/ON semantics.
+    //
+    // Keep both as `Option<u8>`; the activity-log helper picks the
+    // right label set per field below.
     let seatbelts_sign = if is_fenix {
-        Some(t.fnx_signs_seatbelts.round().clamp(0.0, 2.0) as u8)
+        Some(t.fnx_signs_seatbelts.round().clamp(0.0, 1.0) as u8)
     } else {
         None
     };

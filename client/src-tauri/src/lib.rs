@@ -4052,13 +4052,24 @@ fn detect_telemetry_changes(app: &AppHandle, flight: &ActiveFlight, snap: &SimSn
         "Wing anti-ice",
     );
 
-    // ---- Seat-belts and no-smoking signs (3-state).
-    log_three_state_change(
-        app,
-        snap.seatbelts_sign,
-        &mut stats.last_logged_seatbelts_sign,
-        "Seat belts",
-    );
+    // ---- Seat-belts (binary) and no-smoking (3-state).
+    // Different value spaces: Fenix's `L:S_OH_SIGNS` is 0/1 (the
+    // toggle uses logical-NOT) while `L:S_OH_SIGNS_SMOKING` is
+    // 0/1/2 (the toggle branches between 0 and 2 explicitly).
+    if let Some(v) = snap.seatbelts_sign {
+        if stats.last_logged_seatbelts_sign != Some(v) {
+            if stats.last_logged_seatbelts_sign.is_some() {
+                let label = if v == 0 { "OFF" } else { "ON" };
+                log_activity_handle(
+                    app,
+                    ActivityLevel::Info,
+                    format!("Seat belts {label}"),
+                    None,
+                );
+            }
+            stats.last_logged_seatbelts_sign = Some(v);
+        }
+    }
     log_three_state_change(
         app,
         snap.no_smoking_sign,
