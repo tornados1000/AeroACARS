@@ -26,14 +26,18 @@ git push --follow-tags
 ## Step 2 — Build the signed installer
 
 The private signing key is at `client/aeroacars-updater.key` (NEVER committed).
-Tauri reads it via the `TAURI_SIGNING_PRIVATE_KEY_PATH` environment variable:
+Tauri 2 wants the key **content** (not a path) in the env var:
 
-```bash
+```powershell
 cd client
-$env:TAURI_SIGNING_PRIVATE_KEY_PATH = "aeroacars-updater.key"
+$env:TAURI_SIGNING_PRIVATE_KEY = Get-Content aeroacars-updater.key -Raw
 $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ""    # we generated keys without a password
 npm run tauri build -- --bundles nsis
 ```
+
+(The `_PATH` variant in Tauri docs is for older versions; v2's
+plugin-updater build hook reads `TAURI_SIGNING_PRIVATE_KEY` as the
+literal key text.)
 
 This produces three files in `client/src-tauri/target/release/bundle/nsis/`:
 
