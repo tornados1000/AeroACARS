@@ -33,3 +33,9 @@ pub const SIMCONNECT_DATATYPE_STRING256: SIMCONNECT_DATATYPE =
 
 pub const SIMCONNECT_PERIOD_SECOND: SIMCONNECT_PERIOD =
     SIMCONNECT_PERIOD_SIMCONNECT_PERIOD_SECOND;
+/// One callback per rendered video frame — typically ~30 Hz on
+/// MSFS 2024. Required for touchdown V/S / G capture so the ring
+/// buffer has 30× more samples in its 5-second window and the
+/// actual touchdown subframe gets recorded.
+pub const SIMCONNECT_PERIOD_VISUAL_FRAME: SIMCONNECT_PERIOD =
+    SIMCONNECT_PERIOD_SIMCONNECT_PERIOD_VISUAL_FRAME;

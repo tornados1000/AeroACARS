@@ -678,9 +678,33 @@ impl Client {
     /// `DELETE /api/user/bids/{bid_id}` — drop a bid after its PIREP was filed
     /// (or to give it back). phpVMS does NOT auto-consume bids when the PIREP
     /// is filed unless we explicitly remove them.
+    ///
+    /// Some phpVMS deployments (or their reverse proxies / security
+    /// middleware) silently block the DELETE method and return HTTP
+    /// 405 "Method Not Allowed". Standard Laravel workaround: send
+    /// a POST with the `_method=DELETE` form override so Laravel's
+    /// router dispatches the same controller action. We try DELETE
+    /// first (the proper way) and fall back to the override on a
+    /// 405 — this lets us work on the maximum number of phpVMS
+    /// installs without forcing the VA admin to reconfigure their
+    /// server.
     pub async fn delete_bid(&self, bid_id: i64) -> Result<(), ApiError> {
         let path = format!("/api/user/bids/{bid_id}");
-        self.delete_void(&path).await
+        match self.delete_void(&path).await {
+            Ok(()) => Ok(()),
+            Err(ApiError::Server { status: 405, .. }) => {
+                tracing::info!(
+                    bid_id,
+                    "DELETE returned 405 — falling back to POST with _method=DELETE override"
+                );
+                #[derive(serde::Serialize)]
+                struct MethodOverride<'a> {
+                    _method: &'a str,
+                }
+                self.post_void(&path, &MethodOverride { _method: "DELETE" }).await
+            }
+            Err(other) => Err(other),
+        }
     }
 
     /// `POST /api/pireps/prefile` — create an in-flight PIREP.

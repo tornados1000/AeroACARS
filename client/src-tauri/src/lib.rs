@@ -2052,6 +2052,7 @@ async fn flight_start(
     setup_guard.disarm();
 
     spawn_position_streamer(app.clone(), Arc::clone(&flight), client);
+    spawn_touchdown_sampler(app.clone(), Arc::clone(&flight));
 
     let info = flight_info(flight.as_ref());
     log_activity(
@@ -2710,7 +2711,8 @@ async fn flight_resume_confirm(
     // Resume confirmed → clear the banner flag.
     flight.was_just_resumed.store(false, Ordering::Relaxed);
     let client = current_client(&state)?;
-    spawn_position_streamer(app, flight, client);
+    spawn_position_streamer(app.clone(), Arc::clone(&flight), client);
+    spawn_touchdown_sampler(app, flight);
     Ok(())
 }
 
@@ -2752,6 +2754,54 @@ async fn flight_forget(
 /// CAS-guarded: at most one streamer task per ActiveFlight. Repeat calls are
 /// no-ops, which makes it safe to invoke from multiple UI paths
 /// (`flight_resume_confirm` racing with itself, StrictMode double-mount, etc.).
+/// Spawn a high-rate (~30 Hz) sampler dedicated to populating the
+/// touchdown ring buffer in `FlightStats`. Runs alongside the
+/// position streamer (which posts to phpVMS at 1–30 s cadence,
+/// way too slow for sub-second touchdown capture).
+///
+/// The actual telemetry rate is bounded by SimConnect's
+/// `SIMCONNECT_PERIOD_VISUAL_FRAME` updates (~30 Hz typical) and
+/// the adapter worker's 50 ms drain sleep — so in practice the
+/// buffer accumulates ~20 samples/second, which still gives 100
+/// entries in the 5-second look-back window. That is more than
+/// enough to capture the actual touchdown subframe instead of
+/// the bounce rebound that the single 1 Hz sample was catching.
+///
+/// Exits when `flight.stop` is set, just like the streamer.
+fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
+    tauri::async_runtime::spawn(async move {
+        tracing::info!(pirep_id = %flight.pirep_id, "touchdown sampler started");
+        loop {
+            // 33 ms ≈ 30 Hz target. The actual upper bound comes
+            // from how fast `current_snapshot` returns fresh data.
+            tokio::time::sleep(Duration::from_millis(33)).await;
+            if flight.stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let Some(snap) = current_snapshot(&app) else {
+                continue;
+            };
+            let now = Utc::now();
+            let mut stats = flight.stats.lock().expect("flight stats");
+            stats.snapshot_buffer.push_back(TelemetrySample {
+                at: now,
+                vs_fpm: snap.vertical_speed_fpm,
+                g_force: snap.g_force,
+                on_ground: snap.on_ground,
+            });
+            let cutoff = now - chrono::Duration::seconds(TOUCHDOWN_BUFFER_SECS);
+            while stats
+                .snapshot_buffer
+                .front()
+                .is_some_and(|s| s.at < cutoff)
+            {
+                stats.snapshot_buffer.pop_front();
+            }
+        }
+        tracing::info!(pirep_id = %flight.pirep_id, "touchdown sampler stopped");
+    });
+}
+
 fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Client) {
     if flight
         .streamer_spawned
@@ -2987,37 +3037,28 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
     stats.position_count = stats.position_count.saturating_add(1);
     stats.last_fuel_kg = Some(snap.fuel_total_kg);
 
-    // Capture block fuel on the very first snapshot.
-    if stats.block_fuel_kg.is_none() {
-        stats.block_fuel_kg = Some(snap.fuel_total_kg);
-    }
+    // Block fuel is captured at the Pushback / TaxiOut transition
+    // (block-off moment) below in `step_flight`. Capturing it on
+    // the very first snapshot was unreliable: Fenix doesn't load
+    // EFB-managed fuel until ~5 s after flight_start, so the first
+    // tick saw a stale default (typically 3000 kg / 6600 lb) and
+    // we ended up reporting Used Fuel = 0 because the diff against
+    // the higher real value at landing went negative. The field
+    // stays None until block-off — that's both technically and
+    // operationally correct.
 
     // Peak altitude tracker — every tick, take the max with the live
     // MSL altitude. Reported as the PIREP `level` field.
     let alt = snap.altitude_msl_ft as f32;
     stats.peak_altitude_ft = Some(stats.peak_altitude_ft.map_or(alt, |p| p.max(alt)));
 
-    // Touchdown ring-buffer: append the current sample, then drop
-    // anything older than TOUCHDOWN_BUFFER_SECS. Cheap (memory-wise,
-    // 5 s × ~1 Hz = ~5 entries × 24 bytes each), and lets the
-    // Final → Landing transition reconstruct the actual touchdown
-    // V/S and G even when the on-ground tick already shows a
-    // bounce-up.
-    let now_ts = Utc::now();
-    stats.snapshot_buffer.push_back(TelemetrySample {
-        at: now_ts,
-        vs_fpm: snap.vertical_speed_fpm,
-        g_force: snap.g_force,
-        on_ground: snap.on_ground,
-    });
-    let cutoff = now_ts - chrono::Duration::seconds(TOUCHDOWN_BUFFER_SECS);
-    while stats
-        .snapshot_buffer
-        .front()
-        .is_some_and(|s| s.at < cutoff)
-    {
-        stats.snapshot_buffer.pop_front();
-    }
+    // Touchdown ring-buffer is now populated by the dedicated 30 Hz
+    // sampler (`spawn_touchdown_sampler`) — the streamer ticks every
+    // 5–8 s during Final / Landing, way too sparse to reliably catch
+    // the actual touchdown subframe. The sampler shares the same
+    // `stats.snapshot_buffer` so the FSM still reads the buffer when
+    // it transitions to Landing, just with 30× more samples to pick
+    // the worst V/S and peak G from.
 
     let now = Utc::now();
     let prev_phase = stats.phase;
@@ -3062,6 +3103,15 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
             // / hand-flown push (brake released first, then truck).
             if snap.on_ground && snap.groundspeed_kt > 0.5 {
                 stats.block_off_at = Some(now);
+                // Block fuel = fuel on board at the block-off moment.
+                // Capturing here (instead of on the very first
+                // snapshot) survives the typical Fenix-EFB load
+                // sequence: pilot opens EFB during Boarding, sets
+                // fuel via SimBrief import, the LVar settles a few
+                // seconds later. By the time the aircraft actually
+                // moves we're guaranteed to read the final value —
+                // matches what airline ops calls "block fuel".
+                stats.block_fuel_kg = Some(snap.fuel_total_kg);
                 next_phase = if snap.engines_running == 0 {
                     FlightPhase::Pushback
                 } else {

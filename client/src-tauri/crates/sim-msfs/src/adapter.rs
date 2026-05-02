@@ -554,9 +554,20 @@ impl Connection {
         Ok(())
     }
 
-    /// Subscribe at SECOND cadence — the application bumps to faster
-    /// intervals via its own polling loop, but for raw SimConnect a
-    /// 1 Hz feed is plenty for our use.
+    /// Subscribe to live telemetry at VISUAL_FRAME cadence (~30 Hz).
+    /// The 1 Hz SECOND rate we ran on previously was too sparse for
+    /// touchdown capture: the actual ground-contact subframe dropped
+    /// between two snapshots, the ring buffer only had 5 entries in
+    /// the 5-second look-back window, and the recorded V/S routinely
+    /// caught the bounce-rebound rather than the impact (logged
+    /// "V/S -4 fpm" while MSFS reported -114 fpm). At 30 Hz the
+    /// buffer holds 150 entries → impossible to miss the actual
+    /// touchdown frame.
+    ///
+    /// CPU cost is negligible: the dispatch loop already drains all
+    /// queued messages each tick via `get_next_dispatch`, so the
+    /// only difference is more byte-level parsing per second
+    /// (~30 KB/s of data).
     fn request_data_per_second(&mut self) -> Result<(), String> {
         let hr = unsafe {
             sys::SimConnect_RequestDataOnSimObject(
@@ -564,7 +575,7 @@ impl Connection {
                 REQUEST_ID,
                 DEFINITION_ID,
                 sys::SIMCONNECT_OBJECT_ID_USER,
-                sys::SIMCONNECT_PERIOD_SECOND,
+                sys::SIMCONNECT_PERIOD_VISUAL_FRAME,
                 0,
                 0,
                 0,
