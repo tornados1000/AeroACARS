@@ -5223,39 +5223,51 @@ fn build_pirep_notes(flight: &ActiveFlight, stats: &FlightStats) -> String {
     s
 }
 
-/// Map our internal `FlightPhase` to the phpVMS PirepStatus code we POST in
-/// `update_pirep`. Codes follow the canonical phpVMS Core PirepStatus
-/// enum (see `nabeelio/phpvms` `app/Models/Enums/PirepStatus.php`):
+/// Map our internal `FlightPhase` to the phpVMS PirepStatus code we POST
+/// in `update_pirep`. Codes verified against the canonical phpVMS Core
+/// enum at `phpvms/phpvms` → `app/Models/Enums/PirepStatus.php`:
 ///
-///   BST = Boarding              PBT = Pushback           OFB = Off blocks
-///   TXI = Taxi                  TKO = Takeoff (rolling)  TOF = Took off
-///   ICL = Initial climb         ENR = Enroute            TEN = Through 10k
-///   TOD = Top of descent        APR = Approach           FAP = Final
-///   LDG = Landing               LAN = Landed             TXG = Taxi to gate
-///   ARR = Arrived
+///   INI Initiated   SCH Scheduled    BST Boarding         RDT Ready
+///   PBT Pushback    OFB Off block    DIR Ready de-ice     DIC De-icing
+///   GRT Ground rtn  TXI Taxi         TOF Takeoff (roll)   TKO Airborne
+///   ICL Init climb  ENR Enroute      DV  Diverted
+///   TEN Approach    APR Approach     FIN On final         LDG Landing
+///   LAN Landed      ONB On block     ARR Arrived          DX  Cancelled
+///   EMG Emerg desc  PSD Paused
 ///
-/// We deliberately use `PBT` for Pushback rather than `OFB` — many VAs
-/// translate `OFB` as "Abgeflogen" (departed), which confuses pilots
-/// who are still pushing back. `PBT` reads as "Pushback" everywhere.
-///
-/// Some phases collapse to the same code (e.g. Climb and Cruise both
-/// report ENR; Descent uses TEN to make the through-FL100 transition
-/// explicit on the phpVMS live tracker).
+/// Notes / pitfalls discovered while wiring this up (real bugs):
+///   * Pushback must be PBT, not OFB. phpVMS labels `OFB` as
+///     "departed" (German: "Abgeflogen") — sending OFB during pushback
+///     made the live tracker show "Abgeflogen" before the aircraft had
+///     even moved off the gate.
+///   * There is no "TOD" or "FAP" or "TXG" in phpVMS — early versions
+///     of this client invented those, which would have been silently
+///     dropped (or echoed as the literal letters in some VA themes).
+///   * `TOF` is the on-runway-takeoff-roll phase, `TKO` is the
+///     airborne / climb-out phase. Their human-readable labels
+///     collapse to "takeoff" and "enroute" respectively.
+///   * Phases the API offers but we don't drive: SCH, DIR/DIC (de-ice),
+///     GRT (ground return), DV (divert), EMG, PSD. We may emit them
+///     later from manual-end paths.
 fn phase_to_status(phase: FlightPhase) -> Option<&'static str> {
     match phase {
         FlightPhase::Preflight | FlightPhase::Boarding => Some("BST"),
         FlightPhase::Pushback => Some("PBT"),
         FlightPhase::TaxiOut => Some("TXI"),
-        FlightPhase::TakeoffRoll => Some("TKO"),
-        FlightPhase::Takeoff => Some("TOF"),
+        FlightPhase::TakeoffRoll => Some("TOF"),
+        FlightPhase::Takeoff => Some("TKO"),
         FlightPhase::Climb => Some("ICL"),
-        FlightPhase::Cruise => Some("ENR"),
-        FlightPhase::Descent => Some("TOD"),
+        // No dedicated "descent" code in phpVMS — the canonical
+        // taxonomy stays ENROUTE until the aircraft enters the
+        // approach phase (which we cover with APR / FIN below).
+        FlightPhase::Cruise | FlightPhase::Descent => Some("ENR"),
         FlightPhase::Approach => Some("APR"),
-        FlightPhase::Final => Some("FAP"),
+        FlightPhase::Final => Some("FIN"),
         FlightPhase::Landing => Some("LDG"),
-        FlightPhase::TaxiIn => Some("TXG"),
-        FlightPhase::BlocksOn | FlightPhase::Arrived => Some("ARR"),
+        // No separate "taxi to gate" code; phpVMS reuses TXI.
+        FlightPhase::TaxiIn => Some("TXI"),
+        FlightPhase::BlocksOn => Some("ONB"),
+        FlightPhase::Arrived => Some("ARR"),
         FlightPhase::PirepSubmitted => None,
     }
 }
