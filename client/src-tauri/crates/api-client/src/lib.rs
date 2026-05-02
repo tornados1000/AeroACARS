@@ -693,15 +693,30 @@ impl Client {
         match self.delete_void(&path).await {
             Ok(()) => Ok(()),
             Err(ApiError::Server { status: 405, .. }) => {
+                // Laravel's `_method` form-spoof requires the body to be
+                // `application/x-www-form-urlencoded` — sending JSON
+                // doesn't work because Laravel only inspects form
+                // params for the override field. Plus we send the
+                // `X-HTTP-Method-Override: DELETE` header which some
+                // routers / middlewares honour even without form data.
+                // Either path that succeeds wins.
                 tracing::info!(
                     bid_id,
-                    "DELETE returned 405 — falling back to POST with _method=DELETE override"
+                    "DELETE returned 405 — falling back to POST with _method=DELETE form override"
                 );
-                #[derive(serde::Serialize)]
-                struct MethodOverride<'a> {
-                    _method: &'a str,
-                }
-                self.post_void(&path, &MethodOverride { _method: "DELETE" }).await
+                let url = self.endpoint(&path)?;
+                let response = self
+                    .http
+                    .post(url)
+                    .header("X-API-Key", &self.conn.api_key)
+                    .header(header::ACCEPT, "application/json")
+                    .header("X-HTTP-Method-Override", "DELETE")
+                    .form(&[("_method", "DELETE")])
+                    .send()
+                    .await
+                    .map_err(ApiError::from)?;
+                let _ = check_status(response, &path).await?;
+                Ok(())
             }
             Err(other) => Err(other),
         }
