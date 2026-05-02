@@ -4807,12 +4807,10 @@ fn build_pirep_fields(
         f.insert("approach_bank_stddev_deg".into(), format!("{:.2}", sd));
     }
     if let Some(meters) = stats.rollout_distance_m {
-        let feet = meters * 3.28084;
-        f.insert("Rollout Distance".into(), format!("{:.0} ft", feet));
-        // Keep the legacy snake_case field in metres for back-compat
-        // with existing VA scripts; add the ft variant alongside.
+        f.insert("Rollout Distance".into(), format!("{:.0} m", meters));
+        // Keep both numeric fields for VA-script compatibility.
         f.insert("rollout_distance_m".into(), format!("{:.0}", meters));
-        f.insert("rollout_distance_ft".into(), format!("{:.0}", feet));
+        f.insert("rollout_distance_ft".into(), format!("{:.0}", meters * 3.28084));
     }
 
     // ---- SimBrief OFP plan + fuel-efficiency (Landing Analyzer Stage 2) ----
@@ -4882,17 +4880,17 @@ fn build_pirep_fields(
         f.insert(
             "Centerline Offset".into(),
             format!(
-                "{:.1} m {} (= {:.0} ft)",
+                "{:.1} m {}",
                 rw.centerline_distance_m.abs(),
                 rw.side,
-                rw.centerline_distance_abs_ft
             ),
         );
         f.insert(
             "Touchdown Past Threshold".into(),
             format!(
-                "{:.0} ft (runway {:.0} ft long)",
-                rw.touchdown_distance_from_threshold_ft, rw.length_ft
+                "{:.0} m (runway {:.0} m long)",
+                rw.touchdown_distance_from_threshold_ft as f64 * 0.3048,
+                rw.length_ft as f64 * 0.3048,
             ),
         );
         f.insert(
@@ -5076,7 +5074,7 @@ fn build_pirep_notes(flight: &ActiveFlight, stats: &FlightStats) -> String {
             let _ = writeln!(s, "  Apr Bank σ    {:.1}°", sd);
         }
         if let Some(m) = stats.rollout_distance_m {
-            let _ = writeln!(s, "  Rollout       {:.0} ft", m * 3.28084);
+            let _ = writeln!(s, "  Rollout       {:.0} m", m);
         }
         if let Some(score) = stats.landing_score {
             let grade = letter_grade(score.numeric());
@@ -5096,8 +5094,11 @@ fn build_pirep_notes(flight: &ActiveFlight, stats: &FlightStats) -> String {
         wrote_section = true;
         let _ = writeln!(
             s,
-            "  Touchdown     {}/{}  ({}, {:.0} ft long)",
-            rw.airport_ident, rw.runway_ident, rw.surface, rw.length_ft
+            "  Touchdown     {}/{}  ({}, {:.0} m long)",
+            rw.airport_ident,
+            rw.runway_ident,
+            rw.surface,
+            rw.length_ft as f64 * 0.3048,
         );
         let _ = writeln!(
             s,
@@ -5107,8 +5108,8 @@ fn build_pirep_notes(flight: &ActiveFlight, stats: &FlightStats) -> String {
         );
         let _ = writeln!(
             s,
-            "  Past thresh   {:.0} ft",
-            rw.touchdown_distance_from_threshold_ft
+            "  Past thresh   {:.0} m",
+            rw.touchdown_distance_from_threshold_ft as f64 * 0.3048,
         );
     }
 

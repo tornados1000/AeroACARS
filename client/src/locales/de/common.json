@@ -91,6 +91,14 @@
       "rollout": "Bahn-Auslastung",
       "fuel": "Spritverbrauch"
     },
+    "info": {
+      "landing_rate": "Vertikalgeschwindigkeit (V/S) im Moment des Aufsetzens, in Fuß pro Minute. Negativ = sinkend. Boeing-/Airbus-FCOM-Schwellen: bis −240 fpm gilt als sauber, ab −600 fpm als Hard-Landing-Inspektion fällig.",
+      "g_force": "Maximale G-Belastung im 1,5-Sekunden-Fenster um den Touchdown. 1,0 G = ruhig, ab 1,4 G deutlich spürbar, ab 1,7 G strukturkritisch (Boeing 737 FCOM Hard-Landing-Schwelle).",
+      "bounces": "Wie oft das Flugzeug nach dem ersten Aufsetzen wieder über 35 ft AGL gestiegen und erneut gelandet ist (BeatMyLanding-Algorithmus). 0 = sauber gesetzt; jeder Bounce drückt den Score.",
+      "stability": "Standardabweichung (σ) der Sinkrate über die letzten ~10 Minuten Anflug. Niedrig = ruhig und konstant geflogen, hoch = wackelig. < 100 fpm σ gilt als sehr stabil; > 300 fpm σ ist Anlass für Stabilized-Approach-Review.",
+      "rollout": "Prozent der verfügbaren Bahnlänge die du vom Touchdown bis zum Verlassen (Highspeed-Exit < 40 kt oder > 30° Heading-Abweichung) genutzt hast. < 70 % ist normal; > 85 % heißt knapp — bei nasser Bahn riskant.",
+      "fuel": "Abweichung des tatsächlichen Trip-Burns vom SimBrief-Plan. Positiv = mehr verbraucht, negativ = weniger. ±5 % ist saubere Performance-Kalkulation; > ±20 % deutet auf falsche Cruise-Höhe oder Wind-Einfluss."
+    },
     "rat": {
       "smooth_touchdown": "Butterweich aufgesetzt",
       "firm_but_clean": "Feste, aber saubere Landung",

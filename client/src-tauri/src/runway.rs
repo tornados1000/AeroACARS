@@ -95,6 +95,19 @@ pub struct RunwayMatch {
     pub side: String,
 }
 
+/// Heuristic: does this airport_ident look like an ICAO code?
+/// ICAO codes are exactly 4 letters, no digits or dashes. National
+/// fallback identifiers use formats like "DE-0901" / "US-1234".
+/// Matters because OurAirports ships *both* for many real airports —
+/// the German aviation authority assigns DE-#### IDs and OurAirports
+/// dutifully imports them as separate rows alongside the ICAO ones.
+/// Without the dedupe step below the lookup would happily return
+/// "DE-0901" for an EDDM landing — same coordinates, just the wrong
+/// label. Real bug observed 2026-05-02.
+fn looks_like_icao(ident: &str) -> bool {
+    ident.len() == 4 && ident.chars().all(|c| c.is_ascii_uppercase())
+}
+
 /// Parse the embedded CSV exactly once. The OnceLock means concurrent
 /// callers from a thread pool don't race on parsing — first one through
 /// the door does the work, everyone else waits on the lock and reads
@@ -154,8 +167,55 @@ fn runways() -> &'static Vec<RunwayRow> {
                 he_heading_true: he_heading,
             });
         }
-        tracing::debug!(count = out.len(), "runway table parsed");
-        out
+        tracing::debug!(count = out.len(), "runway table parsed (raw)");
+
+        // Dedupe pass: many airports appear *twice* in OurAirports — once
+        // under the ICAO ident, once under a national fallback identifier
+        // (EDDM ↔ DE-0901, KJFK ↔ US-..., RJTT ↔ JP-..., etc.). They
+        // share the exact same threshold coordinates because they
+        // *describe the same physical runway*. Keep the ICAO row when
+        // that happens; otherwise the lookup picks whichever came first
+        // in the CSV (= often the national one) and the PIREP shows
+        // "DE-0901/08L" instead of "EDDM/08L".
+        //
+        // Dedup key: (le_lat × 1e5, le_lon × 1e5, runway_ident) rounded
+        // to ~1 m precision. Any two rows sharing that key are the same
+        // physical runway.
+        let mut by_key: std::collections::HashMap<(i64, i64, String), usize> =
+            std::collections::HashMap::with_capacity(out.len());
+        let mut to_drop: Vec<bool> = vec![false; out.len()];
+        for (idx, row) in out.iter().enumerate() {
+            let key = (
+                (row.le_lat * 1e5).round() as i64,
+                (row.le_lon * 1e5).round() as i64,
+                row.le_ident.clone(),
+            );
+            match by_key.get(&key).copied() {
+                Some(existing_idx) => {
+                    let existing = &out[existing_idx];
+                    let existing_is_icao = looks_like_icao(&existing.airport_ident);
+                    let new_is_icao = looks_like_icao(&row.airport_ident);
+                    if new_is_icao && !existing_is_icao {
+                        // Replace the national-id row with the ICAO row.
+                        to_drop[existing_idx] = true;
+                        by_key.insert(key, idx);
+                    } else {
+                        // Keep the existing row, drop this one.
+                        to_drop[idx] = true;
+                    }
+                }
+                None => {
+                    by_key.insert(key, idx);
+                }
+            }
+        }
+        let final_out: Vec<RunwayRow> = out
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, r)| if to_drop[i] { None } else { Some(r) })
+            .collect();
+        tracing::debug!(count = final_out.len(), "runway table after ICAO dedupe");
+        final_out
     })
 }
 

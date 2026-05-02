@@ -91,6 +91,14 @@
       "rollout": "Runway used",
       "fuel": "Fuel efficiency"
     },
+    "info": {
+      "landing_rate": "Vertical speed (V/S) at the moment of touchdown, in feet per minute. Negative = sinking. Boeing/Airbus FCOM thresholds: clean up to -240 fpm; hard-landing inspection at -600 fpm.",
+      "g_force": "Peak G load in the 1.5-second window around touchdown. 1.0 G is smooth, above 1.4 G is clearly noticeable, above 1.7 G triggers a hard-landing inspection (Boeing 737 FCOM).",
+      "bounces": "How many times the aircraft climbed back above 35 ft AGL after the first touchdown and re-landed (BeatMyLanding algorithm). 0 = clean set; each bounce drops the score.",
+      "stability": "Standard deviation (σ) of vertical speed over the last ~10 minutes of approach. Low = smooth, constant flying. < 100 fpm σ is 'very stable'; > 300 fpm σ warrants a stabilized-approach review.",
+      "rollout": "Percent of available runway length used from touchdown until clearing the runway (high-speed exit below 40 kt or > 30° heading deviation). < 70 % is normal; > 85 % is tight, especially on wet runway.",
+      "fuel": "Deviation of actual trip burn from the SimBrief plan. Positive = burned more, negative = less. ±5 % means clean performance calc; > ±20 % suggests wrong cruise altitude or unaccounted wind."
+    },
     "rat": {
       "smooth_touchdown": "Butter-smooth touchdown",
       "firm_but_clean": "Firm but clean",

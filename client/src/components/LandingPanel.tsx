@@ -209,13 +209,13 @@ function computeSubScores(r: LandingRecord): SubScore[] {
     r.runway_match.length_ft > 0 &&
     r.rollout_distance_m != null
   ) {
-    const rolloutFt = r.rollout_distance_m * 3.28084;
-    const usedPct = (rolloutFt / r.runway_match.length_ft) * 100;
+    const lengthM = r.runway_match.length_ft * 0.3048;
+    const usedPct = (r.rollout_distance_m / lengthM) * 100;
     const ro = scoreRollout(usedPct);
     out.push({
       key: "rollout",
       points: ro.points,
-      value: `${usedPct.toFixed(0)}% (${rolloutFt.toFixed(0)} ft)`,
+      value: `${usedPct.toFixed(0)}% (${r.rollout_distance_m.toFixed(0)} m)`,
       band: band(ro.points),
       rationale: ro.rationale,
     });
@@ -236,47 +236,13 @@ function computeSubScores(r: LandingRecord): SubScore[] {
   return out;
 }
 
-/** Rationale → coach-tip mapping. The detail-view shows the tip for the
- *  WORST sub-score so the pilot has one concrete thing to work on next. */
-const COACH_TIPS: Record<string, string> = {
-  // Landing rate
-  smooth_touchdown: "tip.smooth_touchdown",
-  firm_but_clean: "tip.firm_but_clean",
-  above_target: "tip.above_target",
-  hard_landing: "tip.hard_landing",
-  very_hard: "tip.very_hard",
-  severe_inspection: "tip.severe_inspection",
-  // G-force
-  smooth_g: "tip.smooth_g",
-  comfortable_g: "tip.comfortable_g",
-  noticeable_g: "tip.noticeable_g",
-  firm_g: "tip.firm_g",
-  hard_g: "tip.hard_g",
-  severe_g: "tip.severe_g",
-  // Bounces
-  clean_set: "tip.clean_set",
-  one_bounce: "tip.one_bounce",
-  two_bounces: "tip.two_bounces",
-  many_bounces: "tip.many_bounces",
-  // Stability
-  very_stable: "tip.very_stable",
-  stable: "tip.stable",
-  average_stability: "tip.average_stability",
-  unstable_approach: "tip.unstable_approach",
-  very_unstable: "tip.very_unstable",
-  // Rollout
-  excellent_stop: "tip.excellent_stop",
-  good_stop: "tip.good_stop",
-  long_rollout: "tip.long_rollout",
-  very_long_rollout: "tip.very_long_rollout",
-  marginal_runway: "tip.marginal_runway",
-  // Fuel
-  on_plan: "tip.on_plan",
-  near_plan: "tip.near_plan",
-  off_plan: "tip.off_plan",
-  very_off_plan: "tip.very_off_plan",
-  way_off_plan: "tip.way_off_plan",
-};
+/** Rationale → i18n key for the coach tip. We point straight at the
+ *  fully-qualified `landing.tip.*` path so a missing translation
+ *  shows up as the key (easier to spot in QA) rather than as a
+ *  silent fallback. */
+function coachTipKey(rationale: string): string {
+  return `landing.tip.${rationale}`;
+}
 
 // ---- Helpers ------------------------------------------------------------
 
@@ -429,29 +395,32 @@ function VsCurveChart({ profile }: { profile: LandingProfilePoint[] }) {
       >
         0
       </text>
-      {/* X axis labels */}
-      <text
-        x={pad.left}
-        y={h - 8}
-        fontSize="10"
-        fill="currentColor"
-      >
-        {(tMin / 1000).toFixed(1)}s
-      </text>
-      <text
-        x={pad.left + innerW}
-        y={h - 8}
-        textAnchor="end"
-        fontSize="10"
-        fill="currentColor"
-      >
-        {(tMax / 1000).toFixed(1)}s
-      </text>
+      {/* X axis labels — we hide the right-edge tMax label when TD
+          sits at (or near) the right edge, otherwise the "TD" yellow
+          label visually merges with "0.0s" into "TDs" (real bug
+          observed). Same for tMin/start-edge.                       */}
+      {Math.abs(x(td.t_ms) - pad.left) > 22 && (
+        <text x={pad.left} y={h - 8} fontSize="10" fill="currentColor">
+          {(tMin / 1000).toFixed(1)}s
+        </text>
+      )}
+      {Math.abs(x(td.t_ms) - (pad.left + innerW)) > 22 && (
+        <text
+          x={pad.left + innerW}
+          y={h - 8}
+          textAnchor="end"
+          fontSize="10"
+          fill="currentColor"
+        >
+          {(tMax / 1000).toFixed(1)}s
+        </text>
+      )}
       <text
         x={x(td.t_ms)}
         y={h - 8}
         textAnchor="middle"
         fontSize="10"
+        fontWeight="600"
         fill="#facc15"
       >
         TD
@@ -541,7 +510,7 @@ function RunwayDiagram({ rw }: { rw: LandingRunwayMatch }) {
         fontSize="11"
         fill="currentColor"
       >
-        {rw.length_ft.toFixed(0)} ft
+        {(rw.length_ft * 0.3048).toFixed(0)} m
       </text>
       <text
         x={tdX}
@@ -550,7 +519,7 @@ function RunwayDiagram({ rw }: { rw: LandingRunwayMatch }) {
         fontSize="10"
         fill="#22d3ee"
       >
-        TD · {tdFromThresh.toFixed(0)} ft past thresh
+        TD · {(tdFromThresh * 0.3048).toFixed(0)} m hinter Schwelle
       </text>
       <text
         x={tdX}
@@ -559,7 +528,7 @@ function RunwayDiagram({ rw }: { rw: LandingRunwayMatch }) {
         fontSize="10"
         fill="currentColor"
       >
-        {rw.centerline_distance_abs_ft.toFixed(0)} ft {rw.side.toLowerCase()}
+        {(Math.abs(rw.centerline_distance_m)).toFixed(1)} m {rw.side.toLowerCase()}
       </text>
     </svg>
   );
@@ -775,6 +744,49 @@ function ApproachChart({ samples }: { samples: ApproachSample[] }) {
   );
 }
 
+// ---- (i) info badge — small click-to-toggle popover --------------------
+//
+// Pilots may not know what "V/S σ" or "Bahn-Auslastung" means precisely.
+// Each sub-score card carries a small (i) icon that, when clicked,
+// reveals an explanation popover above/below the card. We use a click
+// instead of hover so it's tappable on touch devices and stays open
+// while the pilot reads it.
+
+function InfoBadge({ explanation }: { explanation: string }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <span className="info-badge-wrap">
+      <button
+        type="button"
+        className={`info-badge ${open ? "info-badge--open" : ""}`}
+        onClick={(e) => {
+          e.stopPropagation();
+          setOpen((v) => !v);
+        }}
+        aria-label="info"
+      >
+        i
+      </button>
+      {open && (
+        <span className="info-badge__popover" role="tooltip">
+          {explanation}
+          <button
+            type="button"
+            className="info-badge__close"
+            onClick={(e) => {
+              e.stopPropagation();
+              setOpen(false);
+            }}
+            aria-label="close"
+          >
+            ×
+          </button>
+        </span>
+      )}
+    </span>
+  );
+}
+
 // ---- Score breakdown card grid -----------------------------------------
 
 function ScoreBreakdown({ subs }: { subs: SubScore[] }) {
@@ -790,6 +802,7 @@ function ScoreBreakdown({ subs }: { subs: SubScore[] }) {
           <div className="landing-subscore__head">
             <span className="landing-subscore__label">
               {t(`landing.sub.${s.key}`)}
+              <InfoBadge explanation={t(`landing.info.${s.key}`)} />
             </span>
             <span className="landing-subscore__points">{s.points} PTS</span>
           </div>
@@ -818,7 +831,7 @@ function CoachTip({ subs }: { subs: SubScore[] }) {
   // everything is ≥ 90, surface the genuine "good landing" message.
   const sorted = [...subs].sort((a, b) => a.points - b.points);
   const worst = sorted[0];
-  const tipKey = COACH_TIPS[worst.rationale] ?? "tip.fallback";
+  const tipKey = coachTipKey(worst.rationale);
   return (
     <div
       className={`landing-coach landing-coach--${
@@ -1163,29 +1176,27 @@ function LandingDetail({
             </div>
             <div>
               <dt>{t("landing.runway_length")}</dt>
-              <dd>{fmtNumber(record.runway_match.length_ft, 0, "ft")}</dd>
+              <dd>
+                {(record.runway_match.length_ft * 0.3048).toFixed(0)} m
+              </dd>
             </div>
             <div>
               <dt>{t("landing.centerline_offset")}</dt>
               <dd>
-                {record.runway_match.centerline_distance_abs_ft.toFixed(0)} ft{" "}
+                {Math.abs(record.runway_match.centerline_distance_m).toFixed(1)} m{" "}
                 {record.runway_match.side.toLowerCase()}
               </dd>
             </div>
             <div>
               <dt>{t("landing.past_threshold")}</dt>
               <dd>
-                {fmtNumber(
-                  record.runway_match.touchdown_distance_from_threshold_ft,
-                  0,
-                  "ft",
-                )}
+                {(record.runway_match.touchdown_distance_from_threshold_ft * 0.3048).toFixed(0)} m
               </dd>
             </div>
             {record.rollout_distance_m != null && (
               <div>
                 <dt>{t("landing.rollout")}</dt>
-                <dd>{(record.rollout_distance_m * 3.28084).toFixed(0)} ft</dd>
+                <dd>{record.rollout_distance_m.toFixed(0)} m</dd>
               </div>
             )}
             {record.runway_match.length_ft > 0 &&
