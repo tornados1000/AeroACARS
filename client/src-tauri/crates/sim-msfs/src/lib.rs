@@ -67,6 +67,22 @@ mod stub {
 
     pub struct MsfsAdapter;
 
+    /// Stubbed PMDG status for non-Windows targets — never has a
+    /// variant detected, never subscribed, never receives data.
+    #[derive(Debug, Clone)]
+    pub struct PmdgStatus {
+        pub variant: Option<crate::pmdg::PmdgVariant>,
+        pub subscribed: bool,
+        pub ever_received: bool,
+        pub stale_secs: u64,
+    }
+
+    impl PmdgStatus {
+        pub fn looks_like_sdk_disabled(&self) -> bool {
+            false
+        }
+    }
+
     impl MsfsAdapter {
         pub fn new() -> Self {
             Self
@@ -80,6 +96,17 @@ mod stub {
             None
         }
         pub fn clear_snapshot(&self) {}
+        pub fn pmdg_ng3_snapshot(&self) -> Option<crate::pmdg::ng3::Pmdg738Snapshot> {
+            None
+        }
+        pub fn pmdg_status(&self) -> PmdgStatus {
+            PmdgStatus {
+                variant: None,
+                subscribed: false,
+                ever_received: false,
+                stale_secs: u64::MAX,
+            }
+        }
         pub fn last_error(&self) -> Option<String> {
             Some("MSFS adapter is Windows-only".into())
         }

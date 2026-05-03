@@ -95,14 +95,36 @@ fn main() {
         .allowlist_type("SIMCONNECT_RECV_QUIT")
         .allowlist_type("SIMCONNECT_RECV_EXCEPTION")
         .allowlist_type("SIMCONNECT_RECV_SIMOBJECT_DATA")
+        // ClientData receiver — `SIMCONNECT_RECV_CLIENT_DATA` is
+        // the same shape as SIMOBJECT_DATA but with a different
+        // RECV_ID, so SimConnect routes the bytes properly.
+        .allowlist_type("SIMCONNECT_RECV_CLIENT_DATA")
+        // System state events for PMDG aircraft change detection.
+        .allowlist_type("SIMCONNECT_RECV_SYSTEM_STATE")
+        .allowlist_type("SIMCONNECT_RECV_EVENT")
         .allowlist_type("SIMCONNECT_EXCEPTION")
         .allowlist_type("SIMCONNECT_DATATYPE")
         .allowlist_type("SIMCONNECT_PERIOD")
+        .allowlist_type("SIMCONNECT_CLIENT_DATA_PERIOD")
         .allowlist_type("SIMCONNECT_DATA_REQUEST_FLAG")
+        .allowlist_type("SIMCONNECT_CLIENT_DATA_REQUEST_FLAG")
+        // ClientData functions — needed for PMDG SDK integration
+        // (Phase H.4). PMDG ships a custom ClientData channel
+        // ("PMDG_NG3_Data" / "PMDG_777X_Data") with the full
+        // cockpit state; subscribing requires these three:
+        .allowlist_function("SimConnect_MapClientDataNameToID")
+        .allowlist_function("SimConnect_AddToClientDataDefinition")
+        .allowlist_function("SimConnect_RequestClientData")
+        // System state — used to detect which aircraft is loaded
+        // (PMDG variant detection from the .air file path).
+        .allowlist_function("SimConnect_RequestSystemState")
+        .allowlist_function("SimConnect_SubscribeToSystemEvent")
         // --- Constants we reference ---
         .allowlist_var("SIMCONNECT_OBJECT_ID_USER")
         .allowlist_var("SIMCONNECT_DATA_REQUEST_FLAG_DEFAULT")
         .allowlist_var("SIMCONNECT_DATA_REQUEST_FLAG_CHANGED")
+        .allowlist_var("SIMCONNECT_CLIENT_DATA_REQUEST_FLAG_DEFAULT")
+        .allowlist_var("SIMCONNECT_CLIENT_DATA_REQUEST_FLAG_CHANGED")
         .generate()
         .expect("Unable to generate SimConnect bindings");
 
