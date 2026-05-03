@@ -41,6 +41,15 @@ mod adapter;
 #[cfg(target_os = "windows")]
 pub use adapter::*;
 
+/// PMDG SimConnect SDK integration (737 NG3 + 777X).
+///
+/// Cross-platform module — the data structures + variant detection
+/// don't depend on Windows. The actual ClientData subscription
+/// will be Windows-only when wired into the adapter (Phase 5.2);
+/// for now this just defines the layouts so other crates can
+/// reference `PmdgVariant` etc. on any platform.
+pub mod pmdg;
+
 // ---- Non-Windows stub ----
 
 #[cfg(not(target_os = "windows"))]
