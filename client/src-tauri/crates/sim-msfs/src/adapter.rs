@@ -219,6 +219,132 @@ fn ng3_to_pmdg_state(s: &crate::pmdg::ng3::Pmdg738Snapshot) -> sim_core::PmdgSta
     }
 }
 
+/// Convert a PMDG 777X snapshot to the generic `sim_core::PmdgState`
+/// shape. 777 differs from NG3 in autoflight modes — instead of
+/// CMD A/B engagement annunciators, the 777 has push-button
+/// engagement with a single AP annunciator per side, and the
+/// FMA modes are FLCH / HDG HOLD / VS_FPA instead of LVL CHG /
+/// HDG SEL / VS. We map them to the closest generic equivalents.
+fn x777_to_pmdg_state(s: &crate::pmdg::x777::Pmdg777XSnapshot) -> sim_core::PmdgState {
+    use sim_core::PmdgState;
+
+    // Speed-mode label. 777 doesn't have a separate "N1" annunciator
+    // (uses FMC ThrustLimitMode for that). When AT is engaged + AP
+    // is engaged, FMA usually shows the active sub-mode label.
+    let fma_speed_mode = if s.fma.at {
+        "SPD"
+    } else {
+        ""
+    };
+    // Roll-mode priority: APP > LOC > LNAV > HDG HOLD.
+    let fma_roll_mode = if s.fma.app {
+        "APP"
+    } else if s.fma.loc {
+        "LOC"
+    } else if s.fma.lnav {
+        "LNAV"
+    } else if s.fma.hdg_hold {
+        "HDG HOLD"
+    } else {
+        ""
+    };
+    // Pitch-mode: VNAV > FLCH > VS_FPA > ALT_HOLD.
+    let fma_pitch_mode = if s.fma.vnav {
+        "VNAV"
+    } else if s.fma.flch {
+        "FLCH"
+    } else if s.fma.alt_hold {
+        "ALT HOLD"
+    } else if s.fma.vs_fpa {
+        if s.mcp_dial_in_fpa_mode { "FPA" } else { "V/S" }
+    } else {
+        ""
+    };
+
+    // Convert 777 flap handle to an approximate degree value for
+    // the generic `flap_angle_deg` field. The actual flap surface
+    // angle isn't in the SDK; we use the canonical handle-to-
+    // degree mapping (0=UP, 1=1°, 2=5°, 3=15°, 4=20°, 5=25°, 6=30°)
+    // which IS what the cockpit FLAP indicator shows.
+    let flap_angle_deg = match s.flap_handle_pos {
+        0 => 0.0,
+        1 => 1.0,
+        2 => 5.0,
+        3 => 15.0,
+        4 => 20.0,
+        5 => 25.0,
+        6 => 30.0,
+        _ => 0.0,
+    };
+
+    PmdgState {
+        variant_label: s.model.label().to_string(),
+
+        mcp_speed_raw: if s.mcp_speed_blanked {
+            None
+        } else {
+            Some(s.mcp_speed_raw)
+        },
+        mcp_heading_deg: Some(s.mcp_heading_deg),
+        mcp_altitude_ft: Some(s.mcp_altitude_ft),
+        mcp_vs_fpm: if s.mcp_vs_blanked {
+            None
+        } else {
+            Some(s.mcp_vs_fpm)
+        },
+
+        fma_speed_mode: fma_speed_mode.to_string(),
+        fma_roll_mode: fma_roll_mode.to_string(),
+        fma_pitch_mode: fma_pitch_mode.to_string(),
+        at_armed: s.fma.at,
+        ap_engaged: s.fma.ap_capt || s.fma.ap_fo,
+        fd_on: s.fma.fd_capt || s.fma.fd_fo,
+
+        fmc_takeoff_flaps_deg: if s.fmc_takeoff_flaps_deg == 0 {
+            None
+        } else {
+            Some(s.fmc_takeoff_flaps_deg)
+        },
+        fmc_landing_flaps_deg: if s.fmc_landing_flaps_deg == 0 {
+            None
+        } else {
+            Some(s.fmc_landing_flaps_deg)
+        },
+        fmc_v1_kt: s.fmc_v_speeds.v1_kt,
+        fmc_vr_kt: s.fmc_v_speeds.vr_kt,
+        fmc_v2_kt: s.fmc_v_speeds.v2_kt,
+        fmc_vref_kt: s.fmc_v_speeds.vref_kt,
+        fmc_cruise_alt_ft: if s.fmc_cruise_alt_ft == 0 {
+            None
+        } else {
+            Some(s.fmc_cruise_alt_ft)
+        },
+        fmc_distance_to_tod_nm: if s.fmc_distance_to_tod_nm < 0.0 {
+            None
+        } else {
+            Some(s.fmc_distance_to_tod_nm)
+        },
+        fmc_distance_to_dest_nm: if s.fmc_distance_to_dest_nm < 0.0 {
+            None
+        } else {
+            Some(s.fmc_distance_to_dest_nm)
+        },
+        fmc_flight_number: s.fmc_flight_number.clone(),
+        fmc_perf_input_complete: s.fmc_perf_input_complete,
+
+        flap_angle_deg,
+        autobrake_label: s.autobrake.label().to_string(),
+        speedbrake_armed: s.speedbrake_armed,
+        speedbrake_extended: s.speedbrake_extended,
+        // 777 doesn't have a "TAKEOFF CONFIG" annunciator the
+        // same way NG3 does — closest equivalents are GPWS
+        // bottom warnings during ground-roll, but those aren't
+        // a perfect match. Leave `false` for now; if needed,
+        // we can derive from EICAS messages later.
+        takeoff_config_warning: false,
+    }
+}
+
 /// Public PMDG SDK status — exposed via `MsfsAdapter::pmdg_status()`
 /// so the UI can show "SDK enabled?" hints, log warnings, etc.
 #[derive(Debug, Clone)]
@@ -258,8 +384,9 @@ struct PmdgSharedState {
     /// block; decoded on demand via `Pmdg738Snapshot::from_raw()`.
     /// `None` until the first frame arrives.
     ng3_raw: Option<Box<crate::pmdg::ng3::Pmdg738RawData>>,
-    /// Reserved for the 777X full-replication phase (5.1b).
-    x777_raw: Option<()>,
+    /// Most recent 777X raw data bytes (684-byte block; decoded
+    /// on demand via `Pmdg777XSnapshot::from_raw()`).
+    x777_raw: Option<Box<crate::pmdg::x777::Pmdg777XRawData>>,
     /// Timestamp of the last PMDG ClientData packet. Used by the
     /// "SDK appears not enabled" UI hint — if we know the variant
     /// (= aircraft loaded) but no packets for >5 s, the user
@@ -330,16 +457,28 @@ impl MsfsAdapter {
 
     pub fn snapshot(&self) -> Option<SimSnapshot> {
         let mut snap = self.shared.snapshot.lock().unwrap().clone()?;
-        // Merge PMDG SDK data when available (Phase 5.4). The
-        // standard SimVar telemetry fills the SimSnapshot's main
-        // body; PMDG fills the optional `pmdg` field with cockpit-
-        // exact values that standard SimVars don't expose (FMA,
-        // MCP, V-speeds). FSM and PIREP code consume the generic
-        // `PmdgState` shape, agnostic to NG3 vs. 777X.
+        // Merge PMDG SDK data when available (Phase 5.4 + 5.4b).
+        // The standard SimVar telemetry fills the SimSnapshot's
+        // main body; PMDG fills the optional `pmdg` field with
+        // cockpit-exact values. NG3 wins if both are somehow
+        // present (would be a bug — only one PMDG aircraft can
+        // be loaded at a time — but defensive).
         if let Some(ng3_state) = self.pmdg_ng3_snapshot() {
             snap.pmdg = Some(ng3_to_pmdg_state(&ng3_state));
+        } else if let Some(x777_state) = self.pmdg_x777_snapshot() {
+            snap.pmdg = Some(x777_to_pmdg_state(&x777_state));
         }
         Some(snap)
+    }
+
+    /// Latest PMDG 777X cockpit state, if a PMDG 777 is loaded
+    /// AND the SDK is enabled in `777X_Options.ini`. Same on-
+    /// demand decoding semantics as the NG3 variant.
+    pub fn pmdg_x777_snapshot(&self) -> Option<crate::pmdg::x777::Pmdg777XSnapshot> {
+        let g = self.shared.pmdg.lock().unwrap();
+        g.x777_raw
+            .as_ref()
+            .map(|raw| crate::pmdg::x777::Pmdg777XSnapshot::from_raw(raw))
     }
 
     /// Latest PMDG NG3 cockpit state, if a PMDG 737 is loaded AND
@@ -695,12 +834,31 @@ fn run_dispatch(
                             }
                         }
                         PMDG_X777_REQUEST_ID => {
-                            // Phase 5.1b — full 777X decoder coming
-                            // in a follow-up. For now just stamp
-                            // last_packet_at so the "SDK enabled?"
-                            // detector knows data is flowing.
-                            let mut g = shared.pmdg.lock().unwrap();
-                            g.last_packet_at = Some(Instant::now());
+                            let expected_len =
+                                std::mem::size_of::<crate::pmdg::x777::Pmdg777XRawData>();
+                            if bytes.len() < expected_len {
+                                tracing::warn!(
+                                    got = bytes.len(),
+                                    expected = expected_len,
+                                    "PMDG 777X ClientData payload too short — ignoring"
+                                );
+                            } else {
+                                let raw: Box<crate::pmdg::x777::Pmdg777XRawData> = unsafe {
+                                    let mut b: Box<std::mem::MaybeUninit<crate::pmdg::x777::Pmdg777XRawData>> =
+                                        Box::new(std::mem::MaybeUninit::uninit());
+                                    std::ptr::copy_nonoverlapping(
+                                        bytes.as_ptr(),
+                                        b.as_mut_ptr() as *mut u8,
+                                        expected_len,
+                                    );
+                                    Box::from_raw(
+                                        Box::into_raw(b) as *mut crate::pmdg::x777::Pmdg777XRawData,
+                                    )
+                                };
+                                let mut g = shared.pmdg.lock().unwrap();
+                                g.x777_raw = Some(raw);
+                                g.last_packet_at = Some(Instant::now());
+                            }
                         }
                         other => {
                             tracing::trace!(
@@ -779,13 +937,15 @@ fn run_dispatch(
                     }
                 }
                 crate::pmdg::PmdgVariant::X777 => {
-                    // Subscription will land in the 777X follow-up.
-                    // For now: just mark as "subscribed" so we
-                    // don't spin trying to register every tick.
-                    tracing::info!(
-                        "PMDG 777X detected — full SDK integration coming in Phase 5.1b"
-                    );
-                    shared.pmdg.lock().unwrap().subscribed = true;
+                    if let Err(e) = conn.register_pmdg_x777() {
+                        tracing::warn!(
+                            error = %e,
+                            "PMDG 777X ClientData subscription failed (SDK probably not enabled in 777X_Options.ini)"
+                        );
+                    } else {
+                        tracing::info!("PMDG 777X ClientData subscription registered");
+                        shared.pmdg.lock().unwrap().subscribed = true;
+                    }
                 }
             }
         }
@@ -1119,6 +1279,62 @@ impl Connection {
         };
         if hr != 0 {
             return Err(format!("RequestClientData returned 0x{hr:08X}"));
+        }
+        Ok(())
+    }
+
+    /// Subscribe to the PMDG 777X `PMDG_777X_Data` ClientData channel.
+    /// Same 3-step pattern as `register_pmdg_ng3` but with the 777X
+    /// names + IDs and a different struct size (684 bytes vs 916).
+    fn register_pmdg_x777(&mut self) -> Result<(), String> {
+        let cname = std::ffi::CString::new(crate::pmdg::x777::PMDG_777X_DATA_NAME)
+            .expect("PMDG_777X_Data is plain ASCII");
+        let hr = unsafe {
+            sys::SimConnect_MapClientDataNameToID(
+                self.handle,
+                cname.as_ptr(),
+                crate::pmdg::x777::PMDG_777X_DATA_ID,
+            )
+        };
+        if hr != 0 {
+            return Err(format!("MapClientDataNameToID(777X) returned 0x{hr:08X}"));
+        }
+
+        let hr = unsafe {
+            sys::SimConnect_AddToClientDataDefinition(
+                self.handle,
+                PMDG_X777_DEFINITION_ID,
+                0,
+                std::mem::size_of::<crate::pmdg::x777::Pmdg777XRawData>() as sys::DWORD,
+                0.0,
+                u32::MAX,
+            )
+        };
+        if hr != 0 {
+            return Err(format!(
+                "AddToClientDataDefinition(777X) returned 0x{hr:08X}"
+            ));
+        }
+
+        let period_on_set: sys::SIMCONNECT_CLIENT_DATA_PERIOD =
+            sys::SIMCONNECT_CLIENT_DATA_PERIOD_SIMCONNECT_CLIENT_DATA_PERIOD_ON_SET;
+        let flag_changed: sys::SIMCONNECT_CLIENT_DATA_REQUEST_FLAG =
+            sys::SIMCONNECT_CLIENT_DATA_REQUEST_FLAG_CHANGED;
+        let hr = unsafe {
+            sys::SimConnect_RequestClientData(
+                self.handle,
+                crate::pmdg::x777::PMDG_777X_DATA_ID,
+                PMDG_X777_REQUEST_ID,
+                PMDG_X777_DEFINITION_ID,
+                period_on_set,
+                flag_changed,
+                0,
+                0,
+                0,
+            )
+        };
+        if hr != 0 {
+            return Err(format!("RequestClientData(777X) returned 0x{hr:08X}"));
         }
         Ok(())
     }

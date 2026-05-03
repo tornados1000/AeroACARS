@@ -99,6 +99,9 @@ mod stub {
         pub fn pmdg_ng3_snapshot(&self) -> Option<crate::pmdg::ng3::Pmdg738Snapshot> {
             None
         }
+        pub fn pmdg_x777_snapshot(&self) -> Option<crate::pmdg::x777::Pmdg777XSnapshot> {
+            None
+        }
         pub fn pmdg_status(&self) -> PmdgStatus {
             PmdgStatus {
                 variant: None,

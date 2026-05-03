@@ -60,12 +60,21 @@ export function PmdgPremiumPanel() {
       ? "pmdg-panel--active"
       : "pmdg-panel--inactive";
 
+  // "vor 0s" looks broken to the eye even though it's actually
+  // healthy — PMDG fires PERIOD_ON_SET + FLAG_CHANGED on every
+  // cockpit-value change, and a living simulation has many
+  // changes per second (fuel needles, engine readouts, etc.).
+  // So "0s old" = "data flowing constantly" = the desired state.
+  // Display as "📡 live" to make that obvious. Pilot feedback
+  // 2026-05-03: "da steht immer vor 0s".
   const ageLabel =
     status.stale_secs === null
       ? "—"
-      : status.stale_secs < 60
-        ? `vor ${status.stale_secs}s`
-        : `vor ${Math.floor(status.stale_secs / 60)} min`;
+      : status.stale_secs <= 1
+        ? "📡 live"
+        : status.stale_secs < 60
+          ? `vor ${status.stale_secs}s`
+          : `vor ${Math.floor(status.stale_secs / 60)} min`;
 
   return (
     <section className={`pmdg-panel ${stateClass}`}>

@@ -73,11 +73,24 @@ impl PmdgVariant {
     /// `"E:\MSFS24_Community\Community\pmdg-aircraft-738\SimObjects\Airplanes\PMDG 737-800\aircraft.cfg"`
     pub fn detect_from_air_path(air_path: &str) -> Option<Self> {
         let p = air_path.to_lowercase();
-        // Both naming conventions seen in real installations.
-        if p.contains("pmdg-aircraft-737")
+        // PMDG 737 NG3 family — covers ALL Boeing 737 variants
+        // PMDG ships under one shared SDK. Folder naming:
+        //   pmdg-aircraft-736  = 737-600
+        //   pmdg-aircraft-737  = 737-700
+        //   pmdg-aircraft-738  = 737-800
+        //   pmdg-aircraft-739  = 737-900
+        // Plus liveries inherit the parent folder (e.g.
+        // pmdg-aircraft-738-sxs-tc-snn) so a substring match
+        // catches them too. The trailing "73x" path also covers
+        // any future numerical variant PMDG might ship.
+        if p.contains("pmdg-aircraft-736")
+            || p.contains("pmdg-aircraft-737")
             || p.contains("pmdg-aircraft-738")
             || p.contains("pmdg-aircraft-739")
             || p.contains("pmdg 737")
+            || p.contains("pmdg 736")
+            || p.contains("pmdg 738")
+            || p.contains("pmdg 739")
         {
             Some(Self::Ng3)
         } else if p.contains("pmdg-aircraft-77")
