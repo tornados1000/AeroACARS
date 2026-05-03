@@ -539,9 +539,17 @@ pub struct FareEntry {
 /// guarantees Eloquent sees the model as dirty and bumps `updated_at`.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct UpdateBody {
-    /// phpVMS PirepState. 1 = IN_PROGRESS, 2 = PENDING, etc.
+    /// phpVMS PirepState. 0 = IN_PROGRESS, 1 = PENDING, 2 = ACCEPTED, etc.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<i32>,
+    /// phpVMS PirepSource. 0 = ACARS, 1 = MANUAL. Smuggled through the
+    /// update endpoint (rules() doesn't validate it but parsePirep
+    /// passes everything to mass-assignment, and `source` is in the
+    /// Pirep $fillable). Used by `flight_end_manual` to flip the source
+    /// to MANUAL before /file so PirepService::submit() routes the
+    /// PIREP through the manual auto-approve path on the pilot's rank.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<i32>,
     /// phpVMS PirepStatus code (e.g. "BST" boarding, "OFB" pushback,
     /// "TKO" takeoff, "ENR" enroute, "APP" approach).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -563,6 +571,25 @@ pub struct UpdateBody {
     pub source_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+    /// ISO-8601 / RFC-3339 timestamp. Smuggled through `parsePirep`
+    /// (which Carbon-converts the field) → mass-assigned onto the
+    /// Pirep model where `updated_at` is in the $fillable list.
+    /// Used by the heartbeat as the guaranteed-dirty marker so
+    /// Eloquent always emits an UPDATE: without this, a heartbeat
+    /// sent while the aircraft is still parked would pass distance=0
+    /// and flight_time=0 — those aren't dirty after the first call,
+    /// no UPDATE fires, and `pireps.updated_at` doesn't bump → cron
+    /// kills the PIREP after `acars.live_time` hours.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+/// phpVMS PirepSource enum values, mirrored here so call sites don't
+/// have to remember the magic numbers. Values match the upstream
+/// `App\Models\Enums\PirepSource` constants.
+pub mod pirep_source {
+    pub const ACARS: i32 = 0;
+    pub const MANUAL: i32 = 1;
 }
 
 /// Single text log line posted to `POST /api/pireps/{id}/acars/logs`. Used
@@ -1146,7 +1173,14 @@ fn parse_simbrief_ofp(xml: &str) -> Option<SimBriefOfp> {
     let route = extract_tag(xml, "route")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    // SimBrief's <alternate>...</alternate> element is a NESTED XML
+    // block (children: icao_code / iata_code / faa_code / icao_region
+    // / elevation / pos_lat / pos_long / ...) — earlier we returned
+    // the raw inner XML which made the PIREP-detail show
+    // "<icao_code>LFBO</icao_code> <iata_code>TLS</iata_code> ..."
+    // as the alternate string. Drill in to grab just the ICAO.
     let alternate = extract_tag(xml, "alternate")
+        .and_then(|inner| extract_tag(inner, "icao_code"))
         .or_else(|| extract_tag(xml, "icao_code"))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
@@ -1216,5 +1250,53 @@ mod tests {
     fn strips_trailing_slash() {
         let c = Connection::new("https://example.com/", "k").unwrap();
         assert!(!c.base_url().ends_with("//"));
+    }
+
+    #[test]
+    fn simbrief_alternate_extracts_clean_icao_from_nested_xml() {
+        // Captured shape from a real SimBrief OFP — the <alternate>
+        // element is a wrapper around child fields. Pre-fix we
+        // returned the raw inner XML soup as the alternate string.
+        let xml = r#"
+            <ofp>
+                <fuel>
+                    <plan_ramp>9733</plan_ramp>
+                    <est_burn>5800</est_burn>
+                    <reserve>1300</reserve>
+                </fuel>
+                <weights>
+                    <est_zfw>71242</est_zfw>
+                    <est_tow>80700</est_tow>
+                    <est_ldw>75380</est_ldw>
+                </weights>
+                <alternate>
+                    <icao_code>LFBO</icao_code>
+                    <iata_code>TLS</iata_code>
+                    <faa_code/>
+                    <icao_region>LF</icao_region>
+                    <elevation>499</elevation>
+                    <pos_lat>43.635000</pos_lat>
+                    <pos_long>1.367778</pos_long>
+                </alternate>
+            </ofp>
+        "#;
+        let ofp = parse_simbrief_ofp(xml).expect("parses");
+        assert_eq!(ofp.alternate.as_deref(), Some("LFBO"));
+    }
+
+    #[test]
+    fn simbrief_alternate_falls_back_to_root_icao_when_no_wrapper() {
+        // Defensive — if a future SimBrief variant flattens the
+        // alternate to a sibling icao_code we still pick it up.
+        let xml = r#"
+            <ofp>
+                <weights>
+                    <est_zfw>71242</est_zfw>
+                </weights>
+                <icao_code>LFBO</icao_code>
+            </ofp>
+        "#;
+        let ofp = parse_simbrief_ofp(xml).expect("parses");
+        assert_eq!(ofp.alternate.as_deref(), Some("LFBO"));
     }
 }

@@ -12,7 +12,7 @@ import { LandingPanel } from "./components/LandingPanel";
 import { UpdateButton } from "./components/UpdateButton";
 import { LiveRecordingIndicator } from "./components/LiveRecordingIndicator";
 import { useSimSession } from "./hooks/useSimSession";
-import type { ActiveFlightInfo, LoginResult } from "./types";
+import type { ActiveFlightInfo, LoginResult, Profile } from "./types";
 
 type SessionStatus =
   | { kind: "loading" }
@@ -191,6 +191,24 @@ function App() {
     }
     if (!activeFlight && hadActiveFlight) {
       setHadActiveFlight(false);
+      // Flight just ended (filed / cancelled / discarded). PhpVMS
+      // updates the pilot's `curr_airport` server-side as part of an
+      // accepted PIREP, but our cached LoginResult never sees it
+      // unless we re-fetch. Without this, the dashboard "Aktueller
+      // Airport" stays at the old value until the next app restart.
+      void invoke<Profile | null>("phpvms_refresh_profile")
+        .then((fresh) => {
+          if (!fresh) return;
+          setStatus((prev) =>
+            prev.kind === "loggedIn"
+              ? {
+                  kind: "loggedIn",
+                  session: { ...prev.session, profile: fresh },
+                }
+              : prev,
+          );
+        })
+        .catch(() => {});
     }
   }, [activeFlight, hadActiveFlight]);
 

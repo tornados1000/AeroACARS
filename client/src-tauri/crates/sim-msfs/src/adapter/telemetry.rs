@@ -1078,8 +1078,12 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
         velocity_body_x_fps: Some(t.velocity_body_x_fps as f32),
         velocity_body_z_fps: Some(t.velocity_body_z_fps as f32),
         groundspeed_kt: t.groundspeed_kt as f32,
-        indicated_airspeed_kt: t.indicated_airspeed_kt as f32,
-        true_airspeed_kt: t.true_airspeed_kt as f32,
+        // Clamp small negative readings to zero — MSFS pitot simulation
+        // (especially with study-level addons) sometimes reports a few
+        // negative knots while parked. Mirrors the X-Plane adapter's
+        // identical clamp; pilots reasonably treat "−10 kt" as a bug.
+        indicated_airspeed_kt: (t.indicated_airspeed_kt as f32).max(0.0),
+        true_airspeed_kt: (t.true_airspeed_kt as f32).max(0.0),
         aircraft_wind_x_kt: Some(t.aircraft_wind_x_kt as f32),
         aircraft_wind_z_kt: Some(t.aircraft_wind_z_kt as f32),
         g_force: t.g_force as f32,

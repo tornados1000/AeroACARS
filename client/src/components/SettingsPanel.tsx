@@ -178,7 +178,7 @@ export function SettingsPanel({
       </div>
 
       <div className="settings__section">
-        <h3>Speicher</h3>
+        <h3>{t("settings.storage_section")}</h3>
         <FlightLogsManager
           autoDelete={autoDeleteFlightLogs}
           onAutoDeleteChange={onAutoDeleteFlightLogsChange}
@@ -229,6 +229,7 @@ export function SettingsPanel({
  * alarming red on a single dropped packet.
  */
 function PhpvmsHeartbeatDebug({ activeFlight }: { activeFlight: ActiveFlightInfo | null }) {
+  const { t } = useTranslation();
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     const id = window.setInterval(() => setNow(Date.now()), 1000);
@@ -240,11 +241,13 @@ function PhpvmsHeartbeatDebug({ activeFlight }: { activeFlight: ActiveFlightInfo
     return Math.max(0, Math.floor((now - new Date(iso).getTime()) / 1000));
   };
   const fmtAge = (sec: number | null): string => {
-    if (sec === null) return "—";
-    if (sec < 60) return `vor ${sec}s`;
+    if (sec === null) return t("phpvms_status.age_unknown");
+    if (sec < 60) return t("phpvms_status.age_seconds", { seconds: sec });
     const m = Math.floor(sec / 60);
     const r = sec % 60;
-    return r === 0 ? `vor ${m}m` : `vor ${m}m ${r}s`;
+    return r === 0
+      ? t("phpvms_status.age_minutes", { minutes: m })
+      : t("phpvms_status.age_minutes_seconds", { minutes: m, seconds: r });
   };
 
   if (!activeFlight) {
@@ -252,17 +255,14 @@ function PhpvmsHeartbeatDebug({ activeFlight }: { activeFlight: ActiveFlightInfo
       <section className="sim-panel sim-panel--disconnected">
         <header className="sim-panel__header">
           <div className="sim-panel__header-left">
-            <h2>phpVMS API</h2>
-            <span className="sim-panel__kind">Heartbeat</span>
+            <h2>{t("phpvms_status.title")}</h2>
+            <span className="sim-panel__kind">{t("phpvms_status.badge_heartbeat")}</span>
           </div>
           <span className="sim-panel__state">
-            <span className="sim-panel__dot" /> Inaktiv
+            <span className="sim-panel__dot" /> {t("phpvms_status.state_inactive")}
           </span>
         </header>
-        <p className="sim-panel__hint">
-          Kein aktiver Flug — die Telemetrie zur phpVMS-Site startet, sobald
-          du einen Flug beginnst (oder einen laufenden adoptierst).
-        </p>
+        <p className="sim-panel__hint">{t("phpvms_status.no_active_flight")}</p>
       </section>
     );
   }
@@ -273,7 +273,9 @@ function PhpvmsHeartbeatDebug({ activeFlight }: { activeFlight: ActiveFlightInfo
   // posted call failed or the streamer hasn't gotten its first one in yet.
   const isStale = heartbeatAge === null || heartbeatAge > 45;
   const state = isStale ? "connecting" : "connected";
-  const stateLabel = isStale ? "Warte auf Heartbeat" : "Aktiv";
+  const stateLabel = isStale
+    ? t("phpvms_status.state_waiting")
+    : t("phpvms_status.state_active");
   // Truncate the PIREP id for the badge — full id is ~16 chars, that's
   // too wide for a header pill. The first 6 chars are enough to
   // disambiguate in practice.
@@ -285,34 +287,36 @@ function PhpvmsHeartbeatDebug({ activeFlight }: { activeFlight: ActiveFlightInfo
     <section className={`sim-panel sim-panel--${state}`}>
       <header className="sim-panel__header">
         <div className="sim-panel__header-left">
-          <h2>phpVMS API</h2>
-          <span className="sim-panel__kind">PIREP {pirepBadge}</span>
+          <h2>{t("phpvms_status.title")}</h2>
+          <span className="sim-panel__kind">
+            {t("phpvms_status.badge_pirep_prefix")} {pirepBadge}
+          </span>
         </div>
         <span className={`sim-panel__state sim-panel__state--${state}`}>
           <span className="sim-panel__dot" /> {stateLabel}
         </span>
       </header>
       <dl className="sim-panel__compact">
-        <dt>Letzte Position</dt>
+        <dt>{t("phpvms_status.row_last_position")}</dt>
         <dd>
           {fmtAge(positionAge)}
           {positionAge !== null && positionAge > 60 && (
-            <span className="sim-panel__compact-muted"> · stale</span>
+            <span className="sim-panel__compact-muted"> · {t("phpvms_status.muted_stale")}</span>
           )}
         </dd>
-        <dt>Letzter Heartbeat</dt>
+        <dt>{t("phpvms_status.row_last_heartbeat")}</dt>
         <dd>
           {fmtAge(heartbeatAge)}
           {heartbeatAge === null && (
-            <span className="sim-panel__compact-muted"> · noch nicht gesendet</span>
+            <span className="sim-panel__compact-muted"> · {t("phpvms_status.muted_not_yet_sent")}</span>
           )}
         </dd>
         {activeFlight.queued_position_count > 0 && (
           <>
-            <dt>Position-Queue</dt>
+            <dt>{t("phpvms_status.row_position_queue")}</dt>
             <dd>
               {activeFlight.queued_position_count}{" "}
-              <span className="sim-panel__compact-muted">ausstehend (offline)</span>
+              <span className="sim-panel__compact-muted">{t("phpvms_status.muted_pending_offline")}</span>
             </dd>
           </>
         )}
@@ -340,6 +344,7 @@ function FlightLogsManager({
   autoDelete: boolean;
   onAutoDeleteChange: (next: boolean) => void;
 }) {
+  const { t } = useTranslation();
   const [stats, setStats] = useState<{ count: number; total_bytes: number } | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -359,15 +364,21 @@ function FlightLogsManager({
   }, []);
 
   const handleDeleteAll = async () => {
-    const ok = window.confirm(
-      "Alle gespeicherten Fluglogs jetzt löschen? Das umfasst auch den aktuell laufenden Flug (falls einer aktiv ist) — die Datei wird dann beim nächsten Event neu angelegt. Dieser Schritt ist nicht rückgängig zu machen.",
-    );
+    const ok = window.confirm(t("settings.delete_all_logs_confirm"));
     if (!ok) return;
     setBusy(true);
     try {
       const res = await invoke<{ deleted: number }>("flight_logs_delete_all");
       await refresh();
-      window.alert(`${res.deleted} Fluglog-Datei${res.deleted === 1 ? "" : "en"} gelöscht.`);
+      window.alert(
+        t("settings.delete_all_logs_done", {
+          count: res.deleted,
+          defaultValue:
+            res.deleted === 1
+              ? t("settings.delete_all_logs_done_one", { count: res.deleted })
+              : t("settings.delete_all_logs_done_other", { count: res.deleted }),
+        }),
+      );
     } catch (e) {
       setError(String(e));
     } finally {
@@ -382,6 +393,15 @@ function FlightLogsManager({
     return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
   };
 
+  const usageText = (() => {
+    if (stats === null) return t("settings.storage_usage_loading");
+    if (stats.count === 0) return t("settings.storage_usage_empty");
+    const key = stats.count === 1
+      ? "settings.storage_usage_count_one"
+      : "settings.storage_usage_count_other";
+    return t(key, { count: stats.count, size: fmtSize(stats.total_bytes) });
+  })();
+
   return (
     <>
       <label className="settings__checkbox">
@@ -391,25 +411,18 @@ function FlightLogsManager({
           onChange={(e) => onAutoDeleteChange(e.target.checked)}
         />
         <span>
-          <strong>Alte Fluglogs automatisch löschen</strong>
-          <span className="settings__row-hint">
-            Beim nächsten App-Start werden Fluglog-Dateien gelöscht, die älter
-            als <strong>30 Tage</strong> sind. Die laufende Aufzeichnung ist
-            nie betroffen.
-          </span>
+          <strong>{t("settings.auto_delete_logs_label")}</strong>
+          <span
+            className="settings__row-hint"
+            dangerouslySetInnerHTML={{ __html: t("settings.auto_delete_logs_hint") }}
+          />
         </span>
       </label>
 
       <div className="storage-card">
         <div className="storage-card__row">
-          <span className="storage-card__label">Aktuell auf der Festplatte</span>
-          <span className="storage-card__value">
-            {stats === null
-              ? "lädt …"
-              : stats.count === 0
-              ? "keine Fluglogs"
-              : `${stats.count} Datei${stats.count === 1 ? "" : "en"} · ${fmtSize(stats.total_bytes)}`}
-          </span>
+          <span className="storage-card__label">{t("settings.storage_usage_label")}</span>
+          <span className="storage-card__value">{usageText}</span>
         </div>
         <div className="storage-card__actions">
           <button
@@ -418,15 +431,15 @@ function FlightLogsManager({
             onClick={handleDeleteAll}
             disabled={busy || stats === null || stats.count === 0}
           >
-            {busy ? "Lösche …" : "Alle Fluglogs jetzt löschen"}
+            {busy ? t("settings.delete_all_logs_busy") : t("settings.delete_all_logs_button")}
           </button>
           <button
             type="button"
             className="storage-card__btn"
             onClick={() => void refresh()}
             disabled={busy}
-            aria-label="Speicher-Statistiken aktualisieren"
-            title="Aktualisieren"
+            aria-label={t("settings.refresh_button_label")}
+            title={t("settings.refresh_button_title")}
           >
             ↻
           </button>

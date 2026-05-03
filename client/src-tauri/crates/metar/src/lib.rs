@@ -162,9 +162,25 @@ async fn fetch_metar_once(icao: &str) -> Result<MetarSnapshot, MetarError> {
     if !status.is_success() {
         return Err(MetarError::Status(status.as_u16()));
     }
-    let list: Vec<ApiMetar> = response
-        .json()
+    // 204 No Content = NOAA has no METAR for this ICAO right now (small
+    // / non-reporting fields like TUPJ in the British Virgin Islands).
+    // The body is empty, so attempting `response.json()` would die with
+    // a "malformed METAR response" parse error and the UI would render
+    // it as a server fault. Treat it explicitly as NotFound instead.
+    if status == reqwest::StatusCode::NO_CONTENT {
+        return Err(MetarError::NotFound(icao.clone()));
+    }
+    let body = response
+        .bytes()
         .await
+        .map_err(|e| MetarError::Network(e.to_string()))?;
+    // Defensive: some intermediaries (proxies, edge caches) may return
+    // an empty 200 body even though we'd expect an array. Don't bother
+    // parsing — same NotFound semantics.
+    if body.iter().all(|b| b.is_ascii_whitespace()) {
+        return Err(MetarError::NotFound(icao.clone()));
+    }
+    let list: Vec<ApiMetar> = serde_json::from_slice(&body)
         .map_err(|e| MetarError::Parse(e.to_string()))?;
     let raw = list
         .into_iter()

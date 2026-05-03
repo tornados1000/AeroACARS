@@ -1958,6 +1958,28 @@ fn current_client(state: &tauri::State<'_, AppState>) -> Result<Client, UiError>
         .ok_or_else(|| UiError::new("not_logged_in", "no active session"))
 }
 
+/// Re-fetch the pilot profile from phpVMS. Returns the fresh profile
+/// (or None if not logged in / fetch failed). Mostly used by the UI to
+/// pick up `curr_airport` after a PIREP files — phpVMS updates the
+/// pilot's current airport server-side once a flight is accepted, but
+/// our cached LoginResult never sees it without an explicit re-fetch.
+#[tauri::command]
+async fn phpvms_refresh_profile(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<Profile>, UiError> {
+    let client = match current_client(&state) {
+        Ok(c) => c,
+        Err(_) => return Ok(None),
+    };
+    match client.get_profile().await {
+        Ok(p) => Ok(Some(p)),
+        Err(e) => {
+            tracing::warn!(error = %e, "profile refresh failed");
+            Ok(None)
+        }
+    }
+}
+
 /// `GET /api/user/bids` — the pilot's open bids.
 #[tauri::command]
 async fn phpvms_get_bids(
@@ -2949,8 +2971,34 @@ async fn flight_start(
         }
     }
 
-    spawn_position_streamer(app.clone(), Arc::clone(&flight), client);
+    spawn_position_streamer(app.clone(), Arc::clone(&flight), client.clone());
     spawn_touchdown_sampler(app.clone(), Arc::clone(&flight));
+
+    // Fire an explicit "Phase: Boarding" entry into phpVMS' acars/logs
+    // for the PIREP detail's Fluglogbuch tab. The streamer only emits
+    // log lines on phase TRANSITIONS, but Boarding is the initial
+    // state — there's no transition INTO it, so without this kick
+    // the Fluglogbuch tab starts at "Phase: Pushback" with no record
+    // of the boarding period. Best-effort, never blocks flight start.
+    {
+        let pirep_id = flight.pirep_id.clone();
+        let log_client = client.clone();
+        tauri::async_runtime::spawn(async move {
+            let entry = api_client::LogEntry {
+                log: "Phase: Boarding".to_string(),
+                lat: None,
+                lon: None,
+                created_at: Some(Utc::now().to_rfc3339()),
+            };
+            if let Err(e) = log_client.post_acars_logs(&pirep_id, &[entry]).await {
+                tracing::warn!(
+                    pirep_id = %pirep_id,
+                    error = %e,
+                    "could not push initial Boarding ACARS log line"
+                );
+            }
+        });
+    }
 
     // New flight = fresh activity log. Pilots were getting confused
     // when the previous flight's events (or yesterday's) lingered at
@@ -3458,8 +3506,14 @@ async fn flight_end(
         };
 
         // Block→remaining diff in kg, converted to pounds for phpVMS.
+        // We round to whole kilograms BEFORE the lb conversion so the
+        // PIREP-detail page shows clean integer values (`9733 kg`
+        // instead of `9733.45 kg`). Real-world refuelling has no
+        // sub-kg precision anyway, and a half-kg loss is invisible
+        // to pilots — what's NOT invisible is `9733.45 kg` looking
+        // like a unit-mix-up bug. Same logic for fuel_used.
         let fuel_used = match (stats.block_fuel_kg, stats.last_fuel_kg) {
-            (Some(b), Some(c)) if b > c => Some((b - c) as f64 * KG_TO_LB),
+            (Some(b), Some(c)) if b > c => Some(((b - c) as f64).round() * KG_TO_LB),
             _ => None,
         };
         // Block fuel sent natively so phpVMS computes "Verbleibender
@@ -3469,7 +3523,7 @@ async fn flight_end(
         let block_fuel = stats
             .block_fuel_kg
             .filter(|kg| *kg > 0.0)
-            .map(|kg| (kg as f64) * KG_TO_LB);
+            .map(|kg| (kg as f64).round() * KG_TO_LB);
         // Cruise level = peak MSL altitude observed. phpVMS column
         // `Flt.Level`. Rounded to the nearest 100 ft so the value
         // matches the conventional FL display.
@@ -3699,19 +3753,20 @@ async fn flight_end_manual(
                     .collect(),
             )
         };
-        // Block→remaining diff in kg, converted to pounds for phpVMS.
+        // Block→remaining diff in kg, rounded to whole kg before lb
+        // conversion (see flight_end for the cleanup rationale).
         // Manual override (kg) wins over the FSM-derived diff.
         let fuel_used = fuel_used_kg
             .filter(|v| *v > 0.0)
-            .map(|kg| (kg as f64) * KG_TO_LB)
+            .map(|kg| (kg as f64).round() * KG_TO_LB)
             .or_else(|| match (stats.block_fuel_kg, stats.last_fuel_kg) {
-                (Some(b), Some(c)) if b > c => Some((b - c) as f64 * KG_TO_LB),
+                (Some(b), Some(c)) if b > c => Some(((b - c) as f64).round() * KG_TO_LB),
                 _ => None,
             });
         let block_fuel = stats
             .block_fuel_kg
             .filter(|kg| *kg > 0.0)
-            .map(|kg| (kg as f64) * KG_TO_LB);
+            .map(|kg| (kg as f64).round() * KG_TO_LB);
         let level = cruise_level_ft.filter(|ft| *ft > 0).or_else(|| {
             stats.peak_altitude_ft.map(|ft| {
                 let rounded = ((ft / 100.0).round() * 100.0) as i32;
@@ -3808,6 +3863,31 @@ async fn flight_end_manual(
             fields: Some(fields),
         }
     };
+    // Flip the PIREP `source` to MANUAL (1) before submitting. PhpVMS's
+    // PirepService::submit() decides ACCEPTED-vs-PENDING based on
+    // (source, rank.auto_approve_acars, rank.auto_approve_manual). With
+    // source=MANUAL and the VA having `auto_approve_manual=false` on the
+    // pilot's rank, the PIREP lands in PENDING for admin review instead
+    // of being auto-accepted as a normal ACARS submission.
+    //
+    // The Acars/UpdateRequest validation rules don't include `source`,
+    // but the controller's parsePirep() forwards EVERY request input
+    // to mass-assignment, and `source` is in the Pirep $fillable. So
+    // the smuggle works as long as upstream phpVMS doesn't change it.
+    // Verified against phpvms@dev on 2026-05-03.
+    let source_marker = UpdateBody {
+        source: Some(api_client::pirep_source::MANUAL),
+        ..Default::default()
+    };
+    if let Err(e) = client.update_pirep(&flight.pirep_id, &source_marker).await {
+        tracing::warn!(
+            pirep_id = %flight.pirep_id,
+            error = %e,
+            "could not flip PIREP source to MANUAL — VA admin must filter on source_name"
+        );
+    } else {
+        tracing::info!(pirep_id = %flight.pirep_id, "PIREP source flipped to MANUAL");
+    }
     tracing::info!(pirep_id = %flight.pirep_id, "filing PIREP (manual)");
     match client.file_pirep(&flight.pirep_id, &body).await {
         Ok(()) => {
@@ -5128,8 +5208,11 @@ fn build_heartbeat_body(
             .unwrap_or(0),
     };
     // Same fuel arithmetic as the file body: block - remaining, in pounds.
+    // Round to whole kg before lb conversion so the live-map / dashboard
+    // shows clean integer kg values (no `5890.29 kg` artefacts from the
+    // round-trip).
     let fuel_used = match (stats.block_fuel_kg, stats.last_fuel_kg) {
-        (Some(b), Some(c)) if b > c => Some((b - c) as f64 * KG_TO_LB),
+        (Some(b), Some(c)) if b > c => Some(((b - c) as f64).round() * KG_TO_LB),
         _ => None,
     };
     // Prefer the peak altitude observed (matches the FILE-time `level`),
@@ -5146,15 +5229,40 @@ fn build_heartbeat_body(
             }
         })
         .map(|v| v.max(0));
+    // Suppress zero / "not yet meaningful" values rather than sending
+    // them as `Some(0)`. Reason: phpVMS's `Pirep::progress_percent`
+    // accessor uses PHP's `empty()` to detect missing distance and
+    // `empty(0)` is true — so a heartbeat with `distance: Some(0.0)`
+    // during boarding makes the live-map render the PIREP at 100 %
+    // progress (upper_bound and distance both fall through to 1 →
+    // 1/1 = 100 %). With None the field isn't sent at all and phpVMS
+    // keeps its existing value (null while pre-flight, real number
+    // once we've actually moved). Same logic for flight_time and
+    // level — until takeoff they're not real.
+    let distance = if stats.distance_nm > 0.5 {
+        Some(stats.distance_nm)
+    } else {
+        None
+    };
+    let flight_time_min = if flight_time_secs >= 60 {
+        Some(flight_time_secs / 60)
+    } else {
+        None
+    };
     UpdateBody {
         state: None,
+        source: None,
         status: phase_to_status(current_phase).map(|s| s.to_string()),
-        flight_time: Some(flight_time_secs / 60),
-        distance: Some(stats.distance_nm),
+        flight_time: flight_time_min,
+        distance,
         fuel_used,
         level,
         source_name: Some(format!("AeroACARS/{}", env!("CARGO_PKG_VERSION"))),
         notes: None,
+        // Always-fresh timestamp so Eloquent sees the row as dirty
+        // even on heartbeats where no other field changed (boarding
+        // / long stable cruise). See `UpdateBody::updated_at` doc.
+        updated_at: Some(now.to_rfc3339()),
     }
 }
 
@@ -5198,18 +5306,16 @@ fn build_pirep_fields(
     _flight: &ActiveFlight,
     stats: &FlightStats,
 ) -> HashMap<String, String> {
-    // FULL custom-fields set, in two parallel forms:
+    // Single-form custom-fields set: human-readable Title Case with
+    // units. Earlier versions emitted EVERY field twice (Title Case +
+    // snake_case "for SQL-sortable leaderboards") which made the
+    // PIREP-detail list balloon to 60+ entries with obvious
+    // duplicates ("Block Fuel: 9733 kg" right next to "block_fuel_kg:
+    // 9733"). VA admins who want raw numbers can hit the database
+    // directly — no point doubling everything in the UI.
     //
-    //   * Title Case (e.g. "Landing Rate") — formatted with units,
-    //     readable in default phpVMS themes.
-    //   * snake_case (e.g. "landing_peak_vs_fpm") — plain numbers
-    //     for SQL-sortable VA leaderboards.
-    //
-    // The Notes block (separate field on the PIREP) carries the
-    // human prose summary; THIS map carries the structured
-    // values for evaluation. We previously slimmed this to ~6
-    // fields after a UX complaint, but the VA admin needs every
-    // value here to grade flights, so we restore the broad set.
+    // Notes block (separate PIREP field) still carries the prose
+    // summary; THIS map carries the structured key-value pairs.
     let mut f: HashMap<String, String> = HashMap::new();
 
     f.insert(
@@ -5261,69 +5367,54 @@ fn build_pirep_fields(
     // ---- Weights & fuel (skip 0-value to avoid Fenix-bogus garbage) ----
     if let Some(w) = stats.takeoff_weight_kg.filter(|v| *v > 0.0) {
         f.insert("Takeoff Weight".into(), format!("{:.0} kg", w));
-        f.insert("takeoff_weight_kg".into(), format!("{:.0}", w));
     }
     if let Some(w) = stats.landing_weight_kg.filter(|v| *v > 0.0) {
         f.insert("Landing Weight".into(), format!("{:.0} kg", w));
-        f.insert("landing_weight_kg".into(), format!("{:.0}", w));
     }
     if let Some(b) = stats.block_fuel_kg.filter(|v| *v > 0.0) {
         f.insert("Block Fuel".into(), format!("{:.0} kg", b));
-        f.insert("block_fuel_kg".into(), format!("{:.0}", b));
     }
     if let Some(fuel) = stats.landing_fuel_kg.filter(|v| *v > 0.0) {
         f.insert("Landing Fuel".into(), format!("{:.0} kg", fuel));
-        f.insert("landing_fuel_kg".into(), format!("{:.0}", fuel));
     }
     if let (Some(b), Some(c)) = (stats.block_fuel_kg, stats.last_fuel_kg) {
         if b > 0.0 && b > c {
             f.insert("Fuel Used".into(), format!("{:.0} kg", b - c));
-            f.insert("fuel_used_kg".into(), format!("{:.0}", b - c));
         }
     }
 
     // ---- Touchdown analysis ----
     if let Some(score) = stats.landing_score {
         let grade = letter_grade(score.numeric());
-        f.insert("Landing Score".into(), score.label().to_string());
-        f.insert("Landing Grade".into(), grade.to_string());
-        f.insert("landing_score".into(), score.numeric().to_string());
-        f.insert("landing_score_label".into(), score.label().to_string());
-        f.insert("landing_grade_letter".into(), grade.to_string());
+        // "A+ (smooth) — 100/100" — combines all three views into one
+        // glanceable line instead of three duplicate fields.
+        f.insert(
+            "Landing Score".into(),
+            format!("{} ({}) — {}/100", grade, score.label(), score.numeric()),
+        );
     }
     if let Some(rate) = stats.landing_rate_fpm {
         // SIGNED — negative on descent. Matches both LandingToast and
         // the latched SimVar reading. Pilots want to see the minus.
-        f.insert("Landing Rate".into(), format!("{:.0} fpm", rate));
-        f.insert("landing_rate_fpm".into(), format!("{:.1}", rate));
+        // The peak (post-touchdown refinement) overrides this when
+        // available since it's the worse of the two.
+        let value = stats.landing_peak_vs_fpm.unwrap_or(rate);
+        f.insert("Landing Rate".into(), format!("{:.0} fpm", value));
     }
-    if let Some(vs) = stats.landing_peak_vs_fpm {
-        f.insert("Peak Landing Rate".into(), format!("{:.0} fpm", vs));
-        f.insert("landing_peak_vs_fpm".into(), format!("{:.1}", vs));
-    }
-    if let Some(g) = stats.landing_g_force {
+    if let Some(g) = stats.landing_peak_g_force.or(stats.landing_g_force) {
         f.insert("Landing G-Force".into(), format!("{:.2} G", g));
-        f.insert("landing_g_force".into(), format!("{:.3}", g));
-    }
-    if let Some(g) = stats.landing_peak_g_force {
-        f.insert("Peak Landing G".into(), format!("{:.2} G", g));
-        f.insert("landing_peak_g".into(), format!("{:.3}", g));
     }
     if let Some(p) = stats.landing_pitch_deg {
         f.insert("Landing Pitch".into(), format!("{:+.1}°", p));
-        f.insert("landing_pitch_deg".into(), format!("{:.2}", p));
     }
     if let Some(s) = stats.landing_speed_kt.filter(|v| *v > 0.0) {
         f.insert("Landing Speed".into(), format!("{:.0} kt", s));
-        f.insert("landing_speed_kt".into(), format!("{:.0}", s));
     }
     if let Some(h) = stats.landing_heading_deg {
         f.insert("Landing Heading".into(), format!("{:03.0}°", h));
-        f.insert("landing_heading_deg".into(), format!("{:.0}", h));
     }
     if let Some(slip) = stats.touchdown_sideslip_deg {
         f.insert("Touchdown Sideslip".into(), format!("{:+.1}°", slip));
-        f.insert("touchdown_sideslip_deg".into(), format!("{:.2}", slip));
     }
     if let Some(hw) = stats.landing_headwind_kt {
         if hw >= 0.0 {
@@ -5331,7 +5422,6 @@ fn build_pirep_fields(
         } else {
             f.insert("Touchdown Tailwind".into(), format!("{:.0} kt", -hw));
         }
-        f.insert("touchdown_headwind_kt".into(), format!("{:.1}", hw));
     }
     if let Some(xw) = stats.landing_crosswind_kt {
         let side = if xw >= 0.0 { "from right" } else { "from left" };
@@ -5339,25 +5429,28 @@ fn build_pirep_fields(
             "Touchdown Crosswind".into(),
             format!("{:.0} kt {}", xw.abs(), side),
         );
-        f.insert("touchdown_crosswind_kt".into(), format!("{:.1}", xw));
     }
-    f.insert("Bounces".into(), stats.bounce_count.to_string());
-    f.insert("bounce_count".into(), stats.bounce_count.to_string());
+    if stats.bounce_count > 0 {
+        // Suppress the "Bounces: 0" row — every clean landing had it
+        // and it added noise without information.
+        f.insert("Bounces".into(), stats.bounce_count.to_string());
+    }
 
     // ---- Approach Stability + Rollout (Landing Analyzer Stage 1) ----
     if let Some(sd) = stats.approach_vs_stddev_fpm {
         f.insert("Approach V/S Stddev".into(), format!("{:.0} fpm", sd));
-        f.insert("approach_vs_stddev_fpm".into(), format!("{:.1}", sd));
     }
     if let Some(sd) = stats.approach_bank_stddev_deg {
         f.insert("Approach Bank Stddev".into(), format!("{:.1}°", sd));
-        f.insert("approach_bank_stddev_deg".into(), format!("{:.2}", sd));
     }
     if let Some(meters) = stats.rollout_distance_m {
-        f.insert("Rollout Distance".into(), format!("{:.0} m", meters));
-        // Keep both numeric fields for VA-script compatibility.
-        f.insert("rollout_distance_m".into(), format!("{:.0}", meters));
-        f.insert("rollout_distance_ft".into(), format!("{:.0}", meters * 3.28084));
+        // Single field with both units — "935 m (3068 ft)" instead of
+        // three separate Rollout Distance / rollout_distance_m /
+        // rollout_distance_ft entries.
+        f.insert(
+            "Rollout Distance".into(),
+            format!("{:.0} m ({:.0} ft)", meters, meters * 3.28084),
+        );
     }
 
     // ---- SimBrief OFP plan + fuel-efficiency (Landing Analyzer Stage 2) ----
@@ -5365,35 +5458,27 @@ fn build_pirep_fields(
     // a fuel-efficiency delta so the VA can grade burn discipline.
     if let Some(b) = stats.planned_block_fuel_kg {
         f.insert("Plan Block Fuel".into(), format!("{:.0} kg", b));
-        f.insert("planned_block_fuel_kg".into(), format!("{:.0}", b));
     }
     if let Some(b) = stats.planned_burn_kg {
         f.insert("Plan Trip Burn".into(), format!("{:.0} kg", b));
-        f.insert("planned_burn_kg".into(), format!("{:.0}", b));
     }
     if let Some(r) = stats.planned_reserve_kg {
         f.insert("Plan Reserve Fuel".into(), format!("{:.0} kg", r));
-        f.insert("planned_reserve_kg".into(), format!("{:.0}", r));
     }
     if let Some(z) = stats.planned_zfw_kg {
         f.insert("Plan ZFW".into(), format!("{:.0} kg", z));
-        f.insert("planned_zfw_kg".into(), format!("{:.0}", z));
     }
     if let Some(t) = stats.planned_tow_kg {
         f.insert("Plan TOW".into(), format!("{:.0} kg", t));
-        f.insert("planned_tow_kg".into(), format!("{:.0}", t));
     }
     if let Some(l) = stats.planned_ldw_kg {
         f.insert("Plan LDW".into(), format!("{:.0} kg", l));
-        f.insert("planned_ldw_kg".into(), format!("{:.0}", l));
     }
     if let Some(route) = stats.planned_route.as_deref().filter(|s| !s.is_empty()) {
         f.insert("Plan Route".into(), route.to_string());
-        f.insert("planned_route".into(), route.to_string());
     }
     if let Some(alt) = stats.planned_alternate.as_deref().filter(|s| !s.is_empty()) {
         f.insert("Plan Alternate".into(), alt.to_string());
-        f.insert("planned_alternate".into(), alt.to_string());
     }
     // Fuel efficiency: compare actual trip burn to the planned trip
     // burn. Use takeoff_fuel_kg − landing_fuel_kg as the actual trip
@@ -5412,25 +5497,26 @@ fn build_pirep_fields(
                 "Fuel Efficiency".into(),
                 format!("{sign}{:.0} kg ({sign}{:.1}%)", diff, pct),
             );
-            f.insert("actual_trip_burn_kg".into(), format!("{:.0}", actual_burn));
-            f.insert("fuel_efficiency_kg_diff".into(), format!("{:.1}", diff));
-            f.insert("fuel_efficiency_pct".into(), format!("{:.2}", pct));
         }
     }
 
     // ---- Runway correlation (Tier 2) ----
     if let Some(rw) = &stats.runway_match {
+        // Composite line covers airport+ident+length+surface in one
+        // glanceable cell instead of five separate snake_case rows.
         f.insert(
             "Touchdown Runway".into(),
-            format!("{}/{}", rw.airport_ident, rw.runway_ident),
+            format!(
+                "{}/{} ({:.0} m, {})",
+                rw.airport_ident,
+                rw.runway_ident,
+                rw.length_ft as f64 * 0.3048,
+                rw.surface,
+            ),
         );
         f.insert(
             "Centerline Offset".into(),
-            format!(
-                "{:.1} m {}",
-                rw.centerline_distance_m.abs(),
-                rw.side,
-            ),
+            format!("{:.1} m {}", rw.centerline_distance_m.abs(), rw.side),
         );
         f.insert(
             "Touchdown Past Threshold".into(),
@@ -5440,25 +5526,6 @@ fn build_pirep_fields(
                 rw.length_ft as f64 * 0.3048,
             ),
         );
-        f.insert(
-            "touchdown_runway_airport".into(),
-            rw.airport_ident.clone(),
-        );
-        f.insert("touchdown_runway_ident".into(), rw.runway_ident.clone());
-        f.insert(
-            "touchdown_runway_length_ft".into(),
-            format!("{:.0}", rw.length_ft),
-        );
-        f.insert(
-            "touchdown_centerline_m".into(),
-            format!("{:.2}", rw.centerline_distance_m),
-        );
-        f.insert("touchdown_centerline_side".into(), rw.side.clone());
-        f.insert(
-            "touchdown_past_threshold_ft".into(),
-            format!("{:.0}", rw.touchdown_distance_from_threshold_ft),
-        );
-        f.insert("touchdown_runway_surface".into(), rw.surface.clone());
     }
 
     // ---- ATC-derived gates and approach runway (from MSFS SimVars) ----
@@ -5478,14 +5545,9 @@ fn build_pirep_fields(
             "Flown Distance".into(),
             format!("{:.1} nm", stats.distance_nm),
         );
-        f.insert(
-            "flown_distance_nm".into(),
-            format!("{:.1}", stats.distance_nm),
-        );
     }
     if let Some(fl) = stats.peak_altitude_ft {
         f.insert("Cruise Level".into(), format!("FL{:.0}", fl / 100.0));
-        f.insert("cruise_level_ft".into(), format!("{:.0}", fl));
     }
 
     // ---- METAR snapshots ----
@@ -7465,6 +7527,7 @@ pub fn run() {
             phpvms_logout,
             phpvms_load_session,
             phpvms_get_bids,
+            phpvms_refresh_profile,
             sim_get_kind,
             sim_set_kind,
             sim_status,

@@ -489,8 +489,14 @@ impl XPlaneState {
             velocity_body_x_fps: Some((self.local_vx_ms / 0.3048) as f32),
             velocity_body_z_fps: Some((self.local_vz_ms / 0.3048) as f32),
             groundspeed_kt: self.groundspeed_ms * KT_PER_MS,
-            indicated_airspeed_kt: self.indicated_airspeed_kt,
-            true_airspeed_kt: self.true_airspeed_kt,
+            // X-Plane's pitot simulation produces small negative IAS/TAS
+            // readings when the aircraft is stationary on the ground
+            // (sensor noise, residual ram pressure modelling). Clamp to
+            // zero at the source so neither the cockpit gauges nor
+            // downstream consumers (PIREP, activity log) ever surface
+            // a "−10 kt" — pilots reasonably treat that as a bug.
+            indicated_airspeed_kt: self.indicated_airspeed_kt.max(0.0),
+            true_airspeed_kt: self.true_airspeed_kt.max(0.0),
             aircraft_wind_x_kt: Some(self.wind_x_ms * KT_PER_MS),
             aircraft_wind_z_kt: Some(self.wind_z_ms * KT_PER_MS),
             g_force: self.g_force,
