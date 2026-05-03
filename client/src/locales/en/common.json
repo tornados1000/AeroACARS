@@ -339,7 +339,7 @@
     "age_unknown": "—"
   },
   "status": {
-    "phpvms": "phpVMS",
+    "phpvms": "GSG",
     "phpvms_connected": "Connected",
     "phpvms_disconnected": "Not connected",
     "simulator": "Simulator",

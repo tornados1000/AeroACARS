@@ -14,7 +14,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.24"
+version = "0.1.25"
 edition = "2021"
 license = "MIT"
 authors = ["Thomas Kant <github@MANFahrer-GF>", "AeroACARS contributors"]
@@ -97,6 +97,11 @@ tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-opener = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+# OS-native notifications (system tray badges, banners). Used to
+# alert pilots when AeroACARS is running in tray-only mode and a
+# critical event happens (PIREP cancelled remotely, sim
+# disconnected mid-flight). Cross-platform.
+tauri-plugin-notification = "2"
 
 serde.workspace = true
 serde_json.workspace = true
