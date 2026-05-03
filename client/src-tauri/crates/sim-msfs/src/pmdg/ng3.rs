@@ -689,6 +689,27 @@ pub struct Pmdg738Snapshot {
 
     // Comm + Misc
     pub xpdr_mode: u8,                  // 0=STBY 1=ALT_RPTG_OFF .. 4=TA/RA
+
+    // ---- Cockpit lights + systems for Premium-First override ----
+    /// Either landing-light switch ON. NG3 has separate Fixed +
+    /// Retractable switches (left/right each); we OR them so the
+    /// generic boolean tells "any landing light on".
+    pub light_landing: bool,
+    pub light_beacon: bool,
+    pub light_strobe: bool,
+    pub light_taxi: bool,
+    pub light_nav: bool,
+    pub light_logo: bool,
+    pub light_wing: bool,
+    pub light_wheel_well: bool, // NG3-only (no Standard SimVar)
+
+    // Anti-ice / pitot
+    pub wing_anti_ice: bool,
+    pub engine_anti_ice: bool,
+    pub pitot_heat: bool,
+
+    // Power
+    pub battery_master: bool,
 }
 
 impl Pmdg738Snapshot {
@@ -765,16 +786,42 @@ impl Pmdg738Snapshot {
             // NG3 SDK has no explicit `APURunning` bool. We
             // derive it from two PMDG fields:
             //   * APU_Selector == 1 (= ON, not OFF or START)
-            //     means the pilot has the master switch on
-            //   * APU_EGTNeedle > 350 °C means the unit has
-            //     reached steady-state running temperature
-            //     (typical NG APU EGT idle: 400-500 °C; cold
-            //     APU: <50 °C; start ramp peaks ~450 °C briefly)
-            // Both true → running. Either alone isn't enough:
-            // selector==1 with cold EGT = pilot turned switch on
-            // but APU didn't start. Hot EGT with selector==0 =
-            // unit is cooling down after shutdown.
+            //   * APU_EGTNeedle > 350 °C (steady-state running)
             apu_running: raw.APU_Selector == 1 && raw.APU_EGTNeedle > 350.0,
+
+            // Cockpit lights — direct from PMDG cockpit state.
+            // Landing light: NG3 has 2 fixed + 2 retractable
+            // switches per side; ANY ON = "landing light on".
+            light_landing: raw.LTS_LandingLtFixedSw[0] != 0
+                || raw.LTS_LandingLtFixedSw[1] != 0
+                || raw.LTS_LandingLtRetractableSw[0] >= 1
+                || raw.LTS_LandingLtRetractableSw[1] >= 1,
+            // Beacon = Anti-Collision per Boeing terminology.
+            light_beacon: raw.LTS_AntiCollisionSw != 0,
+            // PositionSw: 0=STEADY 1=OFF 2=STROBE&STEADY → strobe
+            // is on when value == 2.
+            light_strobe: raw.LTS_PositionSw == 2,
+            light_taxi: raw.LTS_TaxiSw != 0,
+            // NG3 doesn't have a separate "NAV" switch — position
+            // lights are always on with the position switch
+            // (steady = nav lights). Use position-not-OFF as proxy.
+            light_nav: raw.LTS_PositionSw != 1,
+            light_logo: raw.LTS_LogoSw != 0,
+            light_wing: raw.LTS_WingSw != 0,
+            light_wheel_well: raw.LTS_WheelWellSw != 0,
+
+            // Anti-ice
+            wing_anti_ice: raw.ICE_WingAntiIceSw != 0,
+            engine_anti_ice: raw.ICE_EngAntiIceSw[0] != 0
+                || raw.ICE_EngAntiIceSw[1] != 0,
+            // Pitot heat: NG3 has 2 probe heat switches
+            // (Capt + F/O). ANY on = pitot heat on for our purpose.
+            pitot_heat: raw.ICE_ProbeHeatSw[0] != 0
+                || raw.ICE_ProbeHeatSw[1] != 0,
+
+            // Battery: BatSelector 0=OFF 1=BAT 2=ON. Anything
+            // non-zero = battery providing power.
+            battery_master: raw.ELEC_BatSelector != 0,
 
             xpdr_mode: raw.XPDR_ModeSel,
         }

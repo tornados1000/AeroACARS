@@ -751,6 +751,23 @@ pub struct Pmdg777XSnapshot {
     /// Electronic Checklist completion — 10 phases (see SDK
     /// header for index meanings).
     pub ecl_complete: [bool; 10],
+
+    // ---- Cockpit lights + systems for Premium-First override (v0.2.3) ----
+    /// Any of the 3 landing-light switches (L/R/Nose) on.
+    pub light_landing: bool,
+    pub light_beacon: bool,
+    pub light_strobe: bool,
+    pub light_taxi: bool,
+    pub light_nav: bool,
+    pub light_logo: bool,
+    pub light_wing: bool,
+    pub wing_anti_ice: bool,    // 0=OFF 1=AUTO 2=ON → not OFF = active
+    pub engine_anti_ice: bool,  // either eng on
+    pub battery_master: bool,
+    /// 777 has window heat (incl. BackUp_Sw_OFF) but no separate
+    /// pitot/probe heat switch in the SDK — pitot heat is part
+    /// of the broader window heat system.
+    pub pitot_heat: bool,
 }
 
 impl Pmdg777XSnapshot {
@@ -838,6 +855,30 @@ impl Pmdg777XSnapshot {
                 raw.ECL_ChecklistComplete[8] != 0,
                 raw.ECL_ChecklistComplete[9] != 0,
             ],
+
+            // ---- Lights + systems (v0.2.3 Premium-First) ----
+            light_landing: raw.LTS_LandingLights_Sw_ON[0] != 0
+                || raw.LTS_LandingLights_Sw_ON[1] != 0
+                || raw.LTS_LandingLights_Sw_ON[2] != 0,
+            light_beacon: raw.LTS_Beacon_Sw_ON != 0,
+            light_strobe: raw.LTS_Strobe_Sw_ON != 0,
+            light_taxi: raw.LTS_Taxi_Sw_ON != 0,
+            light_nav: raw.LTS_NAV_Sw_ON != 0,
+            light_logo: raw.LTS_Logo_Sw_ON != 0,
+            light_wing: raw.LTS_Wing_Sw_ON != 0,
+            // 777 anti-ice: 0=OFF 1=AUTO 2=ON. Active = not OFF.
+            wing_anti_ice: raw.ICE_WingAntiIceSw != 0,
+            engine_anti_ice: raw.ICE_EngAntiIceSw[0] != 0
+                || raw.ICE_EngAntiIceSw[1] != 0,
+            // Battery: ELEC_Battery_Sw_ON is direct boolean.
+            battery_master: raw.ELEC_Battery_Sw_ON != 0,
+            // 777 has 4 window-heat switches (L-Side/L-Fwd/R-Fwd/
+            // R-Side); pitot heat is part of that system. ANY on
+            // = pitot heat effectively on for our reporting.
+            pitot_heat: raw.ICE_WindowHeat_Sw_ON[0] != 0
+                || raw.ICE_WindowHeat_Sw_ON[1] != 0
+                || raw.ICE_WindowHeat_Sw_ON[2] != 0
+                || raw.ICE_WindowHeat_Sw_ON[3] != 0,
         }
     }
 }

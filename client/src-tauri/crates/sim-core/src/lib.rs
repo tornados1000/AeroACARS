@@ -336,6 +336,37 @@ pub struct PmdgState {
     pub apu_running: Option<bool>,
     /// Wheel chocks set at the gate (777-specific). None for NG3.
     pub wheel_chocks_set: Option<bool>,
+
+    // ---- Cockpit-state overrides for the Standard SimSnapshot ----
+    //
+    // These are the same things the standard MSFS SimVars expose
+    // (LIGHT LANDING, BATTERY MASTER, etc.) but read directly from
+    // the PMDG cockpit-state struct — guaranteed real-time vs. the
+    // standard SimVars which can lag during cold-start. The adapter
+    // overrides the matching SimSnapshot fields when these are set,
+    // so the existing activity-log change detection automatically
+    // uses the better values without any branching downstream.
+    /// Light switches mirrored from PMDG_*_Sw_ON / LTS_*Sw fields.
+    pub light_landing: Option<bool>,
+    pub light_beacon: Option<bool>,
+    pub light_strobe: Option<bool>,
+    pub light_taxi: Option<bool>,
+    pub light_nav: Option<bool>,
+    pub light_logo: Option<bool>,
+    pub light_wing: Option<bool>,
+    /// NG3-only: separate "WHEEL WELL" light switch (no Standard
+    /// SimVar exists for this — pure PMDG bonus).
+    pub light_wheel_well: Option<bool>,
+    /// Anti-ice: WING ANTI-ICE switch position.
+    pub wing_anti_ice: Option<bool>,
+    /// Anti-ice: at least one ENG ANTI-ICE switch is ON.
+    pub engine_anti_ice: Option<bool>,
+    /// Pitot/probe heat (combined).
+    pub pitot_heat: Option<bool>,
+    /// Battery master switch state.
+    pub battery_master: Option<bool>,
+    /// Parking brake set (PMDG-cockpit-authoritative).
+    pub parking_brake: Option<bool>,
 }
 
 impl Default for SimSnapshot {

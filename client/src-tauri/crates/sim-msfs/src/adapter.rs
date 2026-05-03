@@ -228,16 +228,23 @@ fn ng3_to_pmdg_state(s: &crate::pmdg::ng3::Pmdg738Snapshot) -> sim_core::PmdgSta
         // Genuine NG3 SDK gaps — fields below don't exist in
         // PMDG_NG3_SDK.h at all. Leave None so downstream code
         // skips the matching activity-log entries silently.
-        // * thrust_limit_mode: NG3 has MCP_annunN1 + MAIN_N1SetSelector
-        //   but no EICAS-style mode label. 737 cockpit doesn't
-        //   show "TO/CLB/CRZ/G/A" the same way the 777 EICAS does.
-        // * ecl_complete: 737 NG is classic-cockpit, no Electronic
-        //   Checklist exists in real life or in PMDG. ECL came
-        //   with the 737 MAX (different aircraft).
-        // * wheel_chocks_set: not simulated by PMDG on the NG3.
         thrust_limit_mode: String::new(),
         ecl_complete: None,
         wheel_chocks_set: None,
+        // ---- Cockpit overrides (Premium-First) ----
+        light_landing: Some(s.light_landing),
+        light_beacon: Some(s.light_beacon),
+        light_strobe: Some(s.light_strobe),
+        light_taxi: Some(s.light_taxi),
+        light_nav: Some(s.light_nav),
+        light_logo: Some(s.light_logo),
+        light_wing: Some(s.light_wing),
+        light_wheel_well: Some(s.light_wheel_well), // NG3-bonus
+        wing_anti_ice: Some(s.wing_anti_ice),
+        engine_anti_ice: Some(s.engine_anti_ice),
+        pitot_heat: Some(s.pitot_heat),
+        battery_master: Some(s.battery_master),
+        parking_brake: Some(s.parking_brake_set),
     }
 }
 
@@ -373,6 +380,23 @@ fn x777_to_pmdg_state(s: &crate::pmdg::x777::Pmdg777XSnapshot) -> sim_core::Pmdg
         ecl_complete: Some(s.ecl_complete),
         apu_running: Some(s.apu_running),
         wheel_chocks_set: Some(s.wheel_chocks_set),
+
+        // ---- Cockpit overrides (Premium-First, v0.2.3) ----
+        // Same overrides as NG3, but the 777 SDK has no dedicated
+        // wheel-well light bool — leave None there.
+        light_landing: Some(s.light_landing),
+        light_beacon: Some(s.light_beacon),
+        light_strobe: Some(s.light_strobe),
+        light_taxi: Some(s.light_taxi),
+        light_nav: Some(s.light_nav),
+        light_logo: Some(s.light_logo),
+        light_wing: Some(s.light_wing),
+        light_wheel_well: None,
+        wing_anti_ice: Some(s.wing_anti_ice),
+        engine_anti_ice: Some(s.engine_anti_ice),
+        pitot_heat: Some(s.pitot_heat),
+        battery_master: Some(s.battery_master),
+        parking_brake: Some(s.parking_brake_set),
     }
 }
 
@@ -499,6 +523,45 @@ impl MsfsAdapter {
         } else if let Some(x777_state) = self.pmdg_x777_snapshot() {
             snap.pmdg = Some(x777_to_pmdg_state(&x777_state));
         }
+
+        // ---- Premium-First Override (v0.2.3) ----
+        // Where PMDG provides a cockpit-exact value for a field that
+        // the Standard SimVar telemetry also fills, prefer the PMDG
+        // value. This keeps every downstream consumer (FSM,
+        // activity-log, PIREP fields, UI) on the most accurate
+        // signal we have, without each consumer needing to know
+        // about PMDG. The override is silent when PMDG is absent
+        // or the specific field isn't supported (NG3 doesn't have
+        // wheel_well in the override path? actually it does; 777
+        // doesn't — `light_wheel_well` is only set when present).
+        if let Some(pmdg) = snap.pmdg.as_ref() {
+            if let Some(v) = pmdg.light_landing  { snap.light_landing  = Some(v); }
+            if let Some(v) = pmdg.light_beacon   { snap.light_beacon   = Some(v); }
+            if let Some(v) = pmdg.light_strobe   { snap.light_strobe   = Some(v); }
+            if let Some(v) = pmdg.light_taxi     { snap.light_taxi     = Some(v); }
+            if let Some(v) = pmdg.light_nav      { snap.light_nav      = Some(v); }
+            if let Some(v) = pmdg.light_logo     { snap.light_logo     = Some(v); }
+            // SimSnapshot has no top-level light_wing — only PMDG
+            // exposes it; downstream reads it from snap.pmdg.
+            if let Some(v) = pmdg.wing_anti_ice  { snap.wing_anti_ice  = Some(v); }
+            if let Some(v) = pmdg.engine_anti_ice{ snap.engine_anti_ice= Some(v); }
+            if let Some(v) = pmdg.pitot_heat     { snap.pitot_heat     = Some(v); }
+            if let Some(v) = pmdg.battery_master { snap.battery_master = Some(v); }
+            if let Some(v) = pmdg.parking_brake  { snap.parking_brake  = v; }
+            // APU: SimSnapshot stores `apu_switch` (selector ON?)
+            // and `apu_pct_rpm` (rising/running heuristic). PMDG's
+            // `apu_running` is the cockpit-truth boolean — surface
+            // it via apu_switch so the FSM picks it up.
+            if let Some(v) = pmdg.apu_running    { snap.apu_switch     = Some(v); }
+            // Spoilers/autobrake: PMDG has cockpit-exact values for
+            // `speedbrake_armed` and `autobrake_label`. Mirror them
+            // into the standard fields so generic consumers benefit.
+            snap.spoilers_armed = Some(pmdg.speedbrake_armed);
+            if !pmdg.autobrake_label.is_empty() {
+                snap.autobrake = Some(pmdg.autobrake_label.clone());
+            }
+        }
+
         Some(snap)
     }
 
