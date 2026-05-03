@@ -561,7 +561,7 @@
     "adopt_now": "Jetzt fortsetzen",
     "adopting": "Setze fort…",
     "cancel_flight": "Flug abbrechen",
-    "confirm_cancel": "Den aktiven Flug auf phpVMS abbrechen? Der PIREP wird storniert. Diese Aktion kann nicht rückgängig gemacht werden.",
+    "confirm_cancel": "Den aktiven Flug abbrechen? Der PIREP wird auf phpVMS als „storniert\" markiert — er bleibt in der PIREP-Liste sichtbar. Vollständiges Löschen nur über die phpVMS-Webseite.",
     "adopt_failed": "Wiederherstellung fehlgeschlagen",
     "confirm_failed": "Bestätigung fehlgeschlagen",
     "cancel_failed": "Flug konnte nicht abgebrochen werden"
@@ -595,7 +595,7 @@
     "filing": "Reiche ein…",
     "cancel": "Flug verwerfen",
     "cancelling": "Verwerfe…",
-    "confirm_cancel": "Flug wirklich verwerfen? Der PIREP wird auf phpVMS storniert. Diese Aktion kann nicht rückgängig gemacht werden.",
+    "confirm_cancel": "Flug wirklich verwerfen? Der PIREP wird auf phpVMS als „storniert\" markiert — er bleibt in der PIREP-Liste sichtbar. Vollständiges Löschen nur über die phpVMS-Webseite.",
     "forget": "Lokal vergessen",
     "forgetting": "Vergesse…",
     "forget_hint": "Lokalen Flug-Status verwerfen ohne phpVMS zu kontaktieren — z. B. wenn der PIREP serverseitig schon weg ist.",

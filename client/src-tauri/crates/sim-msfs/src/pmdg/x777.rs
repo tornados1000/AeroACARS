@@ -744,6 +744,13 @@ pub struct Pmdg777XSnapshot {
     pub xpdr_mode: u8,
     pub gpws_top_warn: bool,
     pub gpws_bottom_warn: bool,
+
+    // ---- Extras for v0.2.2 wider integration ----
+    /// Wheel chocks set at the gate. Pre-flight ground state.
+    pub wheel_chocks_set: bool,
+    /// Electronic Checklist completion — 10 phases (see SDK
+    /// header for index meanings).
+    pub ecl_complete: [bool; 10],
 }
 
 impl Pmdg777XSnapshot {
@@ -817,7 +824,65 @@ impl Pmdg777XSnapshot {
             xpdr_mode: raw.XPDR_ModeSel,
             gpws_top_warn: raw.GPWS_annunGND_PROX_top != 0,
             gpws_bottom_warn: raw.GPWS_annunGND_PROX_bottom != 0,
+
+            wheel_chocks_set: raw.WheelChocksSet != 0,
+            ecl_complete: [
+                raw.ECL_ChecklistComplete[0] != 0,
+                raw.ECL_ChecklistComplete[1] != 0,
+                raw.ECL_ChecklistComplete[2] != 0,
+                raw.ECL_ChecklistComplete[3] != 0,
+                raw.ECL_ChecklistComplete[4] != 0,
+                raw.ECL_ChecklistComplete[5] != 0,
+                raw.ECL_ChecklistComplete[6] != 0,
+                raw.ECL_ChecklistComplete[7] != 0,
+                raw.ECL_ChecklistComplete[8] != 0,
+                raw.ECL_ChecklistComplete[9] != 0,
+            ],
         }
+    }
+}
+
+/// Map an FMC thrust-limit-mode byte to the EICAS label.
+/// Per the SDK comment table:
+/// 0=TO 1=TO 1 2=TO 2 3=TO B 4=CLB 5=CLB 1 6=CLB 2 7=CRZ 8=CON 9=G/A
+/// 10..16=D-TO/A-TO variants.
+pub fn x777_thrust_limit_label(mode: u8) -> &'static str {
+    match mode {
+        0 => "TO",
+        1 => "TO 1",
+        2 => "TO 2",
+        3 => "TO B",
+        4 => "CLB",
+        5 => "CLB 1",
+        6 => "CLB 2",
+        7 => "CRZ",
+        8 => "CON",
+        9 => "G/A",
+        10 => "D-TO",
+        11 => "D-TO 1",
+        12 => "D-TO 2",
+        13 => "A-TO",
+        14 => "A-TO 1",
+        15 => "A-TO 2",
+        16 => "A-TO B",
+        _ => "?",
+    }
+}
+
+/// Human label for an ECL phase index.
+pub fn ecl_phase_label(idx: usize) -> &'static str {
+    match idx {
+        0 => "Preflight",
+        1 => "Before Start",
+        2 => "Before Taxi",
+        3 => "Before Takeoff",
+        4 => "After Takeoff",
+        5 => "Descent",
+        6 => "Approach",
+        7 => "Landing",
+        8 => "Shutdown",
+        9 => "Secure",
+        _ => "?",
     }
 }
 

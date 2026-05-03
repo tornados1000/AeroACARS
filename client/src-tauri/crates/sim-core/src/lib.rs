@@ -314,6 +314,28 @@ pub struct PmdgState {
     /// Cockpit "TAKEOFF CONFIG" warning is active. If true at
     /// takeoff roll start, the PIREP gets a flag.
     pub takeoff_config_warning: bool,
+
+    // ---- 777-specific extras (None for NG3) ----
+    /// FMC thrust-limit mode label as shown on the EICAS:
+    /// "TO" / "TO 1" / "TO 2" / "CLB" / "CRZ" / "CON" / "G/A"
+    /// / "D-TO" / "A-TO" etc. Empty when not applicable
+    /// (NG3 doesn't expose this).
+    pub thrust_limit_mode: String,
+    /// Electronic Checklist completion state — 10 phases.
+    /// `true` at index N = pilot has marked phase N complete in
+    /// the cockpit checklist. None for NG3 (no ECL there).
+    /// Phases:
+    ///   0=PREFLIGHT 1=BEFORE_START 2=BEFORE_TAXI
+    ///   3=BEFORE_TAKEOFF 4=AFTER_TAKEOFF 5=DESCENT
+    ///   6=APPROACH 7=LANDING 8=SHUTDOWN 9=SECURE
+    pub ecl_complete: Option<[bool; 10]>,
+    /// APU running per the SDK's authoritative bit (more accurate
+    /// than the RPM heuristic on the standard SimVar). None when
+    /// the variant doesn't expose it (NG3 derives from standard
+    /// SimVars instead).
+    pub apu_running: Option<bool>,
+    /// Wheel chocks set at the gate (777-specific). None for NG3.
+    pub wheel_chocks_set: Option<bool>,
 }
 
 impl Default for SimSnapshot {

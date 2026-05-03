@@ -1300,6 +1300,21 @@ struct FlightStats {
     /// not the off-edge).
     last_logged_pmdg_to_warning: Option<bool>,
 
+    // ---- v0.2.2 — wider PMDG integration ----
+    /// FMC thrust limit mode label tracking (777-specific). Logged
+    /// on every change — TO → CLB → CRZ → CON arc tells the VA
+    /// admin the pilot worked the thrust schedule properly.
+    last_logged_pmdg_thrust_mode: Option<String>,
+    /// 777 ECL phase completion tracking — one slot per phase.
+    /// Logged on rising edge (false→true) so the activity log
+    /// shows "ECL: Preflight ✓ complete" once per phase.
+    last_logged_pmdg_ecl: [bool; 10],
+    /// PMDG-authoritative APU-running bit (777). Distinct from
+    /// the standard-SimVar APU tracking which uses RPM heuristics.
+    last_logged_pmdg_apu: Option<bool>,
+    /// Wheel chocks set (777). Pre-flight ground state.
+    last_logged_pmdg_chocks: Option<bool>,
+
     // ---- PMDG PIREP captures (Phase 5.6 / v0.2.0) ----
     /// PMDG aircraft variant label captured once at flight start.
     /// "737-800" / "737-800 SSW" / "777-300ER" / etc. Surfaced in
@@ -1323,6 +1338,10 @@ struct FlightStats {
     /// FMC flight number captured at takeoff (for sanity check
     /// against the bid's flight number).
     pmdg_fmc_flight_number: Option<String>,
+    /// 777-specific: ECL phases marked complete during the flight.
+    /// Captured continuously — final value is the union of all
+    /// phases that were ever ticked (NG3 stays None).
+    pmdg_ecl_phases_complete: Option<[bool; 10]>,
     // FCU debounce state — kept around for the planned switch to the
     // standard `AUTOPILOT * VAR` SimVars (the Fenix LVar variant
     // proved unreliable as encoder click counters; we don't log
@@ -6616,6 +6635,27 @@ fn build_pirep_fields(
             "JA — Warnung war während TakeoffRoll aktiv".to_string(),
         );
     }
+    // 777 ECL phase summary — only emit when at least ONE phase
+    // was completed (avoids "PMDG ECL: 0/10" on aircraft without
+    // ECL like NG3).
+    if let Some(ecl) = stats.pmdg_ecl_phases_complete {
+        let labels = [
+            "Preflight", "BeforeStart", "BeforeTaxi", "BeforeTakeoff",
+            "AfterTakeoff", "Descent", "Approach", "Landing",
+            "Shutdown", "Secure",
+        ];
+        let done: Vec<&str> = ecl
+            .iter()
+            .zip(labels.iter())
+            .filter_map(|(d, l)| if *d { Some(*l) } else { None })
+            .collect();
+        if !done.is_empty() {
+            f.insert(
+                "PMDG ECL Complete".into(),
+                format!("{} / 10 ({})", done.len(), done.join(", ")),
+            );
+        }
+    }
 
     // ---- SimBrief OFP plan + fuel-efficiency (Landing Analyzer Stage 2) ----
     // Surface the dispatcher's plan alongside the actuals, and compute
@@ -7934,6 +7974,96 @@ fn detect_telemetry_changes(app: &AppHandle, flight: &ActiveFlight, snap: &SimSn
                 );
             }
             stats.last_logged_pmdg_to_warning = Some(p.takeoff_config_warning);
+        }
+
+        // ---- v0.2.2 wider integration ----
+
+        // FMC thrust-limit mode (777). Empty string = NG3 (no
+        // thrust-limit field) — skip there, NG3 derives MCP_annunN1
+        // for similar purpose elsewhere.
+        if !p.thrust_limit_mode.is_empty()
+            && stats.last_logged_pmdg_thrust_mode.as_deref()
+                != Some(p.thrust_limit_mode.as_str())
+        {
+            if stats.last_logged_pmdg_thrust_mode.is_some() {
+                log_activity_handle(
+                    app,
+                    ActivityLevel::Info,
+                    format!("Thrust mode → {}", p.thrust_limit_mode),
+                    None,
+                );
+            }
+            stats.last_logged_pmdg_thrust_mode = Some(p.thrust_limit_mode.clone());
+        }
+
+        // 777 Electronic Checklist — log once per phase on rising
+        // edge + capture for the PIREP custom field. Skips
+        // silently for NG3 (ecl_complete = None).
+        if let Some(ecl) = p.ecl_complete {
+            // Capture for final PIREP — sticky union of all phases
+            // ever ticked.
+            let cap = stats.pmdg_ecl_phases_complete.get_or_insert([false; 10]);
+            for (i, &done) in ecl.iter().enumerate() {
+                if done {
+                    cap[i] = true;
+                }
+            }
+            for (idx, &done) in ecl.iter().enumerate() {
+                if done && !stats.last_logged_pmdg_ecl[idx] {
+                    let label = match idx {
+                        0 => "Preflight",
+                        1 => "Before Start",
+                        2 => "Before Taxi",
+                        3 => "Before Takeoff",
+                        4 => "After Takeoff",
+                        5 => "Descent",
+                        6 => "Approach",
+                        7 => "Landing",
+                        8 => "Shutdown",
+                        9 => "Secure",
+                        _ => continue,
+                    };
+                    log_activity_handle(
+                        app,
+                        ActivityLevel::Info,
+                        format!("ECL: {label} ✓ complete"),
+                        None,
+                    );
+                    stats.last_logged_pmdg_ecl[idx] = true;
+                }
+            }
+        }
+
+        // PMDG-authoritative APU bit (777). More accurate than
+        // the standard-SimVar APU_PCT_RPM heuristic. NG3 leaves
+        // this None and falls back to the standard APU detection.
+        if let Some(apu) = p.apu_running {
+            if stats.last_logged_pmdg_apu != Some(apu) {
+                if stats.last_logged_pmdg_apu.is_some() {
+                    log_activity_handle(
+                        app,
+                        ActivityLevel::Info,
+                        format!("APU {} (PMDG)", if apu { "started" } else { "shutdown" }),
+                        None,
+                    );
+                }
+                stats.last_logged_pmdg_apu = Some(apu);
+            }
+        }
+
+        // Wheel chocks (777). Sets/removes around pushback time.
+        if let Some(chocks) = p.wheel_chocks_set {
+            if stats.last_logged_pmdg_chocks != Some(chocks) {
+                if stats.last_logged_pmdg_chocks.is_some() {
+                    log_activity_handle(
+                        app,
+                        ActivityLevel::Info,
+                        format!("Chocks {}", if chocks { "ON" } else { "OFF" }),
+                        None,
+                    );
+                }
+                stats.last_logged_pmdg_chocks = Some(chocks);
+            }
         }
     }
 }

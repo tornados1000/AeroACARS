@@ -561,7 +561,7 @@
     "adopt_now": "Resume now",
     "adopting": "Resuming…",
     "cancel_flight": "Cancel flight",
-    "confirm_cancel": "Cancel the active flight on phpVMS? The PIREP will be discarded. This cannot be undone.",
+    "confirm_cancel": "Cancel the active flight? The PIREP will be marked as \"cancelled\" on phpVMS — it stays visible in the PIREP list. Full deletion only via the phpVMS website.",
     "adopt_failed": "Could not resume the flight",
     "confirm_failed": "Could not confirm the resume",
     "cancel_failed": "Could not cancel the flight"
@@ -595,7 +595,7 @@
     "filing": "Filing…",
     "cancel": "Discard flight",
     "cancelling": "Discarding…",
-    "confirm_cancel": "Really discard this flight? The PIREP will be cancelled on phpVMS. This cannot be undone.",
+    "confirm_cancel": "Really discard this flight? The PIREP will be marked as \"cancelled\" on phpVMS — it stays visible in the PIREP list. Full deletion only via the phpVMS website.",
     "forget": "Forget locally",
     "forgetting": "Forgetting…",
     "forget_hint": "Drop local flight state without contacting phpVMS — useful if the PIREP is already gone server-side.",

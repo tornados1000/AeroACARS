@@ -216,6 +216,14 @@ fn ng3_to_pmdg_state(s: &crate::pmdg::ng3::Pmdg738Snapshot) -> sim_core::PmdgSta
         speedbrake_armed: s.speedbrake_armed,
         speedbrake_extended: s.speedbrake_extended,
         takeoff_config_warning: s.takeoff_config_warning,
+
+        // NG3 doesn't expose ECL / thrust-limit-mode / apu-bit /
+        // wheel-chocks — leave these None / empty so downstream
+        // code can fall back to standard-SimVar derivations.
+        thrust_limit_mode: String::new(),
+        ecl_complete: None,
+        apu_running: None,
+        wheel_chocks_set: None,
     }
 }
 
@@ -342,6 +350,15 @@ fn x777_to_pmdg_state(s: &crate::pmdg::x777::Pmdg777XSnapshot) -> sim_core::Pmdg
         // a perfect match. Leave `false` for now; if needed,
         // we can derive from EICAS messages later.
         takeoff_config_warning: false,
+
+        // 777-specific extras (Phase 5.5b — wider integration).
+        thrust_limit_mode: crate::pmdg::x777::x777_thrust_limit_label(
+            s.fmc_thrust_limit_mode,
+        )
+        .to_string(),
+        ecl_complete: Some(s.ecl_complete),
+        apu_running: Some(s.apu_running),
+        wheel_chocks_set: Some(s.wheel_chocks_set),
     }
 }
 
