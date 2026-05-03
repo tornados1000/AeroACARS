@@ -526,6 +526,26 @@ struct PersistedFlightStats {
     planned_route: Option<String>,
     #[serde(default)]
     planned_alternate: Option<String>,
+    // ---- Touch-and-Go + Go-Around tracking (v0.1.26) ----
+    // Persisted so a Tauri restart mid-flight (or a planned resume
+    // after the pilot closed the app for lunch) doesn't wipe the
+    // training-flight audit trail. `pending_acars_logs` is NOT
+    // persisted on purpose — it's a transient queue between FSM
+    // tick and streamer tick; if the streamer didn't drain it
+    // before shutdown, those log lines are simply lost. Resume
+    // semantics for the GA detector: lowest_agl is preserved so a
+    // pilot who quits the app on short final and resumes can still
+    // get their GA correctly classified.
+    #[serde(default)]
+    touchdown_events: Vec<TouchdownEvent>,
+    #[serde(default)]
+    touch_and_go_pending_since: Option<DateTime<Utc>>,
+    #[serde(default)]
+    go_around_count: u32,
+    #[serde(default)]
+    lowest_agl_during_approach_ft: Option<f32>,
+    #[serde(default)]
+    go_around_climb_pending_since: Option<DateTime<Utc>>,
 }
 
 impl PersistedFlightStats {
@@ -581,6 +601,11 @@ impl PersistedFlightStats {
             planned_ldw_kg: stats.planned_ldw_kg,
             planned_route: stats.planned_route.clone(),
             planned_alternate: stats.planned_alternate.clone(),
+            touchdown_events: stats.touchdown_events.clone(),
+            touch_and_go_pending_since: stats.touch_and_go_pending_since,
+            go_around_count: stats.go_around_count,
+            lowest_agl_during_approach_ft: stats.lowest_agl_during_approach_ft,
+            go_around_climb_pending_since: stats.go_around_climb_pending_since,
         }
     }
 
@@ -642,6 +667,11 @@ impl PersistedFlightStats {
         stats.planned_ldw_kg = self.planned_ldw_kg;
         stats.planned_route = self.planned_route;
         stats.planned_alternate = self.planned_alternate;
+        stats.touchdown_events = self.touchdown_events;
+        stats.touch_and_go_pending_since = self.touch_and_go_pending_since;
+        stats.go_around_count = self.go_around_count;
+        stats.lowest_agl_during_approach_ft = self.lowest_agl_during_approach_ft;
+        stats.go_around_climb_pending_since = self.go_around_climb_pending_since;
     }
 }
 
