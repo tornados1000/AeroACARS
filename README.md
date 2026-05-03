@@ -23,11 +23,6 @@ shippt saubere PIREPs zu deinem phpVMS-Server.
 - ✅ **X-Plane 11 / X-Plane 12** — über native UDP DataRefs
   (cross-platform, kein Plugin nötig)
 
-**Status:** Pre-Beta. Diese Version ist auf den phpVMS-Host
-`german-sky-group.eu` hardcoded — andere VAs können den Code forken
-und den Host in `client/src-tauri/src/lib.rs` (`ALLOWED_PHPVMS_HOST`)
-anpassen.
-
 ---
 
 ## Installation
