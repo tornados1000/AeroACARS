@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import type { ActiveFlightInfo, SimKind, SimStatus } from "../types";
 import type { Theme } from "../theme";
 import { SimDebugPanel } from "./SimDebugPanel";
+import { PmdgPremiumPanel } from "./PmdgPremiumPanel";
 
 const ALL_KINDS: SimKind[] = [
   "msfs2024",
@@ -233,6 +234,7 @@ export function SettingsPanel({
           <div className="settings__debug-panel">
             <SimDebugPanel status={simStatus} />
             <PhpvmsHeartbeatDebug activeFlight={activeFlight} />
+            <PmdgPremiumPanel />
           </div>
         )}
       </div>

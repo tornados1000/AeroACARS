@@ -209,6 +209,111 @@ pub struct SimSnapshot {
     /// standard SimVars (e.g. PMDG 737/777 mostly do); the named variants
     /// cover study-level add-ons that pull state from their own LVars.
     pub aircraft_profile: AircraftProfile,
+
+    // ---- PMDG SDK premium telemetry (Phase H.4) ----
+    /// Live cockpit state from a PMDG aircraft's SimConnect SDK
+    /// (737 NG3 or 777X). `None` when no PMDG aircraft is loaded
+    /// OR the user hasn't enabled `EnableDataBroadcast=1` in the
+    /// aircraft's options ini. When `Some`, the consumer (FSM,
+    /// activity log, PIREP fields) gets cockpit values that
+    /// standard MSFS SimVars don't expose: A/T FMA modes, MCP
+    /// selected values, FMC-computed V-speeds, exact flap angle.
+    /// See `pmdg-sdk-integration.md` for the full mapping.
+    pub pmdg: Option<PmdgState>,
+}
+
+/// PMDG aircraft "premium telemetry" — generic across 737 NG3 and
+/// 777X. The `sim-msfs` crate fills this struct from variant-
+/// specific raw data (`Pmdg738RawData` / `Pmdg777XRawData`); the
+/// FSM and PIREP code consume this generic shape so they don't
+/// need PMDG-variant-specific code paths.
+///
+/// Field choice: only the cockpit values that EITHER aren't in
+/// standard MSFS SimVars at all (FMA modes, MCP selected speed
+/// when blanked, FMC V-speeds) OR are more accurate from PMDG
+/// (autobrake setting, flap angle in degrees vs. handle ratio).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PmdgState {
+    /// Which PMDG variant produced this state — useful for the
+    /// activity log ("PMDG 737-800: …") and for PIREP custom
+    /// fields that want to record the exact aircraft.
+    pub variant_label: String,
+
+    // ---- MCP (Mode Control Panel) — selected autopilot targets ----
+    /// MCP IAS/Mach window value. Above 10.0 = knots; below 10.0
+    /// = Mach. None when the MCP is blanked.
+    pub mcp_speed_raw: Option<f32>,
+    /// MCP heading bug, degrees true. None when MCP is unpowered.
+    pub mcp_heading_deg: Option<u16>,
+    /// MCP altitude window, feet. None when MCP is unpowered.
+    pub mcp_altitude_ft: Option<u16>,
+    /// MCP V/S window, fpm. None when V/S is blanked.
+    pub mcp_vs_fpm: Option<i16>,
+
+    // ---- FMA (Flight Mode Annunciator) — active autoflight modes ----
+    /// Speed-mode label as shown on FMA. Empty string when no
+    /// speed mode is engaged (= cockpit shows nothing). Possible
+    /// values: "N1", "SPD", "TOGA" (when AT pushed at takeoff),
+    /// "RETARD", "IDLE", etc. — exact labels are variant-specific.
+    pub fma_speed_mode: String,
+    /// Roll-mode label: "HDG SEL", "HDG HOLD", "LNAV", "VOR/LOC",
+    /// "APP", "" (none). Non-empty only when AP is engaged.
+    pub fma_roll_mode: String,
+    /// Pitch-mode label: "VNAV", "LVL CHG", "ALT HOLD", "VS",
+    /// "APP", "" (none).
+    pub fma_pitch_mode: String,
+    /// Auto-Throttle armed.
+    pub at_armed: bool,
+    /// At least one AP CMD channel engaged (CMD_A or CMD_B).
+    pub ap_engaged: bool,
+    /// Flight Director on (either side).
+    pub fd_on: bool,
+
+    // ---- FMC (Flight Management Computer) — pilot's plan ----
+    /// FMC takeoff flap setting in degrees. None if not entered.
+    pub fmc_takeoff_flaps_deg: Option<u8>,
+    /// FMC landing flap setting in degrees. None if not entered.
+    pub fmc_landing_flaps_deg: Option<u8>,
+    /// FMC V1 speed in knots. None if not entered.
+    pub fmc_v1_kt: Option<u8>,
+    /// FMC VR (rotate) speed in knots.
+    pub fmc_vr_kt: Option<u8>,
+    /// FMC V2 (takeoff safety) speed in knots.
+    pub fmc_v2_kt: Option<u8>,
+    /// FMC VREF (landing reference) speed in knots.
+    pub fmc_vref_kt: Option<u8>,
+    /// FMC cruise altitude, feet. None if not set.
+    pub fmc_cruise_alt_ft: Option<u16>,
+    /// Distance to top of descent, nautical miles. None when
+    /// already past TOD or not yet computed.
+    pub fmc_distance_to_tod_nm: Option<f32>,
+    /// Distance to destination, nautical miles. None when not
+    /// yet computed.
+    pub fmc_distance_to_dest_nm: Option<f32>,
+    /// FMC flight number (whatever the pilot entered in the FMC).
+    /// Empty if not set. Useful as a sanity check vs. the bid-
+    /// supplied flight number — mismatch = pilot loaded the
+    /// wrong route.
+    pub fmc_flight_number: String,
+    /// True when the pilot has completed the FMC PERF-INIT page.
+    /// Pre-flight checklist signal.
+    pub fmc_perf_input_complete: bool,
+
+    // ---- Controls — flaps, gear, autobrake (PMDG-precise) ----
+    /// Trailing-edge flap angle in degrees (live, not handle
+    /// position). For Boeing 737: 0/1/2/5/10/15/25/30/40 detents.
+    pub flap_angle_deg: f32,
+    /// Autobrake setting label: "RTO" / "OFF" / "1" / "2" / "3"
+    /// / "MAX". The values vary by variant (777 has 4 LO/MED/...
+    /// settings) so we keep this as a label string.
+    pub autobrake_label: String,
+    /// True if the pilot has the speedbrake armed for landing.
+    pub speedbrake_armed: bool,
+    /// True if the speedbrake is currently extended in flight.
+    pub speedbrake_extended: bool,
+    /// Cockpit "TAKEOFF CONFIG" warning is active. If true at
+    /// takeoff roll start, the PIREP gets a flag.
+    pub takeoff_config_warning: bool,
 }
 
 impl Default for SimSnapshot {
@@ -304,6 +409,7 @@ impl Default for SimSnapshot {
             parking_number: None,
             selected_runway: None,
             aircraft_profile: AircraftProfile::default(),
+            pmdg: None,
         }
     }
 }

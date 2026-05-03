@@ -348,6 +348,20 @@
     "simulator_disconnected": "Not connected",
     "checking_session": "Restoring session…"
   },
+  "pmdg_panel": {
+    "title": "PMDG Premium Telemetry",
+    "inactive_hint": "Load a PMDG aircraft (737 / 777) and live cockpit data straight from the PMDG SDK will show up here.",
+    "sdk_disabled_title": "PMDG detected, but SDK not enabled yet",
+    "sdk_disabled_explanation": "For AeroACARS to read FMA, MCP values, V-speeds and FMC data straight from the cockpit, one line needs to go into the PMDG options file. Takes 30 seconds:",
+    "step_close_msfs": "Close MSFS.",
+    "step_open_options_ini": "Open this file in Notepad:",
+    "step_add_lines": "Add these two lines at the end:",
+    "step_save_restart": "Save, restart MSFS, reload the flight — done.",
+    "last_packet": "Last packet",
+    "subscription": "Subscription",
+    "active_hint": "Premium cockpit data flowing — FMA, MCP, V-speeds and FMC values appear in the activity log and get recorded in the PIREP.",
+    "waiting": "Subscription registered — waiting for first data packet …"
+  },
   "pilot_header": {
     "location_tooltip": "Location per website ({{airline}}) — where your last PIREP landed. If this looks stale after a flight, hit \"Refresh\" top-right.",
     "home_tooltip": "Home base per website ({{airline}}) — your career anchor."

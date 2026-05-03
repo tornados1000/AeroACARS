@@ -624,6 +624,8 @@ impl XPlaneState {
             parking_number: None,
             selected_runway: None,
             aircraft_profile: sim_core::AircraftProfile::default(),
+            // PMDG SDK is MSFS-only; X-Plane never fills this.
+            pmdg: None,
         }
     }
 }

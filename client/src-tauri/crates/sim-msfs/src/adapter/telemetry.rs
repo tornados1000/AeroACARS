@@ -1170,5 +1170,9 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
         parking_number: None,
         selected_runway: None,
         aircraft_profile: profile,
+        // PMDG SDK data is filled in MsfsAdapter::snapshot() by
+        // merging the latest ClientData block — not here in the
+        // standard SimVar parse path.
+        pmdg: None,
     }
 }

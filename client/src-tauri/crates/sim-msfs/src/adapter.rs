@@ -37,6 +37,22 @@ const TOUCHDOWN_REQUEST_ID: sys::SIMCONNECT_DATA_REQUEST_ID = 2;
 /// SimVar name can't take down the per-tick telemetry.
 const INSPECTOR_DEFINITION_ID: sys::SIMCONNECT_DATA_DEFINITION_ID = 3;
 const INSPECTOR_REQUEST_ID: sys::SIMCONNECT_DATA_REQUEST_ID = 3;
+
+// ---- PMDG SDK ClientData IDs (Phase H.4) ----
+//
+// The PMDG NG3 + 777X SDKs use SimConnect ClientData (NOT the
+// standard SimObject data). They define their own data area names
+// + IDs in the SDK header (constants from `pmdg::ng3` /
+// `pmdg::x777`). We re-use the IDs defined by PMDG verbatim so the
+// `MapClientDataNameToID` call binds correctly. Definition + request
+// IDs we choose ourselves (must be unique within our own SimConnect
+// session). 100+ keeps them out of the existing telemetry-id range.
+const PMDG_NG3_DEFINITION_ID: sys::SIMCONNECT_DATA_DEFINITION_ID = 100;
+const PMDG_NG3_REQUEST_ID: sys::SIMCONNECT_DATA_REQUEST_ID = 100;
+const PMDG_X777_DEFINITION_ID: sys::SIMCONNECT_DATA_DEFINITION_ID = 101;
+const PMDG_X777_REQUEST_ID: sys::SIMCONNECT_DATA_REQUEST_ID = 101;
+const AIRCRAFT_LOADED_REQUEST_ID: sys::SIMCONNECT_DATA_REQUEST_ID = 200;
+const SIM_START_EVENT_ID: u32 = 300;
 const STALE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Public connection state mirrored to the frontend.
@@ -68,6 +84,187 @@ struct Shared {
     /// vec via add_watch / remove_watch (which sets `dirty=true`),
     /// the worker re-registers definition #3 on the next tick.
     inspector: Mutex<InspectorState>,
+    /// PMDG SDK live data, available only when a PMDG aircraft is
+    /// loaded AND the user has set `EnableDataBroadcast=1` in the
+    /// aircraft's options ini. Variant tells which PMDG family
+    /// is currently parsed; the bytes are decoded at consume-time
+    /// to the appropriate `Pmdg738Snapshot` / `Pmdg777XSnapshot`.
+    /// `None` when no PMDG aircraft is loaded.
+    /// Phase 5.2 — wired into the dispatch loop in this commit.
+    pmdg: Mutex<PmdgSharedState>,
+}
+
+/// Convert a PMDG NG3 (737-specific) snapshot to the generic
+/// `sim_core::PmdgState` shape. The FSM, activity log, and PIREP
+/// code consume `PmdgState` so they don't have to branch on
+/// 737 vs. 777 — this is the boundary that makes that work.
+///
+/// FMA-mode strings: 737 NG MCP shows the active mode via boolean
+/// annunciator lights (one per mode — VNAV, LVL CHG, ALT HOLD,
+/// VS, HDG SEL, LNAV, VOR/LOC, APP, SPEED, N1). We pick the
+/// "most active" one in priority order matching what the real
+/// FMA shows when multiple are momentarily active.
+fn ng3_to_pmdg_state(s: &crate::pmdg::ng3::Pmdg738Snapshot) -> sim_core::PmdgState {
+    use sim_core::PmdgState;
+
+    // Speed-mode: FMA-priority order. SPD wins over N1 if both
+    // (rare; usually only one). Real cockpit shows N1 during
+    // takeoff, SPD during climb/cruise, etc.
+    let fma_speed_mode = if s.fma.speed_n1 {
+        "N1"
+    } else if s.fma.speed {
+        "SPD"
+    } else {
+        ""
+    };
+    // Roll-mode: LNAV wins over VOR/LOC over HDG SEL.
+    let fma_roll_mode = if s.fma.lnav {
+        "LNAV"
+    } else if s.fma.vor_loc {
+        "VOR/LOC"
+    } else if s.fma.app {
+        "APP"
+    } else if s.fma.hdg_sel {
+        "HDG SEL"
+    } else {
+        ""
+    };
+    // Pitch-mode: VNAV / LVL CHG / VS / ALT HOLD priority.
+    let fma_pitch_mode = if s.fma.vnav {
+        "VNAV"
+    } else if s.fma.lvl_chg {
+        "LVL CHG"
+    } else if s.fma.alt_hold {
+        "ALT HOLD"
+    } else if s.fma.vs {
+        "V/S"
+    } else if s.fma.app {
+        "G/S"
+    } else {
+        ""
+    };
+
+    PmdgState {
+        variant_label: s.variant.label().to_string(),
+
+        // MCP — None when blanked or unpowered.
+        mcp_speed_raw: if s.mcp_speed_blanked || !s.mcp_powered {
+            None
+        } else {
+            Some(s.mcp_speed_raw)
+        },
+        mcp_heading_deg: if s.mcp_powered {
+            Some(s.mcp_heading_deg)
+        } else {
+            None
+        },
+        mcp_altitude_ft: if s.mcp_powered {
+            Some(s.mcp_altitude_ft)
+        } else {
+            None
+        },
+        mcp_vs_fpm: if s.mcp_vs_blanked || !s.mcp_powered {
+            None
+        } else {
+            Some(s.mcp_vs_fpm)
+        },
+
+        // FMA modes
+        fma_speed_mode: fma_speed_mode.to_string(),
+        fma_roll_mode: fma_roll_mode.to_string(),
+        fma_pitch_mode: fma_pitch_mode.to_string(),
+        at_armed: s.fma.at_armed,
+        ap_engaged: s.fma.cmd_a || s.fma.cmd_b,
+        fd_on: s.fma.fd_capt || s.fma.fd_fo,
+
+        // FMC plan
+        fmc_takeoff_flaps_deg: if s.fmc_takeoff_flaps_deg == 0 {
+            None
+        } else {
+            Some(s.fmc_takeoff_flaps_deg)
+        },
+        fmc_landing_flaps_deg: if s.fmc_landing_flaps_deg == 0 {
+            None
+        } else {
+            Some(s.fmc_landing_flaps_deg)
+        },
+        fmc_v1_kt: s.fmc_v_speeds.v1_kt,
+        fmc_vr_kt: s.fmc_v_speeds.vr_kt,
+        fmc_v2_kt: s.fmc_v_speeds.v2_kt,
+        fmc_vref_kt: s.fmc_v_speeds.vref_kt,
+        fmc_cruise_alt_ft: if s.fmc_cruise_alt_ft == 0 {
+            None
+        } else {
+            Some(s.fmc_cruise_alt_ft)
+        },
+        fmc_distance_to_tod_nm: if s.fmc_distance_to_tod_nm < 0.0 {
+            None
+        } else {
+            Some(s.fmc_distance_to_tod_nm)
+        },
+        fmc_distance_to_dest_nm: if s.fmc_distance_to_dest_nm < 0.0 {
+            None
+        } else {
+            Some(s.fmc_distance_to_dest_nm)
+        },
+        fmc_flight_number: s.fmc_flight_number.clone(),
+        fmc_perf_input_complete: s.fmc_perf_input_complete,
+
+        // Controls
+        flap_angle_deg: s.flap_angle_deg,
+        autobrake_label: s.autobrake.label().to_string(),
+        speedbrake_armed: s.speedbrake_armed,
+        speedbrake_extended: s.speedbrake_extended,
+        takeoff_config_warning: s.takeoff_config_warning,
+    }
+}
+
+/// Public PMDG SDK status — exposed via `MsfsAdapter::pmdg_status()`
+/// so the UI can show "SDK enabled?" hints, log warnings, etc.
+#[derive(Debug, Clone)]
+pub struct PmdgStatus {
+    /// Detected PMDG variant from the most recent AircraftLoaded.
+    pub variant: Option<crate::pmdg::PmdgVariant>,
+    /// True once `RequestClientData` has succeeded for the variant.
+    pub subscribed: bool,
+    /// True once at least one ClientData packet has arrived (i.e.
+    /// the SDK is genuinely active and broadcasting).
+    pub ever_received: bool,
+    /// Seconds since the last ClientData packet. `u64::MAX` when
+    /// no packet has ever arrived.
+    pub stale_secs: u64,
+}
+
+impl PmdgStatus {
+    /// True when PMDG aircraft is loaded but no data is flowing.
+    /// Drives the "SDK probably not enabled" hint in the UI.
+    pub fn looks_like_sdk_disabled(&self) -> bool {
+        self.variant.is_some() && self.subscribed && !self.ever_received
+            && self.stale_secs > 5
+    }
+}
+
+/// Tracking state for the PMDG SDK ClientData subscription.
+#[derive(Debug, Default)]
+struct PmdgSharedState {
+    /// Detected PMDG variant from the most recent AircraftLoaded
+    /// event. `None` if no PMDG aircraft is loaded.
+    variant: Option<crate::pmdg::PmdgVariant>,
+    /// True once we've successfully called
+    /// `RequestClientData` for the current variant. Cleared on
+    /// aircraft change so the next dispatch re-subscribes.
+    subscribed: bool,
+    /// Most recent NG3 raw data bytes. Stored as the raw 916-byte
+    /// block; decoded on demand via `Pmdg738Snapshot::from_raw()`.
+    /// `None` until the first frame arrives.
+    ng3_raw: Option<Box<crate::pmdg::ng3::Pmdg738RawData>>,
+    /// Reserved for the 777X full-replication phase (5.1b).
+    x777_raw: Option<()>,
+    /// Timestamp of the last PMDG ClientData packet. Used by the
+    /// "SDK appears not enabled" UI hint — if we know the variant
+    /// (= aircraft loaded) but no packets for >5 s, the user
+    /// probably hasn't enabled the SDK.
+    last_packet_at: Option<std::time::Instant>,
 }
 
 impl Default for MsfsAdapter {
@@ -85,6 +282,7 @@ impl MsfsAdapter {
                 last_error: Mutex::new(None),
                 touchdown: Mutex::new(None),
                 inspector: Mutex::new(InspectorState::default()),
+                pmdg: Mutex::new(PmdgSharedState::default()),
             }),
             worker: None,
             stop: Arc::new(AtomicBool::new(false)),
@@ -131,7 +329,46 @@ impl MsfsAdapter {
     }
 
     pub fn snapshot(&self) -> Option<SimSnapshot> {
-        self.shared.snapshot.lock().unwrap().clone()
+        let mut snap = self.shared.snapshot.lock().unwrap().clone()?;
+        // Merge PMDG SDK data when available (Phase 5.4). The
+        // standard SimVar telemetry fills the SimSnapshot's main
+        // body; PMDG fills the optional `pmdg` field with cockpit-
+        // exact values that standard SimVars don't expose (FMA,
+        // MCP, V-speeds). FSM and PIREP code consume the generic
+        // `PmdgState` shape, agnostic to NG3 vs. 777X.
+        if let Some(ng3_state) = self.pmdg_ng3_snapshot() {
+            snap.pmdg = Some(ng3_to_pmdg_state(&ng3_state));
+        }
+        Some(snap)
+    }
+
+    /// Latest PMDG NG3 cockpit state, if a PMDG 737 is loaded AND
+    /// the SDK is enabled in `737NG3_Options.ini`. Returns the
+    /// "useful subset" view (`Pmdg738Snapshot`), not the raw 916-
+    /// byte struct — so callers don't have to know about layout.
+    /// `None` when no PMDG NG3 is loaded or no data has arrived yet.
+    pub fn pmdg_ng3_snapshot(&self) -> Option<crate::pmdg::ng3::Pmdg738Snapshot> {
+        let g = self.shared.pmdg.lock().unwrap();
+        g.ng3_raw
+            .as_ref()
+            .map(|raw| crate::pmdg::ng3::Pmdg738Snapshot::from_raw(raw))
+    }
+
+    /// PMDG SDK status report — what variant is loaded (if any),
+    /// whether we've subscribed, and how stale the most recent
+    /// data is. Drives the Settings-tab "SDK enabled?" hint.
+    pub fn pmdg_status(&self) -> PmdgStatus {
+        let g = self.shared.pmdg.lock().unwrap();
+        let stale_secs = g
+            .last_packet_at
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(u64::MAX);
+        PmdgStatus {
+            variant: g.variant,
+            subscribed: g.subscribed,
+            ever_received: g.ng3_raw.is_some() || g.x777_raw.is_some(),
+            stale_secs,
+        }
     }
 
     /// Force-clear the cached snapshot + touchdown so the next read
@@ -145,6 +382,18 @@ impl MsfsAdapter {
     pub fn clear_snapshot(&self) {
         *self.shared.snapshot.lock().unwrap() = None;
         *self.shared.touchdown.lock().unwrap() = None;
+        // PMDG raw data is part of the same "stale snapshot"
+        // problem — clear it on manual re-sync too. Variant
+        // stays (we still know what aircraft is loaded), but
+        // we clear `subscribed=false` so the next dispatch
+        // re-subscribes and gets a fresh data block.
+        {
+            let mut g = self.shared.pmdg.lock().unwrap();
+            g.ng3_raw = None;
+            g.x777_raw = None;
+            g.subscribed = false;
+            g.last_packet_at = None;
+        }
         *self.shared.state.lock().unwrap() = ConnectionState::Connecting;
         tracing::info!("MSFS snapshot cleared by user (force-resync)");
     }
@@ -215,6 +464,17 @@ fn worker_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>, kind: SimKind) {
                 if let Err(e) = conn.request_touchdown_per_second() {
                     tracing::warn!(error = %e, "request_touchdown_per_second failed — touchdown values will stay None");
                 }
+                // PMDG SDK preflight (Phase 5.2/5.3): subscribe to
+                // AircraftLoaded so the dispatch loop can detect
+                // PMDG variants. This is best-effort — if it fails
+                // we just lose PMDG-specific data, the standard
+                // telemetry continues to work.
+                if let Err(e) = conn.subscribe_aircraft_loaded() {
+                    tracing::warn!(
+                        error = %e,
+                        "AircraftLoaded subscribe failed — PMDG variant detection disabled"
+                    );
+                }
                 run_dispatch(&shared, &stop, &mut conn, kind);
                 // run_dispatch only returns when stop is signalled or
                 // the connection has gone stale. Either way, drop and
@@ -232,6 +492,10 @@ fn worker_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>, kind: SimKind) {
                 // the next snapshot lands.
                 *shared.snapshot.lock().unwrap() = None;
                 *shared.touchdown.lock().unwrap() = None;
+                // PMDG state too — variant + raw + subscribed flag
+                // all reset so the next dispatch session re-detects
+                // and re-subscribes from scratch.
+                *shared.pmdg.lock().unwrap() = PmdgSharedState::default();
                 *shared.state.lock().unwrap() = ConnectionState::Connecting;
             }
             Err(e) => {
@@ -243,13 +507,9 @@ fn worker_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>, kind: SimKind) {
         sleep_or_stop(&stop, Duration::from_secs(2));
     }
     *shared.state.lock().unwrap() = ConnectionState::Disconnected;
-    // Final cleanup on full stop (app exit / sim kind change). Same
-    // reasoning as in the reconnect branch — the next adapter
-    // instance must not be able to read stale data through a shared
-    // mutex (defensive even though Shared lifetime is bound to one
-    // adapter today).
     *shared.snapshot.lock().unwrap() = None;
     *shared.touchdown.lock().unwrap() = None;
+    *shared.pmdg.lock().unwrap() = PmdgSharedState::default();
 }
 
 fn run_dispatch(
@@ -395,9 +655,137 @@ fn run_dispatch(
                         }
                     }
                 }
+                Ok(Some(DispatchMsg::ClientData { request_id, bytes })) => {
+                    // PMDG SDK ClientData arrived. The 916-byte
+                    // NG3 block (or future 777X block) gets stored
+                    // verbatim in `shared.pmdg.{ng3,x777}_raw`;
+                    // higher layers (snapshot integration in
+                    // Phase 5.4) decode on demand via
+                    // `Pmdg738Snapshot::from_raw()`.
+                    match request_id {
+                        PMDG_NG3_REQUEST_ID => {
+                            let expected_len =
+                                std::mem::size_of::<crate::pmdg::ng3::Pmdg738RawData>();
+                            if bytes.len() < expected_len {
+                                tracing::warn!(
+                                    got = bytes.len(),
+                                    expected = expected_len,
+                                    "PMDG NG3 ClientData payload too short — ignoring"
+                                );
+                            } else {
+                                // Safety: `Pmdg738RawData` is `#[repr(C)]`,
+                                // matches MSVC layout, and we just verified
+                                // the payload has at least `size_of()` bytes.
+                                // The struct is `Copy + Clone` so a bytewise
+                                // copy is safe. We Box it because the struct
+                                // is ~1 KB and we don't want it on the stack.
+                                let raw: Box<crate::pmdg::ng3::Pmdg738RawData> = unsafe {
+                                    let mut b: Box<std::mem::MaybeUninit<crate::pmdg::ng3::Pmdg738RawData>> =
+                                        Box::new(std::mem::MaybeUninit::uninit());
+                                    std::ptr::copy_nonoverlapping(
+                                        bytes.as_ptr(),
+                                        b.as_mut_ptr() as *mut u8,
+                                        expected_len,
+                                    );
+                                    Box::from_raw(Box::into_raw(b) as *mut crate::pmdg::ng3::Pmdg738RawData)
+                                };
+                                let mut g = shared.pmdg.lock().unwrap();
+                                g.ng3_raw = Some(raw);
+                                g.last_packet_at = Some(Instant::now());
+                            }
+                        }
+                        PMDG_X777_REQUEST_ID => {
+                            // Phase 5.1b — full 777X decoder coming
+                            // in a follow-up. For now just stamp
+                            // last_packet_at so the "SDK enabled?"
+                            // detector knows data is flowing.
+                            let mut g = shared.pmdg.lock().unwrap();
+                            g.last_packet_at = Some(Instant::now());
+                        }
+                        other => {
+                            tracing::trace!(
+                                request_id = other,
+                                "unknown ClientData request_id"
+                            );
+                        }
+                    }
+                }
+                Ok(Some(DispatchMsg::SystemState { request_id, air_path })) => {
+                    if request_id == AIRCRAFT_LOADED_REQUEST_ID {
+                        let detected =
+                            crate::pmdg::PmdgVariant::detect_from_air_path(&air_path);
+                        let mut g = shared.pmdg.lock().unwrap();
+                        if g.variant != detected {
+                            tracing::info!(
+                                ?detected,
+                                old = ?g.variant,
+                                air_path = %air_path,
+                                "PMDG variant change detected"
+                            );
+                            g.variant = detected;
+                            // Aircraft changed → drop any cached
+                            // raw data + reset subscribed flag so
+                            // the worker re-subscribes for the new
+                            // variant on the next loop iteration.
+                            g.ng3_raw = None;
+                            g.x777_raw = None;
+                            g.subscribed = false;
+                            g.last_packet_at = None;
+                        }
+                    }
+                }
+                Ok(Some(DispatchMsg::SystemEvent { event_id })) => {
+                    if event_id == SIM_START_EVENT_ID {
+                        // SimStart fires when the user loads a new
+                        // flight. Re-request AircraftLoaded so we
+                        // pick up any aircraft change.
+                        if let Err(e) = conn.subscribe_aircraft_loaded() {
+                            tracing::warn!(error = %e, "re-request AircraftLoaded failed");
+                        }
+                    }
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "SimConnect dispatch error");
                     return;
+                }
+            }
+        }
+
+        // PMDG subscription gate. Once we know which variant is
+        // loaded AND we haven't yet subscribed for it, register
+        // the ClientData definition + request data. Best-effort —
+        // an FFI failure logs a warning but doesn't kill the
+        // dispatch loop. Subscribed flag prevents redundant
+        // re-subscriptions on every iteration.
+        let pmdg_action = {
+            let g = shared.pmdg.lock().unwrap();
+            if !g.subscribed {
+                g.variant
+            } else {
+                None
+            }
+        };
+        if let Some(variant) = pmdg_action {
+            match variant {
+                crate::pmdg::PmdgVariant::Ng3 => {
+                    if let Err(e) = conn.register_pmdg_ng3() {
+                        tracing::warn!(
+                            error = %e,
+                            "PMDG NG3 ClientData subscription failed (SDK probably not enabled in 737NG3_Options.ini)"
+                        );
+                    } else {
+                        tracing::info!("PMDG NG3 ClientData subscription registered");
+                        shared.pmdg.lock().unwrap().subscribed = true;
+                    }
+                }
+                crate::pmdg::PmdgVariant::X777 => {
+                    // Subscription will land in the 777X follow-up.
+                    // For now: just mark as "subscribed" so we
+                    // don't spin trying to register every tick.
+                    tracing::info!(
+                        "PMDG 777X detected — full SDK integration coming in Phase 5.1b"
+                    );
+                    shared.pmdg.lock().unwrap().subscribed = true;
                 }
             }
         }
@@ -663,6 +1051,114 @@ impl Connection {
         Ok(())
     }
 
+    // ------------------------------------------------------------
+    // PMDG SDK ClientData (Phase 5.2)
+    // ------------------------------------------------------------
+
+    /// Subscribe to the PMDG NG3 `PMDG_NG3_Data` ClientData channel.
+    ///
+    /// Three-step setup per the SDK reference (`PMDG_NG3_ConnectionTest.cpp`):
+    ///   1. Map the well-known data area name to PMDG's reserved ID.
+    ///   2. Define the area shape (one big 916-byte block at offset 0).
+    ///   3. Request data on change (`PERIOD_ON_SET + FLAG_CHANGED`).
+    ///
+    /// Returns `Err(_)` for any FFI failure. Note that even a perfect
+    /// subscription returns silently if the user hasn't enabled
+    /// `EnableDataBroadcast=1` in the PMDG options ini — the
+    /// `last_packet_at` field of `PmdgSharedState` is the way to
+    /// detect "subscription succeeded but no data flowing".
+    fn register_pmdg_ng3(&mut self) -> Result<(), String> {
+        let cname = std::ffi::CString::new(crate::pmdg::ng3::PMDG_NG3_DATA_NAME)
+            .expect("PMDG_NG3_Data is plain ASCII");
+        let hr = unsafe {
+            sys::SimConnect_MapClientDataNameToID(
+                self.handle,
+                cname.as_ptr(),
+                crate::pmdg::ng3::PMDG_NG3_DATA_ID,
+            )
+        };
+        if hr != 0 {
+            return Err(format!("MapClientDataNameToID returned 0x{hr:08X}"));
+        }
+
+        let hr = unsafe {
+            sys::SimConnect_AddToClientDataDefinition(
+                self.handle,
+                PMDG_NG3_DEFINITION_ID,
+                0, // offset 0 — entire struct in one shot
+                std::mem::size_of::<crate::pmdg::ng3::Pmdg738RawData>() as sys::DWORD,
+                0.0,    // fEpsilon (unused for this layout)
+                u32::MAX, // DatumID (unused)
+            )
+        };
+        if hr != 0 {
+            return Err(format!("AddToClientDataDefinition returned 0x{hr:08X}"));
+        }
+
+        // PERIOD_ON_SET means "send only when PMDG actually pushes
+        // a new value" (NOT once per second), and FLAG_CHANGED
+        // further filters to "only when bytes differ from last".
+        // Combined: zero traffic when nothing changes; near-instant
+        // when something does.
+        let period_on_set: sys::SIMCONNECT_CLIENT_DATA_PERIOD =
+            sys::SIMCONNECT_CLIENT_DATA_PERIOD_SIMCONNECT_CLIENT_DATA_PERIOD_ON_SET;
+        let flag_changed: sys::SIMCONNECT_CLIENT_DATA_REQUEST_FLAG =
+            sys::SIMCONNECT_CLIENT_DATA_REQUEST_FLAG_CHANGED;
+        let hr = unsafe {
+            sys::SimConnect_RequestClientData(
+                self.handle,
+                crate::pmdg::ng3::PMDG_NG3_DATA_ID,
+                PMDG_NG3_REQUEST_ID,
+                PMDG_NG3_DEFINITION_ID,
+                period_on_set,
+                flag_changed,
+                0,
+                0,
+                0,
+            )
+        };
+        if hr != 0 {
+            return Err(format!("RequestClientData returned 0x{hr:08X}"));
+        }
+        Ok(())
+    }
+
+    /// Subscribe to the AircraftLoaded system state — both as a
+    /// one-shot request (so we know what's loaded right now) and as
+    /// a subscription to "SimStart" for live aircraft changes.
+    fn subscribe_aircraft_loaded(&mut self) -> Result<(), String> {
+        let cstate = std::ffi::CString::new("AircraftLoaded")
+            .expect("AircraftLoaded is plain ASCII");
+        let hr = unsafe {
+            sys::SimConnect_RequestSystemState(
+                self.handle,
+                AIRCRAFT_LOADED_REQUEST_ID,
+                cstate.as_ptr(),
+            )
+        };
+        if hr != 0 {
+            return Err(format!(
+                "RequestSystemState(AircraftLoaded) returned 0x{hr:08X}"
+            ));
+        }
+
+        let cevent = std::ffi::CString::new("SimStart")
+            .expect("SimStart is plain ASCII");
+        let hr = unsafe {
+            sys::SimConnect_SubscribeToSystemEvent(
+                self.handle,
+                SIM_START_EVENT_ID,
+                cevent.as_ptr(),
+            )
+        };
+        if hr != 0 {
+            return Err(format!(
+                "SubscribeToSystemEvent(SimStart) returned 0x{hr:08X}"
+            ));
+        }
+        Ok(())
+    }
+
     /// Pull one message off the SimConnect queue, returning None when
     /// the queue is empty. Distinguishes the receiver IDs we actually
     /// care about; the rest are logged at trace level and dropped.
@@ -716,11 +1212,71 @@ impl Connection {
                     bytes: bytes.to_vec(),
                 })
             }
+            id if id == SIMCONNECT_RECV_ID_CLIENT_DATA => {
+                // ClientData has the same payload layout as
+                // SimObjectData. bindgen represents the C++ class
+                // inheritance as `_base` — `_base.dwRequestID` is
+                // the field on the parent SIMOBJECT_DATA struct.
+                let recv_data =
+                    unsafe { &*(p_data as *const sys::SIMCONNECT_RECV_CLIENT_DATA) };
+                let request_id = recv_data._base.dwRequestID;
+                let header_size =
+                    std::mem::size_of::<sys::SIMCONNECT_RECV_CLIENT_DATA>();
+                let total = cb_data as usize;
+                if total < header_size {
+                    return Ok(None);
+                }
+                let payload_start = header_size - std::mem::size_of::<sys::DWORD>();
+                let payload_len = total - payload_start;
+                let bytes = unsafe {
+                    let base = p_data as *const u8;
+                    std::slice::from_raw_parts(base.add(payload_start), payload_len)
+                };
+                Some(DispatchMsg::ClientData {
+                    request_id,
+                    bytes: bytes.to_vec(),
+                })
+            }
+            id if id == SIMCONNECT_RECV_ID_SYSTEM_STATE => {
+                // szString is a fixed-size char buffer in the
+                // SIMCONNECT_RECV_SYSTEM_STATE struct. For
+                // AircraftLoaded that's the .air file path (Windows
+                // path with backslashes). We read it as a NUL-
+                // terminated C-string.
+                let recv =
+                    unsafe { &*(p_data as *const sys::SIMCONNECT_RECV_SYSTEM_STATE) };
+                let request_id = recv.dwRequestID;
+                // szString length is implementation-defined in the
+                // SDK; SimConnect docs guarantee NUL-termination.
+                let cstr = unsafe {
+                    std::ffi::CStr::from_ptr(recv.szString.as_ptr())
+                };
+                let air_path = cstr.to_string_lossy().to_string();
+                Some(DispatchMsg::SystemState {
+                    request_id,
+                    air_path,
+                })
+            }
+            id if id == SIMCONNECT_RECV_ID_EVENT => {
+                let evt = unsafe { &*(p_data as *const sys::SIMCONNECT_RECV_EVENT) };
+                Some(DispatchMsg::SystemEvent { event_id: evt.uEventID })
+            }
             _ => None,
         };
         Ok(msg)
     }
 }
+
+// SimConnect RECV_ID constants we look up dynamically — `sys.rs`
+// doesn't yet export these as named DWORD constants because they
+// were added with the PMDG SDK work. Pulled directly from the
+// bindgen output.
+const SIMCONNECT_RECV_ID_CLIENT_DATA: sys::DWORD =
+    sys::SIMCONNECT_RECV_ID_SIMCONNECT_RECV_ID_CLIENT_DATA as sys::DWORD;
+const SIMCONNECT_RECV_ID_SYSTEM_STATE: sys::DWORD =
+    sys::SIMCONNECT_RECV_ID_SIMCONNECT_RECV_ID_SYSTEM_STATE as sys::DWORD;
+const SIMCONNECT_RECV_ID_EVENT: sys::DWORD =
+    sys::SIMCONNECT_RECV_ID_SIMCONNECT_RECV_ID_EVENT as sys::DWORD;
 
 impl Drop for Connection {
     fn drop(&mut self) {
@@ -747,6 +1303,25 @@ enum DispatchMsg {
         request_id: u32,
         bytes: Vec<u8>,
     },
+    /// PMDG ClientData arrived (or any other ClientData if we ever
+    /// subscribe to additional channels). RECV_ID is
+    /// `SIMCONNECT_RECV_ID_CLIENT_DATA = 16`. Same byte-layout as
+    /// SimObjectData but a different RECV_ID.
+    ClientData {
+        request_id: u32,
+        bytes: Vec<u8>,
+    },
+    /// Response to `RequestSystemState`. We use this to read the
+    /// `.air` file path of the loaded aircraft for PMDG variant
+    /// detection. The `request_id` will be `AIRCRAFT_LOADED_REQUEST_ID`.
+    SystemState {
+        request_id: u32,
+        air_path: String,
+    },
+    /// Subscribed system event fired (e.g. `SimStart` when the user
+    /// loads a new flight or changes aircraft). On a SimStart we
+    /// re-request AircraftLoaded to pick up any variant change.
+    SystemEvent { event_id: u32 },
 }
 
 // Marker so the file always references kind/Utc when stub'd out.

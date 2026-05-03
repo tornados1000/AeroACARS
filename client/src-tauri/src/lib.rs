@@ -1137,6 +1137,62 @@ struct FlightStats {
     /// Autobrake setting label ("OFF" / "LO" / "MED" / "MAX") for
     /// the activity log. Reset on every flight.
     last_logged_autobrake: Option<String>,
+
+    // ---- PMDG SDK tracking (Phase H.4 / v0.2.0) ----
+    /// Once-per-flight banner: "PMDG 737-800 detected — premium
+    /// telemetry active". Fires the first tick we see PmdgState
+    /// in the snapshot, not before (so e.g. the user starts
+    /// AeroACARS, then loads PMDG → the banner appears at PMDG
+    /// load, not at app start).
+    pmdg_detected_logged: bool,
+    /// Once-per-flight V-speeds banner — fires when the FMC
+    /// finally has all four (V1, VR, V2, VREF) populated. We log
+    /// them once at that moment so the timeline shows when the
+    /// pilot completed the perf-init.
+    pmdg_v_speeds_logged: bool,
+    /// FMA mode tracking — combined string ("N1 / VNAV / LNAV")
+    /// so a single change in any sub-mode produces one log entry
+    /// rather than three.
+    last_logged_pmdg_fma: Option<String>,
+    /// MCP selected speed — tracked rounded to nearest knot.
+    last_logged_pmdg_mcp_speed: Option<i16>,
+    /// MCP selected heading.
+    last_logged_pmdg_mcp_heading: Option<u16>,
+    /// MCP selected altitude.
+    last_logged_pmdg_mcp_altitude: Option<u16>,
+    /// MCP selected V/S.
+    last_logged_pmdg_mcp_vs: Option<i16>,
+    /// AT armed state.
+    last_logged_pmdg_at_armed: Option<bool>,
+    /// AP engaged state (CMD A or B).
+    last_logged_pmdg_ap_engaged: Option<bool>,
+    /// Takeoff config warning (one-shot — only logs the on-edge,
+    /// not the off-edge).
+    last_logged_pmdg_to_warning: Option<bool>,
+
+    // ---- PMDG PIREP captures (Phase 5.6 / v0.2.0) ----
+    /// PMDG aircraft variant label captured once at flight start.
+    /// "737-800" / "737-800 SSW" / "777-300ER" / etc. Surfaced in
+    /// the PIREP custom fields as "Aircraft Variant".
+    pmdg_variant_label: Option<String>,
+    /// V-speeds captured at takeoff roll start (= once
+    /// `takeoff_at` is stamped) so the PIREP records the values
+    /// the pilot actually rotated against. (V1, VR, V2)
+    pmdg_v_speeds_takeoff: Option<(u8, u8, u8)>,
+    /// VREF captured at the touchdown moment for the PIREP.
+    pmdg_vref_at_landing: Option<u8>,
+    /// FMC TO-flaps degrees captured at takeoff roll start.
+    pmdg_takeoff_flaps_planned: Option<u8>,
+    /// FMC LDG-flaps degrees captured at landing entry.
+    pmdg_landing_flaps_planned: Option<u8>,
+    /// Takeoff-config-warning was active at any point during
+    /// TakeoffRoll. PIREP flags this as a discipline issue.
+    pmdg_takeoff_config_warning_seen: bool,
+    /// Autobrake setting at touchdown.
+    pmdg_autobrake_at_landing: Option<String>,
+    /// FMC flight number captured at takeoff (for sanity check
+    /// against the bid's flight number).
+    pmdg_fmc_flight_number: Option<String>,
     // FCU debounce state — kept around for the planned switch to the
     // standard `AUTOPILOT * VAR` SimVars (the Fenix LVar variant
     // proved unreliable as encoder click counters; we don't log
@@ -5249,6 +5305,35 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
             }
         }
         FlightPhase::TakeoffRoll => {
+            // PMDG capture (Phase 5.6): TakeoffRoll is the right
+            // moment to record V-speeds + planned TO-flaps + the
+            // takeoff-config-warning-was-active flag, because the
+            // pilot completed PERF-INIT before this point. We
+            // capture continuously through the roll (rather than
+            // once at entry) because V-speeds may not have been
+            // entered until the very last moment.
+            if let Some(p) = &snap.pmdg {
+                if stats.pmdg_takeoff_flaps_planned.is_none() {
+                    stats.pmdg_takeoff_flaps_planned = p.fmc_takeoff_flaps_deg;
+                }
+                if let (Some(v1), Some(vr), Some(v2)) =
+                    (p.fmc_v1_kt, p.fmc_vr_kt, p.fmc_v2_kt)
+                {
+                    if stats.pmdg_v_speeds_takeoff.is_none() {
+                        stats.pmdg_v_speeds_takeoff = Some((v1, vr, v2));
+                    }
+                }
+                if p.takeoff_config_warning {
+                    stats.pmdg_takeoff_config_warning_seen = true;
+                }
+                if stats.pmdg_fmc_flight_number.is_none()
+                    && !p.fmc_flight_number.is_empty()
+                {
+                    stats.pmdg_fmc_flight_number =
+                        Some(p.fmc_flight_number.clone());
+                }
+            }
+
             if was_on_ground && !snap.on_ground {
                 next_phase = FlightPhase::Takeoff;
                 stats.takeoff_at = Some(now);
@@ -5329,6 +5414,26 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
             push_approach_sample(&mut stats, snap);
             // Track lowest AGL during approach for go-around detection.
             update_lowest_approach_agl(&mut stats, snap);
+
+            // PMDG capture (Phase 5.6): on Approach the pilot has
+            // typically dialed in landing flaps + VREF in the FMC,
+            // and chosen autobrake. Capture continuously through
+            // approach so a last-minute change still gets recorded.
+            if let Some(p) = &snap.pmdg {
+                if stats.pmdg_landing_flaps_planned.is_none() {
+                    stats.pmdg_landing_flaps_planned = p.fmc_landing_flaps_deg;
+                }
+                if stats.pmdg_vref_at_landing.is_none() {
+                    stats.pmdg_vref_at_landing = p.fmc_vref_kt;
+                }
+                // Autobrake: keep capturing until touchdown so we
+                // record the LAST setting before landing.
+                if !p.autobrake_label.is_empty() && p.autobrake_label != "?" {
+                    stats.pmdg_autobrake_at_landing =
+                        Some(p.autobrake_label.clone());
+                }
+            }
+
             if let Some(ga_phase) = check_go_around(&mut stats, snap, now) {
                 next_phase = ga_phase;
             } else if snap.altitude_agl_ft < 700.0 {
@@ -6338,6 +6443,42 @@ fn build_pirep_fields(
         f.insert(
             "Rollout Distance".into(),
             format!("{:.0} m ({:.0} ft)", meters, meters * 3.28084),
+        );
+    }
+
+    // ---- PMDG Premium Telemetry (Phase H.4 / v0.2.0) ----
+    // Only emitted when the pilot flew a PMDG aircraft AND had the
+    // SDK enabled (so we got real cockpit data). Field names use
+    // "PMDG …" prefix so VA admins can filter PIREPs that have
+    // premium-telemetry coverage.
+    if let Some(label) = stats.pmdg_variant_label.as_deref() {
+        f.insert("PMDG Aircraft".into(), label.to_string());
+    }
+    if let Some(fnum) = stats.pmdg_fmc_flight_number.as_deref().filter(|s| !s.is_empty()) {
+        f.insert("PMDG FMC Flight #".into(), fnum.to_string());
+    }
+    if let Some((v1, vr, v2)) = stats.pmdg_v_speeds_takeoff {
+        f.insert(
+            "PMDG V-Speeds (Takeoff)".into(),
+            format!("V1 {v1} · VR {vr} · V2 {v2} kt"),
+        );
+    }
+    if let Some(vref) = stats.pmdg_vref_at_landing {
+        f.insert("PMDG VREF (Landing)".into(), format!("{vref} kt"));
+    }
+    if let Some(deg) = stats.pmdg_takeoff_flaps_planned {
+        f.insert("PMDG Plan TO Flaps".into(), format!("{deg}°"));
+    }
+    if let Some(deg) = stats.pmdg_landing_flaps_planned {
+        f.insert("PMDG Plan LDG Flaps".into(), format!("{deg}°"));
+    }
+    if let Some(ab) = stats.pmdg_autobrake_at_landing.as_deref() {
+        f.insert("PMDG Autobrake (Landing)".into(), ab.to_string());
+    }
+    if stats.pmdg_takeoff_config_warning_seen {
+        f.insert(
+            "PMDG TO Config Warning".into(),
+            "JA — Warnung war während TakeoffRoll aktiv".to_string(),
         );
     }
 
@@ -7475,6 +7616,207 @@ fn detect_telemetry_changes(app: &AppHandle, flight: &ActiveFlight, snap: &SimSn
     // already, but those don't update via LVar anyway. User feedback
     // (2026-05-02): "die brauchen wir doch nicht bekommen wir doch
     // eh schon aus dem standart" → drop entirely.
+
+    // ---- PMDG SDK premium telemetry (Phase H.4 / v0.2.0) ----
+    // Activity-log entries derived from snap.pmdg, the cockpit-
+    // exact state we read via PMDG's SimConnect ClientData
+    // channel. No-op if no PMDG aircraft is loaded or the SDK
+    // isn't enabled (snap.pmdg is None in both cases).
+    if let Some(p) = &snap.pmdg {
+        // Capture variant label once for the PIREP custom fields.
+        if stats.pmdg_variant_label.is_none() && !p.variant_label.is_empty() {
+            stats.pmdg_variant_label = Some(p.variant_label.clone());
+        }
+
+        // Once-per-flight: aircraft identification banner.
+        if !stats.pmdg_detected_logged {
+            stats.pmdg_detected_logged = true;
+            log_activity_handle(
+                app,
+                ActivityLevel::Info,
+                format!("{} — PMDG SDK aktiv", p.variant_label),
+                Some("Premium-Cockpit-Daten verfügbar (FMA, MCP, V-Speeds, FMC)".to_string()),
+            );
+        }
+
+        // Once-per-flight: V-speeds banner when all four are set.
+        // Pilots typically enter these via FMC PERF-INIT page; the
+        // banner timestamps when the perf-init was completed.
+        if !stats.pmdg_v_speeds_logged {
+            if let (Some(v1), Some(vr), Some(v2), Some(vref)) = (
+                p.fmc_v1_kt,
+                p.fmc_vr_kt,
+                p.fmc_v2_kt,
+                p.fmc_vref_kt,
+            ) {
+                stats.pmdg_v_speeds_logged = true;
+                log_activity_handle(
+                    app,
+                    ActivityLevel::Info,
+                    format!("V-Speeds gesetzt: V1 {v1} · VR {vr} · V2 {v2} · VREF {vref}"),
+                    None,
+                );
+            }
+        }
+
+        // FMA mode changes — single combined string so a switch from
+        // "N1 / VNAV / LNAV" to "SPD / VNAV / LNAV" produces ONE log
+        // entry, not three. Empty modes filtered out.
+        let fma_combined = format_fma(&p.fma_speed_mode, &p.fma_pitch_mode, &p.fma_roll_mode);
+        if stats.last_logged_pmdg_fma.as_deref() != Some(fma_combined.as_str()) {
+            if let Some(prev) = stats.last_logged_pmdg_fma.as_deref() {
+                if prev != fma_combined {
+                    log_activity_handle(
+                        app,
+                        ActivityLevel::Info,
+                        format!("FMA: {fma_combined}"),
+                        None,
+                    );
+                }
+            }
+            stats.last_logged_pmdg_fma = Some(fma_combined);
+        }
+
+        // MCP selected speed — round to nearest knot (or .01 Mach).
+        // We track as i16 so we get cheap equality. Value > 10 = knots,
+        // ≤ 10 = Mach × 100. Both are valid pilot intents.
+        if let Some(spd) = p.mcp_speed_raw {
+            let spd_int = if spd > 10.0 {
+                spd.round() as i16
+            } else {
+                (spd * 100.0).round() as i16
+            };
+            if stats.last_logged_pmdg_mcp_speed != Some(spd_int) {
+                if stats.last_logged_pmdg_mcp_speed.is_some() {
+                    let display = if spd > 10.0 {
+                        format!("{spd:.0} kt")
+                    } else {
+                        format!("M {spd:.2}")
+                    };
+                    log_activity_handle(
+                        app,
+                        ActivityLevel::Info,
+                        format!("MCP IAS → {display}"),
+                        None,
+                    );
+                }
+                stats.last_logged_pmdg_mcp_speed = Some(spd_int);
+            }
+        }
+
+        // MCP heading — round to nearest degree.
+        if let Some(hdg) = p.mcp_heading_deg {
+            if stats.last_logged_pmdg_mcp_heading != Some(hdg) {
+                if stats.last_logged_pmdg_mcp_heading.is_some() {
+                    log_activity_handle(
+                        app,
+                        ActivityLevel::Info,
+                        format!("MCP HDG → {hdg:03}°"),
+                        None,
+                    );
+                }
+                stats.last_logged_pmdg_mcp_heading = Some(hdg);
+            }
+        }
+
+        // MCP altitude — log only on significant changes (≥ 100 ft)
+        // so a moving knob doesn't spam.
+        if let Some(alt) = p.mcp_altitude_ft {
+            let last = stats.last_logged_pmdg_mcp_altitude;
+            let significant = match last {
+                Some(prev) => alt.abs_diff(prev) >= 100,
+                None => true,
+            };
+            if significant && last != Some(alt) {
+                if last.is_some() {
+                    log_activity_handle(
+                        app,
+                        ActivityLevel::Info,
+                        format!("MCP ALT → {alt} ft"),
+                        None,
+                    );
+                }
+                stats.last_logged_pmdg_mcp_altitude = Some(alt);
+            }
+        }
+
+        // MCP V/S — log on changes ≥ 100 fpm.
+        if let Some(vs) = p.mcp_vs_fpm {
+            let last = stats.last_logged_pmdg_mcp_vs;
+            let significant = match last {
+                Some(prev) => (vs - prev).abs() >= 100,
+                None => true,
+            };
+            if significant && last != Some(vs) {
+                if last.is_some() {
+                    log_activity_handle(
+                        app,
+                        ActivityLevel::Info,
+                        format!("MCP V/S → {vs:+} fpm"),
+                        None,
+                    );
+                }
+                stats.last_logged_pmdg_mcp_vs = Some(vs);
+            }
+        }
+
+        // A/T armed.
+        if stats.last_logged_pmdg_at_armed != Some(p.at_armed) {
+            if stats.last_logged_pmdg_at_armed.is_some() {
+                log_activity_handle(
+                    app,
+                    ActivityLevel::Info,
+                    format!("A/T {}", if p.at_armed { "armed" } else { "disarmed" }),
+                    None,
+                );
+            }
+            stats.last_logged_pmdg_at_armed = Some(p.at_armed);
+        }
+
+        // A/P engaged (CMD A or B).
+        if stats.last_logged_pmdg_ap_engaged != Some(p.ap_engaged) {
+            if stats.last_logged_pmdg_ap_engaged.is_some() {
+                log_activity_handle(
+                    app,
+                    ActivityLevel::Info,
+                    format!("A/P {}", if p.ap_engaged { "engaged" } else { "disengaged" }),
+                    None,
+                );
+            }
+            stats.last_logged_pmdg_ap_engaged = Some(p.ap_engaged);
+        }
+
+        // Takeoff config warning — only on rising edge (warning
+        // turning ON). Falling edge (pilot fixed it) doesn't warrant
+        // a log line.
+        if stats.last_logged_pmdg_to_warning != Some(p.takeoff_config_warning) {
+            if p.takeoff_config_warning {
+                log_activity_handle(
+                    app,
+                    ActivityLevel::Warn,
+                    "TAKEOFF CONFIG warning".to_string(),
+                    Some("Cockpit zeigt rote Warnung — TO-Setup unvollständig".to_string()),
+                );
+            }
+            stats.last_logged_pmdg_to_warning = Some(p.takeoff_config_warning);
+        }
+    }
+}
+
+/// Combine FMA sub-modes into a single human-readable string.
+/// Empty sub-modes are filtered out so a partially-engaged FMA
+/// reads "VNAV / LNAV" rather than " / VNAV / LNAV".
+fn format_fma(speed: &str, pitch: &str, roll: &str) -> String {
+    let parts: Vec<&str> = [speed, pitch, roll]
+        .iter()
+        .copied()
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.is_empty() {
+        "—".to_string()
+    } else {
+        parts.join(" / ")
+    }
 }
 
 /// Activity-log helper for 3-state cabin signs (OFF / AUTO / ON).
@@ -7872,6 +8214,72 @@ fn sim_force_resync(app: AppHandle, state: tauri::State<'_, AppState>) {
     {
         if kind.is_msfs() {
             state.msfs.lock().expect("msfs lock").clear_snapshot();
+        }
+    }
+}
+
+// ---- PMDG SDK status (Phase H.4 / v0.2.0) ----
+//
+// The Settings tab needs to know:
+//   * Is a PMDG aircraft loaded? (variant detected)
+//   * Are we subscribed?
+//   * Are we actually receiving data? (= SDK enabled in pilot's
+//     options ini)
+// to show the "SDK enabled?" hint when needed and to display the
+// premium-telemetry status badge in the cockpit tab.
+
+/// Minimal serializable PMDG status for the UI. Mirrors the
+/// adapter's `PmdgStatus` but with the variant flattened to a
+/// string so JSON parsing is trivial on the frontend side.
+#[derive(serde::Serialize)]
+struct PmdgStatusDto {
+    /// `"ng3"`, `"x777"`, or `null` when no PMDG aircraft is loaded.
+    variant: Option<&'static str>,
+    /// True once SimConnect ClientData subscription has been
+    /// successfully registered.
+    subscribed: bool,
+    /// True once at least one ClientData packet has actually arrived.
+    /// `subscribed && !ever_received` (after a few seconds) is the
+    /// signal that SDK isn't enabled in the pilot's options ini.
+    ever_received: bool,
+    /// Seconds since the last ClientData packet. `null` when never.
+    stale_secs: Option<u64>,
+    /// True when (variant detected, subscribed, but no data flowing
+    /// for >5 s) — the heuristic for "SDK probably not enabled".
+    /// UI shows the enable-hint modal when this is true.
+    looks_like_sdk_disabled: bool,
+}
+
+#[tauri::command]
+fn pmdg_status(state: tauri::State<'_, AppState>) -> PmdgStatusDto {
+    #[cfg(target_os = "windows")]
+    {
+        let adapter = state.msfs.lock().expect("msfs lock");
+        let s = adapter.pmdg_status();
+        return PmdgStatusDto {
+            variant: s.variant.map(|v| match v {
+                sim_msfs::pmdg::PmdgVariant::Ng3 => "ng3",
+                sim_msfs::pmdg::PmdgVariant::X777 => "x777",
+            }),
+            subscribed: s.subscribed,
+            ever_received: s.ever_received,
+            stale_secs: if s.stale_secs == u64::MAX {
+                None
+            } else {
+                Some(s.stale_secs)
+            },
+            looks_like_sdk_disabled: s.looks_like_sdk_disabled(),
+        };
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = state;
+        PmdgStatusDto {
+            variant: None,
+            subscribed: false,
+            ever_received: false,
+            stale_secs: None,
+            looks_like_sdk_disabled: false,
         }
     }
 }
@@ -8872,6 +9280,7 @@ pub fn run() {
             sim_set_kind,
             sim_status,
             sim_force_resync,
+            pmdg_status,
             airport_get,
             flight_status,
             flight_start,

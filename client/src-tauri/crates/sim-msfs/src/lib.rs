@@ -41,6 +41,15 @@ mod adapter;
 #[cfg(target_os = "windows")]
 pub use adapter::*;
 
+/// PMDG SimConnect SDK integration (737 NG3 + 777X).
+///
+/// Cross-platform module — the data structures + variant detection
+/// don't depend on Windows. The actual ClientData subscription
+/// will be Windows-only when wired into the adapter (Phase 5.2);
+/// for now this just defines the layouts so other crates can
+/// reference `PmdgVariant` etc. on any platform.
+pub mod pmdg;
+
 // ---- Non-Windows stub ----
 
 #[cfg(not(target_os = "windows"))]
@@ -58,6 +67,22 @@ mod stub {
 
     pub struct MsfsAdapter;
 
+    /// Stubbed PMDG status for non-Windows targets — never has a
+    /// variant detected, never subscribed, never receives data.
+    #[derive(Debug, Clone)]
+    pub struct PmdgStatus {
+        pub variant: Option<crate::pmdg::PmdgVariant>,
+        pub subscribed: bool,
+        pub ever_received: bool,
+        pub stale_secs: u64,
+    }
+
+    impl PmdgStatus {
+        pub fn looks_like_sdk_disabled(&self) -> bool {
+            false
+        }
+    }
+
     impl MsfsAdapter {
         pub fn new() -> Self {
             Self
@@ -71,6 +96,17 @@ mod stub {
             None
         }
         pub fn clear_snapshot(&self) {}
+        pub fn pmdg_ng3_snapshot(&self) -> Option<crate::pmdg::ng3::Pmdg738Snapshot> {
+            None
+        }
+        pub fn pmdg_status(&self) -> PmdgStatus {
+            PmdgStatus {
+                variant: None,
+                subscribed: false,
+                ever_received: false,
+                stale_secs: u64::MAX,
+            }
+        }
         pub fn last_error(&self) -> Option<String> {
             Some("MSFS adapter is Windows-only".into())
         }

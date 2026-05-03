@@ -353,3 +353,24 @@ export interface AirportInfo {
   lat: number | null;
   lon: number | null;
 }
+
+/** PMDG SDK status for the Settings → PMDG Premium Telemetry section.
+ *  Mirrors the backend `PmdgStatusDto` from the `pmdg_status` Tauri
+ *  command. Drives the "SDK enabled?" hint and the cockpit-tab
+ *  premium-telemetry badge.
+ *
+ *  Phase H.4 / v0.2.0 — Boeing Premium Telemetry. */
+export interface PmdgStatus {
+  /** "ng3" = PMDG 737, "x777" = PMDG 777. `null` = no PMDG aircraft. */
+  variant: "ng3" | "x777" | null;
+  /** True once SimConnect ClientData subscription was registered. */
+  subscribed: boolean;
+  /** True once a packet has actually arrived (= SDK enabled in
+   *  the pilot's options ini). */
+  ever_received: boolean;
+  /** Seconds since last packet, or null if none. */
+  stale_secs: number | null;
+  /** True when (variant detected, subscribed, no data flowing for >5s)
+   *  — the heuristic for "pilot hasn't enabled the SDK yet". */
+  looks_like_sdk_disabled: boolean;
+}
