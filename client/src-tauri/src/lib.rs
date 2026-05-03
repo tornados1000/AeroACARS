@@ -5663,6 +5663,19 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                             stats.bounce_count = 0;
                             stats.bounce_armed_above_threshold = false;
                             stats.touch_and_go_pending_since = None;
+                            // CRITICAL: also clear the GA tracker so the
+                            // NEXT approach starts with a fresh AGL
+                            // minimum. Without this, the just-recorded
+                            // T&G's ~50 ft touchdown AGL becomes the
+                            // floor against which the next GA detector
+                            // compares — which means EVERY future
+                            // approach would trivially exceed
+                            // "lowest + 200 ft" the moment the pilot
+                            // climbs above 250 ft AGL, hiding any real
+                            // missed-approach behind an immediate
+                            // false-positive trigger.
+                            stats.lowest_agl_during_approach_ft = None;
+                            stats.go_around_climb_pending_since = None;
                             // FSM: revert to Climb so the streamer's
                             // phase-change handler emits "Phase: Climb"
                             // and subsequent descent re-detection works.
