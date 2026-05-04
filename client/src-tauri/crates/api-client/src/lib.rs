@@ -390,6 +390,18 @@ pub struct SimBriefOfp {
     /// the planned track alongside the actually flown one.
     #[serde(default)]
     pub waypoints: Vec<RouteFix>,
+    // ---- MAX-Werte aus dem OFP für Overweight-Detection (v0.3.0) ----
+    /// Maximum Zero-Fuel Weight laut Aircraft-Performance. Pilot darf
+    /// `IST-ZFW <= MAX-ZFW` haben — sonst Strukturschaden möglich.
+    /// 0.0 wenn das OFP-XML kein `<max_zfw>`-Tag hatte.
+    pub max_zfw_kg: f32,
+    /// Maximum Takeoff Weight. Drives die Overweight-Warnung im
+    /// Live-Loadsheet und zieht Punkte vom Loadsheet-Score ab wenn
+    /// IST-TOW > MAX-TOW beim Takeoff.
+    pub max_tow_kg: f32,
+    /// Maximum Landing Weight. Bei Overshoot droht Fuel-Dumping
+    /// oder Overweight-Landing-Inspektion.
+    pub max_ldw_kg: f32,
 }
 
 /// Single navlog fix from a SimBrief OFP. `kind` carries the SimBrief
@@ -1248,6 +1260,13 @@ fn parse_simbrief_ofp(xml: &str) -> Option<SimBriefOfp> {
     let plan_ramp = parse_f("plan_ramp").map(to_kg).unwrap_or(0.0);
     let est_burn = parse_f("est_burn").map(to_kg).unwrap_or(0.0);
     let reserve = parse_f("reserve").map(to_kg).unwrap_or(0.0);
+    // v0.3.0: MAX-Werte aus dem Aircraft-Performance-Block des OFP.
+    // SimBrief liefert die in `<max_zfw>` / `<max_tow>` / `<max_ldw>`
+    // unter `<weights>`. Bei Custom-Subfleets können die fehlen — dann
+    // bleibt's bei 0.0 und Frontend skipped die Overweight-Anzeige.
+    let max_zfw = parse_f("max_zfw").map(to_kg).unwrap_or(0.0);
+    let max_tow = parse_f("max_tow").map(to_kg).unwrap_or(0.0);
+    let max_ldw = parse_f("max_ldw").map(to_kg).unwrap_or(0.0);
     let route = extract_tag(xml, "route")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
@@ -1274,6 +1293,9 @@ fn parse_simbrief_ofp(xml: &str) -> Option<SimBriefOfp> {
         route,
         alternate,
         waypoints,
+        max_zfw_kg: max_zfw,
+        max_tow_kg: max_tow,
+        max_ldw_kg: max_ldw,
     })
 }
 

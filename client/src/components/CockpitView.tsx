@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { ActiveFlightInfo, LoginResult, SimSnapshot } from "../types";
 import { ResumeFlightBanner } from "./ResumeFlightBanner";
 import { ActiveFlightPanel } from "./ActiveFlightPanel";
+import { LoadsheetMonitor } from "./LoadsheetMonitor";
 import { DivertBanner } from "./DivertBanner";
 
 interface Props {
@@ -122,6 +123,13 @@ export function CockpitView({
           simSnapshot={simSnapshot}
           onEnded={() => setActiveFlight(null)}
         />
+      )}
+
+      {/* Live-Loadsheet (v0.3.0) — sichtbar während Boarding/Preflight,
+          verschwindet automatisch ab TaxiOut/Pushback. Komponente
+          rendert null wenn weder Plan- noch Live-Werte verfügbar. */}
+      {!activeFlight.was_just_resumed && (
+        <LoadsheetMonitor info={activeFlight} />
       )}
     </>
   );

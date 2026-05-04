@@ -673,6 +673,13 @@ struct PersistedFlightStats {
     planned_route: Option<String>,
     #[serde(default)]
     planned_alternate: Option<String>,
+    // v0.3.0: MAX-Werte aus dem OFP für Overweight-Detection.
+    #[serde(default)]
+    planned_max_zfw_kg: Option<f32>,
+    #[serde(default)]
+    planned_max_tow_kg: Option<f32>,
+    #[serde(default)]
+    planned_max_ldw_kg: Option<f32>,
     // ---- Touch-and-Go + Go-Around tracking (v0.1.26) ----
     // Persisted so a Tauri restart mid-flight (or a planned resume
     // after the pilot closed the app for lunch) doesn't wipe the
@@ -748,6 +755,9 @@ impl PersistedFlightStats {
             planned_ldw_kg: stats.planned_ldw_kg,
             planned_route: stats.planned_route.clone(),
             planned_alternate: stats.planned_alternate.clone(),
+            planned_max_zfw_kg: stats.planned_max_zfw_kg,
+            planned_max_tow_kg: stats.planned_max_tow_kg,
+            planned_max_ldw_kg: stats.planned_max_ldw_kg,
             touchdown_events: stats.touchdown_events.clone(),
             touch_and_go_pending_since: stats.touch_and_go_pending_since,
             go_around_count: stats.go_around_count,
@@ -814,6 +824,9 @@ impl PersistedFlightStats {
         stats.planned_ldw_kg = self.planned_ldw_kg;
         stats.planned_route = self.planned_route;
         stats.planned_alternate = self.planned_alternate;
+        stats.planned_max_zfw_kg = self.planned_max_zfw_kg;
+        stats.planned_max_tow_kg = self.planned_max_tow_kg;
+        stats.planned_max_ldw_kg = self.planned_max_ldw_kg;
         stats.touchdown_events = self.touchdown_events;
         stats.touch_and_go_pending_since = self.touch_and_go_pending_since;
         stats.go_around_count = self.go_around_count;
@@ -1128,6 +1141,16 @@ struct FlightStats {
     planned_route: Option<String>,
     /// Planned alternate ICAO from the OFP.
     planned_alternate: Option<String>,
+    // ---- v0.3.0: MAX-Werte aus dem OFP für Overweight-Detection ----
+    /// Maximum Zero-Fuel Weight (Strukturlimit). None wenn das OFP
+    /// keinen `<max_zfw>`-Eintrag hatte (kommt bei Custom-Subfleets vor).
+    planned_max_zfw_kg: Option<f32>,
+    /// Maximum Takeoff Weight. Drives Overweight-Warnung im Live-
+    /// Loadsheet vor Pushback und Score-Penalty im Landung-Tab.
+    planned_max_tow_kg: Option<f32>,
+    /// Maximum Landing Weight. Bei Overshoot droht Overweight-
+    /// Landing-Inspektion in der echten Welt.
+    planned_max_ldw_kg: Option<f32>,
 
     // ---- METAR snapshots (Phase J.2) ----
     /// Raw METAR text captured at takeoff for the departure airport.
@@ -1145,6 +1168,18 @@ struct FlightStats {
     // ---- Fuel tracking ----
     block_fuel_kg: Option<f32>,
     last_fuel_kg: Option<f32>,
+    // ---- Live-Loadsheet (v0.3.0) ----
+    /// Letzter beobachteter ZFW-Wert vom Sim. Treibt das Live-
+    /// Loadsheet-Display im Cockpit-Tab während der Boarding-Phase
+    /// (Pilot sieht wie ZFW während des Boardings hochläuft).
+    /// None wenn das Aircraft-Profil keinen ZFW-SimVar hat (Fenix).
+    last_zfw_kg: Option<f32>,
+    /// Letzter beobachteter Total-Weight-Wert vom Sim (= TOW während
+    /// der Boarding-Phase, sobald komplett beladen).
+    last_total_weight_kg: Option<f32>,
+    /// True wenn der Loadsheet-Activity-Log-Eintrag beim Block-off
+    /// schon emittet wurde — verhindert Duplikate beim Resume.
+    loadsheet_logged_at_blockoff: bool,
 
     /// Highest MSL altitude we've seen while in Cruise (or any step
     /// climb during Cruise). Drives the Cruise → Descent guard so
@@ -1674,6 +1709,25 @@ pub struct ActiveFlightInfo {
     planned_route: Option<String>,
     /// Geplanter Alternate-Flughafen (ICAO).
     planned_alternate: Option<String>,
+    // ---- v0.3.0: MAX-Werte für Overweight-Detection ----
+    /// Maximum Zero-Fuel Weight (Strukturlimit). None bei Custom-
+    /// Subfleets ohne MAX-Daten im OFP.
+    planned_max_zfw_kg: Option<f32>,
+    /// Maximum Takeoff Weight.
+    planned_max_tow_kg: Option<f32>,
+    /// Maximum Landing Weight.
+    planned_max_ldw_kg: Option<f32>,
+    // ---- v0.3.0: Live-Loadsheet-Werte aus dem aktuellen Sim-Snapshot ----
+    /// Aktuelles Block-Fuel im Tank (kg). Live-Wert aus dem Sim,
+    /// updated bei jedem Snapshot. Driver für die "Tank-Vorgang läuft"-
+    /// Anzeige im Cockpit-Tab vor Pushback.
+    sim_fuel_kg: Option<f32>,
+    /// Aktuelles ZFW (kg). None wenn der Sim/das Aircraft-Profil das
+    /// nicht meldet (z.B. Fenix mit Standard-SimVars).
+    sim_zfw_kg: Option<f32>,
+    /// Aktuelles Total-Weight (= TOW wenn am Boden voll beladen).
+    /// None wenn der Sim das nicht meldet.
+    sim_tow_kg: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3071,6 +3125,15 @@ fn flight_info(flight: &ActiveFlight) -> ActiveFlightInfo {
         planned_block_fuel_kg: stats.planned_block_fuel_kg,
         planned_burn_kg: stats.planned_burn_kg,
         planned_reserve_kg: stats.planned_reserve_kg,
+        planned_max_zfw_kg: stats.planned_max_zfw_kg,
+        planned_max_tow_kg: stats.planned_max_tow_kg,
+        planned_max_ldw_kg: stats.planned_max_ldw_kg,
+        // v0.3.0 — Live-Loadsheet-Werte für Boarding-Phase. Pulled
+        // aus dem letzten beobachteten Sim-Snapshot — wird beim
+        // Block-off "eingefroren" (last_block_fuel_kg etc.).
+        sim_fuel_kg: stats.last_fuel_kg,
+        sim_zfw_kg: stats.last_zfw_kg,
+        sim_tow_kg: stats.last_total_weight_kg,
         planned_zfw_kg: stats.planned_zfw_kg,
         planned_tow_kg: stats.planned_tow_kg,
         planned_ldw_kg: stats.planned_ldw_kg,
@@ -3753,6 +3816,13 @@ async fn flight_start(
         stats.planned_ldw_kg = Some(ofp.planned_ldw_kg).filter(|&v| v > 0.0);
         stats.planned_route = ofp.route;
         stats.planned_alternate = ofp.alternate;
+        // v0.3.0: MAX-Werte für Overweight-Detection im Live-Loadsheet
+        // + Score-Penalty im Landung-Tab. Filter Null-Werte aus —
+        // Custom-Subfleets ohne MAX-Daten kriegen einfach keine
+        // Overweight-Anzeige.
+        stats.planned_max_zfw_kg = Some(ofp.max_zfw_kg).filter(|&v| v > 0.0);
+        stats.planned_max_tow_kg = Some(ofp.max_tow_kg).filter(|&v| v > 0.0);
+        stats.planned_max_ldw_kg = Some(ofp.max_ldw_kg).filter(|&v| v > 0.0);
         drop(stats);
         // Persist immediately so a Tauri restart mid-flight doesn't
         // lose the plan.
@@ -5380,6 +5450,12 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
     stats.position_count = stats.position_count.saturating_add(1);
     let prev_fuel_kg = stats.last_fuel_kg;
     stats.last_fuel_kg = Some(snap.fuel_total_kg);
+    // v0.3.0: ZFW + Total-Weight für Live-Loadsheet (Cockpit-Tab
+    // während Boarding-Phase). Updates jeden Tick. None bleiben sie
+    // wenn das Aircraft-Profil die SimVars nicht meldet (z.B. Fenix
+    // ohne erweiterte Profile).
+    stats.last_zfw_kg = snap.zfw_kg;
+    stats.last_total_weight_kg = snap.total_weight_kg;
 
     // Block fuel = peak fuel observed across the flight, with a
     // defuel guard. Rationale:
@@ -5515,6 +5591,50 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                 // (see top of step_flight), not captured here. APU
                 // burn during boarding would otherwise eat into the
                 // captured value before block-off ever fires.
+                // v0.3.0: Loadsheet-Snapshot ins Activity-Log. Einmalig
+                // beim Block-off — gibt dem PIREP-Audit-Trail einen
+                // klaren "was war geladen, als wir losrollten" Eintrag.
+                if !stats.loadsheet_logged_at_blockoff {
+                    let block = stats.block_fuel_kg.unwrap_or(snap.fuel_total_kg);
+                    let zfw = snap.zfw_kg;
+                    let tow = snap.total_weight_kg;
+                    let plan_block = stats.planned_block_fuel_kg;
+                    // v0.3.0: Loadsheet als kompakte Zeile in den
+                    // pending_acars_logs Buffer pushen. Streamer drainet
+                    // den nächsten Tick und mirrort in Activity-Log
+                    // (Cockpit-UI) UND ACARS-Log (phpVMS-PIREP). Bewusst
+                    // einzeilig — der Drain-Pfad unterstützt keine
+                    // 2-zeiligen Display-Logs.
+                    let mut line = String::from("📋 Loadsheet @ Block-off — Block ");
+                    line.push_str(&format!("{:.0} kg", block));
+                    if let Some(p) = plan_block {
+                        let delta = block - p;
+                        line.push_str(&format!(" (Plan {:.0} kg, Δ {:+.0})", p, delta));
+                    }
+                    if let Some(z) = zfw {
+                        line.push_str(&format!(" · ZFW {:.0} kg", z));
+                    }
+                    if let Some(t) = tow {
+                        line.push_str(&format!(" · TOW {:.0} kg", t));
+                    }
+                    stats.pending_acars_logs.push(line);
+                    // v0.3.0 Bonus 1: "Über-Tankt"-Hinweis als zweiter
+                    // Eintrag, falls IST-Block > Plan-Block + Reserve +
+                    // 500 kg Toleranz. Sanft, nicht blockierend.
+                    if let (Some(p_block), Some(p_reserve)) =
+                        (stats.planned_block_fuel_kg, stats.planned_reserve_kg)
+                    {
+                        let threshold = p_block + p_reserve + 500.0;
+                        if block > threshold {
+                            let extra = block - p_block;
+                            stats.pending_acars_logs.push(format!(
+                                "💡 Über-tankt — Sehr viel Sprit an Bord ({:+.0} kg über Plan + Reserve), höherer Burn unterwegs zu erwarten.",
+                                extra
+                            ));
+                        }
+                    }
+                    stats.loadsheet_logged_at_blockoff = true;
+                }
                 next_phase = if snap.engines_running == 0 {
                     FlightPhase::Pushback
                 } else {

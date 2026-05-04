@@ -371,6 +371,20 @@ export interface ActiveFlightInfo {
   planned_route: string | null;
   /** Geplanter Alternate-Flughafen (ICAO). */
   planned_alternate: string | null;
+  // ---- v0.3.0: MAX-Werte für Overweight-Detection ----
+  /** Maximum Zero-Fuel Weight (kg). null bei Custom-Subfleets ohne MAX. */
+  planned_max_zfw_kg: number | null;
+  /** Maximum Takeoff Weight (kg). */
+  planned_max_tow_kg: number | null;
+  /** Maximum Landing Weight (kg). */
+  planned_max_ldw_kg: number | null;
+  // ---- v0.3.0: Live-Loadsheet-Werte ----
+  /** Aktuelles Block-Fuel im Tank (kg) — live aus dem Sim. */
+  sim_fuel_kg: number | null;
+  /** Aktuelles ZFW (kg) — live aus dem Sim. null bei Profilen die's nicht melden. */
+  sim_zfw_kg: number | null;
+  /** Aktuelles Total-Weight (kg) — entspricht TOW während Boarding. */
+  sim_tow_kg: number | null;
 }
 
 /** Mirrors the Rust-side `ReleaseNotes` struct. Returned by the

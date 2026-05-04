@@ -1379,8 +1379,124 @@ function LandingDetail({
               },
             ]}
           />
+          <LoadsheetScore record={record} />
         </section>
       )}
+    </div>
+  );
+}
+
+// ---- Loadsheet-Bewertung (v0.3.0) ----------------------------------------
+//
+// Numerischer Score 0-100 basierend auf Abweichungen Plan vs. IST. Nicht
+// blockierend — nur Information für den Piloten ("nächstes Mal weniger
+// Reserve-Sprit"). Score wird auch im PIREP-Custom-Field gepostet.
+//
+// Algorithmus:
+// - Start bei 100
+// - Pro Wert (Block-Fuel, ZFW, TOW, LDW): Δ > 5 % → -5 Punkte
+// - Pro Wert: Δ > 10 % → -15 Punkte (additiv: also bei 12% sind's -20)
+// - Niemals < 0
+// - Wenn keine Plan-Werte vorhanden, kein Score (komplette Sektion blendet aus)
+
+interface LoadsheetScoreInput {
+  block_fuel_kg: number | null;
+  takeoff_weight_kg: number | null;
+  landing_weight_kg: number | null;
+  takeoff_fuel_kg: number | null;
+  planned_block_fuel_kg: number | null;
+  planned_tow_kg: number | null;
+  planned_ldw_kg: number | null;
+  planned_zfw_kg: number | null;
+}
+
+function LoadsheetScore({ record }: { record: LoadsheetScoreInput }) {
+  const { t } = useTranslation();
+
+  // Berechne Δ% für jeden vergleichbaren Wert.
+  const items = [
+    {
+      label: "Block-Fuel",
+      ist: record.block_fuel_kg,
+      soll: record.planned_block_fuel_kg,
+    },
+    {
+      label: "TOW",
+      ist: record.takeoff_weight_kg,
+      soll: record.planned_tow_kg,
+    },
+    {
+      label: "LDW",
+      ist: record.landing_weight_kg,
+      soll: record.planned_ldw_kg,
+    },
+    {
+      label: "ZFW",
+      ist:
+        record.takeoff_weight_kg != null && record.takeoff_fuel_kg != null
+          ? record.takeoff_weight_kg - record.takeoff_fuel_kg
+          : null,
+      soll: record.planned_zfw_kg,
+    },
+  ];
+
+  // Nur Items mit beidem vergleichbar.
+  const comparable = items.filter(
+    (i) => i.ist != null && i.soll != null && i.soll > 0,
+  );
+
+  if (comparable.length === 0) return null; // Kein Plan → keine Bewertung
+
+  // Score berechnen + Penalty-Liste sammeln für Anzeige.
+  let score = 100;
+  const breakdown: Array<{ label: string; pct: number; penalty: number }> = [];
+  for (const item of comparable) {
+    const ist = item.ist!;
+    const soll = item.soll!;
+    const pct = Math.abs((ist - soll) / soll) * 100;
+    let penalty = 0;
+    if (pct > 10) penalty += 15;
+    else if (pct > 5) penalty += 5;
+    score -= penalty;
+    breakdown.push({ label: item.label, pct, penalty });
+  }
+  score = Math.max(0, score);
+
+  // Score-Farbe.
+  let scoreClass = "loadsheet-score__value--ok";
+  if (score < 70) scoreClass = "loadsheet-score__value--alert";
+  else if (score < 90) scoreClass = "loadsheet-score__value--warn";
+
+  return (
+    <div className="loadsheet-score">
+      <div className="loadsheet-score__header">
+        <span className="loadsheet-score__title">
+          {t("landing.loadsheet_score")}
+        </span>
+        <span className={`loadsheet-score__value ${scoreClass}`}>
+          {score}/100
+        </span>
+      </div>
+      <ul className="loadsheet-score__breakdown">
+        {breakdown.map((b) => (
+          <li key={b.label}>
+            <span>{b.label}</span>
+            <span
+              className={
+                b.pct < 5
+                  ? "loadsheet-score__pct--ok"
+                  : b.pct < 10
+                  ? "loadsheet-score__pct--warn"
+                  : "loadsheet-score__pct--alert"
+              }
+            >
+              {b.pct < 5 ? "✓" : b.pct < 10 ? "⚠" : "✕"}{" "}
+              {b.pct >= 0.05 ? `${b.pct.toFixed(1)}%` : "0%"}
+              {b.penalty > 0 && ` (-${b.penalty})`}
+            </span>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }

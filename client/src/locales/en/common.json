@@ -78,6 +78,7 @@
     "weight_table": "Weight",
     "trip_burn": "Trip burn",
     "zfw": "ZFW",
+    "loadsheet_score": "Loadsheet score",
     "score_breakdown": "Score breakdown",
     "coach_title": "What to focus on next time",
     "trend": "Trend",
@@ -193,7 +194,19 @@
   "cockpit": {
     "empty_title": "No active flight",
     "empty_hint": "Head to Briefing to start a booked flight or adopt an in-progress PIREP.",
-    "go_briefing": "Go to my flights"
+    "go_briefing": "Go to my flights",
+    "loadsheet": {
+      "title": "Live loadsheet",
+      "preflight": "Preflight",
+      "boarding": "Boarding",
+      "ist": "ACTUAL",
+      "soll": "PLAN",
+      "block": "Block fuel",
+      "hint_ready": "✓ Ready for pushback — values close to plan",
+      "hint_fueling": "🛢 Fuelling in progress — {{missing}} kg short",
+      "hint_boarding": "👥 Boarding in progress — {{missing}} kg short",
+      "hint_overfueled": "💡 +{{extra}} kg above plan — expect higher burn"
+    }
   },
   "recording": {
     "status": {

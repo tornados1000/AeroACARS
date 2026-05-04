@@ -78,6 +78,7 @@
     "weight_table": "Gewicht",
     "trip_burn": "Trip Burn",
     "zfw": "ZFW",
+    "loadsheet_score": "Loadsheet-Bewertung",
     "score_breakdown": "Score-Aufschlüsselung",
     "coach_title": "Worauf du beim nächsten Anflug achten kannst",
     "trend": "Trend",
@@ -193,7 +194,19 @@
   "cockpit": {
     "empty_title": "Kein aktiver Flug",
     "empty_hint": "Wechseln Sie ins Briefing, um einen gebuchten Flug zu starten oder einen offenen PIREP zu adoptieren.",
-    "go_briefing": "Zu meinen Flügen"
+    "go_briefing": "Zu meinen Flügen",
+    "loadsheet": {
+      "title": "Loadsheet Live",
+      "preflight": "Preflight",
+      "boarding": "Boarding",
+      "ist": "IST",
+      "soll": "SOLL",
+      "block": "Block-Fuel",
+      "hint_ready": "✓ Bereit für Pushback — Werte nahe Plan",
+      "hint_fueling": "🛢 Tankvorgang läuft — noch {{missing}} kg fehlen",
+      "hint_boarding": "👥 Boarding läuft — noch {{missing}} kg fehlen",
+      "hint_overfueled": "💡 +{{extra}} kg über Plan — höherer Burn unterwegs zu erwarten"
+    }
   },
   "recording": {
     "status": {

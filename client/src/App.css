@@ -4337,10 +4337,125 @@ input:disabled {
 .landing-comparison__table tbody tr:hover {
   background: var(--surface-1);
 }
-/* Δ-Farbcode: grün <1%, gelb 1-3%, rot >3% Abweichung */
+/* Δ-Farbcode: grün <5%, gelb 5-10%, rot >10% Abweichung */
 .landing-comparison__delta--ok    { color: #4ade80; }
 .landing-comparison__delta--warn  { color: #fbbf24; }
 .landing-comparison__delta--alert { color: #f87171; font-weight: 600; }
+
+/* Live-Loadsheet im Cockpit-Tab (v0.3.0) — Tabelle mit IST/SOLL/Δ/MAX
+   für Block-Fuel, ZFW, TOW. Wird nur in Boarding/Preflight gerendert. */
+.loadsheet {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1rem;
+  margin-top: 1rem;
+}
+.loadsheet__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 0.5rem;
+}
+.loadsheet__title {
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+.loadsheet__phase {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.loadsheet__table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+  font-size: 0.85rem;
+}
+.loadsheet__table th,
+.loadsheet__table td {
+  padding: 0.4rem 0.6rem;
+  text-align: right;
+}
+.loadsheet__table th:first-child,
+.loadsheet__table td:first-child {
+  text-align: left;
+  color: var(--text-muted);
+  font-weight: 400;
+}
+.loadsheet__table thead th {
+  font-size: 0.7rem;
+  font-weight: 500;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-bottom: 1px solid var(--border);
+}
+.loadsheet__delta--ok    { color: #4ade80; }
+.loadsheet__delta--warn  { color: #fbbf24; }
+.loadsheet__delta--alert { color: #f87171; font-weight: 600; }
+.loadsheet__row--overweight {
+  background: rgba(248, 113, 113, 0.08);
+}
+.loadsheet__row--overweight td {
+  color: #f87171;
+}
+.loadsheet__hint {
+  margin-top: 0.6rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--surface-2);
+  border-radius: 6px;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+/* Loadsheet-Bewertung im Landung-Tab (v0.3.0). Score 0-100 + Breakdown. */
+.loadsheet-score {
+  margin-top: 1rem;
+  background: var(--surface-2);
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+}
+.loadsheet-score__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 0.4rem;
+}
+.loadsheet-score__title {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.loadsheet-score__value {
+  font-size: 1.4rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.loadsheet-score__value--ok    { color: #4ade80; }
+.loadsheet-score__value--warn  { color: #fbbf24; }
+.loadsheet-score__value--alert { color: #f87171; }
+.loadsheet-score__breakdown {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 0.3rem 1rem;
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+}
+.loadsheet-score__breakdown li {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.15rem 0;
+}
+.loadsheet-score__pct--ok    { color: #4ade80; }
+.loadsheet-score__pct--warn  { color: #fbbf24; }
+.loadsheet-score__pct--alert { color: #f87171; font-weight: 600; }
 
 .landing-keyvals > div {
   display: flex;
