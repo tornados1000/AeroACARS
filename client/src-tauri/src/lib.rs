@@ -437,6 +437,12 @@ struct AppState {
     /// Without this, a user that cancels the auto-started flight
     /// while still parked at the gate would get an instant re-trigger.
     auto_start_last_bid_id: Mutex<Option<i64>>,
+    /// v0.3.0: Letzter Auto-Start-Skip-Grund. Wenn die UI fragt, wir
+    /// den ausgeben können statt der Pilot grübelt warum nichts
+    /// passiert. Format: "engines_on" / "moving" / "airborne" /
+    /// "no_matching_bid" / "no_bids" — mit Timestamp damit die UI
+    /// erkennen kann ob's gerade aktuell ist oder uralt.
+    auto_start_skip_reason: Mutex<Option<(DateTime<Utc>, String)>>,
     /// When `true`, intercept the main window's CloseRequested event
     /// and `hide()` the window instead of letting it close. The user
     /// gets to it again via the system-tray icon (Win) / menubar
@@ -9397,15 +9403,58 @@ fn spawn_auto_start_watcher(app: AppHandle) {
             }
             // Skip if no sim snapshot yet, or the aircraft is moving /
             // engines on (= already taxiing or rolling, not "ready to
-            // fire" anymore).
+            // fire" anymore). v0.3.0: bei jedem Skip einen kurzen
+            // Hint im Activity-Log, damit der Pilot weiß WARUM Auto-
+            // Start nicht greift. Throttled auf 1× / 60 s pro reason
+            // damit der Log nicht spamt.
             let Some(snap) = current_snapshot(&app) else {
                 continue;
             };
-            if !snap.on_ground
-                || snap.groundspeed_kt > 5.0
-                || snap.engines_running > 0
-            {
+            let skip_reason: Option<(&'static str, &'static str)> = if !snap.on_ground {
+                Some(("airborne", "Du bist in der Luft — Auto-Start funktioniert nur am Boden"))
+            } else if snap.groundspeed_kt > 5.0 {
+                Some(("moving", "Flugzeug rollt schon — Auto-Start greift nur am Stand"))
+            } else if snap.engines_running > 0 {
+                Some(("engines_on", "Triebwerke sind an — Auto-Start greift nur bei kalt/stehendem Flugzeug. Manuell 'Flug starten' nutzen."))
+            } else {
+                None
+            };
+            if let Some((reason_code, reason_msg)) = skip_reason {
+                // Throttle: nur loggen wenn wir den Grund 60s+ nicht
+                // gemeldet haben oder der Grund neu ist.
+                let now = Utc::now();
+                let should_log = {
+                    let mut g = state.auto_start_skip_reason.lock().unwrap();
+                    let log_it = match g.as_ref() {
+                        None => true,
+                        Some((_, last_code)) if last_code != reason_code => true,
+                        Some((last_at, _))
+                            if (now - *last_at).num_seconds() >= 60 =>
+                        {
+                            true
+                        }
+                        _ => false,
+                    };
+                    if log_it {
+                        *g = Some((now, reason_code.to_string()));
+                    }
+                    log_it
+                };
+                if should_log {
+                    log_activity_handle(
+                        &app,
+                        ActivityLevel::Info,
+                        "Auto-Start: nicht möglich".to_string(),
+                        Some(reason_msg.to_string()),
+                    );
+                }
                 continue;
+            }
+            // Voraussetzungen erfüllt — Reason-State löschen damit beim
+            // nächsten skip wieder ein frischer Hint kommt.
+            {
+                let mut g = state.auto_start_skip_reason.lock().unwrap();
+                *g = None;
             }
             // Fetch the user's bids to find a match.
             let client = match {
