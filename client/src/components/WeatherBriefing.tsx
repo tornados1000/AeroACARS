@@ -35,7 +35,11 @@ interface Props {
 function fmtVisibilityKm(meters: number | null): string {
   if (meters == null) return "—";
   const km = meters / 1000;
-  return km >= 10 ? "≥ 10 km" : `${km.toFixed(1)} km`;
+  // v0.3.0: aviation-relevant ≥ 9.5 km wird als "≥ 10 km" angezeigt
+  // (war 10.0 — das hat 9.999 km als "10.0 km" gerendert was identisch
+  // aussieht aber den CAVOK-Indikator unterdrückt). Aviation-Konvention
+  // ist: 9999 m = "10 km oder mehr".
+  return km >= 9.5 ? "≥ 10 km" : `${km.toFixed(1)} km`;
 }
 
 /**
@@ -84,6 +88,13 @@ function extractWeatherPhenomena(raw: string | null): {
   const wxRegex =
     /\b([+-]?)(VC|RE)?(MI|PR|BC|DR|BL|SH|TS|FZ)?(DZ|RA|SN|SG|IC|PL|GR|GS|UP|FG|BR|HZ|FU|VA|DU|SA|PY|SQ|PO|FC|SS|DS)\b/;
   const match = raw.match(wxRegex);
+  // CAVOK = "Ceiling And Visibility OK" — explizit "schönes Wetter":
+  // Sicht ≥ 10 km, keine Wolken < 5000 ft, keine signifikanten WX-
+  // Phänomene. Wir behandeln das als eigenes Top-Level-Signal weil
+  // im METAR-Text keine Cloud-Layer-Codes folgen.
+  if (/\bCAVOK\b/.test(raw)) {
+    return { icon: "☀", label: "CAVOK" };
+  }
   if (match) {
     const intensity = match[1] || "";
     const descriptor = match[3] || "";

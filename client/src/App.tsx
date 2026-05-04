@@ -192,9 +192,37 @@ function App() {
   }, []);
 
   // Sync the persisted auto-start flag to the Rust backend on every
-  // mount/change. Backend default is OFF; localStorage is the source
-  // of truth. Without this sync, the watcher wouldn't run after a
-  // restart even though the toggle is enabled in the UI.
+  // mount/change. Backend default is OFF; ab v0.3.0 ist der Backend-
+  // Wert (persistiert in app_config_dir/auto_start.json) die Source
+  // of truth — localStorage wäre im Tauri-Dev-Mode / nach Force-Kill
+  // unzuverlässig. Beim ersten Mount fragen wir den Backend-Wert ab
+  // und überschreiben den lokalen State falls der abweicht.
+  useEffect(() => {
+    let cancelled = false;
+    void invoke<boolean>("auto_start_get_enabled")
+      .then((backendValue) => {
+        if (cancelled) return;
+        if (backendValue !== autoStart) {
+          // Backend-State zählt — Frontend nachziehen UND localStorage
+          // aktualisieren damit's beim nächsten Frontend-Reload sofort
+          // konsistent ist.
+          setAutoStart(backendValue);
+          saveAutoStart(backendValue);
+        }
+      })
+      .catch(() => {
+        // IPC-Fehler beim ersten Mount nicht tragisch — fallback auf
+        // den localStorage-Wert. Wird beim nächsten Toggle korrigiert.
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Sync localStorage + Backend bei jeder Änderung. Backend persistiert
+  // selbst (siehe write_auto_start_persisted), localStorage ist nur
+  // schneller Frontend-Cache fürs nächste Mount.
   useEffect(() => {
     void invoke("auto_start_set_enabled", { enabled: autoStart }).catch(() => {});
   }, [autoStart]);

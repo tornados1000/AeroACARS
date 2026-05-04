@@ -3735,6 +3735,38 @@ input:disabled {
   border: 1px solid color-mix(in srgb, #f59e0b 40%, var(--border));
 }
 
+/* v0.3.0: Auto-Start-Skip-Banner — gleicher Stil wie sim-position-Warn,
+   aber mit eigenem Icon + 2-zeiligem Text (Titel + Erklärung). */
+.bids__auto-start-skip {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 0 0 12px 0;
+  padding: 10px 14px;
+  font-size: 13px;
+  border-radius: 10px;
+  color: var(--text);
+  background: color-mix(in srgb, #f59e0b 12%, var(--surface));
+  border: 1px solid color-mix(in srgb, #f59e0b 40%, var(--border));
+}
+.bids__auto-start-skip-icon {
+  font-size: 18px;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.bids__auto-start-skip-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.bids__auto-start-skip-text strong {
+  font-size: 13px;
+  color: #fbbf24;
+}
+:root:not([data-theme="dark"]) .bids__auto-start-skip-text strong {
+  color: #a16207;
+}
+
 .bids__sim-position-icon {
   font-size: 16px;
 }

@@ -513,6 +513,15 @@ struct ActiveFlight {
     /// number in MSFS. Empty string when unknown (fresh-PIREP / disk-
     /// resume edge cases where we couldn't match a bid).
     planned_registration: String,
+    /// Aircraft ICAO der Bid (z.B. "B738"). Wird im PIREP-Custom-Field
+    /// "Aircraft Type" rausgegeben damit der VA-Admin auf der phpVMS-
+    /// Detail-Seite ohne extra Lookup weiß was geflogen wurde.
+    /// v0.3.0: vorher nur `planned_registration`, neuer `aircraft_icao`
+    /// kommt aus dem gleichen `client.get_aircraft(id)`-Call.
+    aircraft_icao: String,
+    /// Aircraft-Name (z.B. "Boeing 737-800"). Komplettiert die ICAO-
+    /// Anzeige. Empty wenn nicht ermittelbar.
+    aircraft_name: String,
     flight_number: String,
     dpt_airport: String,
     arr_airport: String,
@@ -3412,20 +3421,34 @@ async fn flight_adopt(
     // Bid.flight has no direct aircraft_id; the chosen aircraft lives
     // on the SimBrief OFP. If the pilot hasn't generated an OFP, we
     // simply leave planned_registration empty.
-    let planned_registration = match matching_bid
+    // v0.3.0: zusätzlich Aircraft-ICAO + Name aus dem gleichen Call
+    // ziehen. Damit der PIREP-Custom-Field "Aircraft Type" gefüllt
+    // werden kann ohne extra Lookup auf der phpVMS-Detail-Seite.
+    let aircraft_details = match matching_bid
         .and_then(|b| b.flight.simbrief.as_ref())
         .and_then(|sb| sb.aircraft_id)
     {
-        Some(id) => client
-            .get_aircraft(id)
-            .await
-            .ok()
-            .and_then(|a| a.registration)
-            .unwrap_or_default()
-            .trim()
-            .to_string(),
-        None => String::new(),
+        Some(id) => client.get_aircraft(id).await.ok(),
+        None => None,
     };
+    let planned_registration = aircraft_details
+        .as_ref()
+        .and_then(|a| a.registration.clone())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let aircraft_icao = aircraft_details
+        .as_ref()
+        .and_then(|a| a.icao.clone())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let aircraft_name = aircraft_details
+        .as_ref()
+        .and_then(|a| a.name.clone())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
 
     let flight = Arc::new(ActiveFlight {
         pirep_id: pirep.id.clone(),
@@ -3435,6 +3458,8 @@ async fn flight_adopt(
         started_at: Utc::now(),
         airline_icao,
         planned_registration,
+        aircraft_icao,
+        aircraft_name,
         flight_number,
         dpt_airport,
         arr_airport,
@@ -3778,6 +3803,20 @@ async fn flight_start(
         .unwrap_or("")
         .trim()
         .to_string();
+    // v0.3.0: Aircraft-ICAO + Name aus dem expected_aircraft ziehen für
+    // den PIREP-Custom-Field "Aircraft Type".
+    let aircraft_icao = expected_aircraft
+        .icao
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let aircraft_name = expected_aircraft
+        .name
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_string();
 
     // ---- Stage 2: SimBrief OFP fetch for planned-fuel comparison ----
     // The bid carries a SimBrief id when the pilot has prepared an OFP.
@@ -3821,6 +3860,8 @@ async fn flight_start(
             .map(|a| a.icao.clone())
             .unwrap_or_default(),
         planned_registration,
+        aircraft_icao,
+        aircraft_name,
         flight_number: bid.flight.flight_number.clone(),
         dpt_airport: bid.flight.dpt_airport_id.clone(),
         arr_airport: bid.flight.arr_airport_id.clone(),
@@ -4431,7 +4472,7 @@ async fn flight_end(
 
     // Snapshot all stats inside a single short-lived guard to avoid holding
     // the Mutex across an `await`.
-    let body = {
+    let (body, block_on_iso) = {
         let stats = flight.stats.lock().expect("flight stats");
         // Flight time = takeoff → landing (when both timestamps were
         // captured by the FSM). Falls back to the started_at → now
@@ -4504,7 +4545,7 @@ async fn flight_end(
             );
         }
 
-        FileBody {
+        let body = FileBody {
             flight_time,
             fuel_used,
             block_fuel,
@@ -4517,8 +4558,170 @@ async fn flight_end(
             fares,
             fields: Some(fields),
             arr_airport_id: divert_to.clone(),
-        }
+        };
+        // Block-on time = touchdown timestamp captured by the FSM.
+        // Needed by the divert-finalize path because we skip /file
+        // entirely there, so phpVMS won't auto-set this column.
+        let block_on_iso = stats.landing_at.map(|t| t.to_rfc3339());
+        (body, block_on_iso)
     };
+    // v0.3.1: Divert finalization bypasses /file entirely.
+    //
+    // Background: earlier versions tried to route diverts into PENDING via
+    // (a) a pre-file source=MANUAL "smuggle" through the update endpoint,
+    // and (b) a post-file state=PENDING update. Both are dead on real
+    // phpVMS deployments:
+    //   * Acars\PirepController::file() ignores the stored source field
+    //     and always evaluates auto_approve_acars on the rank, so (a)
+    //     does not route through auto_approve_manual.
+    //   * Once the PIREP is ACCEPTED, PirepController::checkReadOnly()
+    //     blocks any further state-update, so (b) returns "PIREP is
+    //     read-only" (verified against german-sky-group.eu, 2026-05-04).
+    //
+    // The path that actually works: while the PIREP is still IN_PROGRESS
+    // (not read-only), mass-assign EVERYTHING /file would have written —
+    // including state=PENDING, source=MANUAL, arr_airport_id, all final
+    // stats — through a single update_pirep call. This bypasses
+    // PirepService::submit() and the auto-approve check entirely. The
+    // PIREP shows up in the admin's PENDING queue with the correct
+    // arrival airport and divert notes.
+    //
+    // Strategy verified against phpvms@dev: PirepController::update +
+    // parsePirep() pass the full request payload to mass-assignment, and
+    // (source, state, arr_airport_id, landing_rate, score, submitted_at,
+    // block_on_time) are all in Pirep $fillable. Acars\UpdateRequest
+    // doesn't strip non-validated keys.
+    if divert_to.is_some() {
+        let now_iso = Utc::now().to_rfc3339();
+        let finalize = api_client::UpdateBody {
+            state: Some(1),                                   // PirepState::PENDING
+            source: Some(api_client::pirep_source::MANUAL),   // 1
+            status: Some("ONB".to_string()),                  // PirepStatus::ARRIVED
+            flight_time: body.flight_time,
+            distance: body.distance,
+            fuel_used: body.fuel_used,
+            block_fuel: body.block_fuel,
+            level: body.level,
+            landing_rate: body.landing_rate,
+            score: body.score,
+            source_name: body.source_name.clone(),
+            notes: body.notes.clone(),
+            arr_airport_id: divert_to.clone(),
+            submitted_at: Some(now_iso.clone()),
+            block_on_time: block_on_iso.clone(),
+            updated_at: Some(now_iso),
+        };
+        match client.update_pirep(&flight.pirep_id, &finalize).await {
+            Ok(()) => tracing::info!(
+                pirep_id = %flight.pirep_id,
+                "divert finalize update OK — PIREP mass-assigned to MANUAL/PENDING"
+            ),
+            Err(e) => {
+                log_activity(
+                    &state,
+                    ActivityLevel::Error,
+                    "Divert: Finalisierung fehlgeschlagen".to_string(),
+                    Some(format!("{} — Flug bleibt aktiv für Retry", e)),
+                );
+                let mut guard = state.active_flight.lock().expect("active_flight lock");
+                *guard = Some(flight);
+                return Err(e.into());
+            }
+        }
+        // Custom PIREP fields live in `pirep_field_values` (separate
+        // table from `pireps`) — they don't go through Pirep
+        // mass-assignment. Push them via the dedicated endpoint.
+        // Failures are non-fatal: the main PIREP is already in PENDING.
+        if let Some(fields_map) = body.fields.as_ref() {
+            if let Err(e) = client.post_pirep_fields(&flight.pirep_id, fields_map).await {
+                tracing::warn!(
+                    pirep_id = %flight.pirep_id,
+                    error = %e,
+                    "post_pirep_fields after divert finalize failed (non-fatal)"
+                );
+            }
+        }
+        // Verify the PIREP actually landed in PENDING. The mass-assign
+        // strategy is well-trodden but the verification is cheap and
+        // gives us loud feedback if a future phpVMS upgrade changes the
+        // semantics. Failure here doesn't unwind the file — it just
+        // surfaces a warning so the pilot knows to ping the VA admin.
+        match client.get_pirep(&flight.pirep_id).await {
+            Ok(p) => {
+                let s = p.state.unwrap_or(-1);
+                if s == 1 {
+                    tracing::info!(
+                        pirep_id = %flight.pirep_id,
+                        "verified: divert PIREP state == PENDING"
+                    );
+                } else {
+                    tracing::warn!(
+                        pirep_id = %flight.pirep_id,
+                        actual_state = s,
+                        "divert PIREP did NOT land in PENDING — phpVMS semantics changed?"
+                    );
+                    log_activity(
+                        &state,
+                        ActivityLevel::Error,
+                        "Divert: konnte NICHT für Admin-Review markiert werden".to_string(),
+                        Some(format!(
+                            "Server-Status nach Divert-Finalize: {} (erwartet: 1=PENDING). Bitte VA-Admin manuell informieren.",
+                            s
+                        )),
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    pirep_id = %flight.pirep_id,
+                    error = %e,
+                    "post-divert state verify failed"
+                );
+            }
+        }
+        // Local snapshot + activity log + bid cleanup, mirroring the
+        // /file success path so downstream UI (Landung-Tab, Activity)
+        // sees the same state for divert and normal arrivals.
+        {
+            let stats = flight.stats.lock().expect("flight stats");
+            record_landing_for_filed_flight(&app, &flight, &stats);
+        }
+        clear_persisted_flight(&app);
+        log_activity(
+            &state,
+            ActivityLevel::Info,
+            format!(
+                "PIREP filed: {} {} → {} (DIVERT, planned {})",
+                format_callsign(&flight.airline_icao, &flight.flight_number),
+                flight.dpt_airport,
+                divert_to.as_deref().unwrap_or(&flight.arr_airport),
+                flight.arr_airport,
+            ),
+            {
+                let dist = body.distance.unwrap_or(0.0);
+                let fuel = body.fuel_used.unwrap_or(0.0);
+                let stats_line = if fuel > 0.0 {
+                    format!("Distance {dist:.1} nm, fuel {fuel:.0} lb")
+                } else {
+                    format!("Distance {dist:.1} nm")
+                };
+                Some(format!("{stats_line} · MANUAL/PENDING (admin review)"))
+            },
+        );
+        record_event(
+            &app,
+            &flight.pirep_id,
+            &FlightLogEvent::FlightEnded {
+                timestamp: Utc::now(),
+                pirep_id: flight.pirep_id.clone(),
+                outcome: FlightOutcome::Filed,
+            },
+        );
+        consume_bid_best_effort(&client, flight.bid_id).await;
+        // Drop the in-memory active flight: divert is finalized.
+        let _ = state.active_flight.lock().expect("active_flight lock").take();
+        return Ok(());
+    }
     tracing::info!(
         pirep_id = %flight.pirep_id,
         flight_time = body.flight_time.unwrap_or(0),
@@ -4528,6 +4731,8 @@ async fn flight_end(
         custom_fields = body.fields.as_ref().map(|f| f.len()).unwrap_or(0),
         "filing PIREP"
     );
+    // Non-divert path. (Diverts return early above via the dedicated
+    // mass-assign-to-PENDING flow; only normal arrivals reach /file.)
     match client.file_pirep(&flight.pirep_id, &body).await {
         Ok(()) => {
             // Snapshot the landing into the local history file BEFORE
@@ -4546,7 +4751,7 @@ async fn flight_end(
                     "PIREP filed: {} {} → {}",
                     format_callsign(&flight.airline_icao, &flight.flight_number),
                     flight.dpt_airport,
-                    flight.arr_airport
+                    flight.arr_airport,
                 ),
                 {
                     let dist = body.distance.unwrap_or(0.0);
@@ -4873,12 +5078,21 @@ async fn flight_end_manual(
             log_activity(
                 &state,
                 ActivityLevel::Warn,
-                format!(
-                    "Manual PIREP filed: {} {} → {}",
-                    format_callsign(&flight.airline_icao, &flight.flight_number),
-                    flight.dpt_airport,
-                    flight.arr_airport
-                ),
+                {
+                    let actual_arr = divert_to.as_deref().unwrap_or(&flight.arr_airport);
+                    let suffix = if divert_to.is_some() {
+                        format!(" (DIVERT, planned {})", flight.arr_airport)
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "Manual PIREP filed: {} {} → {}{}",
+                        format_callsign(&flight.airline_icao, &flight.flight_number),
+                        flight.dpt_airport,
+                        actual_arr,
+                        suffix
+                    )
+                },
                 Some("Source tagged 'manual' — admin will review".into()),
             );
             record_event(
@@ -5648,7 +5862,10 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                     // (Cockpit-UI) UND ACARS-Log (phpVMS-PIREP). Bewusst
                     // einzeilig — der Drain-Pfad unterstützt keine
                     // 2-zeiligen Display-Logs.
-                    let mut line = String::from("📋 Loadsheet @ Block-off — Block ");
+                    // v0.3.0: ohne Emoji-Icon — wird in phpVMS-PIREP-
+                    // Detailseite als verzerrter Glyph gerendert (Font-
+                    // Stack hat dort keinen Emoji-Font).
+                    let mut line = String::from("Loadsheet @ Block-off — Block ");
                     line.push_str(&format!("{:.0} kg", block));
                     if let Some(p) = plan_block {
                         let delta = block - p;
@@ -6680,6 +6897,12 @@ fn build_heartbeat_body(
         // even on heartbeats where no other field changed (boarding
         // / long stable cruise). See `UpdateBody::updated_at` doc.
         updated_at: Some(now.to_rfc3339()),
+        // Heartbeat-only path — divert-finalize fields stay None.
+        arr_airport_id: None,
+        landing_rate: None,
+        score: None,
+        submitted_at: None,
+        block_on_time: None,
     }
 }
 
@@ -6720,7 +6943,7 @@ fn handle_remote_cancellation(app: &AppHandle, flight: &Arc<ActiveFlight>, sourc
 /// names follow the de-facto vmsACARS convention so VAs that already configured
 /// fields for vmsACARS see them populate without any work.
 fn build_pirep_fields(
-    _flight: &ActiveFlight,
+    flight: &ActiveFlight,
     stats: &FlightStats,
 ) -> HashMap<String, String> {
     // Single-form custom-fields set: human-readable Title Case with
@@ -6739,6 +6962,22 @@ fn build_pirep_fields(
         "Source".into(),
         format!("AeroACARS/{}", env!("CARGO_PKG_VERSION")),
     );
+
+    // v0.3.0: Aircraft-Type / Name / Reg im PIREP-Custom-Field damit
+    // VA-Admins auf der phpVMS-Detail-Seite ohne Lookup wissen was
+    // geflogen wurde (vorher nur PMDG-Variant; jetzt für jeden
+    // Aircraft-Typ aus dem Bid-Aircraft-Lookup).
+    if !flight.aircraft_icao.is_empty() {
+        let label = if !flight.aircraft_name.is_empty() {
+            format!("{} ({})", flight.aircraft_icao, flight.aircraft_name)
+        } else {
+            flight.aircraft_icao.clone()
+        };
+        f.insert("Aircraft Type".into(), label);
+    }
+    if !flight.planned_registration.is_empty() {
+        f.insert("Aircraft Reg".into(), flight.planned_registration.clone());
+    }
 
     // ---- Times (HH:MM:SS UTC, glanceable) + durations ----
     fn fmt_time(t: &DateTime<Utc>) -> String {
@@ -9302,6 +9541,14 @@ async fn try_resume_flight(
         started_at: persisted.started_at,
         airline_icao,
         planned_registration,
+        // v0.3.0: Aircraft-Type bei Resume aus dem persisted Flight ist
+        // nicht direkt verfügbar — der frühere Stand hatte das nicht.
+        // Beim Resume bleibt der Custom-Field "Aircraft Type" daher
+        // leer. Akzeptabel, weil Resume eh nur passiert wenn der
+        // Pilot mitten im Flug die App neu startet — der ursprüngliche
+        // PIREP hat die Aircraft-Daten phpVMS-seitig schon.
+        aircraft_icao: String::new(),
+        aircraft_name: String::new(),
         flight_number: persisted.flight_number.clone(),
         dpt_airport: persisted.dpt_airport.clone(),
         arr_airport: persisted.arr_airport.clone(),
@@ -9347,6 +9594,74 @@ fn auto_start_get_enabled(state: tauri::State<'_, AppState>) -> bool {
     state.auto_start_enabled.load(Ordering::Relaxed)
 }
 
+/// v0.3.0: Persistenz-Pfad für Auto-Start-Setting. localStorage geht im
+/// Tauri-Dev-Mode bzw. nach Force-Kill der App regelmäßig verloren —
+/// Backend-File überlebt jeden Restart und ist die Source-of-Truth.
+fn auto_start_settings_path(app: &AppHandle) -> Option<PathBuf> {
+    app.path()
+        .app_config_dir()
+        .ok()
+        .map(|p| p.join("auto_start.json"))
+}
+
+fn read_auto_start_persisted(app: &AppHandle) -> bool {
+    let path = match auto_start_settings_path(app) {
+        Some(p) => p,
+        None => return false,
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    // Datei-Format ist trivial: `{"enabled": true}` oder `{"enabled": false}`.
+    // Kein serde-Overkill, plain regex-style match.
+    text.contains("\"enabled\":true") || text.contains("\"enabled\": true")
+}
+
+fn write_auto_start_persisted(app: &AppHandle, enabled: bool) {
+    let Some(path) = auto_start_settings_path(app) else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let body = format!("{{\"enabled\":{}}}", enabled);
+    let _ = std::fs::write(&path, body);
+}
+
+/// v0.3.0: Frontend-API für den Auto-Start-Skip-Grund. Liefert den
+/// aktuellen Reason-Code (engines_on / moving / airborne) plus das
+/// Alter in Sekunden seit der Watcher den letzten Skip festgestellt
+/// hat. Frontend rendert daraus einen Banner im Briefing-Tab — der
+/// Pilot wartet ja nicht im Settings-Log auf Hinweise.
+///
+/// Liefert `None` wenn alles passt (kein Skip kürzlich) oder Auto-
+/// Start aus ist.
+#[tauri::command]
+fn auto_start_skip_status(
+    state: tauri::State<'_, AppState>,
+) -> Option<AutoStartSkipDto> {
+    if !state.auto_start_enabled.load(Ordering::Relaxed) {
+        return None;
+    }
+    let g = state.auto_start_skip_reason.lock().unwrap();
+    let (at, code) = g.as_ref()?;
+    let age_secs = (Utc::now() - *at).num_seconds();
+    // Älter als 10 s: vermutlich nicht mehr aktuell — Frontend soll
+    // den Banner nicht zeigen.
+    if age_secs > 10 {
+        return None;
+    }
+    Some(AutoStartSkipDto {
+        reason: code.clone(),
+        age_secs,
+    })
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AutoStartSkipDto {
+    reason: String,
+    age_secs: i64,
+}
+
 #[tauri::command]
 fn auto_start_set_enabled(
     enabled: bool,
@@ -9354,6 +9669,9 @@ fn auto_start_set_enabled(
     state: tauri::State<'_, AppState>,
 ) -> Result<(), UiError> {
     let was = state.auto_start_enabled.swap(enabled, Ordering::Relaxed);
+    // v0.3.0: Persistieren in JSON-File damit der Toggle-Stand auch
+    // nach App-Restart / Force-Kill / Dev-Build erhalten bleibt.
+    write_auto_start_persisted(&app, enabled);
     // The watcher task itself runs for the entire app lifetime (spawned
     // once in `.setup()`); flipping this flag is enough — no need to
     // spawn or kill anything here. Earlier versions did spawn-on-toggle,
@@ -9410,6 +9728,31 @@ fn spawn_auto_start_watcher(app: AppHandle) {
             let Some(snap) = current_snapshot(&app) else {
                 continue;
             };
+            // v0.3.0: Race-Condition-Fix nach Sim-Reconnect. Wenn der
+            // Sim gerade frisch connected ist (Pilot hat X-Plane neu
+            // gestartet), hat der Snapshot kurz Default-0-Werte
+            // (engines=0, on_ground=true, gs=0) — die ALLE die
+            // Auto-Start-Bedingungen "scheinbar erfüllen" und der
+            // Watcher fired BEVOR die echten Daten reinkommen
+            // (Triebwerke an, Aircraft-Title gesetzt etc.). Pilot
+            // hat dann ungewollt einen Auto-Start mit laufenden
+            // Triebwerken bekommen.
+            //
+            // Lösung: Wir prüfen ob die Snapshot-Daten "warm" sind
+            // (Aircraft-Title vorhanden + Fuel > 100 kg = echtes
+            // Aircraft, nicht Default). Wenn nicht warm, skip ohne
+            // Hint-Banner — die Daten settled binnen 1-3 s und der
+            // Pilot will dafür keinen Banner sehen.
+            let sim_data_warm = snap
+                .aircraft_title
+                .as_deref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+                && snap.fuel_total_kg > 100.0;
+            if !sim_data_warm {
+                tracing::debug!("auto-start: sim data not warm yet — skipping");
+                continue;
+            }
             let skip_reason: Option<(&'static str, &'static str)> = if !snap.on_ground {
                 Some(("airborne", "Du bist in der Luft — Auto-Start funktioniert nur am Boden"))
             } else if snap.groundspeed_kt > 5.0 {
@@ -9996,6 +10339,21 @@ pub fn run() {
             // spawn-on-toggle; that had a Mac-first-launch failure mode
             // where the very first toggle's IPC call lost the spawn race
             // and the user had to restart the app to recover.
+            // v0.3.0: Persistierten Auto-Start-Stand laden bevor der
+            // Watcher startet. Ohne diesen Read würde der AppState
+            // mit Default-`false` initialisiert und der Frontend-Hook
+            // `auto_start_get_enabled` würde immer `false` zurückgeben,
+            // egal ob der Pilot ihn vorher aktiviert hatte.
+            {
+                let persisted = read_auto_start_persisted(&app.handle());
+                let state = app.state::<AppState>();
+                state
+                    .auto_start_enabled
+                    .store(persisted, Ordering::Relaxed);
+                if persisted {
+                    tracing::info!("auto-start restored from persisted settings");
+                }
+            }
             spawn_auto_start_watcher(app.handle().clone());
             // Build the system-tray icon + menu. On Windows this lands
             // in the system tray (bottom-right); on Mac in the menubar
@@ -10021,6 +10379,7 @@ pub fn run() {
             phpvms_get_bids,
             fetch_simbrief_preview,
             phpvms_get_aircraft,
+            auto_start_skip_status,
             phpvms_refresh_profile,
             divert_nearest_airports,
             fetch_release_notes,

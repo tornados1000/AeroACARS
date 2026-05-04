@@ -696,6 +696,12 @@
     "ofp_mismatch_bid": "Bid",
     "ofp_mismatch_ofp": "OFP",
     "ofp_mismatch_hint": "SimBrief always returns the most recently created OFP. Please create a fresh OFP for this booking on simbrief.com — otherwise the plan values (block fuel, TOW, route) don't match your flight.",
+    "auto_start_skip": {
+      "title": "Auto-start active, but currently not possible",
+      "engines_on": "Engines are running — auto-start only works on a cold-and-dark aircraft. Use 'Start flight' manually.",
+      "moving": "Aircraft is already taxiing — auto-start only fires while parked. Use 'Start flight' manually.",
+      "airborne": "You're airborne — auto-start only works on the ground."
+    },
     "open_flight_page": "Open flight page",
     "open_ofp": "Open OFP / briefing",
     "start_flight": "Start flight",

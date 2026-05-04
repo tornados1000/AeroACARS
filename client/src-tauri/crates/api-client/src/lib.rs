@@ -690,6 +690,35 @@ pub struct UpdateBody {
     /// kills the PIREP after `acars.live_time` hours.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+    /// Override the arrival airport. Used by the divert-finalize path
+    /// in `flight_end` to mass-assign the actual landing airport when
+    /// the pilot diverted. `arr_airport_id` is in the Pirep `$fillable`
+    /// list, so this is mass-assigned through `parsePirep` like every
+    /// other field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arr_airport_id: Option<String>,
+    /// Touchdown vertical speed in fpm (negative on a real landing).
+    /// Smuggled the same way as `source` — `landing_rate` is in
+    /// `$fillable`, the Acars\\UpdateRequest doesn't validate it but
+    /// parsePirep passes the raw input through to mass-assignment.
+    /// Used by the divert-finalize path so the PIREP detail shows the
+    /// landing rate even though we never call `/file`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub landing_rate: Option<f64>,
+    /// Numeric landing score 0..100. Same smuggle path as
+    /// `landing_rate` — `score` is in the Pirep $fillable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<i32>,
+    /// ISO-8601 / RFC-3339 timestamp marking when the PIREP was
+    /// submitted. Normally set by `Acars\\PirepController::file()`;
+    /// since the divert-finalize path skips `/file`, we set it here
+    /// so admin queue ordering works.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submitted_at: Option<String>,
+    /// ISO-8601 / RFC-3339 block-on time. Same reason as
+    /// `submitted_at` — `/file` would normally set this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_on_time: Option<String>,
 }
 
 /// phpVMS PirepSource enum values, mirrored here so call sites don't
@@ -750,8 +779,11 @@ pub struct PirepFull {
     pub arr_airport_id: Option<String>,
     #[serde(default)]
     pub flight_time: Option<i32>,
-    #[serde(default)]
-    pub distance: Option<f64>,
+    // `distance` intentionally omitted — phpVMS sometimes returns it as
+    // a `{value, unit}` object (e.g. on `/api/pireps/{id}`) and sometimes
+    // as a bare `f64` (other endpoints), and we don't need it for any
+    // current call site. Serde ignores unknown fields by default, so
+    // dropping it makes the GET resilient to both shapes.
 }
 
 #[derive(Debug, Clone, Deserialize)]

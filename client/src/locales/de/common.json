@@ -696,6 +696,12 @@
     "ofp_mismatch_bid": "Bid",
     "ofp_mismatch_ofp": "OFP",
     "ofp_mismatch_hint": "SimBrief liefert immer den zuletzt erstellten OFP. Bitte für diese Buchung einen neuen OFP auf simbrief.com erstellen — sonst stimmen Plan-Werte (Block-Fuel, TOW, Route) nicht zu deinem Flug.",
+    "auto_start_skip": {
+      "title": "Auto-Start aktiv, aber gerade nicht möglich",
+      "engines_on": "Triebwerke sind an — Auto-Start greift nur bei kalt/stehendem Flugzeug. Manuell „Flug starten\" nutzen.",
+      "moving": "Flugzeug rollt schon — Auto-Start greift nur am Stand. Manuell „Flug starten\" nutzen.",
+      "airborne": "Du bist in der Luft — Auto-Start funktioniert nur am Boden."
+    },
     "open_flight_page": "Flugseite öffnen",
     "open_ofp": "OFP / Briefing öffnen",
     "start_flight": "Flug starten",

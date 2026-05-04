@@ -385,6 +385,11 @@ export function BidsList({
         </div>
       )}
 
+      {/* v0.3.0: Auto-Start-Skip-Banner — zeigt warum Auto-Start
+          gerade nicht greift, damit der Pilot nicht auf eine Meldung
+          wartet die nie kommt. Pollt das Backend alle 3 s. */}
+      <AutoStartSkipBanner />
+
       {state.kind === "loading" && <p className="bids__hint">{t("bids.loading")}</p>}
 
       {state.kind === "empty" && <p className="bids__hint">{t("bids.empty")}</p>}
@@ -946,6 +951,69 @@ function PlanCard({ label, kg, accent }: PlanCardProps) {
         {Math.round(kg).toLocaleString("de-DE")}
         <span className="bid-card__plan-card-unit"> kg</span>
       </span>
+    </div>
+  );
+}
+
+/**
+ * Auto-Start-Skip-Banner (v0.3.0).
+ *
+ * Pollt alle 3 s das Backend `auto_start_skip_status` und zeigt einen
+ * gelben Banner mit der Begründung, wenn Auto-Start gerade nicht
+ * greifen kann (z.B. Triebwerke an, Flugzeug rollt, in der Luft).
+ * Liefert das Backend `null` (Auto-Start aus, oder Voraussetzungen
+ * passen, oder älter als 10 s), wird kein Banner gerendert.
+ *
+ * Spiegelung der Activity-Log-Einträge die der Watcher schreibt —
+ * der Pilot wartet im Briefing-Tab auf eine Meldung, schaut nicht
+ * im Settings-Log nach.
+ */
+interface AutoStartSkipDto {
+  reason: string;
+  age_secs: number;
+}
+
+function AutoStartSkipBanner() {
+  const { t } = useTranslation();
+  const [skip, setSkip] = useState<AutoStartSkipDto | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function poll() {
+      try {
+        const next = await invoke<AutoStartSkipDto | null>(
+          "auto_start_skip_status",
+        );
+        if (!cancelled) setSkip(next);
+      } catch {
+        // IPC-Fehler beim Hot-Reload sind normal — ignorieren.
+      }
+    }
+    void poll();
+    const id = window.setInterval(poll, 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, []);
+
+  if (!skip) return null;
+
+  // Reason-Code → lokalisiertes Label + Erklärung. Backend liefert
+  // den Code (engines_on / moving / airborne); Frontend macht die
+  // Übersetzung selbst damit Theme/Sprache greift.
+  const reasonKey = `bids.auto_start_skip.${skip.reason}`;
+  return (
+    <div
+      className="bids__auto-start-skip"
+      role="status"
+      aria-live="polite"
+    >
+      <span className="bids__auto-start-skip-icon">🤖</span>
+      <div className="bids__auto-start-skip-text">
+        <strong>{t("bids.auto_start_skip.title")}</strong>
+        <span>{t(reasonKey)}</span>
+      </div>
     </div>
   );
 }
