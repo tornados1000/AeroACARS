@@ -64,6 +64,44 @@ export interface SimBrief {
   id: string;
   url: string | null;
   aircraft_id: number | null;
+  /** Subfleet info from the SimBrief OFP — drives the Bid-Card aircraft
+   *  display ("B738 · Boeing 737-800") and the Pax/Cargo load chips. */
+  subfleet: SimBriefSubfleet | null;
+}
+
+export interface SimBriefSubfleet {
+  /** ICAO of the subfleet (e.g. "B738"). Mapped from `<aircraft><icaocode>`. */
+  type_: string | null;
+  /** Marketing name (e.g. "Boeing 737-800"). */
+  name: string | null;
+  /** Per-fare-class load (Pax + Cargo). Used to render "184 PAX" or
+   *  "42.5 t cargo" chips on the Bid-Card. */
+  fares: SimBriefFare[];
+}
+
+export interface SimBriefFare {
+  id: number;
+  code: string | null;
+  name: string | null;
+  capacity: number | null;
+  count: number | null;
+  /** 0 = passenger fare, 1 = cargo (phpVMS convention). */
+  type: number | null;
+}
+
+/** SimBrief OFP plan values — fetched via `fetch_simbrief_preview` Tauri
+ *  command before the flight starts so the Bid-Card / Briefing tab can
+ *  show "your OFP says: Block 13.1t, Burn 9.2t, TOW 73.6t" before the
+ *  pilot has tanked/boarded. All weights / fuel quantities in kg. */
+export interface SimBriefOfp {
+  planned_block_fuel_kg: number;
+  planned_burn_kg: number;
+  planned_reserve_kg: number;
+  planned_zfw_kg: number;
+  planned_tow_kg: number;
+  planned_ldw_kg: number;
+  route: string | null;
+  alternate: string | null;
 }
 
 export interface Flight {

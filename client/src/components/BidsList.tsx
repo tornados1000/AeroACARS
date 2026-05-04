@@ -7,6 +7,7 @@ import type {
   AirportInfo,
   Bid,
   Flight,
+  SimBriefOfp,
   SimConnectionState,
   SimSnapshot,
   UiError,
@@ -608,15 +609,8 @@ export function BidsList({
                     </p>
                   )}
 
-                  {isSelected && f.route && (
-                    <div className="bid-card__details">
-                      <div className="bid-card__route-text">
-                        <span className="bid-card__route-label">
-                          {t("bids.route")}:
-                        </span>{" "}
-                        <code>{f.route}</code>
-                      </div>
-                    </div>
+                  {isSelected && (
+                    <BidDetails flight={f} />
                   )}
                 </article>
               </li>
@@ -625,5 +619,129 @@ export function BidsList({
         </ul>
       )}
     </section>
+  );
+}
+
+/**
+ * Ausgeklappte Bid-Card-Details (v0.3.0):
+ * - Aircraft-Info aus SimBrief-Subfleet (B738 · Boeing 737-800)
+ * - Pax/Cargo-Load aus den fares
+ * - Route-String (kommt aus phpVMS-Bid)
+ * - SimBrief-Plan-Vorschau (Block-Fuel, Trip-Burn, TOW, LDW, Reserve,
+ *   ZFW, Alternate) wird per `fetch_simbrief_preview` Tauri-Command
+ *   geholt sobald die Card ausgeklappt wird. Lädt asynchron, kein
+ *   Blocking — Pilot sieht erstmal die Route, der Plan-Block flutscht
+ *   in 1-2s nach.
+ */
+function BidDetails({ flight }: { flight: Flight }) {
+  const { t } = useTranslation();
+  const [plan, setPlan] = useState<SimBriefOfp | null>(null);
+  const [planError, setPlanError] = useState<string | null>(null);
+  const [planLoading, setPlanLoading] = useState(false);
+
+  // OFP-Vorschau bei Bid-Selection holen. Nur einmal pro Render-Lifetime.
+  useEffect(() => {
+    const ofpId = flight.simbrief?.id;
+    if (!ofpId) return;
+    setPlanLoading(true);
+    setPlanError(null);
+    invoke<SimBriefOfp | null>("fetch_simbrief_preview", { ofpId })
+      .then((result) => {
+        setPlan(result);
+        if (!result) {
+          setPlanError(t("bids.simbrief_unavailable"));
+        }
+      })
+      .catch((err: UiError) => {
+        setPlanError(err.message ?? "Fehler");
+      })
+      .finally(() => setPlanLoading(false));
+  }, [flight.simbrief?.id, t]);
+
+  // Pax + Cargo aus den Fares zusammenrechnen.
+  const fares = flight.simbrief?.subfleet?.fares ?? [];
+  const paxCount = fares
+    .filter((f) => (f.type ?? 0) === 0)
+    .reduce((sum, f) => sum + (f.count ?? 0), 0);
+  const cargoKg = fares
+    .filter((f) => (f.type ?? 0) === 1)
+    .reduce((sum, f) => sum + (f.count ?? 0), 0);
+
+  const aircraftType = flight.simbrief?.subfleet?.type_;
+  const aircraftName = flight.simbrief?.subfleet?.name;
+
+  return (
+    <div className="bid-card__details">
+      {/* Aircraft-Info (wenn SimBrief-Subfleet bekannt) */}
+      {(aircraftType || aircraftName) && (
+        <div className="bid-card__aircraft">
+          <span className="bid-card__detail-label">{t("bids.aircraft")}:</span>{" "}
+          {aircraftType && <code>{aircraftType}</code>}
+          {aircraftName && <span> · {aircraftName}</span>}
+        </div>
+      )}
+      {/* Load-Chips: Pax + Cargo */}
+      {(paxCount > 0 || cargoKg > 0) && (
+        <div className="bid-card__load">
+          {paxCount > 0 && (
+            <span className="bid-card__load-chip bid-card__load-chip--pax">
+              {paxCount} PAX
+            </span>
+          )}
+          {cargoKg > 0 && (
+            <span className="bid-card__load-chip bid-card__load-chip--cargo">
+              {(cargoKg / 1000).toFixed(1)} t cargo
+            </span>
+          )}
+        </div>
+      )}
+      {/* SimBrief Plan-Vorschau: Block / Burn / Reserve / TOW / LDW / ZFW + Alternate */}
+      {flight.simbrief?.id && (
+        <div className="bid-card__simbrief">
+          <div className="bid-card__detail-label">
+            {t("bids.simbrief_plan")}
+            {planLoading && " …"}
+          </div>
+          {plan && (
+            <div className="bid-card__simbrief-grid">
+              <PlanRow label="Block" kg={plan.planned_block_fuel_kg} />
+              <PlanRow label="Trip" kg={plan.planned_burn_kg} />
+              <PlanRow label="Reserve" kg={plan.planned_reserve_kg} />
+              <PlanRow label="TOW" kg={plan.planned_tow_kg} />
+              <PlanRow label="LDW" kg={plan.planned_ldw_kg} />
+              <PlanRow label="ZFW" kg={plan.planned_zfw_kg} />
+              {plan.alternate && (
+                <div className="bid-card__simbrief-row">
+                  <span className="bid-card__simbrief-label">Alt</span>
+                  <code>{plan.alternate}</code>
+                </div>
+              )}
+            </div>
+          )}
+          {planError && !plan && (
+            <div className="bid-card__simbrief-error">{planError}</div>
+          )}
+        </div>
+      )}
+      {/* Route-String aus phpVMS-Bid */}
+      {flight.route && (
+        <div className="bid-card__route-text">
+          <span className="bid-card__route-label">{t("bids.route")}:</span>{" "}
+          <code>{flight.route}</code>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PlanRow({ label, kg }: { label: string; kg: number }) {
+  if (kg <= 0) return null;
+  return (
+    <div className="bid-card__simbrief-row">
+      <span className="bid-card__simbrief-label">{label}</span>
+      <span className="bid-card__simbrief-value">
+        {Math.round(kg).toLocaleString("de-DE")} kg
+      </span>
+    </div>
   );
 }

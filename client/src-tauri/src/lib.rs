@@ -2756,6 +2756,52 @@ async fn phpvms_get_bids(
     }
 }
 
+/// SimBrief OFP-Preview (v0.3.0) — fetcht das letzte SimBrief XML
+/// für eine OFP-ID und liefert die wesentlichen Plan-Werte. Wird vom
+/// Frontend in der ausgeklappten Bid-Card aufgerufen, damit der Pilot
+/// die Plan-Werte (Block-Fuel, Trip-Burn, TOW, LDW etc.) **vor**
+/// dem Flight-Start sieht.
+///
+/// Im Gegensatz zum Auto-Fetch beim flight_start() (der die Werte
+/// in die FlightStats schreibt), liefert dieser Command sie nur
+/// transient an die UI zurück. Kein State-Mutation.
+#[tauri::command]
+async fn fetch_simbrief_preview(
+    state: tauri::State<'_, AppState>,
+    ofp_id: String,
+) -> Result<Option<SimBriefOfpDto>, UiError> {
+    let client = current_client(&state)?;
+    match client.fetch_simbrief_ofp(&ofp_id).await {
+        Ok(Some(ofp)) => Ok(Some(SimBriefOfpDto {
+            planned_block_fuel_kg: ofp.planned_block_fuel_kg,
+            planned_burn_kg: ofp.planned_burn_kg,
+            planned_reserve_kg: ofp.planned_reserve_kg,
+            planned_zfw_kg: ofp.planned_zfw_kg,
+            planned_tow_kg: ofp.planned_tow_kg,
+            planned_ldw_kg: ofp.planned_ldw_kg,
+            route: ofp.route,
+            alternate: ofp.alternate,
+        })),
+        Ok(None) => Ok(None), // OFP nicht abrufbar (Netz-Fehler / 404 / ...)
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// DTO für den SimBrief-Preview-Tauri-Command. Bewusst flach gehalten,
+/// die `waypoints` aus `SimBriefOfp` ignoriert die UI hier (zu sperrig
+/// für die kompakte Bid-Card-Vorschau).
+#[derive(Debug, Clone, Serialize)]
+struct SimBriefOfpDto {
+    planned_block_fuel_kg: f32,
+    planned_burn_kg: f32,
+    planned_reserve_kg: f32,
+    planned_zfw_kg: f32,
+    planned_tow_kg: f32,
+    planned_ldw_kg: f32,
+    route: Option<String>,
+    alternate: Option<String>,
+}
+
 // ---- Active-flight persistence (for resume after crash/restart) ----
 
 fn active_flight_path(app: &AppHandle) -> Result<PathBuf, UiError> {
@@ -9767,6 +9813,7 @@ pub fn run() {
             phpvms_logout,
             phpvms_load_session,
             phpvms_get_bids,
+            fetch_simbrief_preview,
             phpvms_refresh_profile,
             divert_nearest_airports,
             fetch_release_notes,

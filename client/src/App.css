@@ -3925,6 +3925,75 @@ input:disabled {
     monospace;
 }
 
+/* Bid-Card-Erweiterung (v0.3.0): Aircraft + Load + SimBrief Plan-Vorschau */
+.bid-card__detail-label {
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.bid-card__aircraft {
+  font-size: 13px;
+  color: var(--text);
+}
+.bid-card__aircraft code {
+  background: var(--surface-2);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-family: "SF Mono", "Cascadia Code", "Source Code Pro", Menlo, Consolas,
+    monospace;
+  font-size: 12px;
+}
+.bid-card__load {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.bid-card__load-chip {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 4px;
+}
+.bid-card__load-chip--pax   { background: rgba(96, 165, 250, 0.15); color: #93c5fd; }
+.bid-card__load-chip--cargo { background: rgba(251, 146, 60, 0.15); color: #fdba74; }
+
+.bid-card__simbrief {
+  background: var(--surface-2);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-top: 4px;
+}
+.bid-card__simbrief-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 4px 12px;
+  margin-top: 6px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.bid-card__simbrief-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+.bid-card__simbrief-label {
+  color: var(--text-muted);
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+.bid-card__simbrief-value {
+  color: var(--text);
+  font-weight: 500;
+}
+.bid-card__simbrief-error {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-style: italic;
+  margin-top: 4px;
+}
+
 .phase {
   background: var(--surface);
   border: 1px solid var(--border);

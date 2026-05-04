@@ -1422,11 +1422,14 @@ function ComparisonTable({ title, rows }: { title: string; rows: ComparisonRow[]
               delta != null && r.soll != null && r.soll !== 0
                 ? Math.abs(delta / r.soll) * 100
                 : null;
-            // Farbcode: <1% grün, 1-3% gelb, >3% rot
+            // Farbcode (v0.3.0 Schwellen, praxisnah für Flugbetrieb):
+            //   < 5 %   → grün  (im Rahmen normaler Operations)
+            //   5-10 %  → gelb  (erkennbare Abweichung, normal)
+            //   > 10 %  → rot   (substantiell, sollte begründet werden)
             let deltaClass = "";
             if (deltaPct != null) {
-              if (deltaPct < 1) deltaClass = "landing-comparison__delta--ok";
-              else if (deltaPct < 3) deltaClass = "landing-comparison__delta--warn";
+              if (deltaPct < 5) deltaClass = "landing-comparison__delta--ok";
+              else if (deltaPct < 10) deltaClass = "landing-comparison__delta--warn";
               else deltaClass = "landing-comparison__delta--alert";
             }
             return (
