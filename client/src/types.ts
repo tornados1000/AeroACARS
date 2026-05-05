@@ -356,6 +356,12 @@ export interface ActiveFlightInfo {
   /** Positions sitting in the offline queue waiting to replay.
    *  0 means we're online and current. */
   queued_position_count: number;
+  /** v0.4.1: ISO-8601 UTC-Timestamp wann der Streamer den Sim-
+   *  Disconnect detektiert und den Flug pausiert hat. `null` =
+   *  normaler Flug; `string` = Cockpit-Tab zeigt Resume-Banner. */
+  paused_since: string | null;
+  /** v0.4.1: Letzte bekannte Sim-Werte vor Disconnect (für Reposition). */
+  paused_last_known: PausedSnapshot | null;
   /** Set when the FSM noticed the aircraft landed somewhere other than
    *  the planned `arr_airport`. The cockpit renders a banner asking
    *  the pilot to confirm the actual destination so the PIREP can be
@@ -435,6 +441,18 @@ export interface DivertHint {
    *  "nearest"   (found something else nearby),
    *  "unknown"   (no airport in range — manual override required). */
   kind: "alternate" | "nearest" | "unknown";
+}
+
+/** v0.4.1: Snapshot der letzten bekannten Sim-Werte beim Sim-Disconnect.
+ *  Wird im Cockpit-Banner angezeigt damit der Pilot weiß wo er nach
+ *  dem Sim-Restart re-positionieren muss. */
+export interface PausedSnapshot {
+  lat: number;
+  lon: number;
+  heading_deg: number;
+  altitude_ft: number;
+  fuel_total_kg: number;
+  zfw_kg: number | null;
 }
 
 export interface AirportInfo {

@@ -4,6 +4,38 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.4.1] — 2026-05-05
+
+Real-Pilot-Workflow: was tun wenn der Sim mid-flight wegbricht?
+
+### 🆕 Neu: Sim-Disconnect-Handling
+
+Wenn der Streamer länger als 30 s keine brauchbaren Sim-Daten mehr bekommt (Sim-Crash, Quit, Window-Switch-Glitch), passiert jetzt:
+
+1. **Flug wird automatisch in den Pause-Status gesetzt** — keine Position-Updates mehr an phpVMS, kein Phase-FSM, kein Activity-Log-Spam
+2. **Die letzten bekannten Werte werden eingefroren** und sowohl im **Activity-Log** als auch in einem **gelben Banner im Cockpit-Tab** angezeigt:
+   - Latitude / Longitude
+   - Heading + Altitude
+   - Fuel on Board
+   - ZFW (Leergewicht)
+3. **Heartbeat läuft weiter** — phpVMS' Live-Tracking-Cron killt den PIREP NICHT während der Pause (sonst wäre nach 2 h Schluss)
+4. **„🔄 Flug wiederaufnehmen"-Button** im Banner — Pilot startet den Sim neu, lädt das Flugzeug an die richtige Position (oder bewusst andere — kein 5-NM-Restriction wie bei smartCARS), klickt den Button → Streamer macht weiter
+5. **KEIN Auto-Resume:** auch wenn der Sim plötzlich wieder Daten liefert wartet das Backend auf den manuellen Klick (sonst würden Mid-Air-Position-Sprünge wild ins PIREP gehen)
+6. **Reposition-Audit-Log:** beim Resume wird die Distanz zwischen alter und neuer Position berechnet. Bei großen Sprüngen (> 500 nm) als WARN-Level damit's für VA-Audits sichtbar ist
+7. **Distance-Reset bei Resume:** Reposition-Sprung fließt **nicht** in die geloggte Flugdistanz ein. PIREP `distance_nm` zeigt nur tatsächlich geflogene Distanz, der Reposition-Δ wird separat als Activity-Log-Zeile festgehalten
+
+Bewusst KEINE 5-NM/2000-ft-Restriktion wie bei smartCARS — der Pilot entscheidet wo er weitermacht, der Audit-Log macht's nachvollziehbar.
+
+### 🛠 Intern
+- Neuer Tauri-Command `flight_resume_after_disconnect` mit Δ-Distanz-Audit
+- `FlightStats` erweitert um `paused_since` + `paused_last_known: PausedSnapshot`
+- `ActiveFlightInfo` flow-through dieser Felder ans Frontend
+- Neue Cockpit-Component `<DisconnectBanner>` (i18n DE+EN)
+- Konstanten: `SIM_DISCONNECT_THRESHOLD_S=30`, `REPOSITION_WARN_DELTA_NM=500.0`
+- Tests: 76 grün
+
+---
+
 ## [v0.4.0] — 2026-05-05
 
 Erstes Minor-Release der 0.4er-Reihe. Hauptthema: **Discord-Integration**.

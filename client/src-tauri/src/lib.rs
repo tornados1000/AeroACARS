@@ -190,6 +190,24 @@ const DIVERT_NEAREST_SEARCH_RADIUS_NM: f64 = 50.0;
 /// (`acars_update_timer`); we match.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
+/// v0.4.1: nach wie vielen Sekunden ohne brauchbaren Sim-Snapshot
+/// wir den Flug als „pausiert" markieren (Sim-Crash, Quit, Timeout).
+/// 30 s ist ein guter Kompromiss: lang genug dass kurze FPS-Drops oder
+/// Pause-Menü-Ausflüge keinen False-Positive triggern, kurz genug dass
+/// der Pilot den Disconnect zeitnah mitkriegt und re-positionieren kann
+/// bevor phpVMS' Live-Tracking-Cron (default ~2h) den PIREP killt.
+const SIM_DISCONNECT_THRESHOLD_S: i64 = 30;
+
+/// v0.4.1: Repositions-Distanz (in NM) ab der wir den Resume-Eintrag
+/// mit WARN-Level statt INFO im Activity-Log loggen.
+///
+/// Schwelle absichtlich großzügig: 500 nm berücksichtigt legitime
+/// Pilot-Workflows wie „Sim kracht mid-Atlantik, ich will die letzten
+/// 4 h nicht nochmal fliegen, lade kurz vor Approach". Sub-500 nm ist
+/// gängig und harmlos; > 500 nm fällt im VA-Audit zu Recht auf
+/// (Teleport zur Destination, andere Welt-Hemisphäre, etc.).
+const REPOSITION_WARN_DELTA_NM: f64 = 500.0;
+
 /// How close (in nautical miles) the aircraft must be to the departure airport
 /// to start the flight. Generous enough to cover taxi positions and remote
 /// stands; tight enough to reject "I'm at EDDF instead of EDDP".
@@ -937,6 +955,19 @@ struct TouchdownProfilePoint {
 }
 
 
+/// v0.4.1: Snapshot der letzten bekannten Sim-Werte zum Zeitpunkt
+/// als der Streamer den Sim-Disconnect detektiert hat. Gezeigt im
+/// Cockpit-Banner + Activity-Log + bei Bedarf für Reposition.
+#[derive(Debug, Clone, serde::Serialize)]
+struct PausedSnapshot {
+    pub lat: f64,
+    pub lon: f64,
+    pub heading_deg: f32,
+    pub altitude_ft: f64,
+    pub fuel_total_kg: f32,
+    pub zfw_kg: Option<f32>,
+}
+
 #[derive(Default)]
 struct FlightStats {
     // Position tracking.
@@ -978,6 +1009,30 @@ struct FlightStats {
     /// correct `arr_airport_id`. None when we landed at the planned
     /// destination as expected.
     divert_hint: Option<DivertHint>,
+
+    /// v0.4.1: Sim-Disconnect-Pause-State.
+    ///
+    /// Wenn der Simulator mid-flight wegbricht (Crash, Quit, FPS auf 0,
+    /// SimConnect/UDP timeout) und mehr als `SIM_DISCONNECT_THRESHOLD_S`
+    /// Sekunden ohne brauchbaren Snapshot vergangen sind, friert der
+    /// Streamer den Flug ein und wartet auf manuellen Resume-Klick.
+    ///
+    /// Während Pause:
+    ///   * keine Position-Posts mehr an phpVMS (sonst Stale Data)
+    ///   * Heartbeat (`/update`) läuft weiter — sonst killt phpVMS' cron
+    ///     den PIREP nach `acars.live_time` (~2h)
+    ///   * Phase-FSM friert auf dem Stand vor Disconnect
+    ///   * Activity-Log + Discord-Webhook deaktiviert für die Dauer
+    ///
+    /// Beim Disconnect-Übergang loggen wir die letzte bekannte Position
+    /// (Lat/Lon/HDG/Alt/Fuel/ZFW) damit der Pilot weiß wohin er nach
+    /// dem Sim-Restart re-positionieren soll. Kein 5-NM-Restriction wie
+    /// bei smartCARS — der Pilot entscheidet wo er wieder einsteigt.
+    paused_since: Option<DateTime<Utc>>,
+    /// Snapshot der letzten Werte zum Pause-Zeitpunkt — wird in der UI
+    /// + Activity-Log angezeigt damit der Pilot weiß was er für die
+    /// Repositionierung braucht. None solange der Flug nicht pausiert.
+    paused_last_known: Option<PausedSnapshot>,
 
     /// True once the aircraft has actually been airborne above
     /// `WAS_AIRBORNE_AGL_FT` ft AGL since the flight started. Used to
@@ -1709,6 +1764,15 @@ pub struct ActiveFlightInfo {
     /// means the streamer hit a network failure recently and the
     /// dashboard should warn the pilot.
     queued_position_count: u32,
+    /// v0.4.1: ISO-8601 UTC timestamp wann der Streamer den Sim-
+    /// Disconnect detektiert und den Flug pausiert hat. None = Flug
+    /// läuft normal. Some(...) = Cockpit-Tab zeigt Resume-Banner.
+    paused_since: Option<String>,
+    /// v0.4.1: Snapshot der letzten bekannten Sim-Werte (LAT/LON/HDG/
+    /// ALT/Fuel/ZFW) vor dem Disconnect. Pilot nutzt das um sein
+    /// Flugzeug nach Sim-Restart wieder an die richtige Stelle zu
+    /// setzen. None solange nicht pausiert.
+    paused_last_known: Option<PausedSnapshot>,
     /// Divert hint when the FSM noticed the aircraft landed somewhere
     /// other than the planned `arr_airport`. The cockpit renders a
     /// banner ("you landed at LFBO, planned was LEBL — file as divert
@@ -3312,6 +3376,8 @@ fn flight_info(flight: &ActiveFlight) -> ActiveFlightInfo {
         last_position_at: stats.last_position_at.map(|t| t.to_rfc3339()),
         last_heartbeat_at: stats.last_heartbeat_at.map(|t| t.to_rfc3339()),
         queued_position_count: stats.queued_position_count,
+        paused_since: stats.paused_since.map(|t| t.to_rfc3339()),
+        paused_last_known: stats.paused_last_known.clone(),
         divert_hint: stats.divert_hint.clone(),
         touch_and_go_count: stats
             .touchdown_events
@@ -5445,6 +5511,116 @@ async fn flight_forget(
     Ok(())
 }
 
+/// v0.4.1: Pilot klickt „Flug wiederaufnehmen" nachdem der Sim wegbrach
+/// und neu positioniert wurde. Hebt den Pause-State in den FlightStats auf
+/// — der Streamer fängt im nächsten Tick wieder an Position-Posts an
+/// phpVMS zu schicken, der Phase-FSM nimmt die Verarbeitung auf den
+/// neuen Sim-Werten wieder auf.
+///
+/// Loggt eine Repositions-Audit-Zeile mit der Distanz zwischen letzter
+/// bekannter Position (vor Disconnect) und der aktuellen Sim-Position
+/// (nach Reposition). Bei großen Sprüngen (> REPOSITION_WARN_DELTA_NM)
+/// als WARN-Level damit's bei VA-Audits sichtbar bleibt.
+///
+/// Bewusst KEINE 5-NM/2000-ft-Restriktion wie bei smartCARS — der Pilot
+/// entscheidet wo er weitermacht, der Audit-Log macht's nachvollziehbar.
+#[tauri::command]
+async fn flight_resume_after_disconnect(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), UiError> {
+    let flight = state
+        .active_flight
+        .lock()
+        .expect("active_flight lock")
+        .as_ref()
+        .map(Arc::clone)
+        .ok_or_else(|| UiError::new("no_active_flight", "no flight is active"))?;
+
+    // Snapshot grab the pre-pause position before clearing state.
+    let prev_known = {
+        let stats = flight.stats.lock().expect("flight stats");
+        if stats.paused_since.is_none() {
+            return Err(UiError::new(
+                "not_paused",
+                "flight is not currently paused — nothing to resume",
+            ));
+        }
+        stats.paused_last_known.clone()
+    };
+
+    // Read the current sim snapshot (best-effort) for the delta calculation.
+    let current_snap = current_snapshot(&app);
+
+    // Clear pause state. Streamer will resume normal posting from next tick.
+    //
+    // **Wichtig:** `last_lat/last_lon` wird auf None gesetzt — das ist der
+    // Anker für die Distance-Akkumulation in `step_flight`. Ohne den Reset
+    // würde der nächste Tick die volle Reposition-Strecke (z.B. 800 nm
+    // wenn der Pilot zur Approach gesprungen ist) als geflogene Distanz
+    // ins `distance_nm` reinschieben. Der Pilot hätte dann einen PIREP
+    // mit künstlich aufgeblähter Distanz — das wäre auch dann „Cheating
+    // im PIREP" wenn der Pilot es nicht beabsichtigt.
+    //
+    // Mit None startet der nächste Tick mit einer frischen Distance-
+    // Baseline, der Reposition-Sprung fließt **nicht** in die geloggte
+    // Flugdistanz ein. Die Reposition-Distanz selbst wird separat in
+    // einer Activity-Log-Zeile festgehalten („▶ Flug wiederaufgenommen
+    // — Repositioniert X nm") und ist damit für VA-Audits nachvoll-
+    // ziehbar, ohne den PIREP-Distance-Counter zu verfälschen.
+    {
+        let mut stats = flight.stats.lock().expect("flight stats");
+        stats.paused_since = None;
+        stats.paused_last_known = None;
+        stats.last_lat = None;
+        stats.last_lon = None;
+    }
+    save_active_flight(&app, &flight);
+
+    // Build the resume audit log entry.
+    let delta_nm = match (&prev_known, &current_snap) {
+        (Some(prev), Some(cur)) => {
+            let d_m = ::geo::distance_m(prev.lat, prev.lon, cur.lat, cur.lon);
+            Some(d_m / 1852.0)
+        }
+        _ => None,
+    };
+
+    let (level, msg) = match delta_nm {
+        Some(d) if d >= REPOSITION_WARN_DELTA_NM => (
+            ActivityLevel::Warn,
+            format!(
+                "▶ Flug wiederaufgenommen — Repositioniert {:.1} nm (auffällig groß)",
+                d
+            ),
+        ),
+        Some(d) => (
+            ActivityLevel::Info,
+            format!("▶ Flug wiederaufgenommen — Repositioniert {:.1} nm", d),
+        ),
+        None => (
+            ActivityLevel::Info,
+            "▶ Flug wiederaufgenommen".to_string(),
+        ),
+    };
+    let detail = match (&prev_known, &current_snap) {
+        (Some(prev), Some(cur)) => Some(format!(
+            "Vorher: LAT {:.4}° · LON {:.4}° · ALT {:.0} ft\nJetzt:  LAT {:.4}° · LON {:.4}° · ALT {:.0} ft",
+            prev.lat, prev.lon, prev.altitude_ft,
+            cur.lat, cur.lon, cur.altitude_msl_ft,
+        )),
+        _ => None,
+    };
+    log_activity(&state, level, msg, detail);
+
+    tracing::info!(
+        pirep_id = %flight.pirep_id,
+        delta_nm = ?delta_nm,
+        "flight resumed after disconnect"
+    );
+    Ok(())
+}
+
 /// Spawn the background task that pushes the latest sim snapshot to phpVMS at
 /// `POSITION_INTERVAL_SECS`. Stops when `flight.stop` is set or the active
 /// flight is replaced.
@@ -5537,6 +5713,12 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
         // (5 s during takeoff/landing, 8 s on approach/final, 10 s on the
         // ground / climb / descent, 30 s in cruise — capped at 30 s so the
         // live map never goes more than half a minute stale).
+        // v0.4.1: track last good snapshot so we can detect Sim-Disconnect
+        // (kein Snapshot mehr für > SIM_DISCONNECT_THRESHOLD_S s) und den
+        // letzten bekannten Stand für Repositions-Anzeige im Cockpit-Banner
+        // einfrieren.
+        let mut last_good_snap: Option<SimSnapshot> = None;
+        let mut last_good_snap_at: Option<std::time::Instant> = None;
         loop {
             let current_phase = {
                 let stats = flight.stats.lock().expect("flight stats");
@@ -5548,10 +5730,92 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
             }
 
             let snapshot = current_snapshot(&app);
+            if let Some(ref s) = snapshot {
+                last_good_snap = Some(s.clone());
+                last_good_snap_at = Some(std::time::Instant::now());
+            }
+
+            // v0.4.1: paused state check — if we're paused, skip everything
+            // (kein Position-Post, kein Phase-FSM-Step, kein Activity-Log).
+            // Heartbeat unten läuft trotzdem damit phpVMS' Cron den PIREP
+            // nicht killt während der Pilot den Sim neu startet. **Kein**
+            // Auto-Resume — selbst wenn der Sim wieder Daten liefert, der
+            // Streamer wartet auf den Resume-Klick (Tauri-Command
+            // `flight_resume_after_disconnect`).
+            let is_paused = flight
+                .stats
+                .lock()
+                .expect("flight stats")
+                .paused_since
+                .is_some();
+            if is_paused {
+                // Heartbeat trotzdem feuern (siehe weiter unten — wir lassen
+                // den Heartbeat-Code-Pfad ungestört durchlaufen, müsste hier
+                // also eigentlich `continue` sein. Der Heartbeat fired
+                // unten am Schleifen-Ende, deshalb erstmal next-iteration.
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+
+            // Sim-Disconnect-Detection: hatten irgendwann mal Daten, aber
+            // der letzte gute Snapshot ist > THRESHOLD her → Pause auslösen.
+            let disconnect_detected = match (last_good_snap_at, snapshot.is_some()) {
+                (Some(t), false) => {
+                    t.elapsed() > Duration::from_secs(SIM_DISCONNECT_THRESHOLD_S as u64)
+                }
+                _ => false,
+            };
+            if disconnect_detected {
+                if let Some(ref last) = last_good_snap {
+                    let paused = PausedSnapshot {
+                        lat: last.lat,
+                        lon: last.lon,
+                        heading_deg: last.heading_deg_true,
+                        altitude_ft: last.altitude_msl_ft,
+                        fuel_total_kg: last.fuel_total_kg,
+                        zfw_kg: last.zfw_kg,
+                    };
+                    {
+                        let mut stats = flight.stats.lock().expect("flight stats");
+                        if stats.paused_since.is_none() {
+                            stats.paused_since = Some(Utc::now());
+                            stats.paused_last_known = Some(paused.clone());
+                        }
+                    }
+                    let detail = format!(
+                        "Letzte bekannte Position: LAT {:.4}° · LON {:.4}° · HDG {:.0}° · ALT {:.0} ft · Fuel {:.0} kg · ZFW {}",
+                        paused.lat,
+                        paused.lon,
+                        paused.heading_deg,
+                        paused.altitude_ft,
+                        paused.fuel_total_kg,
+                        paused
+                            .zfw_kg
+                            .map(|v| format!("{:.0} kg", v))
+                            .unwrap_or_else(|| "—".to_string())
+                    );
+                    log_activity_handle(
+                        &app,
+                        ActivityLevel::Warn,
+                        "⏸ Sim getrennt — Flug pausiert. Klicke „Flug wiederaufnehmen\" sobald du repositioniert hast.".to_string(),
+                        Some(detail),
+                    );
+                    save_active_flight(&app, &flight);
+                    tracing::warn!(
+                        pirep_id = %flight.pirep_id,
+                        "sim disconnect detected, flight paused"
+                    );
+                }
+                continue;
+            }
+
+            // Wenn weder pausiert noch frischer Snapshot da, einfach weiter
+            // warten — bis zum Threshold poll'n wir geduldig.
             let Some(snap) = snapshot else {
-                tracing::warn!(
+                tracing::debug!(
                     pirep_id = %flight.pirep_id,
-                    "no sim snapshot yet — skipping position post"
+                    "no sim snapshot yet — waiting (will pause after {}s)",
+                    SIM_DISCONNECT_THRESHOLD_S
                 );
                 continue;
             };
@@ -10668,6 +10932,7 @@ pub fn run() {
             phpvms_get_bids,
             fetch_simbrief_preview,
             flight_refresh_simbrief,
+            flight_resume_after_disconnect,
             phpvms_get_aircraft,
             auto_start_skip_status,
             phpvms_refresh_profile,

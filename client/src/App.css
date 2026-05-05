@@ -5500,3 +5500,91 @@ input:disabled {
   font-size: 0.85rem;
   color: var(--success, #2c8a3a);
 }
+
+/* ======================================================================
+ * v0.4.1: Sim-Disconnect-Pause-Banner (ActiveFlightPanel)
+ * ====================================================================== */
+
+.active-flight__paused-banner {
+  background: rgba(251, 191, 36, 0.08);
+  border: 2px solid rgba(251, 191, 36, 0.5);
+  border-radius: 10px;
+  padding: 1rem 1.2rem;
+  margin-bottom: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+}
+
+.active-flight__paused-header {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+}
+
+.active-flight__paused-header > div {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+
+.active-flight__paused-header strong {
+  font-size: 1.05rem;
+  color: #fbbf24;
+}
+
+.active-flight__paused-icon {
+  font-size: 1.8rem;
+  line-height: 1;
+}
+
+.active-flight__paused-since {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.active-flight__paused-instructions {
+  margin: 0;
+  font-size: 0.88rem;
+  color: var(--text);
+  line-height: 1.4;
+}
+
+.active-flight__paused-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 0.5rem 1rem;
+  background: rgba(0, 0, 0, 0.18);
+  padding: 0.7rem 0.9rem;
+  border-radius: 7px;
+}
+
+.active-flight__paused-grid > div {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.active-flight__paused-label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+
+.active-flight__paused-grid code {
+  font-size: 0.92rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.active-flight__paused-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.6rem;
+}
+
+.active-flight__paused-error {
+  margin: 0;
+  color: var(--danger, #d33);
+  font-size: 0.85rem;
+}

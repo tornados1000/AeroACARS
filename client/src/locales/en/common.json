@@ -629,6 +629,17 @@
     "refresh_ofp_busy": "Refreshing…",
     "refresh_ofp_hint": "Pull a fresh SimBrief OFP for the running flight — useful if you regenerated the OFP on simbrief.com after starting the flight.",
     "refresh_ofp_done": "Plan values refreshed from SimBrief. The loadsheet now compares against the new plan.",
+    "paused": {
+      "title": "Sim disconnected — flight paused",
+      "since": "since {{time}}",
+      "instructions": "The simulator hasn't sent data for more than 30 seconds. Restart the sim, load your aircraft at the position shown below (or a deliberately different one — your call), and restore fuel + ZFW. Then click \"Resume flight\". No position updates go to phpVMS in the meantime; the PIREP itself stays active.",
+      "position": "Position",
+      "heading_alt": "Heading & Altitude",
+      "fuel": "Fuel",
+      "zfw": "Empty weight (ZFW)",
+      "resume": "🔄 Resume flight",
+      "resuming": "Resuming …"
+    },
     "validation": {
       "title": "PIREP can't be filed yet",
       "intro": "The following required data is missing or implausible — filing now would store a broken flight on phpVMS:",

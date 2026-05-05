@@ -629,6 +629,17 @@
     "refresh_ofp_busy": "Aktualisiere…",
     "refresh_ofp_hint": "Den SimBrief-OFP für den laufenden Flug neu ziehen — nutzbar wenn du nach dem Flight-Start einen neuen OFP auf simbrief.com generiert hast.",
     "refresh_ofp_done": "Plan-Werte aus SimBrief aktualisiert. Loadsheet vergleicht jetzt gegen den neuen Plan.",
+    "paused": {
+      "title": "Sim getrennt — Flug pausiert",
+      "since": "seit {{time}} Uhr",
+      "instructions": "Der Simulator hat seit über 30 Sekunden keine Daten mehr geliefert. Starte den Sim neu, lade dein Flugzeug an die unten gezeigte Position (oder eine bewusst andere — du entscheidest), und setze Tankfüllung + ZFW wiederher. Klicke dann auf „Flug wiederaufnehmen“. Bis dahin werden keine Position-Updates an phpVMS geschickt; der PIREP bleibt aber aktiv.",
+      "position": "Position",
+      "heading_alt": "Heading & Altitude",
+      "fuel": "Treibstoff",
+      "zfw": "Leergewicht (ZFW)",
+      "resume": "🔄 Flug wiederaufnehmen",
+      "resuming": "Nehme auf …"
+    },
     "validation": {
       "title": "PIREP kann so nicht eingereicht werden",
       "intro": "Folgende Pflichtdaten fehlen oder sind unplausibel — phpVMS würde einen unbrauchbaren Flug speichern:",

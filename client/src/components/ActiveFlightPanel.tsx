@@ -187,6 +187,21 @@ export function ActiveFlightPanel({ info, simSnapshot, onEnded }: Props) {
   return (
     <section className="active-flight">
       {confirmDialog}
+      {/* v0.4.1: Sim-Disconnect-Pause-Banner. Sichtbar nur wenn der
+          Streamer einen Disconnect detektiert hat — sonst null.
+          Pilot sieht die letzten Sim-Werte zum Repositionieren und
+          klickt „Flug wiederaufnehmen" sobald er den Sim wieder
+          aufgesetzt hat. */}
+      {info.paused_since && info.paused_last_known && (
+        <DisconnectBanner
+          pausedSince={info.paused_since}
+          lastKnown={info.paused_last_known}
+          onResumed={() => {
+            // Trigger a status refresh by notifying the parent.
+            onEnded?.();
+          }}
+        />
+      )}
       <header className="active-flight__header">
         <div className="active-flight__title-block">
           <span className="active-flight__label">
@@ -320,5 +335,129 @@ export function ActiveFlightPanel({ info, simSnapshot, onEnded }: Props) {
         />
       )}
     </section>
+  );
+}
+
+// ===========================================================================
+// v0.4.1: Sim-Disconnect-Pause-Banner
+// ===========================================================================
+//
+// Wenn der Streamer im Backend `paused_since` setzt (Sim wegbrach >30 s),
+// rendert ActiveFlightPanel diese Component an oberster Stelle. Pilot
+// sieht die letzten bekannten Werte (LAT/LON/HDG/ALT/Fuel/ZFW), kann
+// damit das Flugzeug nach Sim-Restart auf die richtige Position setzen,
+// und klickt dann „Flug wiederaufnehmen" — der Streamer macht weiter.
+// Bewusst KEIN Auto-Resume — selbst wenn der Sim plötzlich wieder
+// Daten liefert, wartet das Backend auf den expliziten Klick (siehe
+// `flight_resume_after_disconnect` in lib.rs).
+
+interface DisconnectBannerProps {
+  pausedSince: string;
+  lastKnown: import("../types").PausedSnapshot;
+  onResumed: () => void;
+}
+
+function DisconnectBanner({
+  pausedSince,
+  lastKnown,
+  onResumed,
+}: DisconnectBannerProps) {
+  const { t } = useTranslation();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const pausedDate = new Date(pausedSince);
+  const pausedTime = `${pausedDate.getHours().toString().padStart(2, "0")}:${pausedDate.getMinutes().toString().padStart(2, "0")}`;
+
+  const fmtCoord = (val: number, isLat: boolean): string => {
+    const hemi = isLat ? (val >= 0 ? "N" : "S") : val >= 0 ? "E" : "W";
+    return `${Math.abs(val).toFixed(4)}° ${hemi}`;
+  };
+
+  async function handleResume() {
+    setBusy(true);
+    setError(null);
+    try {
+      await invoke("flight_resume_after_disconnect");
+      onResumed();
+    } catch (err: unknown) {
+      const msg =
+        typeof err === "object" && err !== null && "message" in err
+          ? String((err as { message: string }).message)
+          : String(err);
+      setError(msg);
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="active-flight__paused-banner" role="alert">
+      <div className="active-flight__paused-header">
+        <span className="active-flight__paused-icon">⏸</span>
+        <div>
+          <strong>{t("active_flight.paused.title")}</strong>
+          <span className="active-flight__paused-since">
+            {t("active_flight.paused.since", { time: pausedTime })}
+          </span>
+        </div>
+      </div>
+      <p className="active-flight__paused-instructions">
+        {t("active_flight.paused.instructions")}
+      </p>
+      <div className="active-flight__paused-grid">
+        <div>
+          <span className="active-flight__paused-label">
+            {t("active_flight.paused.position")}
+          </span>
+          <code>
+            {fmtCoord(lastKnown.lat, true)} · {fmtCoord(lastKnown.lon, false)}
+          </code>
+        </div>
+        <div>
+          <span className="active-flight__paused-label">
+            {t("active_flight.paused.heading_alt")}
+          </span>
+          <code>
+            HDG {Math.round(lastKnown.heading_deg)}° · ALT{" "}
+            {Math.round(lastKnown.altitude_ft).toLocaleString()} ft
+          </code>
+        </div>
+        <div>
+          <span className="active-flight__paused-label">
+            {t("active_flight.paused.fuel")}
+          </span>
+          <code>
+            {Math.round(lastKnown.fuel_total_kg).toLocaleString()} kg
+          </code>
+        </div>
+        <div>
+          <span className="active-flight__paused-label">
+            {t("active_flight.paused.zfw")}
+          </span>
+          <code>
+            {lastKnown.zfw_kg !== null
+              ? `${Math.round(lastKnown.zfw_kg).toLocaleString()} kg`
+              : "—"}
+          </code>
+        </div>
+      </div>
+      <div className="active-flight__paused-actions">
+        <button
+          type="button"
+          className="button button--primary"
+          onClick={() => void handleResume()}
+          disabled={busy}
+        >
+          {busy
+            ? t("active_flight.paused.resuming")
+            : t("active_flight.paused.resume")}
+        </button>
+      </div>
+      {error && (
+        <p className="active-flight__paused-error" role="alert">
+          {error}
+        </p>
+      )}
+    </div>
   );
 }
