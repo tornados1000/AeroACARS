@@ -116,13 +116,24 @@ pub const CATALOG: &[DatarefEntry] = &[
         field: FieldId::Longitude,
     },
     DatarefEntry {
-        // X-Plane reports MSL altitude in METERS via `elevation`.
-        // The misleading `_ft` in the FieldId is historic — we
-        // convert to feet at the snapshot boundary, alongside AGL.
-        // Live-bug 2026-05-03: pilot saw "HÖHE 5.554 ft / AGL
-        // 18.113 ft" at FL180 because we treated meters as feet
-        // (5554 m × 3.28084 = 18221 ft, ≈ AGL).
-        name: "sim/flightmodel/position/elevation",
+        // INDICATED altitude (the value the pilot reads off the
+        // altimeter / flies AP-ALT to). Already in feet, NO conversion
+        // needed at snapshot boundary.
+        //
+        // Why not `sim/flightmodel/position/elevation`?  That is TRUE
+        // MSL (geographic height above sea level), which differs from
+        // indicated altitude whenever the air mass is non-ISA (warmer
+        // than ISA → indicated reads lower than true → live bug
+        // 2026-05-05: pilot at FL390 mit OAT −46 °C sah AeroACARS
+        // 40,009 ft melden während das PFD korrekt 39,000 ft zeigte;
+        // Differenz 1.000 ft ist exakt die ISA-deviation × Faustformel
+        // 4 ft/°C × ~10 °C über ISA bei FL390).
+        //
+        // `altitude_ft_pilot` matches the cockpit altimeter exactly
+        // and converges with TRUE MSL on descent (where QNH ≈ STD ≈
+        // ambient). FieldId still says `_ft` — semantically correct
+        // now (used to lie about meters; see `value_setters`).
+        name: "sim/cockpit2/gauges/indicators/altitude_ft_pilot",
         field: FieldId::AltitudeMslFt,
     },
     DatarefEntry {
@@ -335,27 +346,33 @@ pub const CATALOG: &[DatarefEntry] = &[
         name: "sim/cockpit2/ice/ice_pitot_heat_on_pilot",
         field: FieldId::PitotHeat,
     },
-    // QNH (hPa) and ambient temp — both rewired 2026-05-03 after
-    // a live pilot bug report:
+    // QNH (hPa) and ambient temp — rewired several times after live
+    // bug reports:
     //
-    // Old QNH DataRef `sim/weather/region/altimeter_temperature_effect`
-    // is NOT pressure — it's a unitless temperature-correction
-    // factor for the cold-weather altimeter. We were storing that
-    // factor in `qnh_inhg` and multiplying by 33.86 → producing
-    // garbage (typical reading: ~1.0 → "33 hPa", way off).
+    // 2026-05-03: switched OAT from `temperatures_aloft_deg_c[0]`
+    // (= SURFACE temp, not aircraft altitude — pilot at FL180 sah
+    // "+22°C" während Cockpit-PFD korrekt SAT −18°C zeigte) to
+    // `cockpit2/temperature/outside_air_temp_degc` (aircraft-level
+    // ambient = SAT in modern X-Plane).
     //
-    // Old OAT DataRef `sim/weather/region/temperatures_aloft_deg_c[0]`
-    // is the SURFACE temperature (index 0 of the aloft array), not
-    // the temperature at aircraft altitude. Pilot at FL180 saw
-    // "+22°C" while the cockpit PFD correctly showed SAT −18°C.
-    //
-    // The cockpit2/temperature DataRef is the actual aircraft-level
-    // ambient (= SAT in modern X-Plane). The barometer_current_inhg
-    // DataRef is the standard altimeter reading the pilot would
-    // dial into the Kollsman window — same value across X-Plane 11
-    // and 12, no version branching needed.
+    // 2026-05-05: switched QNH from `barometer_current_inhg` to
+    // `altimeter_setting_in_hg_pilot`. The former is the AMBIENT
+    // air pressure at aircraft altitude (~5.85 inHg / 198 hPa at
+    // FL390), NOT what the pilot dials into the Kollsman window.
+    // Live bug: pilot at FL390 saw "QNH 198 hPa" — physically
+    // impossible at sea level, but exactly the static pressure at
+    // cruise altitude. The new DataRef is the actual altimeter-
+    // setting (1013.25 hPa with STD selected, ~29.92 inHg).
     DatarefEntry {
-        name: "sim/weather/barometer_current_inhg",
+        // BAROMETER, nicht altimeter — verwirrend benannt in X-Plane.
+        // Die "altimeter setting" heißt im DataRef-Namespace
+        // `barometer_setting_in_hg_*`. Quellen: FlyWithLua-Skripte,
+        // X-RAAS-Plugin, developer.x-plane.com referenzieren
+        // konsistent `barometer_setting_in_hg_alt_preselector` /
+        // `_pilot` / `_copilot`. Verifiziert 2026-05-05 vor Release —
+        // ein Tippfehler hier wäre stillschweigend tot (kein RREF
+        // mehr, QNH bleibt bei 0).
+        name: "sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pilot",
         field: FieldId::QnhInHg,
     },
     DatarefEntry {
@@ -512,8 +529,12 @@ impl XPlaneState {
         match entry.field {
             FieldId::Latitude => self.lat = value as f64,
             FieldId::Longitude => self.lon = value as f64,
-            FieldId::AltitudeMslFt => self.altitude_msl_m = value as f64, // misnamed: stored in m
-            FieldId::AltitudeAglFt => self.altitude_agl_m = value as f64, // misnamed: stored in m
+            // MSL: DataRef now delivers FEET (`altitude_ft_pilot`).
+            // We still store internally in meters to keep the
+            // snapshot conversion uniform with AGL — convert ft→m here.
+            // 0.3048 mirrors the M_PER_FT constant in `to_snapshot()`.
+            FieldId::AltitudeMslFt => self.altitude_msl_m = (value as f64) * 0.3048,
+            FieldId::AltitudeAglFt => self.altitude_agl_m = value as f64, // y_agl: native meters
             FieldId::HeadingDegTrue => self.heading_true_deg = value,
             FieldId::HeadingDegMagnetic => self.heading_magnetic_deg = value,
             FieldId::PitchDeg => self.pitch_deg = value,

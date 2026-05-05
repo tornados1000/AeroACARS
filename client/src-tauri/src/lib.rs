@@ -6966,21 +6966,19 @@ fn build_heartbeat_body(
             }
         })
         .map(|v| v.max(0));
-    // Suppress zero / "not yet meaningful" values rather than sending
-    // them as `Some(0)`. Reason: phpVMS's `Pirep::progress_percent`
-    // accessor uses PHP's `empty()` to detect missing distance and
-    // `empty(0)` is true — so a heartbeat with `distance: Some(0.0)`
-    // during boarding makes the live-map render the PIREP at 100 %
-    // progress (upper_bound and distance both fall through to 1 →
-    // 1/1 = 100 %). With None the field isn't sent at all and phpVMS
-    // keeps its existing value (null while pre-flight, real number
-    // once we've actually moved). Same logic for flight_time and
-    // level — until takeoff they're not real.
-    let distance = if stats.distance_nm > 0.5 {
-        Some(stats.distance_nm)
-    } else {
-        None
-    };
+    // phpVMS' `Pirep::progress_percent` uses PHP's `empty()` to gate
+    // the distance/upper_bound division. `empty(0)` AND `empty(null)`
+    // are BOTH true in PHP — so the v0.3.0 fix (send `None` when
+    // distance < 0.5 nm) never worked: phpVMS still saw null, fell
+    // back to upper_bound=1, computed 1/1 = 100 % progress, and
+    // showed "Geflogene Route: 100%" during Boarding. Live bug
+    // confirmed 2026-05-05 (pilot Michel D. on YBBN→NWWW).
+    //
+    // Fix: send a tiny non-zero floor (0.001 nm) until real distance
+    // accumulates. `empty(0.001)` is false → PHP runs the real
+    // division → 0.001 / planned_distance ≈ 0.00..% → displayed as
+    // 0 % during boarding, ramps up correctly once we move.
+    let distance = Some(stats.distance_nm.max(0.001));
     let flight_time_min = if flight_time_secs >= 60 {
         Some(flight_time_secs / 60)
     } else {
