@@ -78,6 +78,7 @@
     "weight_table": "Weight",
     "trip_burn": "Trip burn",
     "zfw": "ZFW",
+    "no_plan_hint": "No plan values available — no SimBrief OFP was loaded for this flight. On your next flight, watch the activity log for a \"SimBrief OFP fetched\" entry at start; if it's missing, the bid had no plan or the fetch failed silently.",
     "loadsheet_score": "Loadsheet score",
     "score_breakdown": "Score breakdown",
     "coach_title": "What to focus on next time",
@@ -195,6 +196,9 @@
     "empty_title": "No active flight",
     "empty_hint": "Head to Briefing to start a booked flight or adopt an in-progress PIREP.",
     "go_briefing": "Go to my flights",
+    "pirep_filed_title": "PIREP filed successfully",
+    "pirep_filed_detail": "{{callsign}} · {{dpt}} → {{arr}} — flight submitted to phpVMS. It's now in the Landing tab and on the phpVMS website.",
+    "pirep_filed_dismiss": "Dismiss",
     "loadsheet": {
       "title": "Live loadsheet",
       "label": "Loadsheet",

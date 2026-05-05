@@ -1325,6 +1325,18 @@ function LandingDetail({
             {t("landing.fuel")}
             <InfoBadge explanation={t("landing.info.fuel_section")} />
           </h3>
+          {/* v0.4.2: Hinweis wenn der Flug keinen SimBrief-OFP hatte —
+              dann sind alle SOLL-Spalten in den Tabellen unten leer.
+              Banner erklärt klar warum, statt nur ratlose Striche. */}
+          {record.planned_block_fuel_kg == null &&
+            record.planned_burn_kg == null &&
+            record.planned_tow_kg == null &&
+            record.planned_ldw_kg == null &&
+            record.planned_zfw_kg == null && (
+              <div className="landing-no-plan-hint" role="note">
+                ℹ️ {t("landing.no_plan_hint")}
+              </div>
+            )}
           {record.planned_burn_kg != null && record.actual_trip_burn_kg != null && (
             <FuelComparisonBar
               plan={record.planned_burn_kg}

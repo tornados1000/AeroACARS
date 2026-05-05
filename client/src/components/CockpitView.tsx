@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import type { ActiveFlightInfo, LoginResult, SimSnapshot } from "../types";
@@ -42,6 +42,21 @@ export function CockpitView({
   autoFile,
 }: Props) {
   const { t } = useTranslation();
+  // v0.4.2: Snapshot der gerade gefilten Flugdaten — wird beim
+  // onEnded-Callback gefüllt und nach 8 s automatisch wieder cleared.
+  // Banner zeigt Pilot eine prominente „PIREP eingereicht"-Bestätigung
+  // statt nur stillem Verschwinden des ActiveFlightPanel.
+  const [filedFlightInfo, setFiledFlightInfo] = useState<{
+    callsign: string;
+    dpt: string;
+    arr: string;
+    at: number;
+  } | null>(null);
+  useEffect(() => {
+    if (!filedFlightInfo) return;
+    const id = window.setTimeout(() => setFiledFlightInfo(null), 8000);
+    return () => window.clearTimeout(id);
+  }, [filedFlightInfo]);
 
   // Auto-file the PIREP once the FSM marks the flight as Arrived
   // (BlocksOn + 30 s + engines off + parking brake set). Most pilots
@@ -88,20 +103,48 @@ export function CockpitView({
 
   if (!activeFlight) {
     return (
-      <section className="cockpit-empty">
-        <div className="cockpit-empty__icon" aria-hidden="true">
-          ✈
-        </div>
-        <h2 className="cockpit-empty__title">{t("cockpit.empty_title")}</h2>
-        <p className="cockpit-empty__hint">{t("cockpit.empty_hint")}</p>
-        <button
-          type="button"
-          className="button button--primary"
-          onClick={onSwitchToBriefing}
-        >
-          {t("cockpit.go_briefing")}
-        </button>
-      </section>
+      <>
+        {/* v0.4.2: PIREP-Erfolgs-Banner. Bleibt 8 s sichtbar nach
+            erfolgreichem Filing, dann auto-dismiss. Pilot kann
+            sofort weiter arbeiten — Banner ist nicht-blockierend. */}
+        {filedFlightInfo && (
+          <div className="cockpit-pirep-success" role="status">
+            <div className="cockpit-pirep-success__icon">✅</div>
+            <div className="cockpit-pirep-success__text">
+              <strong>{t("cockpit.pirep_filed_title")}</strong>
+              <span>
+                {t("cockpit.pirep_filed_detail", {
+                  callsign: filedFlightInfo.callsign,
+                  dpt: filedFlightInfo.dpt,
+                  arr: filedFlightInfo.arr,
+                })}
+              </span>
+            </div>
+            <button
+              type="button"
+              className="cockpit-pirep-success__close"
+              onClick={() => setFiledFlightInfo(null)}
+              aria-label={t("cockpit.pirep_filed_dismiss")}
+            >
+              ✕
+            </button>
+          </div>
+        )}
+        <section className="cockpit-empty">
+          <div className="cockpit-empty__icon" aria-hidden="true">
+            ✈
+          </div>
+          <h2 className="cockpit-empty__title">{t("cockpit.empty_title")}</h2>
+          <p className="cockpit-empty__hint">{t("cockpit.empty_hint")}</p>
+          <button
+            type="button"
+            className="button button--primary"
+            onClick={onSwitchToBriefing}
+          >
+            {t("cockpit.go_briefing")}
+          </button>
+        </section>
+      </>
     );
   }
 
@@ -124,7 +167,21 @@ export function CockpitView({
         <ActiveFlightPanel
           info={activeFlight}
           simSnapshot={simSnapshot}
-          onEnded={() => setActiveFlight(null)}
+          onEnded={() => {
+            // v0.4.2: Snapshot der gerade abgeschlossenen Flugdaten
+            // an den Banner unten hochreichen — der Pilot soll eine
+            // prominente Bestätigung sehen, nicht nur ein stilles
+            // Verschwinden des ActiveFlightPanels.
+            setFiledFlightInfo({
+              callsign: activeFlight.airline_icao
+                ? `${activeFlight.airline_icao} ${activeFlight.flight_number}`
+                : activeFlight.flight_number,
+              dpt: activeFlight.dpt_airport,
+              arr: activeFlight.arr_airport,
+              at: Date.now(),
+            });
+            setActiveFlight(null);
+          }}
         />
       )}
 

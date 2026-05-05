@@ -4,6 +4,28 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.4.2] — 2026-05-05
+
+UX-Polish nach Pilot-Feedback heute Abend.
+
+### 🆕 Neu
+- **PIREP-Erfolgs-Banner** im Cockpit-Tab nach erfolgreichem File. Grüner Banner mit Callsign + Route bleibt 8 s sichtbar, manuell schließbar via X. Vorher verschwand das ActiveFlightPanel still — Pilot wusste nicht ob's wirklich gefilt wurde oder hängengeblieben ist.
+- **Hint-Banner im Landung-Tab** wenn keine SimBrief-Plan-Werte vorhanden sind (alle SOLL-Spalten leer wären). Erklärt warum statt nur stille Striche.
+- **SimBrief-OFP-Status im Activity-Log** beim Flight-Start. Vorher: Fetch-Fehler nur in Tracing-Logs (unsichtbar für Pilot). Jetzt drei Activity-Log-Einträge je nach Outcome:
+  - ✅ „SimBrief OFP geladen" mit Plan-Block / Trip / TOW
+  - ⚠️ „SimBrief-OFP konnte nicht geladen werden" mit OFP-ID + Erklärung
+  - ⚠️ „SimBrief-OFP-Fetch fehlgeschlagen" mit Error-Detail
+  - ℹ️ „Kein SimBrief-OFP für diesen Flug" wenn der Bid gar keinen hatte
+
+So sehen Piloten beim nächsten Mal sofort wenn der OFP-Fetch silently scheitert (was zum heutigen „Landung-Tab hat keine SOLL-Werte"-Bug geführt hat).
+
+### 🛠 Intern
+- Neue UI-Component für PIREP-Success-Banner in `CockpitView.tsx` mit 8s Auto-Dismiss + Manual-Close
+- i18n DE+EN für alle neuen Texte
+- Tests: 76 grün
+
+---
+
 ## [v0.4.1] — 2026-05-05
 
 Real-Pilot-Workflow: was tun wenn der Sim mid-flight wegbricht?

@@ -78,6 +78,7 @@
     "weight_table": "Gewicht",
     "trip_burn": "Trip Burn",
     "zfw": "ZFW",
+    "no_plan_hint": "Keine SOLL-Werte verfügbar — für diesen Flug wurde kein SimBrief-OFP geladen. Achte beim nächsten Flug auf den Activity-Log-Eintrag „SimBrief OFP geladen“ beim Start; fehlt der, hatte der Bid keinen Plan oder der Fetch schlug fehl.",
     "loadsheet_score": "Loadsheet-Bewertung",
     "score_breakdown": "Score-Aufschlüsselung",
     "coach_title": "Worauf du beim nächsten Anflug achten kannst",
@@ -195,6 +196,9 @@
     "empty_title": "Kein aktiver Flug",
     "empty_hint": "Wechseln Sie ins Briefing, um einen gebuchten Flug zu starten oder einen offenen PIREP zu adoptieren.",
     "go_briefing": "Zu meinen Flügen",
+    "pirep_filed_title": "PIREP erfolgreich eingereicht",
+    "pirep_filed_detail": "{{callsign}} · {{dpt}} → {{arr}} — Flug wurde an phpVMS übermittelt. Du findest ihn jetzt im Landung-Tab und auf der phpVMS-Webseite.",
+    "pirep_filed_dismiss": "Schließen",
     "loadsheet": {
       "title": "Loadsheet Live",
       "label": "Loadsheet",

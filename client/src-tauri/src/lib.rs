@@ -4042,8 +4042,13 @@ async fn flight_start(
     // The bid carries a SimBrief id when the pilot has prepared an OFP.
     // We fetch the OFP XML now (best-effort, never blocks the flight) so
     // the PIREP can compare actual fuel burn against the dispatcher's
-    // plan. Fetch errors are logged and ignored — a missing plan just
-    // means no fuel-efficiency line in the PIREP.
+    // plan.
+    //
+    // v0.4.2: Fetch-Fehler werden zusätzlich ins Activity-Log geschrieben
+    // (vorher nur Tracing-Log → unsichtbar für Pilot). Pilot-Report von
+    // heute: Flug hatte OFP, aber Landung-Tab zeigte trotzdem keine SOLL-
+    // Werte → Fetch war silently fehlgeschlagen, niemand merkte was. Mit
+    // Activity-Log-Eintrag sieht der Pilot's beim nächsten Mal sofort.
     let planned_ofp = if let Some(sb) = bid.flight.simbrief.as_ref() {
         match client.fetch_simbrief_ofp(&sb.id).await {
             Ok(Some(ofp)) => {
@@ -4054,18 +4059,56 @@ async fn flight_start(
                     plan_tow_kg = ofp.planned_tow_kg,
                     "SimBrief OFP fetched"
                 );
+                log_activity(
+                    &state,
+                    ActivityLevel::Info,
+                    "SimBrief OFP geladen".to_string(),
+                    Some(format!(
+                        "Plan-Block {:.0} kg · Trip {:.0} kg · TOW {:.0} kg",
+                        ofp.planned_block_fuel_kg,
+                        ofp.planned_burn_kg,
+                        ofp.planned_tow_kg
+                    )),
+                );
                 Some(ofp)
             }
             Ok(None) => {
                 tracing::warn!(sb_id = %sb.id, "SimBrief OFP fetch returned no usable data");
+                log_activity(
+                    &state,
+                    ActivityLevel::Warn,
+                    "SimBrief-OFP konnte nicht geladen werden".to_string(),
+                    Some(format!(
+                        "OFP-ID {} liefert keine brauchbaren Daten — Landung-Tab zeigt deshalb keine SOLL-Werte. Bitte einen frischen OFP auf simbrief.com erstellen.",
+                        sb.id
+                    )),
+                );
                 None
             }
             Err(e) => {
                 tracing::warn!(sb_id = %sb.id, error = %e, "SimBrief OFP fetch failed");
+                log_activity(
+                    &state,
+                    ActivityLevel::Warn,
+                    "SimBrief-OFP-Fetch fehlgeschlagen".to_string(),
+                    Some(format!(
+                        "OFP-ID {} konnte nicht geladen werden ({}). Landung-Tab zeigt deshalb keine SOLL-Werte. Probier später nochmal Refresh in My-Flights, oder generier einen neuen OFP.",
+                        sb.id, e
+                    )),
+                );
                 None
             }
         }
     } else {
+        // Bid hatte überhaupt keine SimBrief-Verbindung — kein Fehler,
+        // aber wir sagen es dem Piloten damit er weiß warum keine
+        // SOLL-Werte kommen.
+        log_activity(
+            &state,
+            ActivityLevel::Info,
+            "Kein SimBrief-OFP für diesen Flug".to_string(),
+            Some("Der Bid hat keinen SimBrief-OFP gelinkt. Du kannst trotzdem fliegen — der Landung-Tab zeigt dann nur die IST-Werte ohne SOLL/Δ-Vergleich.".to_string()),
+        );
         None
     };
 

@@ -5588,3 +5588,78 @@ input:disabled {
   color: var(--danger, #d33);
   font-size: 0.85rem;
 }
+
+/* v0.4.2: Hint im Landung-Tab wenn keine SOLL-Werte verfügbar
+ * (kein SimBrief-OFP für den Flug). Blauer Info-Banner statt nur
+ * stille leere Tabellen-Zellen. */
+.landing-no-plan-hint {
+  background: rgba(59, 130, 246, 0.08);
+  border: 1px solid rgba(59, 130, 246, 0.35);
+  border-radius: 7px;
+  padding: 0.7rem 0.95rem;
+  margin: 0.5rem 0 1rem;
+  font-size: 0.88rem;
+  color: var(--text);
+  line-height: 1.4;
+}
+
+/* v0.4.2: PIREP-Erfolgs-Banner (CockpitView). 8s sichtbar nach
+ * erfolgreichem File, dann auto-dismiss. Manuell schließbar via X. */
+.cockpit-pirep-success {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  background: rgba(34, 197, 94, 0.1);
+  border: 1.5px solid rgba(34, 197, 94, 0.5);
+  border-radius: 10px;
+  padding: 0.85rem 1.1rem;
+  margin-bottom: 1rem;
+  animation: cockpit-pirep-success-in 220ms ease-out;
+}
+
+@keyframes cockpit-pirep-success-in {
+  from { opacity: 0; transform: translateY(-6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.cockpit-pirep-success__icon {
+  font-size: 1.6rem;
+  line-height: 1;
+}
+
+.cockpit-pirep-success__text {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.cockpit-pirep-success__text strong {
+  color: #22c55e;
+  font-size: 1rem;
+}
+
+.cockpit-pirep-success__text span {
+  font-size: 0.86rem;
+  color: var(--text);
+}
+
+.cockpit-pirep-success__close {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 0.78rem;
+  transition: border-color 100ms, color 100ms;
+}
+
+.cockpit-pirep-success__close:hover {
+  border-color: var(--text);
+  color: var(--text);
+}
