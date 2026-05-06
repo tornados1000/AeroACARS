@@ -10127,10 +10127,22 @@ fn xplane_inspector_list(state: tauri::State<'_, AppState>) -> Vec<serde_json::V
 /// Best-effort detection of the X-Plane install path. Returns the
 /// absolute path as a string when found, or `null` when nothing
 /// plausible exists — UI then falls back to a folder picker.
+///
+/// MUST be async + `spawn_blocking`: the Windows path runs
+/// `reg.exe query` (sub-process spawn ~200-800ms cold-start) plus
+/// up to 4 filesystem `is_dir` probes. Doing that on a sync
+/// `#[tauri::command]` blocks the Tauri IPC bandwidth and freezes
+/// the Settings panel during its first paint (v0.5.0 release-day
+/// regression — pilot reported jerky scrolling + language-switcher
+/// hang while the registry probe was running).
 #[tauri::command]
-fn xplane_detect_install_path() -> Option<String> {
-    xplane_plugin_install::detect_install_path()
-        .map(|p| p.to_string_lossy().into_owned())
+async fn xplane_detect_install_path() -> Option<String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        xplane_plugin_install::detect_install_path()
+            .map(|p| p.to_string_lossy().into_owned())
+    })
+    .await
+    .unwrap_or(None)
 }
 
 /// Download the matching plugin zip from this AeroACARS version's
@@ -10147,11 +10159,17 @@ async fn xplane_install_plugin(
 }
 
 /// Remove the plugin folder from the given X-Plane install. No-op
-/// when no plugin folder exists.
+/// when no plugin folder exists. Async + `spawn_blocking` so a slow
+/// `remove_dir_all` (Windows Defender scanning, network drives, etc.)
+/// can't stall IPC.
 #[tauri::command]
-fn xplane_uninstall_plugin(install_dir: String) -> Result<(), String> {
+async fn xplane_uninstall_plugin(install_dir: String) -> Result<(), String> {
     let path = std::path::PathBuf::from(install_dir);
-    xplane_plugin_install::uninstall_plugin(&path)
+    tauri::async_runtime::spawn_blocking(move || {
+        xplane_plugin_install::uninstall_plugin(&path)
+    })
+    .await
+    .map_err(|e| format!("worker thread panicked: {e}"))?
 }
 
 /// Status of the optional AeroACARS X-Plane Plugin (v0.5.0+

@@ -4,6 +4,24 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.5.1] — 2026-05-06
+
+🩹 **Hotfix für v0.5.0-Regression — Settings-Tab hängt beim ersten Öffnen.**
+
+Pilot-Feedback nach v0.5.0-Install: „Einstellungsseite ist hakelig beim Scrollen, Sprache konnte erst nicht verstellt werden." Klassischer Synchronization-Bug — der neue X-Plane-Premium-Panel rief auf seinem ersten Render einen synchronen Tauri-Command (`xplane_detect_install_path`) auf, der intern `reg.exe query` als Subprocess startete. Auf dem Main-Thread = blockiert den ganzen IPC-Kanal für ~200-800 ms, während dem **kein einziger anderer Command** durchkommt — daher Sprachwechsel-Hang + Scroll-Lag.
+
+### 🐛 Behoben
+
+- **`xplane_detect_install_path` ist jetzt async + `spawn_blocking`** — der `reg.exe`-Query läuft auf einem Worker-Thread, IPC bleibt frei, Settings-Panel reagiert sofort.
+- **`xplane_uninstall_plugin` ebenfalls async** — beugt potenziellem Stall bei langsamen `remove_dir_all` (Windows Defender, Netzlaufwerke) vor.
+
+### 🛠 Intern
+
+- Selbe Pattern wie `detect_running_sim` (das schon seit v0.3.0 async ist).
+- Tests: 82 grün (unverändert).
+
+---
+
 ## [v0.5.0] — 2026-05-06
 
 🚀 **„X-Plane Premium" — Frame-genaue Touchdown-Erfassung via nativem Plugin.**
