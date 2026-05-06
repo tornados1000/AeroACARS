@@ -6816,20 +6816,31 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                 stats.cruise_peak_msl = Some(snap.altitude_msl_ft as f32);
             }
 
-            // Cruise → Descent only when BOTH conditions hold:
-            //   * Sustained sink rate (< −500 fpm — filters
-            //     turbulence and autopilot trim noise)
-            //   * Lost > 5000 ft from the cruise peak (a real TOD
-            //     drops you many thousand feet; an ATC step-down
-            //     FL380 → FL360 is only 2000 ft and stays in Cruise)
+            // Cruise → Descent triggers when sustained sink (-500 fpm,
+            // filters trim/turbulence noise) is observed AND one of:
             //
-            // Step-climbs and short step-downs are *not* phase
-            // changes — they're routine cruise activity. Flipping
-            // back to Climb / forward to Descent for every new
-            // assigned level would ping-pong the timeline.
+            //   (a) Lost > 5000 ft from the cruise peak — typical
+            //       airline TOD. ATC step-downs (FL380 → FL360 = 2000 ft)
+            //       stay in Cruise and don't ping-pong the timeline.
+            //
+            //   (b) AGL < 3000 ft — low-altitude pattern / GA flight.
+            //       v0.5.4 hotfix: pilot reported a short MWCR → MWCR
+            //       test at 5000-ft pattern altitude that never left
+            //       Cruise. The FSM expected a 5000-ft drop from the
+            //       cruise peak, but the cruise peak was barely above
+            //       5000 ft AGL, so the drop maxed out at 4973 ft —
+            //       just below threshold. Universal Arrived fallback
+            //       then jumped straight Cruise → Arrived, skipping
+            //       Final → Landing entirely (= no touchdown captured).
+            //       AGL < 3000 ft + sinking is unambiguous approach
+            //       territory regardless of cruise altitude; allow
+            //       the transition.
             let lost_alt =
                 stats.cruise_peak_msl.unwrap_or(0.0) - snap.altitude_msl_ft as f32;
-            if snap.vertical_speed_fpm < -500.0 && lost_alt > 5000.0 {
+            let sinking = snap.vertical_speed_fpm < -500.0;
+            let big_drop = lost_alt > 5000.0;
+            let close_to_ground = snap.altitude_agl_ft < 3000.0;
+            if sinking && (big_drop || close_to_ground) {
                 next_phase = FlightPhase::Descent;
             }
         }
@@ -7579,8 +7590,49 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                     // way the analyzer expects. If we never recorded
                     // landing_at, stamp it now so the file body has a
                     // sensible flight_time.
+                    //
+                    // v0.5.4 enhancement: prefer the sampler's actual
+                    // touchdown timestamp + VS / G if it captured the
+                    // edge. The sampler runs at 50 Hz independently of
+                    // the FSM, so even when we skipped Final → Landing
+                    // (e.g. the v0.5.3 low-altitude-cruise FSM bug),
+                    // the touchdown moment is still recorded in
+                    // `stats.sampler_touchdown_*`. Without this
+                    // rescue path the file_body would have null VS
+                    // and a `now`-anchored landing_at, losing the
+                    // landing-rate data entirely.
                     if stats.landing_at.is_none() && stats.takeoff_at.is_some() {
-                        stats.landing_at = Some(now);
+                        if let Some(sampler_at) = stats.sampler_touchdown_at {
+                            stats.landing_at = Some(sampler_at);
+                            // Also copy VS / G / rate so the LandingRecord
+                            // has real touchdown values, not nulls. Without
+                            // these, the dashboard shows "0 fpm / no rating"
+                            // for any flight that bypassed Final → Landing.
+                            if let Some(vs) = stats.sampler_touchdown_vs_fpm {
+                                if stats.landing_rate_fpm.is_none() {
+                                    stats.landing_rate_fpm = Some(vs);
+                                }
+                                if stats.landing_peak_vs_fpm.is_none() {
+                                    stats.landing_peak_vs_fpm = Some(vs);
+                                }
+                            }
+                            if let Some(g) = stats.sampler_touchdown_g_force {
+                                if stats.landing_g_force.is_none() {
+                                    stats.landing_g_force = Some(g);
+                                }
+                                if stats.landing_peak_g_force.is_none() {
+                                    stats.landing_peak_g_force = Some(g);
+                                }
+                            }
+                            tracing::info!(
+                                "Arrived fallback rescued touchdown from sampler: \
+                                 vs={:?} g={:?}",
+                                stats.sampler_touchdown_vs_fpm,
+                                stats.sampler_touchdown_g_force
+                            );
+                        } else {
+                            stats.landing_at = Some(now);
+                        }
                     }
                     if let Some(hint) = detected_hint {
                         stats.divert_hint = Some(hint);
