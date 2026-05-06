@@ -131,6 +131,9 @@ elseif(APPLE)
     set_target_properties(AeroACARS PROPERTIES
         # Universal binary — both Apple Silicon and Intel.
         OSX_ARCHITECTURES "x86_64;arm64"
+        # CMake auto-prepends "lib" to MODULE libs on Unix; X-Plane
+        # expects exactly `mac.xpl` (no prefix).
+        PREFIX ""
         SUFFIX ".xpl"
         OUTPUT_NAME "mac"
         # Plugin doesn't go in an .app bundle, RPATH is irrelevant.
@@ -150,6 +153,9 @@ elseif(UNIX)
     # we don't link any, so this is fine. We deliberately do NOT pass
     # `-Wl,--no-undefined` (which would error on every XPLM* call).
     set_target_properties(AeroACARS PROPERTIES
+        # CMake auto-prepends "lib" to MODULE libs on Unix; X-Plane
+        # expects exactly `lin.xpl` (no prefix).
+        PREFIX ""
         SUFFIX ".xpl"
         OUTPUT_NAME "lin"
     )
