@@ -71,12 +71,132 @@ jobs:
           includeUpdaterJson: true
           args: ${{ matrix.args }}
 
+  # ---- X-Plane Premium Plugin: per-platform build ----
+  # Builds the optional native X-Plane plugin on each platform. Produces
+  # one `.xpl` per OS:
+  #   Windows  → win.xpl  (MSVC, x86_64)
+  #   macOS    → mac.xpl  (Clang, universal x86_64+arm64)
+  #   Linux    → lin.xpl  (GCC, x86_64)
+  # The artifacts are uploaded individually so the `plugin-package`
+  # job can stitch them into the X-Plane fat-folder layout and ship
+  # one combined `.zip` to pilots.
+  plugin-build:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            generator: 'Visual Studio 17 2022'
+            cmake_args: '-A x64'
+            xpl_name: 'win.xpl'
+            os_label: 'Windows x64'
+          - platform: macos-latest
+            generator: 'Unix Makefiles'
+            # Semicolon in CMake list arg must be inside double-quotes
+            # so bash doesn't split it as a command separator.
+            cmake_args: '-DCMAKE_BUILD_TYPE=Release "-DCMAKE_OSX_ARCHITECTURES=x86_64;arm64"'
+            xpl_name: 'mac.xpl'
+            os_label: 'macOS universal'
+          - platform: ubuntu-latest
+            generator: 'Unix Makefiles'
+            cmake_args: '-DCMAKE_BUILD_TYPE=Release'
+            xpl_name: 'lin.xpl'
+            os_label: 'Linux x64'
+
+    runs-on: ${{ matrix.platform }}
+    name: Plugin — ${{ matrix.os_label }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Configure CMake
+        working-directory: xplane-plugin
+        shell: bash
+        run: |
+          cmake -B build -G "${{ matrix.generator }}" ${{ matrix.cmake_args }}
+
+      - name: Build plugin (Release)
+        working-directory: xplane-plugin
+        shell: bash
+        run: |
+          cmake --build build --config Release --target AeroACARS
+
+      - name: List build output (debug)
+        working-directory: xplane-plugin
+        shell: bash
+        run: |
+          ls -la build/AeroACARS/64/
+
+      - name: Upload .xpl artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xplane-plugin-${{ matrix.xpl_name }}
+          path: xplane-plugin/build/AeroACARS/64/${{ matrix.xpl_name }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---- X-Plane Premium Plugin: package + upload to release ----
+  # Downloads all three .xpl artifacts, assembles the X-Plane fat-
+  # plugin folder layout, and uploads `AeroACARS-XPlane-Plugin-vX.zip`
+  # to the GitHub draft release. Pilots can drop that zip straight
+  # into <X-Plane>/Resources/plugins/.
+  plugin-package:
+    needs: [plugin-build, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download Windows .xpl
+        uses: actions/download-artifact@v4
+        with:
+          name: xplane-plugin-win.xpl
+          path: pkg/AeroACARS/64
+
+      - name: Download macOS .xpl
+        uses: actions/download-artifact@v4
+        with:
+          name: xplane-plugin-mac.xpl
+          path: pkg/AeroACARS/64
+
+      - name: Download Linux .xpl
+        uses: actions/download-artifact@v4
+        with:
+          name: xplane-plugin-lin.xpl
+          path: pkg/AeroACARS/64
+
+      - name: Stage attribution + readme
+        run: |
+          cp xplane-plugin/README.md pkg/AeroACARS/README.md
+          cp xplane-plugin/third_party/XPSDK430/license.txt pkg/AeroACARS/XPLM_SDK_LICENSE.txt
+
+      - name: Show staged folder
+        run: |
+          find pkg -type f -printf '%p (%s bytes)\n'
+
+      - name: Zip plugin folder
+        working-directory: pkg
+        run: |
+          zip -r ../AeroACARS-XPlane-Plugin-${{ github.ref_name }}.zip AeroACARS
+
+      - name: Upload zip to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.ref_name }}" \
+            "AeroACARS-XPlane-Plugin-${{ github.ref_name }}.zip" \
+            --clobber
+
   # ---- Finalise the release ----
-  # Once both per-platform builds finish, flip the draft release to
-  # public. `tauri-action` already merged the `latest.json` for both
-  # platforms thanks to `includeUpdaterJson: true`.
+  # Once the per-platform installer builds AND the plugin packaging
+  # finish, flip the draft release to public. `tauri-action` already
+  # merged the `latest.json` for both platforms thanks to
+  # `includeUpdaterJson: true`.
   publish:
-    needs: build
+    needs: [build, plugin-package]
     runs-on: ubuntu-latest
     permissions:
       contents: write

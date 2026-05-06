@@ -5,6 +5,7 @@ import type { ActiveFlightInfo, SimKind, SimStatus } from "../types";
 import type { Theme } from "../theme";
 import { SimDebugPanel } from "./SimDebugPanel";
 import { PmdgPremiumPanel } from "./PmdgPremiumPanel";
+import { XPlanePremiumPanel } from "./XPlanePremiumPanel";
 import { useConfirm } from "./ConfirmDialog";
 
 const ALL_KINDS: SimKind[] = [
@@ -238,6 +239,9 @@ export function SettingsPanel({
             <PmdgPremiumPanel
               simState={simStatus?.state ?? "disconnected"}
               simSnapshot={simStatus?.snapshot ?? null}
+            />
+            <XPlanePremiumPanel
+              simState={simStatus?.state ?? "disconnected"}
             />
           </div>
         )}

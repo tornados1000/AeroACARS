@@ -30,6 +30,7 @@ const WEBHOOK_URL: &str = "https://discord.com/api/webhooks/1501257121235468418/
 /// discord.com/developers als „AeroACARS / German Sky Group". Wird
 /// im Discord-Client als App-Name angezeigt neben dem RP-Status.
 /// Bei Fork: eigene App registrieren und ID hier austauschen.
+#[allow(dead_code)] // Wiring in den Streamer kommt in v0.4.5
 const RICH_PRESENCE_APP_ID: &str = "1340818636616634489";
 
 /// Welcher Lifecycle-Event Discord posten soll. Mapped 1:1 auf einen
@@ -487,6 +488,7 @@ pub async fn post_event(kind: EventKind, ctx: EventContext) {
 /// Tuple weil das Mapping-Verhalten je nach Phase unterschiedlich
 /// ist (z.B. Cruise zeigt FL, Boarding zeigt's nicht).
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Wiring in den Streamer kommt in v0.4.5
 pub enum PresenceState {
     /// Kein aktiver Flug — Pilot scrollt durch Bids o.ä.
     Idle,
@@ -509,6 +511,11 @@ pub enum PresenceState {
 ///
 /// Der Service ist optional — fehlt Discord oder schlägt der Connect
 /// fehl, loggen wir warn und gehen weiter. Niemals fatal.
+///
+/// **WIP-Status (v0.4.0+):** Foundation gebaut, Wiring in den Streamer
+/// kommt in v0.4.5. `#[allow(dead_code)]` damit der vorbereitete
+/// Code keine Warnings im Build wirft bis er dann live geht.
+#[allow(dead_code)]
 pub struct RichPresenceService {
     /// `None` wenn Discord nicht erreichbar ist (nicht installiert,
     /// nicht laufend, IPC-Pipe noch nicht offen). `Some` sobald die
@@ -518,6 +525,7 @@ pub struct RichPresenceService {
     client: Mutex<Option<DiscordIpcClient>>,
 }
 
+#[allow(dead_code)] // Wiring in den Streamer kommt in v0.4.5
 impl RichPresenceService {
     pub fn new() -> Self {
         Self {
@@ -591,6 +599,7 @@ impl Default for RichPresenceService {
 ///
 /// Wir nutzen `details` für die wichtigste Info (Callsign + Route)
 /// und `state` für Phase + zusätzliche Details (FL, Aircraft).
+#[allow(dead_code)] // Wiring kommt in v0.4.5
 fn build_activity(state: &PresenceState) -> Activity<'_> {
     match state {
         PresenceState::Idle => Activity::new()
@@ -644,6 +653,7 @@ fn build_activity(state: &PresenceState) -> Activity<'_> {
 /// Bytes, im Schnitt 1 Update pro Phase-Change → über einen ganzen
 /// Flug ~10 Updates × 100 Bytes = 1 KB total. Wer 1000 Flüge in einer
 /// Session macht ohne den Client neu zu starten, leakt 1 MB — okay.
+#[allow(dead_code)] // Wiring kommt in v0.4.5
 fn string_leak(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())
 }

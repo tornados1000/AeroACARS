@@ -14,7 +14,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.4.3"
+version = "0.5.0"
 edition = "2021"
 license = "MIT"
 authors = ["Thomas Kant <github@MANFahrer-GF>", "AeroACARS contributors"]
@@ -127,6 +127,13 @@ discord-rich-presence.workspace = true
 # Bundled CSV parser for the embedded ourairports runway table
 # (used by `src/runway.rs` to map a touchdown coord → runway).
 csv = "1.3"
+
+# In-process zip extraction for the X-Plane plugin auto-install
+# flow — pulls `AeroACARS-XPlane-Plugin-vX.Y.Z.zip` from the matching
+# GitHub release and unpacks it into `<X-Plane>/Resources/plugins/
+# AeroACARS/`. Default features cover deflate, which is what GitHub
+# Actions' `zip` action uses. No native deps.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # Internal crates — wired up for use as the project grows
 api-client.workspace = true

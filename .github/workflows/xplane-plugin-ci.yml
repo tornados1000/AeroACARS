@@ -1,0 +1,90 @@
+name: X-Plane Plugin CI
+
+# Standalone build verification for the AeroACARS X-Plane Plugin.
+# Runs on:
+#   * Every push touching xplane-plugin/** or this workflow
+#   * Pull requests touching the same paths
+#   * Manual dispatch (gh workflow run xplane-plugin-ci.yml)
+#
+# Purpose: catch Mac / Linux build breakage BEFORE we cut a v0.x.y
+# release tag. Independent of release.yml — no artifacts get
+# uploaded to GitHub Releases here, just to the workflow's artifact
+# storage so we can inspect the .xpl files if needed.
+
+on:
+  push:
+    paths:
+      - 'xplane-plugin/**'
+      - '.github/workflows/xplane-plugin-ci.yml'
+  pull_request:
+    paths:
+      - 'xplane-plugin/**'
+      - '.github/workflows/xplane-plugin-ci.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            generator: 'Visual Studio 17 2022'
+            cmake_args: '-A x64'
+            xpl_name: 'win.xpl'
+            os_label: 'Windows x64'
+          - platform: macos-latest
+            generator: 'Unix Makefiles'
+            # Semicolon in CMake list arg must be inside double-quotes
+            # so bash doesn't split it as a command separator.
+            cmake_args: '-DCMAKE_BUILD_TYPE=Release "-DCMAKE_OSX_ARCHITECTURES=x86_64;arm64"'
+            xpl_name: 'mac.xpl'
+            os_label: 'macOS universal'
+          - platform: ubuntu-latest
+            generator: 'Unix Makefiles'
+            cmake_args: '-DCMAKE_BUILD_TYPE=Release'
+            xpl_name: 'lin.xpl'
+            os_label: 'Linux x64'
+
+    runs-on: ${{ matrix.platform }}
+    name: ${{ matrix.os_label }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Configure CMake
+        working-directory: xplane-plugin
+        shell: bash
+        run: |
+          cmake -B build -G "${{ matrix.generator }}" ${{ matrix.cmake_args }}
+
+      - name: Build plugin (Release)
+        working-directory: xplane-plugin
+        shell: bash
+        run: |
+          cmake --build build --config Release --target AeroACARS --verbose
+
+      - name: List build output
+        working-directory: xplane-plugin
+        shell: bash
+        run: |
+          ls -la build/AeroACARS/64/
+
+      # Sanity check: the .xpl must be non-empty and (on platforms where
+      # `file` is available) must report as a shared library / DLL.
+      - name: Inspect .xpl
+        if: matrix.platform != 'windows-latest'
+        working-directory: xplane-plugin
+        shell: bash
+        run: |
+          file build/AeroACARS/64/${{ matrix.xpl_name }}
+
+      - name: Upload .xpl artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aeroacars-${{ matrix.xpl_name }}
+          path: xplane-plugin/build/AeroACARS/64/${{ matrix.xpl_name }}
+          if-no-files-found: error
+          retention-days: 14

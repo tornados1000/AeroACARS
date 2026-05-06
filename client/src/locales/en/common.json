@@ -391,6 +391,23 @@
     "waiting_for_aircraft": "Waiting for aircraft load — SDK status check resumes once the aircraft is fully loaded in MSFS / X-Plane.",
     "waiting_init": "Subscription registered — giving PMDG {{secs}} s more to initialise …"
   },
+  "xplane_premium_panel": {
+    "title": "X-Plane Premium Plugin",
+    "active_hint": "Native telemetry is streaming from X-Plane — touchdowns are captured in the exact frame of wheel contact (peak descent VS, pitch-corrected).",
+    "inactive_hint_xp_running": "Optional: the AeroACARS plugin provides frame-perfect landing-rate capture. Copy the plugin into X-Plane/Resources/plugins/AeroACARS/ and restart X-Plane.",
+    "inactive_hint_xp_not_running": "Will activate as soon as X-Plane runs with the AeroACARS plugin installed. Standard RREF capture works without it.",
+    "packets_label": "Packets received",
+    "bind_error_title": "Plugin listener failed to start",
+    "bind_error_explanation": "Port 49001 is held by another application — most likely a second AeroACARS instance is running. Close it and click \"Re-check sim\".",
+    "install_path_label": "X-Plane root folder",
+    "install_path_placeholder": "e.g. C:\\X-Plane 12  (or /Applications/X-Plane 12)",
+    "detect_button": "Auto-detect",
+    "detect_success": "X-Plane install found — you can install now.",
+    "detect_failed": "Could not auto-detect X-Plane — please enter the path to your X-Plane root folder manually.",
+    "install_button": "Install plugin",
+    "installing": "Installing …",
+    "install_success": "Plugin installed at {{path}} ({{files}} files). Restart X-Plane and the status will turn \"live\"."
+  },
   "pilot_header": {
     "location_tooltip": "Location per website ({{airline}}) — where your last PIREP landed. If this looks stale after a flight, hit \"Refresh\" top-right.",
     "home_tooltip": "Home base per website ({{airline}}) — your career anchor."

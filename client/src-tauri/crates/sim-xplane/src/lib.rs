@@ -44,11 +44,13 @@
 
 mod adapter;
 mod dataref;
+mod premium;
 mod probe;
 mod rref;
 mod web_api;
 
 pub use adapter::{ConnectionState, XPlaneAdapter};
+pub use premium::{PremiumStatus, PremiumTouchdown, PREMIUM_UDP_PORT};
 pub use probe::is_xplane_running;
 
 /// Default UDP port X-Plane listens on. Subscriptions get sent here.

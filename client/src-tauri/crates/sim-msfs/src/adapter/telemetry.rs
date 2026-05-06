@@ -1088,6 +1088,11 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
         aircraft_wind_z_kt: Some(t.aircraft_wind_z_kt as f32),
         g_force: t.g_force as f32,
         on_ground: t.on_ground,
+        // MSFS-Adapter liefert keinen Gear-Normal-Force-Wert; das
+        // X-Plane-Pendant (sampler-side touchdown edge) ist hier
+        // nicht aktiv — MSFS hat eh den separaten
+        // PLANE TOUCHDOWN NORMAL VELOCITY-SimVar als Primary-Quelle.
+        gear_normal_force_n: None,
         parking_brake,
         stall_warning: t.stall_warning,
         overspeed_warning: t.overspeed_warning,

@@ -60,6 +60,14 @@ pub struct SimSnapshot {
     // Forces & flags
     pub g_force: f32,
     pub on_ground: bool,
+    /// v0.4.4: X-Plane only — Normal force on the landing gear (N).
+    /// 0 in the air, spikes the moment a wheel touches the runway.
+    /// Used by the touchdown sampler for sub-frame-accurate edge
+    /// detection (xgs-style). MSFS doesn't provide this — `None` there,
+    /// the existing `PLANE TOUCHDOWN NORMAL VELOCITY` SimVar is the
+    /// MSFS-equivalent (already wired).
+    #[serde(default)]
+    pub gear_normal_force_n: Option<f32>,
     pub parking_brake: bool,
     pub stall_warning: bool,
     pub overspeed_warning: bool,
@@ -426,6 +434,7 @@ impl Default for SimSnapshot {
             aircraft_wind_z_kt: None,
             g_force: 1.0,
             on_ground: true,
+            gear_normal_force_n: None,
             parking_brake: true,
             stall_warning: false,
             overspeed_warning: false,

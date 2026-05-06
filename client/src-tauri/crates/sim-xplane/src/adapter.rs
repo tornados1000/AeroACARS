@@ -33,6 +33,7 @@ const STALE_TIMEOUT: Duration = Duration::from_secs(5);
 use sim_core::{SimKind, SimSnapshot, Simulator};
 
 use crate::dataref::{XPlaneState, CATALOG};
+use crate::premium::{PremiumListener, PremiumStatus, PremiumTouchdown};
 use crate::rref::{decode_response, encode_request};
 use crate::web_api::{AircraftInfo, DrefIdCache, WebApiClient};
 use crate::{SUBSCRIPTION_HZ, XPLANE_LISTEN_PORT};
@@ -93,6 +94,13 @@ pub struct XPlaneAdapter {
     /// Independently joined so we always tear down both threads on
     /// `stop()` even if one already exited.
     web_api_worker: Option<JoinHandle<()>>,
+    /// Listener for the optional AeroACARS X-Plane Plugin (v0.5.0+).
+    /// When the pilot has the plugin installed, this thread receives
+    /// JSON telemetry/touchdown packets on UDP 49001 and surfaces a
+    /// frame-perfect touchdown event. Inert if no plugin is present
+    /// — bind succeeds, no packets ever arrive, RREF path handles
+    /// everything as before.
+    premium: PremiumListener,
     /// Cached SimKind so `snapshot()` knows whether to stamp
     /// `Simulator::XPlane11` or `XPlane12`.
     kind: SimKind,
@@ -119,6 +127,7 @@ impl XPlaneAdapter {
             shared,
             worker: None,
             web_api_worker: None,
+            premium: PremiumListener::new(),
             kind: SimKind::XPlane12,
         }
     }
@@ -157,6 +166,9 @@ impl XPlaneAdapter {
             .spawn(move || run_web_api_poller(shared_for_web))
             .expect("spawn xplane-web-api thread");
         self.web_api_worker = Some(web_handle);
+        // Start the premium plugin listener too. No-op unless the
+        // optional X-Plane Plugin is installed — see `premium.rs`.
+        self.premium.start();
         tracing::info!(?kind, "X-Plane adapter started");
     }
 
@@ -176,7 +188,33 @@ impl XPlaneAdapter {
             // re-check the stop flag; join is fast.
             let _ = handle.join();
         }
+        // Tear down the premium listener last so it can drain any
+        // in-flight packet before close. Idempotent.
+        self.premium.stop();
         *self.shared.state.lock().unwrap() = ConnectionState::Disconnected;
+    }
+
+    /// Status of the AeroACARS X-Plane Plugin connection (v0.5.0+).
+    /// `active=true` when we've received a packet within the last
+    /// 3 s — drives the "X-PLANE PREMIUM" badge in the UI.
+    pub fn premium_status(&self) -> PremiumStatus {
+        self.premium.status()
+    }
+
+    /// Drain a pending plugin-emitted touchdown event, if any. The
+    /// flight sampler in the main app calls this each tick after
+    /// the standard `snapshot()` read; if Some, the values override
+    /// the sampler's own RREF-based touchdown detection (frame-
+    /// perfect timing, lookback-peak VS).
+    pub fn take_premium_touchdown(&self) -> Option<PremiumTouchdown> {
+        self.premium.take_touchdown()
+    }
+
+    /// Last error from the premium listener (e.g. bind failure).
+    /// Independent from `last_error()` so RREF and premium errors
+    /// don't clobber each other.
+    pub fn premium_last_error(&self) -> Option<String> {
+        self.premium.last_error()
     }
 
     pub fn state(&self) -> ConnectionState {

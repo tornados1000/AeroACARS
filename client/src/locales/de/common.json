@@ -391,6 +391,23 @@
     "waiting_for_aircraft": "Warte auf Aircraft-Load — sobald das Flugzeug im MSFS / X-Plane fertig geladen ist, prüfe ich den SDK-Status.",
     "waiting_init": "Subscription registriert — gebe PMDG noch {{secs}} s Zeit zum Initialisieren …"
   },
+  "xplane_premium_panel": {
+    "title": "X-Plane Premium Plugin",
+    "active_hint": "Native Telemetrie fließt aus X-Plane — Touchdowns werden im Frame der Bodenberührung erfasst (peak descent VS, pitch-korrigiert).",
+    "inactive_hint_xp_running": "Optional: Das AeroACARS-Plugin liefert frame-genaue Landing-Rate-Erfassung. Plugin in den Ordner X-Plane/Resources/plugins/AeroACARS/ kopieren und X-Plane neu starten.",
+    "inactive_hint_xp_not_running": "Wird aktiv sobald X-Plane mit installiertem AeroACARS-Plugin läuft. Standard-RREF-Erfassung läuft auch ohne Plugin.",
+    "packets_label": "Empfangene Pakete",
+    "bind_error_title": "Plugin-Listener konnte nicht starten",
+    "bind_error_explanation": "Port 49001 ist von einer anderen Anwendung belegt — wahrscheinlich läuft eine zweite AeroACARS-Instanz. Schließe diese und klicke „Sim erneut prüfen\".",
+    "install_path_label": "X-Plane-Hauptordner",
+    "install_path_placeholder": "z. B. C:\\X-Plane 12  (oder /Applications/X-Plane 12)",
+    "detect_button": "Auto-Erkennung",
+    "detect_success": "X-Plane-Installation gefunden — du kannst jetzt installieren.",
+    "detect_failed": "Konnte X-Plane nicht automatisch finden — bitte den Pfad zum X-Plane-Hauptordner manuell eintragen.",
+    "install_button": "Plugin installieren",
+    "installing": "Wird installiert …",
+    "install_success": "Plugin installiert in {{path}} ({{files}} Dateien). X-Plane neu starten, dann erscheint der „live\"-Status."
+  },
   "pilot_header": {
     "location_tooltip": "Standort laut Webseite ({{airline}}) — wo Ihr letzter PIREP gelandet ist. Falls der Wert nach einem Flug nicht aktuell wirkt, oben rechts auf „Aktualisieren\" klicken.",
     "home_tooltip": "Heimatbasis laut Webseite ({{airline}}) — Ihr Karriere-Ankerpunkt."

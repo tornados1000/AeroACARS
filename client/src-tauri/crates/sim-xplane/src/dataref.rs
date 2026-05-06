@@ -43,6 +43,10 @@ pub enum FieldId {
     TrueAirspeedKt,
     GForce,
     OnGround,
+    /// v0.4.4: Normal force on the gear (N). Used for sampler-side
+    /// touchdown edge detection — fires far earlier and more reliably
+    /// than `OnGround` which is a binary flight-model flag.
+    GearNormalForceN,
     ParkingBrake,
     GearDeploy,
     FlapsHandle,
@@ -206,6 +210,18 @@ pub const CATALOG: &[DatarefEntry] = &[
         // bool 0/1
         name: "sim/flightmodel/failures/onground_any",
         field: FieldId::OnGround,
+    },
+    DatarefEntry {
+        // Normal force on the gear (N). Nonzero exactly at the physical
+        // moment of wheel-runway contact. xgs (etabliertes X-Plane-
+        // Landing-Speed-Plugin, ~10 Jahre in production) nutzt das als
+        // Touchdown-Edge-Trigger statt `onground_any` weil letzteres
+        // im Flight-Model-Frame laggt und bouncen kann. Wir trigger
+        // unsere Sampler-Side-Edge-Detection auf einen rising edge
+        // hier: in der Luft = ~0 N, beim Touchdown spikt's auf
+        // mehrere kN für die Aircraft-Masse × Touchdown-G.
+        name: "sim/flightmodel/forces/fnrml_gear",
+        field: FieldId::GearNormalForceN,
     },
     DatarefEntry {
         // 0..1 ratio
@@ -459,6 +475,9 @@ pub struct XPlaneState {
     pub true_airspeed_kt: f32,
     pub g_force: f32,
     pub on_ground: bool,
+    /// v0.4.4: Normal force on the gear (N). 0 in air, spikes on
+    /// touchdown. Used by Sampler-Side-Edge-Detection im Main-Crate.
+    pub gear_normal_force_n: f32,
     pub parking_brake_ratio: f32,
     pub gear_deploy: f32,
     pub flaps_handle: f32,
@@ -568,6 +587,7 @@ impl XPlaneState {
             FieldId::TrueAirspeedKt => self.true_airspeed_kt = value,
             FieldId::GForce => self.g_force = value,
             FieldId::OnGround => self.on_ground = value > 0.5,
+            FieldId::GearNormalForceN => self.gear_normal_force_n = value,
             FieldId::ParkingBrake => self.parking_brake_ratio = value,
             FieldId::GearDeploy => self.gear_deploy = value,
             FieldId::FlapsHandle => self.flaps_handle = value,
@@ -663,6 +683,7 @@ impl XPlaneState {
             aircraft_wind_z_kt: Some(self.wind_z_ms * KT_PER_MS),
             g_force: self.g_force,
             on_ground: self.on_ground,
+            gear_normal_force_n: Some(self.gear_normal_force_n),
             parking_brake: self.parking_brake_ratio > 0.5,
             stall_warning: self.stall_warning,
             overspeed_warning: false, // X-Plane has no direct overspeed annunciator

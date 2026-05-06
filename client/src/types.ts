@@ -482,3 +482,25 @@ export interface PmdgStatus {
    *  — the heuristic for "pilot hasn't enabled the SDK yet". */
   looks_like_sdk_disabled: boolean;
 }
+
+/** Status of the optional AeroACARS X-Plane Plugin (v0.5.0+
+ *  "Premium Mode"). Mirrors the backend `xplane_premium_status`
+ *  Tauri command. Drives the "X-PLANE PREMIUM" badge in Settings →
+ *  Debug and (eventually) the cockpit tab.
+ *
+ *  When the pilot has installed the plugin into their X-Plane
+ *  `Resources/plugins/AeroACARS/` folder, `active` flips to true
+ *  within 100 ms of X-Plane loading the plugin. Until then it
+ *  stays false — and the standard RREF UDP path silently handles
+ *  every flight, just at lower precision around touchdown. */
+export interface XPlanePremiumStatus {
+  /** True when we've received a packet within the last 3 s. */
+  active: boolean;
+  /** True if any premium packet has arrived this session. */
+  ever_seen: boolean;
+  /** Total packets received since the X-Plane adapter started. */
+  packet_count: number;
+  /** Last error from the listener (e.g. bind failure). `null`
+   *  while the listener is healthy. */
+  last_error: string | null;
+}

@@ -7,6 +7,7 @@
 
 mod discord;
 mod runway;
+mod xplane_plugin_install;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -1110,6 +1111,22 @@ struct FlightStats {
     /// `None` until we capture it; `None` also when the buffer can't
     /// produce a track (e.g. taxi-speed touchdown after a roll-out).
     touchdown_sideslip_deg: Option<f32>,
+    /// v0.4.4: Sampler-side touchdown capture. Der 50Hz-Touchdown-Sampler
+    /// detektiert die `on_ground=false→true`-Flanke direkt (innerhalb
+    /// von 20ms) und merkt sich VS am Edge plus VS-Min in den letzten
+    /// 500ms davor (= echter Touchdown-Sinkflug, bevor Rollout den
+    /// Wert kaputt-mittelt). Wenn step_flight später (bis zu 5s
+    /// verspätet im Streamer-Tick) die Edge auch detektiert, nimmt es
+    /// diese pre-captured Werte statt den Buffer-Window-Scan zu
+    /// versuchen — dann sind die Pre-TD-Samples nämlich schon evicted.
+    ///
+    /// Live-Bug Pilot-Test 2026-05-06 (DAL93 EDDB→KJFK): X-Plane Land-
+    /// ung mit echtem -300 fpm → AeroACARS scorte +35 fpm (smooth)
+    /// weil Streamer 5s nach Touchdown wachte und Buffer dann nur
+    /// noch Rollout-Samples mit VS≈0 enthielt.
+    sampler_touchdown_at: Option<DateTime<Utc>>,
+    sampler_touchdown_vs_fpm: Option<f32>,
+    sampler_touchdown_g_force: Option<f32>,
     /// Frozen subsample of the ring buffer covering ±2 s around touchdown,
     /// for V/S-curve reconstruction in the PIREP notes block. Captured
     /// once when the on-ground edge fires; surviving across a Tauri
@@ -5688,6 +5705,24 @@ async fn flight_resume_after_disconnect(
 fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
     tauri::async_runtime::spawn(async move {
         tracing::info!(pirep_id = %flight.pirep_id, "touchdown sampler started");
+        // v0.4.4: lokale Edge-Tracking-State.
+        //
+        // X-Plane: bevorzugt `gear_normal_force_n` (Newton, spikt
+        // präzise im Frame des physischen Touchdowns) — das macht
+        // auch xgs (etabliertes X-Plane-Landing-Speed-Plugin seit ~10
+        // Jahren). xgs nutzt exakt `force != 0.0` als Trigger; wir
+        // wählen `> 1.0 N` als minimaler Filter gegen Float-Noise und
+        // catchen damit immer noch den ersten Kontakt-Frame (echte
+        // Touchdowns gehen blitzartig auf mehrere kN — ein 60-300t
+        // Airliner mit 1.0g Bremsmoment = mindestens 588-2940 kN auf
+        // dem Gear). 1.0 N = ~100g Auflagedruck, also unter jeder
+        // physikalisch plausiblen Touchdown-Schwelle.
+        //
+        // MSFS: gear_normal_force_n ist None → fallback auf
+        // `on_ground`-Edge wie vorher (MSFS hat eh den separaten
+        // `PLANE TOUCHDOWN NORMAL VELOCITY`-SimVar als Primary).
+        let mut prev_in_air: Option<bool> = None;
+        const GEAR_TOUCHDOWN_THRESHOLD_N: f32 = 1.0;
         loop {
             // 20 ms = 50 Hz target — matches GEES (`SAMPLE_RATE = 20`),
             // the only open-source reference impl that publishes its
@@ -5718,6 +5753,121 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
                 pitch_deg: snap.pitch_deg,
                 bank_deg: snap.bank_deg,
             });
+
+            // v0.4.4: Edge-Detection direkt im Sampler.
+            //
+            // Primary signal: `gear_normal_force_n` (X-Plane-only) —
+            // spikt im Frame des physischen Touchdowns (xgs-Methode).
+            // Fallback: `on_ground`-Flag (für MSFS und falls X-Plane-
+            // DataRef mal None liefert).
+            //
+            // Wir halten `prev_in_air` als rolling-state. Der Edge
+            // ist `true → false` (vom in-air zu am-Boden).
+            //
+            // Capture nur ONCE: sampler_touchdown_at bleibt Some bis
+            // Flight-Reset → kein Re-Trigger bei Bouncing nach dem
+            // initialen Touchdown.
+            let in_air_now = match snap.gear_normal_force_n {
+                Some(force) => force < GEAR_TOUCHDOWN_THRESHOLD_N,
+                None => !snap.on_ground,
+            };
+            let edge_detected = matches!(prev_in_air, Some(true)) && !in_air_now;
+
+            // v0.5.0: Premium-Plugin-Override.
+            //
+            // Wenn der AeroACARS X-Plane Plugin (optional, v0.5.0+) ein
+            // Touchdown-Event gesendet hat, übernimmt es den Capture
+            // unabhängig von der RREF-Edge — der Plugin sieht das Edge
+            // mit Frame-Genauigkeit und kennt das tatsächliche peak
+            // descent VS aus seinem eigenen 500ms-Lookback-Buffer
+            // (gleicher Algorithmus wie unten, aber INNERHALB von
+            // X-Plane gemessen, also keine UDP-Verzögerung / Eviction-
+            // Race). Wir brauchen lokal den `prev_in_air`-Reset
+            // trotzdem, damit das `bouncing`-Re-Trigger-Guard greift
+            // wenn das Aircraft kurz wieder abhebt.
+            //
+            // `stats.sampler_touchdown_at.is_none()`-Guard: identisch
+            // zur RREF-Edge — nur ein Capture pro Landing.
+            if let Some(td) = current_premium_touchdown(&app) {
+                if stats.sampler_touchdown_at.is_none() {
+                    stats.sampler_touchdown_at = Some(now);
+                    stats.sampler_touchdown_vs_fpm = Some(td.captured_vs_fpm);
+                    stats.sampler_touchdown_g_force = Some(td.captured_g_normal);
+                    tracing::info!(
+                        pirep_id = %flight.pirep_id,
+                        captured_vs_fpm = td.captured_vs_fpm,
+                        captured_g = td.captured_g_normal,
+                        captured_pitch_deg = td.captured_pitch_deg,
+                        captured_ias_kt = td.captured_ias_kt,
+                        source = "x-plane-plugin-premium",
+                        "premium touchdown event captured (frame-perfect)"
+                    );
+                    prev_in_air = Some(in_air_now);
+                    let cutoff = now - chrono::Duration::seconds(TOUCHDOWN_BUFFER_SECS);
+                    while stats
+                        .snapshot_buffer
+                        .front()
+                        .is_some_and(|s| s.at < cutoff)
+                    {
+                        stats.snapshot_buffer.pop_front();
+                    }
+                    continue;
+                }
+            }
+
+            if edge_detected && stats.sampler_touchdown_at.is_none() {
+                // Pitch-Korrektur: world-frame Y-Velocity → body-axial
+                // (xgs-Pattern). Bei typischem Touchdown-Pitch ~3-5°
+                // ist cos(pitch)≈0.998, also <0.5% Unterschied. Bei
+                // steilen Flares (STOL-Aircraft, ~10°) bis 1.5%.
+                // Konsistent mit xgs's `vy * cos(theta * deg2rad)`.
+                let pitch_rad = (snap.pitch_deg as f32) * std::f32::consts::PI / 180.0;
+                let pitch_cos = pitch_rad.cos();
+                let current_vs = snap.vertical_speed_fpm * pitch_cos;
+                // VS-min der letzten 500ms — fängt den echten Sinkflug
+                // ein bevor Rollout-Damping zugeschlagen hat.
+                let lookback_start = now - chrono::Duration::milliseconds(500);
+                let recent_vs_min: f32 = stats
+                    .snapshot_buffer
+                    .iter()
+                    .filter(|s| s.at >= lookback_start)
+                    .map(|s| {
+                        // Pitch-Korrektur auch auf Buffer-Samples — die
+                        // sind je nach Aircraft beim Flare auch unter
+                        // Nase-hoch-Bedingungen erfasst worden.
+                        let p_rad = (s.pitch_deg as f32) * std::f32::consts::PI / 180.0;
+                        s.vs_fpm * p_rad.cos()
+                    })
+                    .fold(f32::INFINITY, f32::min);
+                let captured_vs = if recent_vs_min.is_finite() {
+                    recent_vs_min.min(current_vs)
+                } else {
+                    current_vs
+                };
+                // Peak G im gleichen Window
+                let recent_g_peak: f32 = stats
+                    .snapshot_buffer
+                    .iter()
+                    .filter(|s| s.at >= lookback_start)
+                    .map(|s| s.g_force)
+                    .fold(0.0, f32::max);
+                let captured_g = recent_g_peak.max(snap.g_force);
+
+                stats.sampler_touchdown_at = Some(now);
+                stats.sampler_touchdown_vs_fpm = Some(captured_vs);
+                stats.sampler_touchdown_g_force = Some(captured_g);
+                tracing::info!(
+                    pirep_id = %flight.pirep_id,
+                    captured_vs_fpm = captured_vs,
+                    current_vs_fpm = current_vs,
+                    captured_g = captured_g,
+                    fnrml_n = snap.gear_normal_force_n,
+                    on_ground = snap.on_ground,
+                    "sampler-side touchdown edge detected"
+                );
+            }
+            prev_in_air = Some(in_air_now);
+
             let cutoff = now - chrono::Duration::seconds(TOUCHDOWN_BUFFER_SECS);
             while stats
                 .snapshot_buffer
@@ -6284,6 +6434,41 @@ fn current_snapshot(app: &AppHandle) -> Option<SimSnapshot> {
     None
 }
 
+/// Drain any pending touchdown event from the AeroACARS X-Plane Plugin
+/// (v0.5.0+ premium mode). Returns `Some` exactly once per landing
+/// when the plugin is installed and detected a touchdown edge in its
+/// flight-loop callback. `None` if the plugin isn't running, or if
+/// the active sim isn't X-Plane, or if no touchdown is pending. The
+/// touchdown sampler calls this each tick and prefers premium values
+/// over its own RREF-derived edge detection when available.
+fn current_premium_touchdown(app: &AppHandle) -> Option<sim_xplane::PremiumTouchdown> {
+    let state = app.state::<AppState>();
+    let kind = read_sim_config(app).kind;
+    if !kind.is_xplane() {
+        return None;
+    }
+    let adapter = state.xplane.lock().expect("xplane lock");
+    adapter.take_premium_touchdown()
+}
+
+/// Status of the AeroACARS X-Plane Plugin connection. Returns
+/// `(ever_seen, active)` for the X-Plane sim path; `(false, false)`
+/// for any other sim. UI uses `active` to show the "X-PLANE PREMIUM"
+/// badge.
+fn current_premium_status(app: &AppHandle) -> sim_xplane::PremiumStatus {
+    let state = app.state::<AppState>();
+    let kind = read_sim_config(app).kind;
+    if !kind.is_xplane() {
+        return sim_xplane::PremiumStatus {
+            ever_seen: false,
+            active: false,
+            packet_count: 0,
+        };
+    }
+    let adapter = state.xplane.lock().expect("xplane lock");
+    adapter.premium_status()
+}
+
 /// Update running stats AND step the flight-phase FSM. Returns the new phase
 /// when a transition fires, otherwise `None`.
 fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase> {
@@ -6750,21 +6935,33 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                     .find(|s| s.on_ground)
                     .cloned();
 
-                // V/S capture — GEES-aligned: prefer the latched
-                // SimVar `PLANE TOUCHDOWN NORMAL VELOCITY` (already
-                // sign-corrected in the adapter). It's the cleanest
-                // signal because MSFS itself latches it at the
-                // physics frame of contact. Fallback chain only
-                // kicks in when the addon doesn't wire it:
+                // V/S capture — Fallback-Chain in Reihenfolge der
+                // Datenqualität:
                 //
-                //   1. Latched touchdown SimVar (primary, GEES uses this)
-                //   2. Most-negative V/S from buffered samples within
-                //      ±TOUCHDOWN_VS_WINDOW_MS/2 of the actual TD
-                //      timestamp (fallback for non-Fenix-style addons)
-                //   3. Live `vertical_speed_fpm` at the edge tick
-                //      (last resort, e.g. resumed flight with empty
-                //      buffer)
-                let touchdown_vs = if let Some(latched) = snap.touchdown_vs_fpm {
+                //   1. v0.4.4: Sampler-side gear-Edge-Detection (X-Plane
+                //      idiomatic, xgs-aligned). Der 50Hz-Sampler hat
+                //      das fnrml_gear-Spike erkannt und die VS-Min der
+                //      letzten 500 ms vor dem Edge eingefroren. KEINE
+                //      Buffer-Eviction-Race wie wenn der Streamer
+                //      verspätet wacht.
+                //   2. MSFS-latched Touchdown-SimVar (`PLANE TOUCHDOWN
+                //      NORMAL VELOCITY` — MSFS-only, GEES-aligned).
+                //   3. Buffer-Window-Scan ±TOUCHDOWN_VS_WINDOW_MS/2 um
+                //      actual_td_at — funktioniert wenn Streamer früh
+                //      wach wurde, fällt durch wenn zu spät (Buffer
+                //      ist 5 s, Pre-TD-Samples evicted).
+                //   4. Live `vertical_speed_fpm` am Edge-Tick — last
+                //      resort, post-rollout meistens schon ~0.
+                let touchdown_vs = if let Some(sampler_vs) = stats.sampler_touchdown_vs_fpm {
+                    // Wenn der Sampler den Edge selbst detektiert hat
+                    // (innerhalb von 20 ms), nutzen wir auch dessen
+                    // actual_td_at — viel präziser als unser
+                    // 5s-Streamer-Tick-Edge.
+                    if let Some(sampler_at) = stats.sampler_touchdown_at {
+                        stats.landing_at = Some(sampler_at);
+                    }
+                    sampler_vs
+                } else if let Some(latched) = snap.touchdown_vs_fpm {
                     latched
                 } else {
                     let half_window =
@@ -6786,15 +6983,20 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                 stats.landing_rate_fpm = Some(touchdown_vs);
                 stats.landing_peak_vs_fpm = Some(touchdown_vs);
 
-                // G capture: peak G from full buffer (5 s of pre-touchdown
+                // G capture: prefer sampler-side (v0.4.4) wenn verfügbar.
+                // Sonst peak G from full buffer (5 s of pre-touchdown
                 // history). Subsequent ticks in the Landing arm refine
                 // this further until TOUCHDOWN_G_WINDOW_MS elapses.
-                let buffered_g_peak: f32 = stats
-                    .snapshot_buffer
-                    .iter()
-                    .map(|s| s.g_force)
-                    .fold(0.0, f32::max);
-                let touchdown_g = buffered_g_peak.max(snap.g_force);
+                let touchdown_g = if let Some(sampler_g) = stats.sampler_touchdown_g_force {
+                    sampler_g
+                } else {
+                    let buffered_g_peak: f32 = stats
+                        .snapshot_buffer
+                        .iter()
+                        .map(|s| s.g_force)
+                        .fold(0.0, f32::max);
+                    buffered_g_peak.max(snap.g_force)
+                };
                 stats.landing_g_force = Some(touchdown_g);
                 stats.landing_peak_g_force = Some(touchdown_g);
 
@@ -9922,6 +10124,62 @@ fn xplane_inspector_list(state: tauri::State<'_, AppState>) -> Vec<serde_json::V
         .collect()
 }
 
+/// Best-effort detection of the X-Plane install path. Returns the
+/// absolute path as a string when found, or `null` when nothing
+/// plausible exists — UI then falls back to a folder picker.
+#[tauri::command]
+fn xplane_detect_install_path() -> Option<String> {
+    xplane_plugin_install::detect_install_path()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Download the matching plugin zip from this AeroACARS version's
+/// GitHub release and extract it into `<install_dir>/Resources/
+/// plugins/AeroACARS/`. Idempotent — overwrites in place. Returns
+/// the install summary (path, bytes, files) on success, or an
+/// error message string on failure.
+#[tauri::command]
+async fn xplane_install_plugin(
+    install_dir: String,
+) -> Result<xplane_plugin_install::PluginInstallResult, String> {
+    let path = std::path::PathBuf::from(install_dir);
+    xplane_plugin_install::install_plugin(&path).await
+}
+
+/// Remove the plugin folder from the given X-Plane install. No-op
+/// when no plugin folder exists.
+#[tauri::command]
+fn xplane_uninstall_plugin(install_dir: String) -> Result<(), String> {
+    let path = std::path::PathBuf::from(install_dir);
+    xplane_plugin_install::uninstall_plugin(&path)
+}
+
+/// Status of the optional AeroACARS X-Plane Plugin (v0.5.0+
+/// "Premium Mode"). The Cockpit tab uses this to show a green
+/// "X-PLANE PREMIUM" badge when frame-perfect telemetry is flowing.
+///
+/// Return shape (JSON):
+///   {
+///     "active":      bool,    // packets in last 3 s
+///     "ever_seen":   bool,    // any packet this session
+///     "packet_count": u64,    // total since adapter start
+///     "last_error":  string?  // bind-failure reason, if any
+///   }
+///
+/// Inert when the active sim isn't X-Plane (returns all-false).
+#[tauri::command]
+fn xplane_premium_status(state: tauri::State<'_, AppState>) -> serde_json::Value {
+    let adapter = state.xplane.lock().expect("xplane lock");
+    let s = adapter.premium_status();
+    let err = adapter.premium_last_error();
+    serde_json::json!({
+        "active": s.active,
+        "ever_seen": s.ever_seen,
+        "packet_count": s.packet_count,
+        "last_error": err,
+    })
+}
+
 /// Probe both potential simulators and return a suggested SimKind.
 /// Used on first launch when no sim is configured, OR via a
 /// "Detect Sim" button in Settings.
@@ -11009,6 +11267,10 @@ pub fn run() {
             inspector_remove,
             inspector_list,
             xplane_inspector_list,
+            xplane_premium_status,
+            xplane_detect_install_path,
+            xplane_install_plugin,
+            xplane_uninstall_plugin,
             detect_running_sim,
             auto_start_set_enabled,
             auto_start_get_enabled,
