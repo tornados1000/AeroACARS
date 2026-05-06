@@ -1127,6 +1127,19 @@ struct FlightStats {
     sampler_touchdown_at: Option<DateTime<Utc>>,
     sampler_touchdown_vs_fpm: Option<f32>,
     sampler_touchdown_g_force: Option<f32>,
+    /// v0.5.5: running peak-descent VS tracker. Updated every sampler
+    /// tick from when the FSM enters Approach onward. Picks the most
+    /// negative pitch-corrected VS seen during the entire approach +
+    /// final segment. Robust against:
+    ///   * Sparse RREF stream (sampler buffer might be stale at
+    ///     touchdown if X-Plane downgraded our 50 Hz request to ~5 Hz)
+    ///   * Aggressive flare (real descent peak was 30 s ago, not 500 ms)
+    ///   * Buffer-eviction race (5 s ring vs 9 s streamer cadence
+    ///     during landing — observed in pilot test 2026-05-06 21:22)
+    /// Used as the most-negative-wins tiebreaker against sampler-
+    /// edge capture and buffer-window scan during Final → Landing.
+    /// Reset on Approach entry so go-arounds don't carry stale data.
+    approach_vs_min_fpm: Option<f32>,
     /// Frozen subsample of the ring buffer covering ±2 s around touchdown,
     /// for V/S-curve reconstruction in the PIREP notes block. Captured
     /// once when the on-ground edge fires; surviving across a Tauri
@@ -5754,6 +5767,28 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
                 bank_deg: snap.bank_deg,
             });
 
+            // v0.5.5: running peak-descent VS during approach + final.
+            // Independent of buffer state — picks the most negative
+            // pitch-corrected VS seen since Approach entry. Used by
+            // the Final → Landing transition as a most-negative-wins
+            // tiebreaker against sampler-edge capture and the buffer
+            // window scan, which both proved unreliable on a low-
+            // RREF-rate run (pilot test 2026-05-06: captured +57 fpm
+            // because last 500 ms of the buffer only had post-
+            // touchdown rebound samples).
+            let approach_or_final = matches!(
+                stats.phase,
+                FlightPhase::Approach | FlightPhase::Final
+            );
+            if approach_or_final && !snap.on_ground {
+                let pitch_rad = (snap.pitch_deg as f32) * std::f32::consts::PI / 180.0;
+                let vs_corrected = snap.vertical_speed_fpm * pitch_rad.cos();
+                let curr_min = stats.approach_vs_min_fpm.unwrap_or(f32::INFINITY);
+                if vs_corrected < curr_min {
+                    stats.approach_vs_min_fpm = Some(vs_corrected);
+                }
+            }
+
             // v0.4.4: Edge-Detection direkt im Sampler.
             //
             // Primary signal: `gear_normal_force_n` (X-Plane-only) —
@@ -5824,9 +5859,15 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
                 let pitch_rad = (snap.pitch_deg as f32) * std::f32::consts::PI / 180.0;
                 let pitch_cos = pitch_rad.cos();
                 let current_vs = snap.vertical_speed_fpm * pitch_cos;
-                // VS-min der letzten 500ms — fängt den echten Sinkflug
-                // ein bevor Rollout-Damping zugeschlagen hat.
-                let lookback_start = now - chrono::Duration::milliseconds(500);
+                // VS-min der letzten 2 s — fängt den echten Sinkflug
+                // ein bevor Rollout-Damping zugeschlagen hat. v0.5.5
+                // erweitert das Fenster von 500 ms auf 2 s nachdem ein
+                // Pilot-Test gezeigt hat dass 500 ms bei aggressivem
+                // Flare nur Post-Touchdown-Rebound-Samples sieht (alle
+                // VS-Werte positiv). 2 s deckt sicher die letzte
+                // Flare-Phase ab; falls X-Plane uns RREF mit niedriger
+                // Rate liefert haben wir trotzdem genug Samples drin.
+                let lookback_start = now - chrono::Duration::milliseconds(2000);
                 let recent_vs_min: f32 = stats
                     .snapshot_buffer
                     .iter()
@@ -6853,6 +6894,12 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
             // destination, not when it happened to skim a peak.
             if snap.altitude_agl_ft < 5000.0 && snap.vertical_speed_fpm < 0.0 {
                 next_phase = FlightPhase::Approach;
+                // v0.5.5: reset running peak-descent tracker on Approach
+                // entry. Stays alive across Approach → Final transitions
+                // (we keep tracking through final). Only resets here so a
+                // go-around (which routes Final → Climb → Approach again)
+                // gets a clean per-attempt picture.
+                stats.approach_vs_min_fpm = None;
             }
         }
         FlightPhase::Approach => {
@@ -6990,6 +7037,16 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                     } else {
                         snap.vertical_speed_fpm
                     }
+                };
+                // v0.5.5: most-negative-wins tiebreaker against the
+                // running approach-VS-min tracker. Pilot test 2026-05-06
+                // captured +57 fpm because all of (sampler edge, buffer
+                // window, live snap) had post-flare positive VS values
+                // — but the actual descent peak earlier in approach was
+                // -513 fpm. The running tracker remembers it and wins.
+                let touchdown_vs = match stats.approach_vs_min_fpm {
+                    Some(approach_min) if approach_min < touchdown_vs => approach_min,
+                    _ => touchdown_vs,
                 };
                 stats.landing_rate_fpm = Some(touchdown_vs);
                 stats.landing_peak_vs_fpm = Some(touchdown_vs);
