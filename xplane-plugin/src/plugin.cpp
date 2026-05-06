@@ -181,15 +181,21 @@ float g_airborne_vs_min = 0.0f;
 // (gap detection) only, not for ordering.
 uint32_t g_seq = 0;
 
-// VS lookback ring buffer. Stores the last N (timestamp, vs_fpm) pairs
-// so when the touchdown edge fires we can find the peak descent VS in
-// the last VS_LOOKBACK_MS milliseconds.
+// VS / AGL lookback ring buffer. Stores the last N samples so when
+// the touchdown edge fires we can:
+//   * Find the peak descent VS in the last VS_LOOKBACK_MS ms (legacy)
+//   * Compute geometric descent rate via ΔAGL/Δt over multiple
+//     windows (v0.5.8 — LandingRate-1 algorithm, primary method)
+//
+// AGL field added v0.5.8 — same idea as LandingRate-1.lua: VSI lies
+// during flare, AGL geometry doesn't.
 struct VSSample {
     double t_sec;     // X-Plane elapsed sim time (sim/time/total_running_time_sec)
     float vs_fpm;
     float pitch_deg;
+    float agl_ft;     // v0.5.8: snap AGL for AGL-derivative method
 };
-constexpr size_t VS_BUFFER_CAP = 64;  // 64 samples × ~50ms = ~3.2s history
+constexpr size_t VS_BUFFER_CAP = 128;  // v0.5.8: 128 × ~30ms = ~3.8s history
 VSSample g_vs_buffer[VS_BUFFER_CAP];
 size_t g_vs_buffer_head = 0;  // next write index (ring)
 size_t g_vs_buffer_count = 0; // valid samples (caps at VS_BUFFER_CAP)
@@ -373,6 +379,7 @@ float flight_loop_cb(float, float, int, void*) noexcept {
         slot.t_sec     = sim_t;
         slot.vs_fpm    = vs_fpm;
         slot.pitch_deg = pitch_deg;
+        slot.agl_ft    = agl_ft;  // v0.5.8: for AGL-derivative method
         g_vs_buffer_head = (g_vs_buffer_head + 1) % VS_BUFFER_CAP;
         if (g_vs_buffer_count < VS_BUFFER_CAP) g_vs_buffer_count++;
     }
@@ -453,27 +460,70 @@ float flight_loop_cb(float, float, int, void*) noexcept {
 
     // -- Touchdown event packet (one-shot, frame-perfect) ---------------
     if (edge) {
-        // Find the most-negative VS — three-way most-negative-wins:
-        //   1. Lookback window (last 500 ms) — fast post-flare values
-        //   2. Running airborne min — full approach memory (v0.5.6)
-        //   3. Live vs_fpm — fallback in case both are stale
-        // Pilot test 2026-05-06 showed the lookback alone misses the
-        // peak when the pilot flares hard in the last few seconds.
-        // The airborne tracker covers the entire approach so it
-        // remembers the actual descent peak even if it happened 30+ s
-        // before the gear edge.
+        // v0.5.8: PRIMARY METHOD — AGL-derivative (LandingRate-1.lua,
+        // Volanta — established X-Plane convention since ~2014). VSI
+        // lies during flare due to flight-model dampening; AGL change
+        // is geometric truth. Compute over multiple windows (1 s, 2 s,
+        // 3 s) and pick the most negative. Different flare profiles
+        // peak at different windows:
+        //   * Hard landing (no flare): all windows agree
+        //   * Airliner (~3 s flare): 2 s window captures pre-flare
+        //   * GA long flare: 3 s window covers the meaningful slice
+        //   * Floaters (long shallow): 1 s window measures the very
+        //     last seconds
+        auto derive_at = [&](double window_secs) -> float {
+            const double window_start = sim_t - window_secs;
+            float agl_sum = 0.0f;
+            int n = 0;
+            float earliest_t = 1e30f;
+            float agl_at_td = agl_ft;
+            for (size_t i = 0; i < g_vs_buffer_count; ++i) {
+                const VSSample& s = g_vs_buffer[i];
+                if (s.t_sec >= window_start && s.t_sec <= sim_t) {
+                    agl_sum += s.agl_ft;
+                    n++;
+                    if (static_cast<float>(s.t_sec) < earliest_t) {
+                        earliest_t = static_cast<float>(s.t_sec);
+                    }
+                }
+            }
+            if (n < 3) return 0.0f;  // not enough samples
+            const float avg_agl = agl_sum / static_cast<float>(n);
+            const float timespan = static_cast<float>(sim_t) - earliest_t;
+            if (timespan < 0.5f) return 0.0f;
+            const float agl_midpoint = agl_at_td - avg_agl;
+            return (agl_midpoint / (timespan / 2.0f)) * 60.0f;
+        };
+        const float derived_1s = derive_at(1.0);
+        const float derived_2s = derive_at(2.0);
+        const float derived_3s = derive_at(3.0);
+        // Most-negative wins among the three derived rates. 0.0 means
+        // "no valid sample" — ignore those.
+        float derived_best = 0.0f;
+        if (derived_1s < derived_best) derived_best = derived_1s;
+        if (derived_2s < derived_best) derived_best = derived_2s;
+        if (derived_3s < derived_best) derived_best = derived_3s;
+
+        // SECONDARY — VSI-based methods (v0.5.6 fallbacks). Robust
+        // tiebreaker if AGL data is too sparse (plugin just started,
+        // sim was paused mid-buffer-fill, etc.).
         const double cutoff_t = sim_t - (VS_LOOKBACK_MS / 1000.0);
-        float captured_vs = vs_fpm;
+        float vsi_captured = vs_fpm;
         for (size_t i = 0; i < g_vs_buffer_count; ++i) {
             const VSSample& s = g_vs_buffer[i];
-            if (s.t_sec >= cutoff_t && s.vs_fpm < captured_vs) {
-                captured_vs = s.vs_fpm;
+            if (s.t_sec >= cutoff_t && s.vs_fpm < vsi_captured) {
+                vsi_captured = s.vs_fpm;
             }
         }
-        // Airborne running min wins if it's more negative than either
-        // the lookback window or the live snap.
-        if (g_airborne_vs_min < captured_vs) {
-            captured_vs = g_airborne_vs_min;
+        if (g_airborne_vs_min < vsi_captured) {
+            vsi_captured = g_airborne_vs_min;
+        }
+
+        // FINAL: most-negative wins between AGL-derivative and VSI
+        // methods. AGL is geometric truth; VSI is a backup.
+        float captured_vs = vsi_captured;
+        if (derived_best < captured_vs) {
+            captured_vs = derived_best;
         }
         char buf[PACKET_BUF_SIZE];
         int n = std::snprintf(buf, sizeof(buf),

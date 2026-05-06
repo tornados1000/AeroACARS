@@ -7049,74 +7049,79 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                     _ => touchdown_vs,
                 };
 
-                // v0.5.7: AGL-derivative method (LandingRate-1 plugin
-                // for X-Plane has used this since ~2014, Volanta does
-                // the same). VSI / local_vy goes to ~0 during a hard
-                // flare because the flight model dampens vertical
-                // velocity for stick-feel — but the AIRCRAFT IS STILL
-                // PHYSICALLY DESCENDING. The geometry doesn't lie:
-                // measure ΔAGL / Δt over a 2 s window centered on
-                // touchdown and you get the actual descent rate of
-                // the airframe, not the smoothed flight-model output.
+                // v0.5.7/8: AGL-derivative method (LandingRate-1.lua,
+                // Volanta — established X-Plane convention since ~2014).
+                // VSI / local_vy goes to ~0 during flare because the
+                // flight model dampens vertical velocity for stick-
+                // feel — but the AIRCRAFT IS STILL PHYSICALLY
+                // DESCENDING. Geometry doesn't lie: ΔAGL / Δt over a
+                // window gives the actual airframe descent rate.
                 //
                 //   gVS = (current_agl - avg_agl_over_window) /
                 //         (window_seconds / 2) * 60
                 //
-                // Math: avg AGL is "where you were on average across
-                // the window". For a linear descent that's the
-                // midpoint. The rate from midpoint→now over (window/2)
-                // is the geometric descent rate. Multiply by 60 to
-                // get ft/min.
-                //
-                // This is the PRIMARY value if the buffer has enough
-                // pre-touchdown samples. It bypasses every flight-
-                // model artifact and matches what other proven X-Plane
-                // landing tools report.
-                const AGL_DERIVATIVE_WINDOW_SECS: i64 = 2;
-                let agl_window_start = actual_td_at
-                    - chrono::Duration::seconds(AGL_DERIVATIVE_WINDOW_SECS);
-                let recent_samples: Vec<&TelemetrySample> = stats
-                    .snapshot_buffer
-                    .iter()
-                    .filter(|s| s.at >= agl_window_start && s.at <= actual_td_at)
-                    .collect();
-                let derived_vs_fpm = if recent_samples.len() >= 3 {
-                    let avg_agl: f32 = recent_samples
+                // v0.5.8: evaluate at 1 s, 2 s, AND 3 s windows in
+                // parallel and pick the most negative. This handles
+                // every flare profile robustly:
+                //   * Hard landing (no flare): all windows agree
+                //   * Airliner standard flare (~3 s): 2 s window
+                //     catches the steep descent before flare
+                //   * Light GA long flare (~5+ s): 3 s window covers
+                //     the meaningful descent slice
+                //   * Floaters (long shallow approach): 1 s window
+                //     measures only the very last seconds, gives the
+                //     gentle butter rate
+                let derive_at = |window_secs: i64| -> Option<f32> {
+                    let win_start = actual_td_at
+                        - chrono::Duration::seconds(window_secs);
+                    let samples: Vec<&TelemetrySample> = stats
+                        .snapshot_buffer
+                        .iter()
+                        .filter(|s| s.at >= win_start && s.at <= actual_td_at)
+                        .collect();
+                    if samples.len() < 3 {
+                        return None;
+                    }
+                    let avg_agl: f32 = samples
                         .iter()
                         .map(|s| s.agl_ft)
                         .sum::<f32>()
-                        / recent_samples.len() as f32;
-                    let agl_at_td = recent_samples
+                        / samples.len() as f32;
+                    let agl_at_td = samples
                         .last()
                         .map(|s| s.agl_ft)
                         .unwrap_or(snap.altitude_agl_ft as f32);
                     let timespan_sec = (actual_td_at
-                        - recent_samples.first().unwrap().at)
+                        - samples.first().unwrap().at)
                         .num_milliseconds() as f32
                         / 1000.0;
-                    if timespan_sec > 0.5 {
-                        let agl_midpoint = agl_at_td - avg_agl;
-                        // (ft / sec) * 60 = ft/min
-                        Some((agl_midpoint / (timespan_sec / 2.0)) * 60.0)
-                    } else {
-                        None
+                    if timespan_sec < 0.5 {
+                        return None;
                     }
-                } else {
-                    None
+                    let agl_midpoint = agl_at_td - avg_agl;
+                    Some((agl_midpoint / (timespan_sec / 2.0)) * 60.0)
                 };
+                // Most-negative of three windows wins. None values
+                // ignored — if the buffer is too sparse, we just
+                // skip the whole AGL-derivative branch.
+                let derived_vs_fpm = [derive_at(1), derive_at(2), derive_at(3)]
+                    .into_iter()
+                    .flatten()
+                    .filter(|v| *v < 0.0) // ignore positive (climbing) windows
+                    .fold(None::<f32>, |acc, v| match acc {
+                        Some(a) if a < v => Some(a),
+                        _ => Some(v),
+                    });
 
-                // Use AGL-derived value as PRIMARY when it's negative
-                // (the aircraft was actually descending). Most-negative
-                // wins against the running min — the AGL-derived
-                // value is geometric truth and beats any VSI-based
-                // capture. We never use it when positive (aircraft
-                // climbing through window — invalid for landing).
+                // PRIMARY when it beats the prior capture. The AGL-
+                // derivative value is geometric truth — beats any
+                // VSI-based capture.
                 let touchdown_vs = match derived_vs_fpm {
-                    Some(d) if d < touchdown_vs && d < 0.0 => {
+                    Some(d) if d < touchdown_vs => {
                         tracing::info!(
                             agl_derived_fpm = d,
                             previous_capture_fpm = touchdown_vs,
-                            "AGL-derivative method overrode VSI-based capture (LandingRate-1 algo)"
+                            "AGL-derivative method overrode VSI-based capture (LandingRate-1 algo, multi-window)"
                         );
                         d
                     }

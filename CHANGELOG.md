@@ -4,6 +4,33 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.5.8] — 2026-05-07
+
+🎯 **Multi-Window AGL-Δ + Plugin-Update — komplette Algorithmus-Konvergenz mit Volanta-Niveau.**
+
+Pilot-Hinweis: „Volanta nutzt kein Plugin mehr und kriegt trotzdem korrekte Werte." Bestätigt unsere Strategie — der AGL-Δ-Algorithmus aus v0.5.7 ist self-sufficient ohne Plugin. v0.5.8 robustifiziert ihn weiter.
+
+### 🆕 Multi-Window AGL-Derivative
+
+Statt nur 2 s evaluiert der Client/Plugin jetzt **drei Fenster gleichzeitig** (1 s, 2 s, 3 s) und nimmt das negativste:
+- **Hard Landing** (kein Flare): alle drei Fenster geben gleiche Werte
+- **Airliner-Standard-Flare** (~3 s): 2 s-Fenster fängt den Pre-Flare-Sinkflug
+- **GA Long-Flare** (~5 s): 3 s-Fenster deckt den relevanten Slice ab
+- **Floater** (lange flache Approach): 1 s-Fenster misst nur die letzten Sekunden = sanfte Butter-Rate
+
+### 🆕 Plugin (v0.5.8) — gleiche Methode
+
+Plugin's Ring-Buffer hat jetzt auch AGL-Werte (war vorher nur VS+Pitch). Multi-Window-AGL-Δ läuft im Plugin self-sufficient. Kombiniert mit running airborne-VS-min als Backup.
+
+**Aber wichtig:** Plugin ist optional. Volanta beweist dass die UDP-RREF-Daten von X-Plane (Port 49000) reichen — der Algorithmus macht den Unterschied, nicht der Plugin.
+
+### 🛠 Intern
+- Client: drei parallele AGL-Fenster, most-negative wins
+- Plugin: VS-Buffer von 64 → 128 Samples (~3.8 s history bei 30 fps)
+- Tests: 82 grün
+
+---
+
 ## [v0.5.7] — 2026-05-07
 
 🎯 **Methoden-Wechsel: VS wird jetzt aus AGL-Δ berechnet (LandingRate-1-Algorithmus, seit ~10 Jahren in der X-Plane-Welt erprobt).**
