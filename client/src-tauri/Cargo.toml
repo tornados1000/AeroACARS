@@ -10,11 +10,12 @@ members = [
     "crates/secrets",
     "crates/geo",
     "crates/metar",
+    "crates/aeroacars-mqtt",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.5.10"
+version = "0.5.11"
 edition = "2021"
 license = "MIT"
 authors = ["Thomas Kant <github@MANFahrer-GF>", "AeroACARS contributors"]
@@ -71,6 +72,7 @@ storage    = { path = "crates/storage" }
 secrets    = { path = "crates/secrets" }
 geo        = { path = "crates/geo" }
 metar      = { path = "crates/metar" }
+aeroacars-mqtt = { path = "crates/aeroacars-mqtt" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -143,6 +145,7 @@ storage.workspace = true
 secrets.workspace = true
 geo.workspace = true
 metar.workspace = true
+aeroacars-mqtt.workspace = true
 
 # MSFS adapter is Windows-only
 [target.'cfg(target_os = "windows")'.dependencies]

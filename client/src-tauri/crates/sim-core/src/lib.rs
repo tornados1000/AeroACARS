@@ -684,6 +684,14 @@ pub enum FlightPhase {
     Takeoff,
     Climb,
     Cruise,
+    /// v0.5.11: dedicated Holding phase. Detected when the aircraft
+    /// circles at constant altitude (sustained bank > 15° + |VS| <
+    /// 200 fpm for > 90 s). Triggered from Cruise (high-altitude
+    /// hold over a fix) or Approach (low-altitude approach hold).
+    /// On exit, returns to whichever phase we came from — or to
+    /// Approach if a sustained descent has begun (= ATC clears us
+    /// out of the hold for the approach).
+    Holding,
     Descent,
     Approach,
     Final,

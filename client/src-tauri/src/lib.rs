@@ -74,6 +74,9 @@ fn position_interval(phase: FlightPhase) -> Duration {
         // Cruise: long straight legs, sparse samples are enough — capped
         // at 30 s so the live map never goes more than half a minute stale.
         FlightPhase::Cruise => 30,
+        // v0.5.11: Holding — same cadence as Cruise (slow track update,
+        // we're circling at constant altitude).
+        FlightPhase::Holding => 30,
         // Parked / pre-/post-flight — keep a 30 s heartbeat so phpVMS
         // sees the PIREP is alive while the pilot files.
         FlightPhase::Preflight
@@ -138,6 +141,30 @@ const TOUCH_AND_GO_DWELL_SECS: i64 = 1;
 /// AGL increase from `lowest_agl_during_approach_ft` that signals a
 /// possible go-around in progress.
 const GO_AROUND_AGL_RECOVERY_FT: f32 = 200.0;
+
+// ---- Holding-pattern detection (v0.5.11) ------------------------------
+//
+// A holding pattern is a circle at constant altitude. We detect it via
+// sustained turn (banked) + level flight (low VS). Real ICAO holds:
+//   * 1-min legs at <FL140, 1.5-min legs above → 4-6 min full circuit
+//   * Standard 3°/sec turn rate = full 360° in 2 min
+//   * Constant altitude (±100 ft)
+//
+// Entry threshold: 90 s of sustained bank > 15° + |VS| < 200 fpm.
+// This filters out:
+//   * 90° heading change at standard rate (~30 s) — won't trigger
+//   * Procedure turn / teardrop entry (~60 s) — won't trigger
+//   * Long ATC vector with sustained 30° bank (~2 min) — WILL trigger,
+//     which is fine: the FSM simply shows "Holding" briefly and then
+//     exits when bank levels off
+//
+// Exit threshold: 30 s of sustained bank < 5° (level flight). Or
+// active descent (< -300 fpm + AGL < 5000) which means ATC cleared
+// us out of the hold for the approach.
+const HOLDING_ENTRY_DWELL_SECS: i64 = 90;
+const HOLDING_EXIT_DWELL_SECS: i64 = 30;
+const HOLDING_BANK_THRESHOLD_DEG: f32 = 15.0;
+const HOLDING_VS_THRESHOLD_FPM: f32 = 200.0;
 /// Sustained climb time required before we classify a Go-Around.
 const GO_AROUND_DWELL_SECS: i64 = 8;
 /// Minimum positive V/S at which the GA detector accepts a sample
@@ -477,6 +504,15 @@ struct AppState {
     /// AeroACARS-Session. Wenn kein Profile geladen → `None`, der
     /// Discord-Embed fällt auf "AeroACARS Pilot" zurück.
     cached_pilot: Mutex<Option<(String, String)>>,
+    /// v0.5.11: MQTT live-tracking publisher handle. Connects to
+    /// the aeroacars-live VPS (live.kant.ovh) via auto-provisioning
+    /// the first time AeroACARS sees a logged-in pilot's API key.
+    /// Pure background feature — pilot-invisible, no UI. Failure is
+    /// non-fatal: AeroACARS works exactly as before if MQTT is
+    /// unreachable. tokio::sync::Mutex (not std) because Handle is
+    /// only ever accessed from async contexts (hook points run
+    /// inside the streamer's async tasks).
+    mqtt: tokio::sync::Mutex<Option<aeroacars_mqtt::Handle>>,
 }
 
 /// RAII guard for `AppState::flight_setup_in_progress`. Acquire it at the
@@ -755,6 +791,13 @@ struct PersistedFlightStats {
     lowest_agl_during_approach_ft: Option<f32>,
     #[serde(default)]
     go_around_climb_pending_since: Option<DateTime<Utc>>,
+    // v0.5.11 holding-pattern tracking
+    #[serde(default)]
+    holding_pending_since: Option<DateTime<Utc>>,
+    #[serde(default)]
+    holding_exit_pending_since: Option<DateTime<Utc>>,
+    #[serde(default)]
+    previous_phase_before_holding: Option<FlightPhase>,
 }
 
 impl PersistedFlightStats {
@@ -819,6 +862,9 @@ impl PersistedFlightStats {
             go_around_count: stats.go_around_count,
             lowest_agl_during_approach_ft: stats.lowest_agl_during_approach_ft,
             go_around_climb_pending_since: stats.go_around_climb_pending_since,
+            holding_pending_since: stats.holding_pending_since,
+            holding_exit_pending_since: stats.holding_exit_pending_since,
+            previous_phase_before_holding: stats.previous_phase_before_holding,
         }
     }
 
@@ -889,6 +935,9 @@ impl PersistedFlightStats {
         stats.go_around_count = self.go_around_count;
         stats.lowest_agl_during_approach_ft = self.lowest_agl_during_approach_ft;
         stats.go_around_climb_pending_since = self.go_around_climb_pending_since;
+        stats.holding_pending_since = self.holding_pending_since;
+        stats.holding_exit_pending_since = self.holding_exit_pending_since;
+        stats.previous_phase_before_holding = self.previous_phase_before_holding;
     }
 }
 
@@ -1132,18 +1181,22 @@ struct FlightStats {
     sampler_touchdown_vs_fpm: Option<f32>,
     sampler_touchdown_g_force: Option<f32>,
     /// v0.5.5: running peak-descent VS tracker. Updated every sampler
-    /// tick from when the FSM enters Approach onward. Picks the most
-    /// negative pitch-corrected VS seen during the entire approach +
-    /// final segment. Robust against:
-    ///   * Sparse RREF stream (sampler buffer might be stale at
-    ///     touchdown if X-Plane downgraded our 50 Hz request to ~5 Hz)
-    ///   * Aggressive flare (real descent peak was 30 s ago, not 500 ms)
-    ///   * Buffer-eviction race (5 s ring vs 9 s streamer cadence
-    ///     during landing — observed in pilot test 2026-05-06 21:22)
-    /// Used as the most-negative-wins tiebreaker against sampler-
-    /// edge capture and buffer-window scan during Final → Landing.
+    /// tick while AGL ≤ 250 ft (low-altitude / final approach territory).
+    /// Picks the most negative pitch-corrected VS seen ONLY in the
+    /// touchdown footprint, NOT across the whole approach.
+    ///
+    /// v0.5.11 hardening (renamed from `approach_vs_min_fpm`):
+    /// the previous variant tracked min across the whole Approach +
+    /// Final segment. Pilot's deep analysis exposed the bug class:
+    /// a pre-flare descent at -1346 fpm @ 943 ft AGL would win over
+    /// the actual gentle touchdown. AGL ≤ 250 ft restricts tracking
+    /// to the meaningful zone.
+    ///
+    /// Used ONLY as a fallback when the AGL-derivative estimator
+    /// fails (very sparse RREF, no usable AGL samples). Never wins
+    /// against a real AGL-Δ estimate.
     /// Reset on Approach entry so go-arounds don't carry stale data.
-    approach_vs_min_fpm: Option<f32>,
+    low_agl_vs_min_fpm: Option<f32>,
     /// Frozen subsample of the ring buffer covering ±2 s around touchdown,
     /// for V/S-curve reconstruction in the PIREP notes block. Captured
     /// once when the on-ground edge fires; surviving across a Tauri
@@ -1234,6 +1287,22 @@ struct FlightStats {
     /// `GO_AROUND_DWELL_SECS` before firing — otherwise every brief
     /// climb-correction during a normal approach would count as a GA.
     go_around_climb_pending_since: Option<DateTime<Utc>>,
+
+    // ---- v0.5.11 holding-pattern tracking ----
+    /// Timestamp of the first tick where the aircraft satisfied
+    /// holding-pattern conditions (banked turn at constant altitude).
+    /// Cleared whenever conditions break — only when sustained for
+    /// `HOLDING_ENTRY_DWELL_SECS` does the FSM transition to Holding.
+    holding_pending_since: Option<DateTime<Utc>>,
+    /// Timestamp of the first tick where the aircraft has level wings
+    /// while in Holding. Cleared if bank rises again. Sustained for
+    /// `HOLDING_EXIT_DWELL_SECS` triggers the exit back to the
+    /// previous phase.
+    holding_exit_pending_since: Option<DateTime<Utc>>,
+    /// What phase we entered Holding from (Cruise or Approach).
+    /// Restored on Holding exit unless an active descent has begun
+    /// (then we go directly to Approach).
+    previous_phase_before_holding: Option<FlightPhase>,
 
     /// Free-form ACARS log lines that `step_flight` wants posted to
     /// phpVMS' `/acars/logs` on the next streamer tick — primarily
@@ -2041,6 +2110,14 @@ fn check_go_around(
             ));
             stats.lowest_agl_during_approach_ft = None;
             stats.go_around_climb_pending_since = None;
+            // v0.5.11: reset climb_peak_msl so the missed-approach
+            // climb back up tracks fresh peaks. Without this, the
+            // prior peak (the cruise altitude) stays as reference,
+            // and the moment the aircraft descends back through it
+            // for the second approach attempt, the low-altitude
+            // Climb→Descent trigger could fire prematurely against
+            // a stale peak.
+            stats.climb_peak_msl = None;
             return Some(FlightPhase::Climb);
         }
     } else {
@@ -2050,6 +2127,174 @@ fn check_go_around(
         stats.go_around_climb_pending_since = None;
     }
     None
+}
+
+/// v0.5.11: detect entry into a holding pattern.
+///
+/// Triggered from Cruise or Approach when the aircraft sustains a
+/// turn at constant altitude for `HOLDING_ENTRY_DWELL_SECS`.
+/// Returns `true` once the dwell elapses; the caller then transitions
+/// the FSM to `FlightPhase::Holding`.
+///
+/// Detection criteria each tick:
+///   * |bank| > 15° (banked turn — standard rate is ~25-30°)
+///   * |VS| < 200 fpm (level — real holds are within ±100 ft)
+///
+/// Once both fail (e.g. straight-and-level resumed), the dwell timer
+/// resets so brief intermediate level segments during a 360° turn
+/// don't accidentally fire (banked → level → banked is normal at
+/// hold turn entry/exit).
+fn check_holding_entry(
+    stats: &mut FlightStats,
+    snap: &SimSnapshot,
+    now: DateTime<Utc>,
+) -> bool {
+    let in_hold_pattern = snap.bank_deg.abs() > HOLDING_BANK_THRESHOLD_DEG
+        && snap.vertical_speed_fpm.abs() < HOLDING_VS_THRESHOLD_FPM;
+    if in_hold_pattern {
+        let pending = stats.holding_pending_since.get_or_insert(now);
+        if (now - *pending).num_seconds() >= HOLDING_ENTRY_DWELL_SECS {
+            tracing::info!(
+                bank_deg = snap.bank_deg,
+                vs_fpm = snap.vertical_speed_fpm,
+                agl_ft = snap.altitude_agl_ft,
+                "holding pattern detected — entering Holding phase"
+            );
+            stats.holding_pending_since = None;
+            return true;
+        }
+    } else {
+        stats.holding_pending_since = None;
+    }
+    false
+}
+
+// ---- v0.5.11: AGL-derivative touchdown VS estimator -------------------
+//
+// Pilot's deep analysis pinpointed the bug class in v0.5.5+:
+// "approach_vs_min_fpm" picks the most-negative VS across the WHOLE
+// approach. A pre-flare descent at -1346 fpm @ 943 ft AGL would win
+// over the actual gentle touchdown at -200 fpm @ 0 ft. Result:
+// "phantom hard landing" reports.
+//
+// Correct approach: ONLY count samples close to the ground for
+// touchdown VS. The window-tier strategy (LandingRate-1.lua, Volanta)
+// uses geometric AGL change over a tight time window centred on the
+// actual touchdown moment. Pre-flare descent gets ignored entirely.
+//
+// Window tiers (most preferred first):
+//   1. 750 ms   — dense plugin-fed samples (≥5 samples)
+//   2. 1000 ms  — typical RREF cadence
+//   3. 1500 ms  — slower RREF (still inside flare)
+//   4. 2000 ms  — wider for very sparse RREF
+//   5. 3000 ms  — last "real" tier
+//   6. 12000 ms — sparse fallback (the famous 9-sec gap in pilot
+//                 reports). Lower confidence but better than nothing.
+//
+// All tiers must satisfy:
+//   * Last sample AGL ≤ 5 ft  (genuine touchdown frame, not Sim-glitch)
+//   * Earliest sample AGL ≤ 250 ft (= we're below pattern altitude)
+//   * Sample count ≥ MIN_SAMPLES (5 for short tiers, 3 for sparse)
+//   * Result < 0 fpm (no positive "landing rate" is physical)
+
+const TD_WINDOW_TIERS_MS: &[(i64, usize)] = &[
+    (750, 5),
+    (1000, 5),
+    (1500, 5),
+    (2000, 4),
+    (3000, 3),
+    (12000, 3),
+];
+const TD_AGL_MAX_AT_TOUCHDOWN_FT: f32 = 5.0;
+const TD_AGL_MAX_AT_WINDOW_START_FT: f32 = 250.0;
+
+/// Result of a touchdown VS estimation, including diagnostics so the
+/// rest of the system can log which window won and its sample
+/// density.
+#[derive(Debug, Clone, Copy)]
+pub struct TouchdownVsEstimate {
+    /// Negative fpm (descent rate). Always strictly < 0.
+    pub fpm: f32,
+    pub source: &'static str,
+    pub window_ms: i64,
+    pub sample_count: usize,
+}
+
+/// Estimate touchdown VS from snapshot_buffer AGL samples.
+///
+/// Walks the window tiers in order (shortest first); returns the
+/// first tier that satisfies all guards. Returns `None` when no
+/// window has enough samples or all windows give a non-negative
+/// (= unphysical) result.
+fn estimate_xplane_touchdown_vs_from_agl(
+    buffer: &std::collections::VecDeque<TelemetrySample>,
+    touchdown_at: DateTime<Utc>,
+) -> Option<TouchdownVsEstimate> {
+    for (window_ms, min_samples) in TD_WINDOW_TIERS_MS {
+        let win_start = touchdown_at - chrono::Duration::milliseconds(*window_ms);
+        let samples: Vec<&TelemetrySample> = buffer
+            .iter()
+            .filter(|s| s.at >= win_start && s.at <= touchdown_at)
+            .collect();
+        if samples.len() < *min_samples {
+            continue;
+        }
+        // Touchdown sample (latest) must really be at the ground.
+        let last = samples.last()?;
+        if last.agl_ft > TD_AGL_MAX_AT_TOUCHDOWN_FT {
+            continue;
+        }
+        // Window-start sample must already be near the ground (i.e.
+        // we're not picking up a high-altitude pre-flare descent).
+        let first = samples.first()?;
+        if first.agl_ft > TD_AGL_MAX_AT_WINDOW_START_FT {
+            continue;
+        }
+        // Geometric descent rate via avg-AGL midpoint trick
+        // (LandingRate-1.lua method). For a linear descent the avg
+        // is the time-midpoint; the rate from midpoint → now over
+        // (timespan / 2) is the geometric descent rate.
+        let avg_agl: f32 =
+            samples.iter().map(|s| s.agl_ft).sum::<f32>() / samples.len() as f32;
+        let timespan_sec =
+            (last.at - first.at).num_milliseconds() as f32 / 1000.0;
+        if timespan_sec < 0.2 {
+            continue;
+        }
+        let agl_midpoint = last.agl_ft - avg_agl;
+        let fpm = (agl_midpoint / (timespan_sec / 2.0)) * 60.0;
+        // Reject positive (climbing) results — physically wrong for
+        // a touchdown estimate.
+        if !fpm.is_finite() || fpm >= 0.0 {
+            continue;
+        }
+        return Some(TouchdownVsEstimate {
+            fpm,
+            source: match *window_ms {
+                750 => "agl_750ms",
+                1000 => "agl_1000ms",
+                1500 => "agl_1500ms",
+                2000 => "agl_2000ms",
+                3000 => "agl_3000ms",
+                12000 => "agl_sparse_12s",
+                _ => "agl_unknown",
+            },
+            window_ms: *window_ms,
+            sample_count: samples.len(),
+        });
+    }
+    None
+}
+
+/// Discard non-negative VS values. Used as a safety filter on every
+/// fallback source (sampler, plugin, buffer-min). A positive
+/// "landing rate" is physically impossible — the airframe is by
+/// definition descending (or settled at 0) at the touchdown frame.
+/// Plugin / buffer values can briefly read positive due to gear
+/// oscillation rebound; we never want those as the published
+/// landing rate.
+fn negative_only(value: Option<f32>) -> Option<f32> {
+    value.filter(|v| v.is_finite() && *v < 0.0)
 }
 
 /// Compute population standard deviations of V/S and bank over the
@@ -2662,6 +2907,16 @@ async fn phpvms_login(
         .map_err(|e| UiError::new("keyring", e.to_string()))?;
     write_site_config(&app, &SiteConfig { url: locked_url.clone() })?;
 
+    // v0.5.11: kick off live-tracking provisioning in the background.
+    // Non-blocking — login completes regardless of whether the
+    // provision call succeeds. Pure background feature, no UI.
+    {
+        let app_for_mqtt = app.clone();
+        tauri::async_runtime::spawn(async move {
+            init_mqtt_publisher_via_provisioning(app_for_mqtt).await;
+        });
+    }
+
     let base_url = client.connection().base_url().to_string();
     *state.client.lock().expect("client mutex") = Some(client.clone());
     cache_pilot(&state, &profile);
@@ -2693,6 +2948,126 @@ fn cache_pilot(state: &tauri::State<'_, AppState>, profile: &api_client::Profile
     }
 }
 
+// ---- v0.5.11: MQTT live-tracking auto-provisioning --------------------
+//
+// Pure background feature — pilot-invisible, no UI. Provisioning is
+// optional: failure is non-fatal, AeroACARS continues to function as
+// before. Spec: aeroacars-live/docs/aeroacars-integration-spec-v2.md.
+
+const MQTT_KEYRING_USERNAME: &str = "mqtt-username";
+const MQTT_KEYRING_PASSWORD: &str = "mqtt-password";
+const MQTT_KEYRING_VA: &str = "mqtt-va";
+const MQTT_KEYRING_PILOT_ID: &str = "mqtt-pilot-id";
+const MQTT_KEYRING_BROKER: &str = "mqtt-broker-url";
+
+/// Try to start the MQTT live-tracking publisher.
+///
+/// Two-stage flow:
+///   1. If MQTT credentials are already cached in the keyring (from
+///      a previous successful provision), use them directly.
+///   2. Otherwise, read the phpVMS API key from the keyring (must be
+///      present — the user has logged in at least once) and call
+///      live.kant.ovh's `/api/provision` endpoint with it. The
+///      server returns MQTT credentials which we cache and use.
+///
+/// All failures are logged via `tracing::warn!` and ignored — this
+/// is a non-fatal background feature. If the user's never logged in,
+/// or the VPS is down, or the API key is invalid, the function just
+/// returns without starting MQTT.
+async fn init_mqtt_publisher_via_provisioning(app: AppHandle) {
+    use aeroacars_mqtt::{provision::provision, start, MqttConfig};
+
+    let state = app.state::<AppState>();
+
+    // Check cache first.
+    let cached = (|| -> Option<MqttConfig> {
+        let user = secrets::load_api_key(MQTT_KEYRING_USERNAME).ok().flatten()?;
+        let pw = secrets::load_api_key(MQTT_KEYRING_PASSWORD).ok().flatten()?;
+        let va = secrets::load_api_key(MQTT_KEYRING_VA).ok().flatten()?;
+        let pilot_id = secrets::load_api_key(MQTT_KEYRING_PILOT_ID).ok().flatten()?;
+        let broker = secrets::load_api_key(MQTT_KEYRING_BROKER).ok().flatten()?;
+        Some(MqttConfig {
+            broker_url: broker,
+            username: user,
+            password: pw,
+            va_prefix: va,
+            pilot_id,
+        })
+    })();
+
+    let cfg = if let Some(c) = cached {
+        tracing::info!("live-tracking: using cached MQTT credentials");
+        c
+    } else {
+        // No cache — provision from server.
+        let api_key = match secrets::load_api_key(KEYRING_ACCOUNT) {
+            Ok(Some(k)) => k,
+            Ok(None) => {
+                tracing::debug!(
+                    "live-tracking: no phpVMS API key in keyring yet — \
+                     will retry after login"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "live-tracking: keyring read failed — skipping"
+                );
+                return;
+            }
+        };
+
+        let resp = match provision(&api_key, None).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "live-tracking: provision call failed (non-fatal)"
+                );
+                return;
+            }
+        };
+
+        // Cache for next launch. Failures here are non-fatal —
+        // we'll just provision again next time.
+        let _ = secrets::store_api_key(MQTT_KEYRING_USERNAME, &resp.username);
+        let _ = secrets::store_api_key(MQTT_KEYRING_PASSWORD, &resp.password);
+        let _ = secrets::store_api_key(MQTT_KEYRING_VA, &resp.va_prefix);
+        let _ = secrets::store_api_key(MQTT_KEYRING_PILOT_ID, &resp.pilot_id);
+        let _ = secrets::store_api_key(MQTT_KEYRING_BROKER, &resp.broker_url);
+        tracing::info!(
+            pilot_id = %resp.pilot_id,
+            va = %resp.va_prefix,
+            newly_created = resp.newly_created,
+            "live-tracking provisioned"
+        );
+        resp.into()
+    };
+
+    let handle = match start(cfg) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(error = %e, "live-tracking: MQTT start failed");
+            return;
+        }
+    };
+
+    *state.mqtt.lock().await = Some(handle);
+    tracing::info!("live-tracking publisher running");
+}
+
+/// Forget cached MQTT credentials. Called from logout — next session
+/// re-provisions cleanly. The phpVMS API key in `KEYRING_ACCOUNT`
+/// already gets cleared by the existing logout flow.
+fn clear_mqtt_credentials_cache() {
+    let _ = secrets::delete_api_key(MQTT_KEYRING_USERNAME);
+    let _ = secrets::delete_api_key(MQTT_KEYRING_PASSWORD);
+    let _ = secrets::delete_api_key(MQTT_KEYRING_VA);
+    let _ = secrets::delete_api_key(MQTT_KEYRING_PILOT_ID);
+    let _ = secrets::delete_api_key(MQTT_KEYRING_BROKER);
+}
+
 /// Forget the current session. Removes the keyring entry and site config,
 /// clears the in-memory client.
 #[tauri::command]
@@ -2703,6 +3078,13 @@ async fn phpvms_logout(
     *state.client.lock().expect("client mutex") = None;
     secrets::delete_api_key(KEYRING_ACCOUNT)
         .map_err(|e| UiError::new("keyring", e.to_string()))?;
+    // v0.5.11: stop the MQTT publisher and forget cached credentials
+    // so the next login provisions fresh (handles the case where
+    // a different pilot logs in on the same machine).
+    if let Some(handle) = state.mqtt.lock().await.take() {
+        handle.shutdown();
+    }
+    clear_mqtt_credentials_cache();
     clear_site_config(&app)?;
     tracing::info!("logged out");
     Ok(())
@@ -3458,6 +3840,7 @@ fn phase_to_snake(phase: FlightPhase) -> &'static str {
         FlightPhase::Takeoff => "takeoff",
         FlightPhase::Climb => "climb",
         FlightPhase::Cruise => "cruise",
+        FlightPhase::Holding => "holding",
         FlightPhase::Descent => "descent",
         FlightPhase::Approach => "approach",
         FlightPhase::Final => "final",
@@ -5148,6 +5531,29 @@ async fn flight_end(
                 drop(stats_for_post);
                 tokio::spawn(discord::post_event(discord::EventKind::PirepFiled, ctx));
             }
+            // v0.5.11: MQTT live-tracking PIREP publish. Best-effort,
+            // fire-and-forget. Monitor uses this to mark a flight
+            // as completed in the live history.
+            {
+                let mqtt = state.mqtt.lock().await;
+                if let Some(handle) = mqtt.as_ref() {
+                    let payload = aeroacars_mqtt::PirepPayload {
+                        ts: Utc::now().timestamp_millis(),
+                        pirep_id: flight.pirep_id.clone(),
+                        flight_number: format_callsign(
+                            &flight.airline_icao,
+                            &flight.flight_number,
+                        ),
+                        dep: flight.dpt_airport.clone(),
+                        arr: flight.arr_airport.clone(),
+                        block_time_min: body.flight_time,
+                        fuel_used_kg: body.fuel_used.map(|kg| kg as f32),
+                        landing_vs_fpm: body.landing_rate.map(|r| r as i32),
+                        notes: None,
+                    };
+                    handle.pirep(payload);
+                }
+            }
             consume_bid_best_effort(&client, flight.bid_id).await;
             Ok(())
         }
@@ -5776,25 +6182,31 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
                 bank_deg: snap.bank_deg,
             });
 
-            // v0.5.5: running peak-descent VS during approach + final.
-            // Independent of buffer state — picks the most negative
-            // pitch-corrected VS seen since Approach entry. Used by
-            // the Final → Landing transition as a most-negative-wins
-            // tiebreaker against sampler-edge capture and the buffer
-            // window scan, which both proved unreliable on a low-
-            // RREF-rate run (pilot test 2026-05-06: captured +57 fpm
-            // because last 500 ms of the buffer only had post-
-            // touchdown rebound samples).
+            // v0.5.11: running peak-descent VS in the LOW-ALTITUDE zone
+            // only (AGL ≤ 250 ft). Earlier versions (v0.5.5+) tracked
+            // this across the whole Approach + Final segment, which
+            // produced phantom hard-landing reports when a steep
+            // pre-flare descent (e.g. -1346 fpm @ 943 ft AGL) won
+            // over the actual gentle touchdown.
+            //
+            // Now: ONLY samples from the low-altitude footprint count.
+            // This is a fallback only — the AGL-derivative estimator
+            // (estimate_xplane_touchdown_vs_from_agl) is the primary
+            // source. low_agl_vs_min_fpm is used when the estimator
+            // can't find a valid window (extremely sparse RREF, etc.).
             let approach_or_final = matches!(
                 stats.phase,
                 FlightPhase::Approach | FlightPhase::Final
             );
-            if approach_or_final && !snap.on_ground {
+            if approach_or_final
+                && !snap.on_ground
+                && snap.altitude_agl_ft <= 250.0
+            {
                 let pitch_rad = (snap.pitch_deg as f32) * std::f32::consts::PI / 180.0;
                 let vs_corrected = snap.vertical_speed_fpm * pitch_rad.cos();
-                let curr_min = stats.approach_vs_min_fpm.unwrap_or(f32::INFINITY);
+                let curr_min = stats.low_agl_vs_min_fpm.unwrap_or(f32::INFINITY);
                 if vs_corrected < curr_min {
-                    stats.approach_vs_min_fpm = Some(vs_corrected);
+                    stats.low_agl_vs_min_fpm = Some(vs_corrected);
                 }
             }
 
@@ -6137,6 +6549,49 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
             // Returns Some(message) the first time a score is announced
             // so the streamer can mirror it into `acars/logs`.
             let landing_log_message = announce_landing_score(&app, &flight);
+            // v0.5.11: MQTT touchdown event. Fires once per landing
+            // when the score message gets generated (= touchdown was
+            // captured + scored). Snapshot relevant fields from
+            // FlightStats inside a short-lived block so the
+            // std::sync::MutexGuard (not Send) doesn't span the
+            // tokio Mutex `.await` below.
+            if landing_log_message.is_some() {
+                let payload_opt: Option<aeroacars_mqtt::TouchdownPayload> = {
+                    let stats = flight.stats.lock().expect("flight stats");
+                    stats.landing_at.map(|landing_at| {
+                        aeroacars_mqtt::TouchdownPayload {
+                            ts: landing_at.timestamp_millis(),
+                            vs_fpm: stats
+                                .landing_rate_fpm
+                                .or(stats.landing_peak_vs_fpm)
+                                .map(|v| v.round() as i32)
+                                .unwrap_or(0),
+                            ias_kt: stats
+                                .landing_speed_kt
+                                .map(|v| v.round() as i32)
+                                .unwrap_or(0),
+                            gs_kt: None,
+                            pitch_deg: stats.landing_pitch_deg,
+                            bank_deg: None,
+                            g_load: stats.landing_peak_g_force,
+                            sideslip_deg: stats.touchdown_sideslip_deg,
+                            headwind_kt: None,
+                            crosswind_kt: None,
+                            score: stats.landing_score.map(|s| s.numeric()),
+                            bounce: Some(stats.bounce_count > 0),
+                            runway: stats.approach_runway.clone(),
+                            airport: Some(flight.arr_airport.clone()),
+                        }
+                    })
+                };
+                if let Some(payload) = payload_opt {
+                    let app_state = app.state::<AppState>();
+                    let mqtt = app_state.mqtt.lock().await;
+                    if let Some(handle) = mqtt.as_ref() {
+                        handle.touchdown(payload);
+                    }
+                }
+            }
             // Diff cockpit knobs against last-seen values and log changes
             // to the activity feed. One entry per change, not per tick.
             detect_telemetry_changes(&app, &flight, &snap);
@@ -6155,6 +6610,16 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                     lon: Some(snap.lon),
                     created_at: Some(Utc::now().to_rfc3339()),
                 });
+                // v0.5.11: live-tracking phase publish. Retained
+                // message — Monitor sees current phase on connect
+                // even when joining mid-flight.
+                {
+                    let app_state = app.state::<AppState>();
+                    let mqtt = app_state.mqtt.lock().await;
+                    if let Some(handle) = mqtt.as_ref() {
+                        handle.phase(new_phase, Utc::now());
+                    }
+                }
             }
             if let Some(msg) = landing_log_message {
                 acars_log_entries.push(api_client::LogEntry {
@@ -6208,6 +6673,30 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
             let queue = open_position_queue(&app);
             if let Some(q) = &queue {
                 drain_position_queue(q, &client, &flight.pirep_id).await;
+            }
+
+            // v0.5.11: MQTT live-tracking publish (best-effort,
+            // independent of phpVMS post). Publishing happens on a
+            // bounded mpsc — try_send drops at full buffer so a
+            // stalled broker can NEVER stall the streamer's hot
+            // path. Position is the high-frequency channel; the
+            // crate marks it QoS 0 retained for live-map snap-on-
+            // connect.
+            {
+                let app_state = app.state::<AppState>();
+                    let mqtt = app_state.mqtt.lock().await;
+                if let Some(handle) = mqtt.as_ref() {
+                    let meta = aeroacars_mqtt::FlightMeta {
+                        callsign: format_callsign(
+                            &flight.airline_icao,
+                            &flight.flight_number,
+                        ),
+                        aircraft_icao: flight.aircraft_icao.clone(),
+                        dep_icao: flight.dpt_airport.clone(),
+                        arr_icao: flight.arr_airport.clone(),
+                    };
+                    handle.position(&snap, &meta);
+                }
             }
 
             match client
@@ -6452,6 +6941,7 @@ fn phase_human_label(phase: FlightPhase) -> &'static str {
         FlightPhase::Takeoff => "Takeoff",
         FlightPhase::Climb => "Initial Climb",
         FlightPhase::Cruise => "Cruise",
+        FlightPhase::Holding => "Holding",
         FlightPhase::Descent => "Descent",
         FlightPhase::Approach => "Approach",
         FlightPhase::Final => "Final",
@@ -6654,6 +7144,31 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
         }
     }
 
+    // v0.5.11: freeze FSM transitions during sim pause / slew mode.
+    //
+    // Position recording, distance tracking, fuel tracking, peak-altitude
+    // tracking, and the phpVMS heartbeat above all continue running.
+    // Only the phase classifier pauses with the sim — otherwise:
+    //
+    //   * Pause: a frozen snapshot with bank > 15° and |VS| < 200 fpm
+    //     would let the wall-clock dwell timer falsely classify the
+    //     pilot as "in Holding" after 90 real-world seconds (pilot
+    //     making coffee while paused mid-turn = falsely identified as
+    //     a holding pattern).
+    //   * Slew: teleporting from FL340 → 500 ft AGL produces a
+    //     massive lost_altitude spike in one tick → would falsely
+    //     fire Climb→Descent / Heli-vertical transitions / mid-air
+    //     ground-edges. Slew is a debug/positioning tool, not real
+    //     flight motion.
+    //
+    // When the pilot un-pauses or exits slew, FSM resumes from the
+    // current state with current snapshot values. Any pending dwell
+    // timers (Holding, Touch-and-Go, Go-Around) keep their last
+    // value and continue from there.
+    if snap.paused || snap.slew_mode {
+        return None;
+    }
+
     // Match on a local Copy so the rest of the body is free to mutate `stats`.
     match prev_phase {
         FlightPhase::Boarding => {
@@ -6671,7 +7186,22 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
             // Both flows MSFS supports get covered: the native Ctrl+P
             // push (often doesn't touch parking brake) and the GSX
             // / hand-flown push (brake released first, then truck).
-            if snap.on_ground && snap.groundspeed_kt > 0.5 {
+            // v0.5.11: accept water surface as ground-equivalent for
+            // seaplanes. Some sims (MSFS especially) report
+            // on_ground=false when an aircraft is sitting on water,
+            // because the gear-on-pavement contact model returns
+            // false on liquid surfaces. The aircraft is functionally
+            // on the surface (AGL ≈ 0, VS ≈ 0) and water-taxi
+            // movement is real motion. Without this, seaplanes that
+            // boot on water would stay stuck in Boarding forever.
+            //
+            // The AGL < 5 ft + |VS| < 50 fpm guard ensures we're
+            // genuinely at surface level (not low-level approach,
+            // which is past Boarding anyway, but defensive).
+            let on_surface = snap.on_ground
+                || (snap.altitude_agl_ft < 5.0
+                    && snap.vertical_speed_fpm.abs() < 50.0);
+            if on_surface && snap.groundspeed_kt > 0.5 {
                 stats.block_off_at = Some(now);
                 // Note: block_fuel_kg is tracked as a running peak
                 // (see top of step_flight), not captured here. APU
@@ -6730,15 +7260,25 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                     FlightPhase::TaxiOut
                 };
             }
-            // v0.5.10: pure-hover helicopter departure escape hatch.
-            // Helis that lift off straight from the gate without
-            // ground-rolling (GS stays at 0) would otherwise stay in
-            // Boarding forever. Detect the on_ground edge with
-            // engines running and skip straight to Takeoff.
+            // v0.5.10/11: pure-hover / glider direct-launch escape hatch.
+            // Aircraft that lift off straight from the gate without
+            // ever entering TaxiOut would otherwise stay in Boarding
+            // forever. Detect the on_ground edge and skip straight to
+            // Takeoff. Covers:
+            //   * Helicopters that take off vertically from the gate
+            //     (GS = 0, never triggers Boarding → TaxiOut on
+            //     groundspeed alone)
+            //   * Gliders that get winched from the boarding spot
+            //     (engines = 0 throughout)
+            //
+            // v0.5.11 widening: dropped engines > 0 requirement so
+            // glider winch launches fire correctly. AGL > 3 ft +
+            // VS > 100 fpm remain as the safety net against sim-
+            // glitch on_ground-flicker during boarding.
             else if was_on_ground
                 && !snap.on_ground
-                && snap.engines_running > 0
                 && snap.altitude_agl_ft > 3.0
+                && snap.vertical_speed_fpm > 100.0
             {
                 next_phase = FlightPhase::Takeoff;
                 stats.takeoff_at = Some(now);
@@ -6817,17 +7357,50 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
             {
                 next_phase = FlightPhase::TakeoffRoll;
             }
-            // v0.5.10: helicopter / VTOL escape hatch.
+            // v0.5.10/11: helicopter / VTOL / glider / seaplane
+            // escape hatch.
             //
-            // Helicopters take off vertically — ground speed never
-            // exceeds 30 kt on the ground, so TakeoffRoll never
-            // fires. Without this, the FSM would stay in TaxiOut
-            // forever during the entire helicopter flight.
+            // Conventional aircraft trigger TakeoffRoll via GS > 30 kt,
+            // then Takeoff via the on_ground edge. Several classes of
+            // aircraft skip TakeoffRoll entirely:
+            //   * Helicopters / VTOL: take off vertically (GS stays
+            //     below 30 kt the whole time on the ground)
+            //   * Gliders on aerotow: GS > 30 kt but engines = 0
+            //     (the glider's own engine is off, the towplane pulls)
+            //   * Gliders on winch: very fast vertical climb, engines = 0
+            //   * Seaplanes that report on_ground=true on water:
+            //     same path as conventional but engines might briefly
+            //     show 0 in some sims
             //
-            // When we observe the on_ground edge (true → false)
-            // while still in TaxiOut, treat it as a direct takeoff:
-            // skip TakeoffRoll, jump straight to Takeoff.
-            else if was_on_ground && !snap.on_ground && snap.engines_running > 0 {
+            // For all of these we want: when in TaxiOut and the
+            // on_ground edge fires (ground → air), promote to Takeoff
+            // directly. The AGL > 5 ft + VS > 100 fpm guards confirm
+            // a REAL liftoff (not sim-glitch on_ground-flicker on
+            // bumpy runways / PMDG texture quirks).
+            //
+            // v0.5.11 widening: dropped the engines > 0 requirement
+            // so glider tow / winch launches also fire correctly.
+            // The AGL/VS guards remain as the false-positive safety
+            // net (a single-frame on_ground-flicker can't satisfy
+            // both AGL > 5 ft AND VS > 100 fpm).
+            else if (was_on_ground
+                && !snap.on_ground
+                && snap.altitude_agl_ft > 5.0
+                && snap.vertical_speed_fpm > 100.0)
+                // v0.5.11: seaplane catchall — sims that report
+                // on_ground=false on water never produce the ground
+                // edge above. Once the seaplane lifts off the water
+                // (AGL > 50 ft + VS > 100 fpm + actively airborne),
+                // fire Takeoff regardless of edge. AGL > 50 is a
+                // strict guard against sim-spawn-at-altitude
+                // false-fires; a real water takeoff easily exceeds
+                // 50 ft AGL within seconds of breaking the surface.
+                || (!snap.on_ground
+                    && snap.altitude_agl_ft > 50.0
+                    && snap.vertical_speed_fpm > 100.0
+                    && !snap.slew_mode
+                    && !snap.paused)
+            {
                 next_phase = FlightPhase::Takeoff;
                 stats.takeoff_at = Some(now);
                 stats.takeoff_fuel_kg = Some(snap.fuel_total_kg);
@@ -6842,7 +7415,7 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                 }
                 tracing::info!(
                     pirep_id = %flight.pirep_id,
-                    "vertical takeoff detected (helicopter / VTOL) — TaxiOut → Takeoff"
+                    "non-conventional takeoff detected (heli / glider / seaplane) — TaxiOut → Takeoff"
                 );
             }
         }
@@ -6957,22 +7530,18 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                 && snap.altitude_agl_ft > 5000.0
             {
                 next_phase = FlightPhase::Cruise;
-            } else if snap.vertical_speed_fpm.abs() < 100.0
-                && lost_from_peak.abs() < 100.0
-                && stats.climb_peak_msl.is_some()
-                && snap.altitude_agl_ft > 1000.0
-            {
-                // v0.5.10: low-altitude Cruise alternative. Pattern /
-                // GA / heli flights that level off below 5000 ft AGL
-                // (e.g. Cessna at 2500 ft, heli at 1500 ft) deserve a
-                // proper Cruise phase too. Trigger when level flight
-                // is sustained: very low VS (<100 fpm) AND altitude
-                // hasn't drifted significantly from climb peak (<100 ft).
-                // The latter ensures we're actually at a level
-                // segment, not in the middle of a continuing climb
-                // momentarily smoothing through 0 fpm.
-                next_phase = FlightPhase::Cruise;
             }
+            // v0.5.11: removed low-altitude Cruise alternative path.
+            // The pre-release v0.5.10 attempt to detect Pattern /
+            // GA cruise via "vs.abs() < 100 + lost_from_peak < 100"
+            // was unsafe — during ACTIVE climb, lost_from_peak is
+            // always ~0 (peak updates each tick). A single tick with
+            // vs ≈ 50 fpm (autopilot mode switch, trim, turbulence)
+            // would falsely trigger Cruise. GA aircraft just stay in
+            // Climb until they descend; our enhanced Climb → Descent
+            // triggers above handle the transition robustly. Cruise
+            // is reserved for high-altitude flights that genuinely
+            // need the 30 s streamer cadence.
         }
         FlightPhase::Cruise => {
             // Track the highest altitude we've seen at this cruise
@@ -7009,6 +7578,45 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
             let close_to_ground = snap.altitude_agl_ft < 3000.0;
             if sinking && (big_drop || close_to_ground) {
                 next_phase = FlightPhase::Descent;
+            } else if check_holding_entry(&mut stats, snap, now) {
+                stats.previous_phase_before_holding = Some(FlightPhase::Cruise);
+                next_phase = FlightPhase::Holding;
+            }
+        }
+        FlightPhase::Holding => {
+            // v0.5.11: detect holding pattern exit. Three exit modes:
+            //
+            //   1. Active descent (vs < -300 fpm + AGL < 5000 ft) —
+            //      ATC has cleared us out of the hold for the
+            //      approach. Jump directly to Approach.
+            //   2. Low-altitude descent at any rate — going down
+            //      toward the runway, definitely not holding anymore.
+            //   3. Sustained straight-and-level (bank < 5° for
+            //      HOLDING_EXIT_DWELL_SECS) — resumed normal flight.
+            //      Restore the phase we came from (Cruise or Approach).
+            let descent_resumed = snap.vertical_speed_fpm < -300.0
+                && snap.altitude_agl_ft < 5000.0;
+            if descent_resumed {
+                next_phase = FlightPhase::Approach;
+                stats.holding_pending_since = None;
+                stats.holding_exit_pending_since = None;
+                stats.previous_phase_before_holding = None;
+                // Reset approach VS-min tracker (v0.5.5) for fresh
+                // approach measurement post-hold.
+                stats.low_agl_vs_min_fpm = None;
+            } else if snap.bank_deg.abs() < 5.0 {
+                let exit = stats.holding_exit_pending_since.get_or_insert(now);
+                if (now - *exit).num_seconds() >= HOLDING_EXIT_DWELL_SECS {
+                    let prev = stats
+                        .previous_phase_before_holding
+                        .unwrap_or(FlightPhase::Cruise);
+                    next_phase = prev;
+                    stats.holding_pending_since = None;
+                    stats.holding_exit_pending_since = None;
+                    stats.previous_phase_before_holding = None;
+                }
+            } else {
+                stats.holding_exit_pending_since = None;
             }
         }
         FlightPhase::Descent => {
@@ -7025,7 +7633,7 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                 // (we keep tracking through final). Only resets here so a
                 // go-around (which routes Final → Climb → Approach again)
                 // gets a clean per-attempt picture.
-                stats.approach_vs_min_fpm = None;
+                stats.low_agl_vs_min_fpm = None;
             }
         }
         FlightPhase::Approach => {
@@ -7064,6 +7672,14 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                 // run. Real-world Final starts ~700 ft AGL (FAF crossed
                 // for non-precision, decision height area for ILS).
                 next_phase = FlightPhase::Final;
+            } else if check_holding_entry(&mut stats, snap, now) {
+                // v0.5.11: Approach-level holding (low-altitude hold).
+                // VATSIM ATC frequently issues "hold over WAYPOINT"
+                // during inbound sequencing — aircraft circles at
+                // ~5000 ft for 5-15 minutes. Without this we'd just
+                // see endless Approach phase with no signal.
+                stats.previous_phase_before_holding = Some(FlightPhase::Approach);
+                next_phase = FlightPhase::Holding;
             }
         }
         FlightPhase::Final => {
@@ -7119,140 +7735,97 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                     .find(|s| s.on_ground)
                     .cloned();
 
-                // V/S capture — Fallback-Chain in Reihenfolge der
-                // Datenqualität:
+                // v0.5.11: clean priority chain per pilot's deep
+                // analysis (2026-05-07). The bug class fixed here:
+                // earlier versions let "most-negative VS anywhere
+                // in approach" win, which produced phantom hard-
+                // landing reports when a pre-flare descent at
+                // -1346 fpm @ 943 ft AGL beat the actual gentle
+                // touchdown at -200 fpm @ 0 ft.
                 //
-                //   1. v0.4.4: Sampler-side gear-Edge-Detection (X-Plane
-                //      idiomatic, xgs-aligned). Der 50Hz-Sampler hat
-                //      das fnrml_gear-Spike erkannt und die VS-Min der
-                //      letzten 500 ms vor dem Edge eingefroren. KEINE
-                //      Buffer-Eviction-Race wie wenn der Streamer
-                //      verspätet wacht.
-                //   2. MSFS-latched Touchdown-SimVar (`PLANE TOUCHDOWN
-                //      NORMAL VELOCITY` — MSFS-only, GEES-aligned).
-                //   3. Buffer-Window-Scan ±TOUCHDOWN_VS_WINDOW_MS/2 um
-                //      actual_td_at — funktioniert wenn Streamer früh
-                //      wach wurde, fällt durch wenn zu spät (Buffer
-                //      ist 5 s, Pre-TD-Samples evicted).
-                //   4. Live `vertical_speed_fpm` am Edge-Tick — last
-                //      resort, post-rollout meistens schon ~0.
-                let touchdown_vs = if let Some(sampler_vs) = stats.sampler_touchdown_vs_fpm {
-                    // Wenn der Sampler den Edge selbst detektiert hat
-                    // (innerhalb von 20 ms), nutzen wir auch dessen
-                    // actual_td_at — viel präziser als unser
-                    // 5s-Streamer-Tick-Edge.
-                    if let Some(sampler_at) = stats.sampler_touchdown_at {
-                        stats.landing_at = Some(sampler_at);
-                    }
-                    sampler_vs
-                } else if let Some(latched) = snap.touchdown_vs_fpm {
-                    latched
+                // New architecture — landing rate ONLY from samples
+                // close to the ground:
+                //
+                //   1. AGL-derivative estimator (PRIMARY) — geometric
+                //      ΔAGL/Δt over tight windows (750 ms → 12 s
+                //      sparse-fallback), all guarded by AGL ≤ 250 ft
+                //      at window-start AND AGL ≤ 5 ft at touchdown.
+                //   2. Sampler-side gear-edge capture (FALLBACK) —
+                //      v0.4.4 mechanism. negative_only filtered.
+                //   3. MSFS-latched touchdown SimVar (FALLBACK) —
+                //      MSFS-only, normally a clean signal but
+                //      negative_only filtered for safety.
+                //   4. Tight buffer-window scan around actual_td_at
+                //      (FALLBACK) — TOUCHDOWN_VS_WINDOW_MS / 2 each
+                //      side, negative_only filtered.
+                //   5. low_agl_vs_min_fpm (LAST-RESORT) — only
+                //      contains VS samples from AGL ≤ 250 ft so it
+                //      can't introduce pre-flare phantoms.
+                //
+                // The plugin's captured_vs_fpm is included via path 2
+                // (it pre-fills sampler_touchdown_vs_fpm). The plugin
+                // is now a touchdown-EDGE source, not the VS authority.
+                //
+                // Use sampler timestamp when available — much more
+                // precise than the streamer's 5-s tick edge.
+                if let Some(sampler_at) = stats.sampler_touchdown_at {
+                    stats.landing_at = Some(sampler_at);
+                }
+                let actual_td_at = stats.landing_at.unwrap_or(actual_td_at);
+
+                // ---- Path 1: AGL-derivative (PRIMARY) ----
+                let agl_estimate = estimate_xplane_touchdown_vs_from_agl(
+                    &stats.snapshot_buffer,
+                    actual_td_at,
+                );
+                if let Some(ref est) = agl_estimate {
+                    tracing::info!(
+                        fpm = est.fpm,
+                        source = est.source,
+                        window_ms = est.window_ms,
+                        sample_count = est.sample_count,
+                        "touchdown VS — AGL-derivative estimator (PRIMARY)"
+                    );
+                }
+
+                // ---- Fallback paths (only used if AGL estimate fails) ----
+                let half_window =
+                    chrono::Duration::milliseconds(TOUCHDOWN_VS_WINDOW_MS / 2);
+                let vs_window_start = actual_td_at - half_window;
+                let vs_window_end = actual_td_at + half_window;
+                let buffered_vs_min_raw: f32 = stats
+                    .snapshot_buffer
+                    .iter()
+                    .filter(|s| s.at >= vs_window_start && s.at <= vs_window_end)
+                    .filter(|s| s.agl_ft <= TD_AGL_MAX_AT_WINDOW_START_FT)
+                    .map(|s| s.vs_fpm)
+                    .fold(f32::INFINITY, f32::min);
+                let buffered_vs_min = if buffered_vs_min_raw.is_finite() {
+                    Some(buffered_vs_min_raw)
                 } else {
-                    let half_window =
-                        chrono::Duration::milliseconds(TOUCHDOWN_VS_WINDOW_MS / 2);
-                    let vs_window_start = actual_td_at - half_window;
-                    let vs_window_end = actual_td_at + half_window;
-                    let buffered_vs_min: f32 = stats
-                        .snapshot_buffer
-                        .iter()
-                        .filter(|s| s.at >= vs_window_start && s.at <= vs_window_end)
-                        .map(|s| s.vs_fpm)
-                        .fold(f32::INFINITY, f32::min);
-                    if buffered_vs_min.is_finite() {
-                        buffered_vs_min
-                    } else {
-                        snap.vertical_speed_fpm
-                    }
-                };
-                // v0.5.5: most-negative-wins tiebreaker against the
-                // running approach-VS-min tracker. Pilot test 2026-05-06
-                // captured +57 fpm because all of (sampler edge, buffer
-                // window, live snap) had post-flare positive VS values
-                // — but the actual descent peak earlier in approach was
-                // -513 fpm. The running tracker remembers it and wins.
-                let touchdown_vs = match stats.approach_vs_min_fpm {
-                    Some(approach_min) if approach_min < touchdown_vs => approach_min,
-                    _ => touchdown_vs,
+                    None
                 };
 
-                // v0.5.7/8: AGL-derivative method (LandingRate-1.lua,
-                // Volanta — established X-Plane convention since ~2014).
-                // VSI / local_vy goes to ~0 during flare because the
-                // flight model dampens vertical velocity for stick-
-                // feel — but the AIRCRAFT IS STILL PHYSICALLY
-                // DESCENDING. Geometry doesn't lie: ΔAGL / Δt over a
-                // window gives the actual airframe descent rate.
-                //
-                //   gVS = (current_agl - avg_agl_over_window) /
-                //         (window_seconds / 2) * 60
-                //
-                // v0.5.8: evaluate at 1 s, 2 s, AND 3 s windows in
-                // parallel and pick the most negative. This handles
-                // every flare profile robustly:
-                //   * Hard landing (no flare): all windows agree
-                //   * Airliner standard flare (~3 s): 2 s window
-                //     catches the steep descent before flare
-                //   * Light GA long flare (~5+ s): 3 s window covers
-                //     the meaningful descent slice
-                //   * Floaters (long shallow approach): 1 s window
-                //     measures only the very last seconds, gives the
-                //     gentle butter rate
-                let derive_at = |window_secs: i64| -> Option<f32> {
-                    let win_start = actual_td_at
-                        - chrono::Duration::seconds(window_secs);
-                    let samples: Vec<&TelemetrySample> = stats
-                        .snapshot_buffer
-                        .iter()
-                        .filter(|s| s.at >= win_start && s.at <= actual_td_at)
-                        .collect();
-                    if samples.len() < 3 {
-                        return None;
-                    }
-                    let avg_agl: f32 = samples
-                        .iter()
-                        .map(|s| s.agl_ft)
-                        .sum::<f32>()
-                        / samples.len() as f32;
-                    let agl_at_td = samples
-                        .last()
-                        .map(|s| s.agl_ft)
-                        .unwrap_or(snap.altitude_agl_ft as f32);
-                    let timespan_sec = (actual_td_at
-                        - samples.first().unwrap().at)
-                        .num_milliseconds() as f32
-                        / 1000.0;
-                    if timespan_sec < 0.5 {
-                        return None;
-                    }
-                    let agl_midpoint = agl_at_td - avg_agl;
-                    Some((agl_midpoint / (timespan_sec / 2.0)) * 60.0)
-                };
-                // Most-negative of three windows wins. None values
-                // ignored — if the buffer is too sparse, we just
-                // skip the whole AGL-derivative branch.
-                let derived_vs_fpm = [derive_at(1), derive_at(2), derive_at(3)]
-                    .into_iter()
-                    .flatten()
-                    .filter(|v| *v < 0.0) // ignore positive (climbing) windows
-                    .fold(None::<f32>, |acc, v| match acc {
-                        Some(a) if a < v => Some(a),
-                        _ => Some(v),
-                    });
+                // negative_only filter on every fallback. Positive
+                // values are physically impossible touchdown rates —
+                // they're rebound oscillation captures, not landings.
+                let touchdown_vs = agl_estimate
+                    .map(|e| e.fpm)
+                    .or_else(|| negative_only(stats.sampler_touchdown_vs_fpm))
+                    .or_else(|| negative_only(snap.touchdown_vs_fpm))
+                    .or_else(|| negative_only(buffered_vs_min))
+                    .or_else(|| negative_only(stats.low_agl_vs_min_fpm))
+                    .unwrap_or(0.0);
 
-                // PRIMARY when it beats the prior capture. The AGL-
-                // derivative value is geometric truth — beats any
-                // VSI-based capture.
-                let touchdown_vs = match derived_vs_fpm {
-                    Some(d) if d < touchdown_vs => {
-                        tracing::info!(
-                            agl_derived_fpm = d,
-                            previous_capture_fpm = touchdown_vs,
-                            "AGL-derivative method overrode VSI-based capture (LandingRate-1 algo, multi-window)"
-                        );
-                        d
-                    }
-                    _ => touchdown_vs,
-                };
+                if touchdown_vs == 0.0 {
+                    tracing::warn!(
+                        sampler_vs = ?stats.sampler_touchdown_vs_fpm,
+                        latched = ?snap.touchdown_vs_fpm,
+                        buffer_min = ?buffered_vs_min,
+                        low_agl_min = ?stats.low_agl_vs_min_fpm,
+                        "touchdown VS — all sources failed or were positive, defaulting to 0"
+                    );
+                }
 
                 stats.landing_rate_fpm = Some(touchdown_vs);
                 stats.landing_peak_vs_fpm = Some(touchdown_vs);
@@ -7654,6 +8227,20 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                             // false-positive trigger.
                             stats.lowest_agl_during_approach_ft = None;
                             stats.go_around_climb_pending_since = None;
+                            // v0.5.11: also reset climb_peak_msl so
+                            // the new Climb segment after T&G starts
+                            // fresh. Without this, the prior pattern
+                            // altitude (e.g. 2000 ft) stays as the
+                            // peak — and the moment the aircraft
+                            // descends 500+ ft below it for the next
+                            // approach, the v0.5.10 low-altitude
+                            // Climb→Descent trigger would fire
+                            // immediately (lost_from_peak > 500
+                            // already satisfied via stale data).
+                            // Pattern flying with multiple T&Gs
+                            // would oscillate between Climb and
+                            // Descent on every traffic-pattern leg.
+                            stats.climb_peak_msl = None;
                             // FSM: revert to Climb so the streamer's
                             // phase-change handler emits "Phase: Climb"
                             // and subsequent descent re-detection works.
@@ -8755,6 +9342,11 @@ fn phase_to_status(phase: FlightPhase) -> Option<&'static str> {
         // taxonomy stays ENROUTE until the aircraft enters the
         // approach phase (which we cover with APR / FIN below).
         FlightPhase::Cruise | FlightPhase::Descent => Some("ENR"),
+        // v0.5.11: phpVMS has no "Holding" status code. ENR is the
+        // closest match (we're enroute, just circling). The Cockpit
+        // tab UI has its own Holding badge that does NOT depend on
+        // this status code mapping.
+        FlightPhase::Holding => Some("ENR"),
         FlightPhase::Approach => Some("APR"),
         FlightPhase::Final => Some("FIN"),
         FlightPhase::Landing => Some("LDG"),
@@ -11556,6 +12148,16 @@ pub fn run() {
                 // notification on critical-state transitions.
                 spawn_tray_updater(app.handle().clone());
             }
+            // v0.5.11: try to start MQTT live-tracking publisher in
+            // the background. Non-fatal — if no API key is present
+            // yet (fresh install, user hasn't logged in) it just
+            // returns and we'll retry after login.
+            {
+                let app_for_mqtt = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    init_mqtt_publisher_via_provisioning(app_for_mqtt).await;
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -11611,8 +12213,33 @@ pub fn run() {
             flight_logs_delete_all,
             flight_logs_purge_older_than,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running AeroACARS");
+        .build(tauri::generate_context!())
+        .expect("error while building AeroACARS")
+        .run(|app_handle, event| {
+            // v0.5.11: clean MQTT publisher shutdown on app exit.
+            // ExitRequested fires once before the process tears down;
+            // we send the LWT-replacement OFFLINE status, give the
+            // network thread a brief moment to flush, then return so
+            // Tauri continues the exit. If we don't do this, the
+            // last-will-and-testament eventually publishes OFFLINE
+            // anyway when the broker times the connection out (~60 s),
+            // but the explicit shutdown is faster and cleaner.
+            if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
+                let app_for_mqtt = app_handle.clone();
+                tauri::async_runtime::block_on(async move {
+                    let state = app_for_mqtt.state::<AppState>();
+                    let handle = state.mqtt.lock().await.take();
+                    if let Some(handle) = handle {
+                        handle.shutdown();
+                        // Brief flush window so the publisher task can
+                        // post the OFFLINE status before tokio shuts
+                        // down. 200 ms is the spec recommendation.
+                        tokio::time::sleep(std::time::Duration::from_millis(200))
+                            .await;
+                    }
+                });
+            }
+        });
 }
 
 // ----------------------------------------------------------------------
@@ -11788,6 +12415,176 @@ mod touch_and_go_go_around_tests {
         );
         assert!(out.is_none());
         assert_eq!(stats.go_around_count, 0);
+    }
+}
+
+// ---- v0.5.11: AGL-derivative touchdown VS estimator regression tests ----
+//
+// Per pilot's deep analysis 2026-05-07. These tests guard against
+// the entire bug class identified there.
+#[cfg(test)]
+mod touchdown_vs_estimator_tests {
+    use super::*;
+    use chrono::TimeZone;
+    use std::collections::VecDeque;
+
+    fn t0() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap()
+    }
+
+    fn make_sample(at: DateTime<Utc>, agl_ft: f32, vs_fpm: f32) -> TelemetrySample {
+        TelemetrySample {
+            at,
+            vs_fpm,
+            g_force: 1.0,
+            on_ground: false,
+            agl_ft,
+            heading_true_deg: 0.0,
+            groundspeed_kt: 130.0,
+            indicated_airspeed_kt: 130.0,
+            lat: 0.0,
+            lon: 0.0,
+            pitch_deg: 0.0,
+            bank_deg: 0.0,
+        }
+    }
+
+    /// Test 1: Rebound-VSI is positive but AGL is geometrically
+    /// dropping → result must be NEGATIVE.
+    /// Reproduces the original pilot bug (V/S +57 fpm at G 1.52).
+    #[test]
+    fn agl_estimator_overrides_positive_rebound_vsi() {
+        let td = t0();
+        let mut buffer = VecDeque::new();
+        // Last 1 second of approach: AGL drops 25 → 0 ft.
+        // VS readings are positive (rebound) but geometry says
+        // descent at -25 ft/sec = -1500 fpm avg.
+        for ms in 0..=1000 {
+            if ms % 100 != 0 {
+                continue;
+            }
+            let agl = 25.0 - (ms as f32 / 1000.0) * 25.0;
+            let vs = 50.0; // positive rebound — VSI lies
+            buffer.push_back(make_sample(
+                td - chrono::Duration::milliseconds(1000 - ms),
+                agl.max(0.0),
+                vs,
+            ));
+        }
+        let est = estimate_xplane_touchdown_vs_from_agl(&buffer, td)
+            .expect("should estimate from AGL despite positive VSI");
+        assert!(
+            est.fpm < 0.0,
+            "expected negative descent rate, got {} fpm",
+            est.fpm
+        );
+        assert!(
+            est.fpm < -500.0,
+            "expected steep descent (~-1500 fpm), got {} fpm",
+            est.fpm
+        );
+    }
+
+    /// Test 2: Pre-flare steep descent (-1300 fpm @ 900 ft AGL)
+    /// followed by gentle touchdown (-200 fpm @ 0 ft).
+    /// Estimator must IGNORE the high-altitude steep descent.
+    #[test]
+    fn agl_estimator_ignores_pre_flare_high_altitude_descent() {
+        let td = t0();
+        let mut buffer = VecDeque::new();
+        // 9 seconds ago: AGL 900 ft, VS -1300 fpm (steep descent)
+        buffer.push_back(make_sample(
+            td - chrono::Duration::seconds(9),
+            900.0,
+            -1300.0,
+        ));
+        // Last 1 second: smooth flare from 30 → 0 ft AGL = -1800 fpm
+        // Wait, let me make this gentler: 3 → 0 ft over 1s = -180 fpm
+        for ms in 0..=1000 {
+            if ms % 100 != 0 {
+                continue;
+            }
+            let agl = 3.0 - (ms as f32 / 1000.0) * 3.0;
+            buffer.push_back(make_sample(
+                td - chrono::Duration::milliseconds(1000 - ms),
+                agl.max(0.0),
+                -200.0,
+            ));
+        }
+        let est = estimate_xplane_touchdown_vs_from_agl(&buffer, td)
+            .expect("should pick the close-to-ground tier");
+        // Should be gentle (~-180 fpm), NOT the -1300 from 900 ft.
+        assert!(
+            est.fpm > -500.0,
+            "expected gentle descent (NOT pre-flare -1300 contamination), got {} fpm",
+            est.fpm
+        );
+    }
+
+    /// Test 3: Butter landing — slow flare, gentle touchdown.
+    /// Estimator should give ~-100 fpm, not the original approach descent.
+    #[test]
+    fn agl_estimator_butter_landing() {
+        let td = t0();
+        let mut buffer = VecDeque::new();
+        // Last 2 seconds: AGL 4 → 1 ft (= -90 fpm avg, butter)
+        for ms in 0..=2000 {
+            if ms % 200 != 0 {
+                continue;
+            }
+            let agl = 4.0 - (ms as f32 / 2000.0) * 3.0;
+            buffer.push_back(make_sample(
+                td - chrono::Duration::milliseconds(2000 - ms),
+                agl,
+                -100.0,
+            ));
+        }
+        let est = estimate_xplane_touchdown_vs_from_agl(&buffer, td)
+            .expect("should give a butter result");
+        assert!(est.fpm < 0.0, "expected negative descent, got {}", est.fpm);
+        assert!(
+            est.fpm > -300.0,
+            "expected gentle butter (~-100 to -200 fpm), got {} fpm",
+            est.fpm
+        );
+    }
+
+    /// Test 4: All VS readings are positive (extreme rebound) but
+    /// AGL drops geometrically. AGL wins, result is negative.
+    #[test]
+    fn agl_estimator_wins_when_all_vs_positive() {
+        let td = t0();
+        let mut buffer = VecDeque::new();
+        // Last 1 second: AGL 10 → 0 ft, VS readings all positive (impossible
+        // physically but happens in sim post-touchdown rebound)
+        for ms in 0..=1000 {
+            if ms % 100 != 0 {
+                continue;
+            }
+            let agl = 10.0 - (ms as f32 / 1000.0) * 10.0;
+            buffer.push_back(make_sample(
+                td - chrono::Duration::milliseconds(1000 - ms),
+                agl.max(0.0),
+                100.0, // all positive!
+            ));
+        }
+        let est = estimate_xplane_touchdown_vs_from_agl(&buffer, td)
+            .expect("AGL should give answer despite all-positive VS");
+        assert!(
+            est.fpm < 0.0,
+            "expected negative descent from AGL geometry, got {} fpm (VS readings would have given positive)",
+            est.fpm
+        );
+    }
+
+    /// negative_only filter test: positives are dropped.
+    #[test]
+    fn negative_only_drops_positive_values() {
+        assert_eq!(negative_only(Some(57.0)), None);
+        assert_eq!(negative_only(Some(0.0)), None);
+        assert_eq!(negative_only(Some(-200.0)), Some(-200.0));
+        assert_eq!(negative_only(None), None);
+        assert_eq!(negative_only(Some(f32::NAN)), None);
     }
 }
 

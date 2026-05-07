@@ -299,6 +299,7 @@ export type FlightPhase =
   | "takeoff"
   | "climb"
   | "cruise"
+  | "holding"
   | "descent"
   | "approach"
   | "final"

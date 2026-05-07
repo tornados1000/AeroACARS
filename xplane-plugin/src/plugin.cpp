@@ -398,21 +398,22 @@ float flight_loop_cb(float, float, int, void*) noexcept {
     }
     const bool edge = prev_in_air && !in_air_now && !touchdown_captured;
 
-    // -- v0.5.6: running peak-descent VS tracker ------------------------
+    // -- v0.5.6/11: running peak-descent VS tracker (LOW-AGL only) ------
     //
-    // Reset on the ground→air edge (= takeoff or go-around lift-off):
-    // we want a fresh tracker per landing attempt. While airborne,
-    // remember the most negative pitch-corrected VS we've ever seen.
-    // The lookback ring buffer is only ~3.2 s wide; this tracker has
-    // unlimited memory for the current airborne segment, which fixes
-    // the aggressive-flare class of bug (peak descent was 8 s before
-    // touchdown, lookback window only sees the last 500 ms = mostly
-    // post-rebound positive VS values, captured wrong).
+    // v0.5.11 hardening per pilot's deep analysis: this tracker now
+    // ONLY accumulates samples while AGL ≤ 250 ft (= touchdown
+    // footprint). Earlier versions accumulated across the entire
+    // airborne segment, which produced phantom hard-landing values
+    // when a steep pre-flare descent (e.g. -1346 fpm @ 943 ft AGL)
+    // beat the actual gentle touchdown. Limiting to AGL ≤ 250 ft
+    // ensures pre-flare descent rates can't pollute the touchdown
+    // capture.
+    //
+    // Reset on the ground→air edge so a fresh approach starts clean.
     if (in_air_now && !prev_in_air) {
-        // ground→air edge: reset for fresh approach tracking
         g_airborne_vs_min = 0.0f;
     }
-    if (in_air_now && vs_fpm < g_airborne_vs_min) {
+    if (in_air_now && agl_ft <= 250.0f && vs_fpm < g_airborne_vs_min) {
         g_airborne_vs_min = vs_fpm;
     }
 
@@ -460,71 +461,95 @@ float flight_loop_cb(float, float, int, void*) noexcept {
 
     // -- Touchdown event packet (one-shot, frame-perfect) ---------------
     if (edge) {
-        // v0.5.8: PRIMARY METHOD — AGL-derivative (LandingRate-1.lua,
-        // Volanta — established X-Plane convention since ~2014). VSI
-        // lies during flare due to flight-model dampening; AGL change
-        // is geometric truth. Compute over multiple windows (1 s, 2 s,
-        // 3 s) and pick the most negative. Different flare profiles
-        // peak at different windows:
-        //   * Hard landing (no flare): all windows agree
-        //   * Airliner (~3 s flare): 2 s window captures pre-flare
-        //   * GA long flare: 3 s window covers the meaningful slice
-        //   * Floaters (long shallow): 1 s window measures the very
-        //     last seconds
-        auto derive_at = [&](double window_secs) -> float {
-            const double window_start = sim_t - window_secs;
+        // v0.5.11: AGL-derivative with strict guards (per pilot's
+        // 2026-05-07 deep analysis). Window-tier strategy mirrors the
+        // Tauri-client implementation in lib.rs:
+        //
+        //   * Window tiers (most preferred first):
+        //     750 ms / 1000 ms / 1500 ms / 2000 ms / 3000 ms / 12000 ms
+        //   * All tiers require AGL ≤ 5 ft at the touchdown frame
+        //     AND AGL ≤ 250 ft at window start (= sample is within
+        //     the actual touchdown footprint, not pre-flare descent)
+        //   * Result must be < 0 fpm (positive = unphysical)
+        //
+        // Plugin's role here: first-class touchdown VS estimator
+        // running at flight-loop frequency (faster than the client's
+        // 50 Hz sampler). The client receives the result in the
+        // touchdown packet and uses it as path #2 in its priority
+        // chain (sampler_touchdown_vs_fpm). The client may STILL
+        // override with its own AGL-Δ estimate if it has more
+        // samples — that's by design (v0.5.11 client-wins
+        // architecture, plugin entmachten).
+        struct WindowTier { double ms; int min_samples; const char* label; };
+        static const WindowTier tiers[] = {
+            { 750.0,   5, "agl_750ms"        },
+            { 1000.0,  5, "agl_1000ms"       },
+            { 1500.0,  5, "agl_1500ms"       },
+            { 2000.0,  4, "agl_2000ms"       },
+            { 3000.0,  3, "agl_3000ms"       },
+            { 12000.0, 3, "agl_sparse_12s"   },
+        };
+        constexpr float TD_AGL_MAX_AT_TD_FT      = 5.0f;
+        constexpr float TD_AGL_MAX_AT_START_FT   = 250.0f;
+
+        float captured_vs = 0.0f;
+        const char* vs_source = "none";
+        int vs_window_ms = 0;
+        int vs_sample_count = 0;
+
+        for (const auto& t : tiers) {
+            const double window_start = sim_t - (t.ms / 1000.0);
             float agl_sum = 0.0f;
             int n = 0;
-            float earliest_t = 1e30f;
-            float agl_at_td = agl_ft;
+            double earliest_t = 1e30;
+            double latest_t = -1e30;
+            float agl_at_first = 1e30f;
+            float agl_at_last = 0.0f;
             for (size_t i = 0; i < g_vs_buffer_count; ++i) {
                 const VSSample& s = g_vs_buffer[i];
                 if (s.t_sec >= window_start && s.t_sec <= sim_t) {
                     agl_sum += s.agl_ft;
                     n++;
-                    if (static_cast<float>(s.t_sec) < earliest_t) {
-                        earliest_t = static_cast<float>(s.t_sec);
+                    if (s.t_sec < earliest_t) {
+                        earliest_t = s.t_sec;
+                        agl_at_first = s.agl_ft;
+                    }
+                    if (s.t_sec > latest_t) {
+                        latest_t = s.t_sec;
+                        agl_at_last = s.agl_ft;
                     }
                 }
             }
-            if (n < 3) return 0.0f;  // not enough samples
+            if (n < t.min_samples) continue;
+            // Touchdown sample must really be at the ground.
+            if (agl_at_last > TD_AGL_MAX_AT_TD_FT) continue;
+            // Window-start must be near the ground (no high-altitude
+            // pre-flare contamination).
+            if (agl_at_first > TD_AGL_MAX_AT_START_FT) continue;
+            const float timespan = static_cast<float>(latest_t - earliest_t);
+            if (timespan < 0.2f) continue;
             const float avg_agl = agl_sum / static_cast<float>(n);
-            const float timespan = static_cast<float>(sim_t) - earliest_t;
-            if (timespan < 0.5f) return 0.0f;
-            const float agl_midpoint = agl_at_td - avg_agl;
-            return (agl_midpoint / (timespan / 2.0f)) * 60.0f;
-        };
-        const float derived_1s = derive_at(1.0);
-        const float derived_2s = derive_at(2.0);
-        const float derived_3s = derive_at(3.0);
-        // Most-negative wins among the three derived rates. 0.0 means
-        // "no valid sample" — ignore those.
-        float derived_best = 0.0f;
-        if (derived_1s < derived_best) derived_best = derived_1s;
-        if (derived_2s < derived_best) derived_best = derived_2s;
-        if (derived_3s < derived_best) derived_best = derived_3s;
-
-        // SECONDARY — VSI-based methods (v0.5.6 fallbacks). Robust
-        // tiebreaker if AGL data is too sparse (plugin just started,
-        // sim was paused mid-buffer-fill, etc.).
-        const double cutoff_t = sim_t - (VS_LOOKBACK_MS / 1000.0);
-        float vsi_captured = vs_fpm;
-        for (size_t i = 0; i < g_vs_buffer_count; ++i) {
-            const VSSample& s = g_vs_buffer[i];
-            if (s.t_sec >= cutoff_t && s.vs_fpm < vsi_captured) {
-                vsi_captured = s.vs_fpm;
-            }
-        }
-        if (g_airborne_vs_min < vsi_captured) {
-            vsi_captured = g_airborne_vs_min;
+            const float agl_midpoint = agl_at_last - avg_agl;
+            const float fpm = (agl_midpoint / (timespan / 2.0f)) * 60.0f;
+            if (!std::isfinite(fpm) || fpm >= 0.0f) continue;
+            // Found a valid tier — accept and stop.
+            captured_vs = fpm;
+            vs_source = t.label;
+            vs_window_ms = static_cast<int>(t.ms);
+            vs_sample_count = n;
+            break;
         }
 
-        // FINAL: most-negative wins between AGL-derivative and VSI
-        // methods. AGL is geometric truth; VSI is a backup.
-        float captured_vs = vsi_captured;
-        if (derived_best < captured_vs) {
-            captured_vs = derived_best;
+        // Fallback: if NO tier produced a valid result, fall back to
+        // the low-AGL VS-min tracker (now AGL ≤ 250 ft only — see
+        // g_airborne_vs_min update above). Last resort.
+        if (captured_vs == 0.0f && g_airborne_vs_min < 0.0f) {
+            captured_vs = g_airborne_vs_min;
+            vs_source = "low_agl_vs_min";
+            vs_window_ms = 0;
+            vs_sample_count = 0;
         }
+
         char buf[PACKET_BUF_SIZE];
         int n = std::snprintf(buf, sizeof(buf),
             "{"
@@ -535,6 +560,9 @@ float flight_loop_cb(float, float, int, void*) noexcept {
             "\"lat\":%.7f,"
             "\"lon\":%.7f,"
             "\"captured_vs_fpm\":%.2f,"
+            "\"captured_vs_source\":\"%s\","
+            "\"captured_vs_window_ms\":%d,"
+            "\"captured_vs_samples\":%d,"
             "\"captured_g_normal\":%.4f,"
             "\"captured_pitch_deg\":%.3f,"
             "\"captured_bank_deg\":%.3f,"
@@ -548,6 +576,9 @@ float flight_loop_cb(float, float, int, void*) noexcept {
             sim_t,
             lat, lon,
             static_cast<double>(captured_vs),
+            vs_source,
+            vs_window_ms,
+            vs_sample_count,
             static_cast<double>(gnorm),
             static_cast<double>(pitch_deg),
             static_cast<double>(bank_deg),

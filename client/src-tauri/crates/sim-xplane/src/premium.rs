@@ -140,6 +140,15 @@ pub struct PremiumTouchdown {
     pub agl_ft: f32,
     #[serde(default)]
     pub ts: f64,
+    /// v0.5.11 plugin diagnostic metadata (optional, plugins from
+    /// older versions don't send these). Lets the client log which
+    /// AGL-window tier the plugin used and how many samples it had.
+    #[serde(default)]
+    pub captured_vs_source: String,
+    #[serde(default)]
+    pub captured_vs_window_ms: i64,
+    #[serde(default)]
+    pub captured_vs_samples: u32,
     /// Wall-clock time we received this packet on the client side.
     /// Useful for the UI layer ("touchdown captured 0.4 s ago").
     /// `None` until set by the listener.

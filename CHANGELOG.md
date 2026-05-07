@@ -4,50 +4,133 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
-## [v0.5.10] — 2026-05-07
+## [v0.5.11] — 2026-05-07
 
-🎯 **Phasen-Erkennung für GA, Helikopter und Pattern-Flüge — komplette FSM-Audit.**
+🚀 **Großes Release — drei zusammenhängende Themen:**
+1. **FSM-Audit** für alle Flugzeug-Klassen (Airliner / GA / Heli / Glider / Seaplane) inkl. Touch-and-Go, Go-Around, Holding-Pattern, Pause/Slew-Robustheit
+2. **X-Plane Touchdown-Erfassung neu architektiert** nach LandingRate-1-Methode (AGL-Δ statt VSI), Plugin entmachtet
+3. **MQTT Live-Tracking** zur aeroacars-live VPS — komplett unsichtbar im Hintergrund
 
-Pilot-Frage: „Können wir mal alle Flugphasen für GA / Airliner / Heli prüfen — die generelle Erkennung muss besser werden?" — ja, die FSM war bisher auf Airliner-Profile optimiert. Drei Klassen-Bugs aufgedeckt und behoben.
+87 Tests grün. Frontend ohne Änderungen.
 
-### 🐛 Behoben
+---
 
-**Bug A — Helikopter (vertikaler Start aus Taxi):**
-TaxiOut → TakeoffRoll erwartet GS > 30 kt am Boden. Helikopter erreichen das nie (vertikales Lift-off). Vorher: FSM hängt für den ganzen Flug in TaxiOut.
+### 🛩 Teil 1: FSM-Phasen-Audit (alle Aircraft-Klassen)
 
-Fix: Wenn in TaxiOut der `on_ground`-Flag von true auf false wechselt UND Engines laufen → direkt Takeoff (TakeoffRoll überspringen). Vertikales Lift-off wird erkannt.
+Pilot-Frage: „können wir alle Flugphasen für GA / Airliner / Heli prüfen?" — ja. v0.5.11 ist das Ergebnis einer vollständigen FSM-Audit mit Tiefen-Analyse der False-Positive-Risiken **bevor** gepusht wurde.
 
-**Bug A2 — Helikopter (pure Hover-Departure aus Boarding):**
-Heli die direkt vom Gate ohne Bodenrollen abheben (GS bleibt 0) gehen nie auf TaxiOut, also auch nicht TakeoffRoll. FSM stuck in Boarding.
+**🚁 Helikopter vertikaler Start aus Taxi**
+TaxiOut→TakeoffRoll erwartet GS>30 kt am Boden, Helis erreichen das nie. Vorher: FSM hängt für ganzen Flug in TaxiOut.
+→ Fix: TaxiOut → Takeoff direkt wenn `on_ground` true→false + AGL>5 ft + VS>100 fpm (Hardening gegen on_ground-Flicker).
 
-Fix: Boarding → Takeoff direkt wenn `on_ground` edge feuert + Engines laufen + AGL > 3 ft (false-positive-Schutz gegen Sim-Glitches während Boarding).
+**🚁 Helikopter pure-hover Departure aus Boarding**
+Heli die direkt vom Gate vertikal abheben gehen nie auf TaxiOut → stuck in Boarding.
+→ Fix: Boarding → Takeoff direkt + AGL>3 ft + VS>100 fpm.
 
-**Bug B — GA-Niedrigflug (Climb-Sackgasse):**
-Cessna mit Cruise auf 3000 ft AGL: erreicht nie Climb → Cruise (braucht > 5000 ft) UND erreicht nie Climb → Descent (braucht VS < -500 fpm, GA sinkt sanft mit -300). FSM bleibt komplett in Climb.
+**✈ Glider (Tow + Winch)**
+engines>0 Anforderung in Heli-Pfaden gedroppt → Glider-Tow funktioniert (Glider ist airborne mit GS>0 aber engines=0).
 
-Fix: Climb → Descent triggert jetzt in DREI Szenarien:
+**🛟 Seaplane Wasser-Operationen**
+Boarding→TaxiOut akzeptiert jetzt Wasser-Oberfläche (`AGL<5 + |VS|<50` ≈ ground-equivalent). TaxiOut→Takeoff Catchall für Seaplanes wo on_ground=false bleibt: `!on_ground + AGL>50 + VS>100 + !slew + !paused`.
+
+**🛩 GA Niedrigflug-Sackgasse**
+Cessna mit Cruise auf 3000 ft AGL erreichte vorher nie Climb→Descent (braucht VS<-500). Climb→Descent triggert jetzt in DREI Szenarien:
 - Standard TOD (Airliner): vs<-500 + lost>200 ft
-- **NEU** Low-altitude approach: vs<-100 + AGL<3000 + lost>500 ft (GA-Pattern-Anflug)
-- **NEU** Near-ground catchall: AGL<2000 + lost>800 ft + vs<0 (Bush-Flying / Heli-Operations)
+- Low-altitude approach: vs<-100 + AGL<3000 + lost>500 ft
+- Near-ground catchall: AGL<2000 + lost>800 ft + vs<0
 
-**Bug C — Pattern-Cruise nicht erkannt:**
-Aircraft die auf 1500-3000 ft AGL leveln (Pattern, GA-Cruise, Heli-Enroute): Climb→Cruise feuert nie (braucht AGL > 5000).
+**🔄 Touch-and-Go + Go-Around: climb_peak_msl Reset**
+Beide Handler springen zurück zu Climb, aber der climb_peak_msl-Tracker wurde vorher nur bei Takeoff→Climb zurückgesetzt → Stale-Peak nach T&G/GA hätte mein neuen Low-Altitude-Trigger fälschlich feuern lassen.
 
-Fix: Alternativer Climb → Cruise Pfad wenn `vs.abs()<100 + Höhe stabil über Climb-Peak (Δ<100 ft) + AGL>1000 ft`. Echtes Level-Off auf jeder Höhe wird erkannt, ohne dass momentane VS=0-Smoothing während Climb fälschlich triggert.
+**⏸ Pause + Slew Guard**
+Während sim-pause oder slew-mode friert die FSM-Logik ein (kein Phasenwechsel), aber Position-Recording, Distanz-Tracking, Heartbeat laufen weiter. Verhindert dass eingefrorene snapshots Holding-Detektor-Timer fälschlich ablaufen lassen.
 
-### Phasen-Audit-Ergebnis (alle Klassen)
+**🎯 NEUE Phase: Holding**
+ICAO-konforme Holding-Pattern-Erkennung (sustained turn 90s + level flight). Triggert aus Cruise (high-altitude hold) oder Approach (low-altitude approach hold). Exit über bank<5° für 30s ODER aktiver Sinkflug → Approach.
 
-| Klasse | Boarding→Taxi | Takeoff | Cruise | Descent | Approach→Landing |
-|---|---|---|---|---|---|
-| Airliner | ✅ | ✅ | ✅ FL | ✅ TOD-Drop | ✅ |
-| GA Cessna 172 | ✅ | ✅ | ✅ **NEU** | ✅ **NEU** | ✅ |
-| Helikopter mit Taxi | ✅ | ✅ **NEU** vertikal | ✅ **NEU** | ✅ **NEU** | ✅ |
-| Helikopter pure Hover | ✅ **NEU** direct | ✅ **NEU** | ✅ **NEU** | ✅ **NEU** | ✅ |
+**Audit-Endergebnis:**
+
+| Aircraft | Vorher | Nach v0.5.11 |
+|---|---|---|
+| Airliner FL340 | ✅ | ✅ unverändert |
+| Cessna 172 @ 3000 ft | ❌ stuck in Climb | ✅ alle Phasen |
+| Bell 407 vertikal | ❌ stuck in TaxiOut | ✅ alle Phasen |
+| EC135 pure-hover | ❌ stuck in Boarding | ✅ alle Phasen |
+| Glider Aerotow / Winch | ❌ engines>0 lockt aus | ✅ alle Phasen |
+| Seaplane (Wasser) | ❌ stuck in Boarding | ✅ alle Phasen |
+| Pattern + Touch-and-Go | ⚠️ stuck nach 2. Anflug | ✅ Multi-T&G stabil |
+| Missed Approach + GA | ⚠️ 2. Approach instabil | ✅ stabil |
+| ATC Holding-Pattern | (nicht erkannt) | ✅ neue HOLDING-Phase |
+
+**⚠️ Verworfen aus pre-release v0.5.10:** Der dortige Climb→Cruise low-altitude-Pfad (vs.abs()<100 + lost.abs()<100) wäre während aktivem Climb fälschlich gefeuert (lost-from-peak ist immer ~0 beim aktiven Climb). Komplett rausgenommen — GA bleibt in Climb bis Descent.
+
+---
+
+### 🎯 Teil 2: X-Plane Touchdown-Erfassung — Architektur-Refactor
+
+Pilot-Analyse 2026-05-07: „warum kriegen LandingRate.lua und Volanta plausible Werte und wir nicht? Plus: most-negative-anywhere-in-approach kann pre-flare-Sinkraten als Touchdown ausgeben."
+
+**Bug-Klasse:** v0.5.5+ trackte den negativsten VS-Wert über den GANZEN Approach. Ein steiler Pre-Flare-Sinkflug bei 943 ft AGL (z.B. -1346 fpm) hätte den echten gentle Touchdown bei 0 ft AGL überschrieben → Phantom-Hard-Landing-Reports.
+
+**Fix — neue clean Hierarchie für Touchdown-VS-Erfassung:**
+
+1. **PRIMÄR: AGL-Δ Estimator** mit Window-Tiers (750 ms / 1 s / 1.5 s / 2 s / 3 s / 12 s sparse-fallback)
+   - LandingRate-1-Algorithmus (etabliert seit ~2014, gleiche Methode wie Volanta)
+   - **Strikte Guards:** AGL ≤ 5 ft am Touchdown-Frame, AGL ≤ 250 ft am Window-Start
+   - Pre-flare-Höhen können physisch nicht in die Berechnung kommen
+2. Sampler-Edge-Capture (negative_only filtered)
+3. MSFS-latched Touchdown-SimVar (negative_only)
+4. Tighter buffer-window-scan + AGL≤250 Filter (negative_only)
+5. `low_agl_vs_min_fpm` (umbenannt von `approach_vs_min_fpm`, jetzt nur AGL≤250 trackend)
+
+**`negative_only` Filter:** alle Fallback-Quellen werden gefiltert — eine positive Landing-Rate ist physikalisch unmöglich.
+
+**Plugin entmachtet:**
+- Plugin-Code spiegelt gleichen Algorithmus + AGL≤250-Limit
+- Plugin-Buffer hat 128 Samples (~3.8 s history)
+- Plugin sendet Diagnose-Metadaten (`captured_vs_source`, `captured_vs_window_ms`, `captured_vs_samples`) im Touchdown-Paket
+- Plugin liefert weiterhin `captured_vs_fpm` aber Client kann mit eigener AGL-Estimate **überschreiben** wenn er bessere Samples hat
+- Plugin-Reinstall **nicht zwingend** — alte Plugin-Versionen werden durch Client-Logik korrekt gefiltert
+
+**5 Regression-Tests** (alle grün): rebound-VSI / pre-flare-spike / butter-landing / all-positive-VS / negative_only-Filter.
+
+---
+
+### 📡 Teil 3: MQTT Live-Tracking zur aeroacars-live VPS
+
+**NEUE Crate** `client/src-tauri/crates/aeroacars-mqtt/` integriert. Komplett unsichtbares Hintergrund-Feature (KEINE UI, KEIN Settings-Tab, KEIN Toggle).
+
+**Auto-Provisioning** beim Login:
+- Client ruft `https://live.kant.ovh/api/provision` mit phpVMS-API-Key auf
+- Server validiert API-Key gegen phpVMS-Backend, liefert MQTT-Credentials zurück
+- Credentials werden im OS-Keyring gecacht — Re-Install = same credentials (idempotent)
+- Logout flusht Cache + sauberer Shutdown
+
+**5 Hook-Points im Streamer:**
+- **Position** (high-frequency, retained, QoS 0) — bei jedem position-tick
+- **Phase** (low-frequency, retained, QoS 1) — bei FSM-Phasenwechsel inkl. neue HOLDING-Phase
+- **Touchdown** (event, QoS 1) — wenn `announce_landing_score` ein Score-Message generiert
+- **PIREP** (event, QoS 1) — nach `file_pirep` success
+- **Shutdown** (clean OFFLINE flush mit 200ms-Pause) — auf RunEvent::ExitRequested
+
+**Sicherheitseigenschaften:**
+- MQTT-Connect über `wss://live.kant.ovh/mqtt` (TLS via rustls, kein OpenSSL-dep)
+- `try_send` mit bounded queue → broker stall kann NIE den Streamer hot-path blocken
+- Provision-Failure ist non-fatal — AeroACARS funktioniert exakt wie ohne MQTT
+- LWT (last-will-and-testament) sorgt dafür dass beim Crash der OFFLINE-Status kommt
+- Topic-ACL: jeder Pilot kann nur in `aeroacars/<va>/<seine-id>/#` publishen
+
+**Wichtig für VA-Admins:** der Server-seitige Monitor-Frontend muss noch um die neue `HOLDING`-Phase erweitert werden — bis dahin fällt das Frontend auf den raw-String zurück (kein Funktionsverlust, nur Cosmetics).
+
+---
 
 ### 🛠 Intern
-- Tests: 82 grün
-- Wirkt für **MSFS und X-Plane** (FSM-Code ist sim-agnostisch)
-- Universal-Arrived-Fallback bleibt als zweite Verteidigungslinie aktiv
+
+- Tests: 87 grün (82 vorher + 5 neue Regression-Tests)
+- Backend kompiliert cross-platform clean
+- Plugin baut auf Windows (Mac/Linux via CI)
+- Frontend: 0 Änderungen
+- pre-release v0.5.10 wurde verworfen (Climb→Cruise alt-path zu riskant, T&G/GA-Reset fehlte)
 
 ---
 

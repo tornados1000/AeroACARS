@@ -1,0 +1,33 @@
+[package]
+name = "aeroacars-mqtt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "MQTT publisher for AeroACARS — feeds aeroacars-live monitor relay"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+
+# rumqttc 0.24: async MQTT-Client. Features:
+# - websocket  → MQTT-over-WebSocket (für wss:// gegen Caddy)
+# - use-rustls → TLS via rustls (kein OpenSSL-dep, gleicher TLS-Stack
+#                wie reqwest im api-client crate)
+rumqttc = { version = "0.24", default-features = false, features = ["websocket", "use-rustls"] }
+
+# rustls 0.22 weil rumqttc 0.24 intern auf 0.22 pinned. Wenn man hier 0.23 nimmt,
+# kompiliert nicht ("expected ClientConfig (0.22), found ClientConfig (0.23)").
+rustls = "0.22"
+webpki-roots = "0.26"
+
+url = "2"
+sim-core = { path = "../sim-core" }
