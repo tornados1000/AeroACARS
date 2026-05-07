@@ -4,6 +4,31 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.5.9] — 2026-05-07
+
+🩹 **Climb→Descent FSM-Bug: ein einzelner VS-Spike beendete den Steigflug.**
+
+Pilot Michael (MSFS, EGPH→HEGN B738): bei Climb auf FL050 hat ein einzelner -742 fpm-Spike (Level-Off-Maneuver) die FSM auf Descent geflippt. Aircraft stieg weiter durch FL340 und cruiste, aber FSM blieb 50+ Min in Descent hängen weil es keinen Descent→Climb Rücktransitionspfad gibt.
+
+### 🐛 Behoben
+
+Climb→Descent verlangt jetzt **zusätzlich** dass das Aircraft **echten Höhenverlust** vom Climb-Peak hat (>200 ft MSL).
+
+```
+Vorher: vs < -500 fpm                                    → Descent
+Jetzt:  vs < -500 fpm AND lost_from_climb_peak > 200 ft → Descent
+```
+
+Single-Sample-Spikes (Turbulenz, Auto-Pilot-Trim, ATC-Level-Off) werden gefiltert. Erst wenn das Aircraft tatsächlich >200 ft Höhe verliert, gilt's als Descent. Echter Top-of-Descent verliert sofort tausende Fuß → triggert problemlos.
+
+### 🛠 Intern
+- Neues Feld `climb_peak_msl` in FlightStats (persistiert)
+- Reset bei Takeoff→Climb (Re-Takeoff nach Divert)
+- Wirkt für **MSFS und X-Plane** (FSM ist sim-agnostisch)
+- Tests: 82 grün
+
+---
+
 ## [v0.5.8] — 2026-05-07
 
 🎯 **Multi-Window AGL-Δ + Plugin-Update — komplette Algorithmus-Konvergenz mit Volanta-Niveau.**

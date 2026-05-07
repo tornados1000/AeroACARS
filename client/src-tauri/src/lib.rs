@@ -675,6 +675,8 @@ struct PersistedFlightStats {
     #[serde(default)]
     cruise_peak_msl: Option<f32>,
     #[serde(default)]
+    climb_peak_msl: Option<f32>,
+    #[serde(default)]
     peak_altitude_ft: Option<f32>,
     #[serde(default)]
     aircraft_banner_logged: bool,
@@ -787,6 +789,7 @@ impl PersistedFlightStats {
             arr_gate: stats.arr_gate.clone(),
             approach_runway: stats.approach_runway.clone(),
             cruise_peak_msl: stats.cruise_peak_msl,
+            climb_peak_msl: stats.climb_peak_msl,
             peak_altitude_ft: stats.peak_altitude_ft,
             aircraft_banner_logged: stats.aircraft_banner_logged,
             touchdown_sideslip_deg: stats.touchdown_sideslip_deg,
@@ -856,6 +859,7 @@ impl PersistedFlightStats {
         stats.arr_gate = self.arr_gate;
         stats.approach_runway = self.approach_runway;
         stats.cruise_peak_msl = self.cruise_peak_msl;
+        stats.climb_peak_msl = self.climb_peak_msl;
         stats.peak_altitude_ft = self.peak_altitude_ft;
         stats.aircraft_banner_logged = self.aircraft_banner_logged;
         stats.touchdown_sideslip_deg = self.touchdown_sideslip_deg;
@@ -1306,6 +1310,11 @@ struct FlightStats {
     /// Descent — only a real TOD drop of >5000 ft from this peak
     /// counts.
     cruise_peak_msl: Option<f32>,
+    /// v0.5.9: peak MSL altitude during the Climb phase. Reset on
+    /// Climb entry. Used by the Climb → Descent guard — require
+    /// >200 ft loss from this peak before transitioning, so single
+    /// VS spikes (turbulence, level-off) don't flip the FSM.
+    climb_peak_msl: Option<f32>,
     /// Peak MSL altitude across the entire flight, regardless of
     /// phase. Reported as the PIREP `level` field — phpVMS shows it
     /// as "Flt.Level". Updated on every snapshot during Climb /
@@ -6832,15 +6841,40 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
         FlightPhase::Takeoff => {
             if snap.altitude_agl_ft > 500.0 {
                 next_phase = FlightPhase::Climb;
+                // v0.5.9: reset climb peak so the new climb segment
+                // starts fresh (handles re-takeoffs after a divert).
+                stats.climb_peak_msl = None;
             }
         }
         FlightPhase::Climb => {
-            // Descent threshold raised to −500 fpm (was −300). Real
-            // top-of-descent rates are −1500..−2500 fpm; −300 was
-            // tripping on level-off corrections, autopilot trims and
-            // light turbulence and pushing the dashboard into
-            // Descent prematurely.
-            if snap.vertical_speed_fpm < -500.0 {
+            // Track the highest altitude we've seen while climbing —
+            // used as the reference point for "did we really start
+            // descending, or is this just a single VS spike?".
+            let climb_peak = stats.climb_peak_msl.unwrap_or(0.0);
+            if (snap.altitude_msl_ft as f32) > climb_peak {
+                stats.climb_peak_msl = Some(snap.altitude_msl_ft as f32);
+            }
+
+            // v0.5.9: Climb → Descent now requires BOTH:
+            //   * Sustained sink rate (< −500 fpm)
+            //   * Altitude actually lost from climb peak (> 200 ft)
+            //
+            // Pilot Michael 2026-05-07 EGPH→HEGN: a single -742 fpm
+            // sample (level-off blip during climb to FL340) flipped
+            // the FSM to Descent at FL050. Aircraft kept climbing to
+            // FL340 and cruised, but FSM was stuck in Descent for the
+            // next 50+ minutes because there's no Descent → Climb
+            // transition. Without the altitude-lost guard a single
+            // turbulence spike or autopilot trim correction wrecks
+            // the rest of the timeline.
+            //
+            // 200 ft threshold filters typical level-off oscillation
+            // (pitch-corrections + turbulence rarely exceed this) but
+            // is well below any real top-of-descent (which loses
+            // thousands of feet quickly).
+            let lost_from_peak =
+                stats.climb_peak_msl.unwrap_or(0.0) - snap.altitude_msl_ft as f32;
+            if snap.vertical_speed_fpm < -500.0 && lost_from_peak > 200.0 {
                 next_phase = FlightPhase::Descent;
             } else if snap.vertical_speed_fpm.abs() < 200.0
                 && snap.altitude_agl_ft > 5000.0
