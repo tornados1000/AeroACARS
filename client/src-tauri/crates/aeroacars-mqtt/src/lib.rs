@@ -260,32 +260,6 @@ pub struct TouchdownPayload {
     /// — drives the "Spritverbrauch" sub-score. None when the bid had
     /// no SimBrief OFP attached (planned-burn unavailable).
     pub fuel_efficiency_pct: Option<f32>,
-    /// v0.5.23: pre-computed score breakdown — same six sub-scores the
-    /// AeroACARS app shows the pilot in the in-app PIREP detail. Single
-    /// source of truth lives in the `landing_scoring` Rust module of
-    /// the main app crate; the values are mirrored into this MQTT
-    /// payload so the live monitor doesn't reimplement the math.
-    /// Empty when no input data is available (= pre-rollout PIREP).
-    #[serde(default)]
-    pub sub_scores: Vec<TouchdownSubScore>,
-}
-
-/// One sub-score row mirrored from `aeroacars_app::landing_scoring::SubScore`.
-/// Kept as a separate type here (instead of importing from the app crate)
-/// so `aeroacars-mqtt` stays a leaf dependency. Wire format is identical.
-#[derive(Clone, Debug, Serialize)]
-pub struct TouchdownSubScore {
-    /// One of: "landing_rate", "g_force", "bounces", "stability",
-    /// "rollout", "fuel". Server maps to localized label.
-    pub key: String,
-    pub points: i32,
-    /// Pre-formatted display value ("-53 fpm", "1.07 G", …).
-    pub value: String,
-    /// "good" / "ok" / "bad" — drives the colour band server-side.
-    pub band: String,
-    /// Stable rationale key ("smooth_touchdown", "very_unstable", …).
-    /// Server maps to localized label + coach tip.
-    pub rationale: String,
 }
 
 #[derive(Clone, Debug, Serialize)]

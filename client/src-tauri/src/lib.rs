@@ -6,7 +6,6 @@
 //! never on disk in plaintext.
 
 mod discord;
-mod landing_scoring;
 mod runway;
 mod xplane_plugin_install;
 
@@ -6903,62 +6902,6 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                                     Some(((actual - plan) / plan) * 100.0)
                                 }
                                 _ => None,
-                            },
-                            // v0.5.23: pre-computed score breakdown —
-                            // single-source-of-truth lives in
-                            // `landing_scoring::compute_sub_scores`.
-                            // Mirroring as MQTT-friendly types here so
-                            // the live-tracking server can render
-                            // exactly what the in-app PIREP shows
-                            // without reimplementing the math.
-                            sub_scores: {
-                                let inputs = landing_scoring::ScoringInputs {
-                                    vs_fpm: stats
-                                        .landing_peak_vs_fpm
-                                        .or(stats.landing_rate_fpm),
-                                    peak_g_force: stats.landing_peak_g_force,
-                                    g_force: stats.landing_g_force,
-                                    bounce_count: Some(stats.bounce_count as u32),
-                                    approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
-                                    rollout_distance_m: stats
-                                        .rollout_distance_m
-                                        .map(|d| d as f32),
-                                    runway_length_m: rwy_match
-                                        .map(|m| m.length_ft * 0.3048),
-                                    fuel_efficiency_pct: match (
-                                        stats.block_fuel_kg,
-                                        stats.landing_fuel_kg,
-                                        stats.planned_burn_kg,
-                                    ) {
-                                        (Some(block), Some(landing), Some(plan))
-                                            if plan > 0.0 =>
-                                        {
-                                            let actual = block - landing;
-                                            Some(((actual - plan) / plan) * 100.0)
-                                        }
-                                        _ => None,
-                                    },
-                                };
-                                landing_scoring::compute_sub_scores(&inputs)
-                                    .into_iter()
-                                    .map(|s| aeroacars_mqtt::TouchdownSubScore {
-                                        key: serde_json::to_value(&s.key)
-                                            .ok()
-                                            .and_then(|v| {
-                                                v.as_str().map(|x| x.to_string())
-                                            })
-                                            .unwrap_or_default(),
-                                        points: s.points,
-                                        value: s.value,
-                                        band: serde_json::to_value(&s.band)
-                                            .ok()
-                                            .and_then(|v| {
-                                                v.as_str().map(|x| x.to_string())
-                                            })
-                                            .unwrap_or_default(),
-                                        rationale: s.rationale.to_string(),
-                                    })
-                                    .collect()
                             },
                         }
                     })
