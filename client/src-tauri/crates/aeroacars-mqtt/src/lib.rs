@@ -594,21 +594,31 @@ fn simulator_label(sim: Simulator) -> &'static str {
 }
 
 fn phase_label(p: FlightPhase) -> &'static str {
+    // v0.5.18: granular 1:1 mapping of all 17 internal FSM phases to
+    // distinct MQTT labels. Pre-v0.5.18 we collapsed 5 pairs/triples
+    // (Preflight+Boarding → PREFLIGHT, Pushback+TaxiOut → TAXI_OUT,
+    // TakeoffRoll+Takeoff → TAKEOFF, BlocksOn+Arrived+PirepSubmitted
+    // → ON_BLOCK) for "simpler live-map" — but this lost data the
+    // server needs for proper flight-phase analytics, rotation
+    // timing, post-landing state distinction etc. The server-side
+    // mapping table is being updated in lockstep.
     match p {
-        FlightPhase::Preflight | FlightPhase::Boarding => "PREFLIGHT",
-        FlightPhase::Pushback | FlightPhase::TaxiOut => "TAXI_OUT",
-        FlightPhase::TakeoffRoll | FlightPhase::Takeoff => "TAKEOFF",
+        FlightPhase::Preflight => "PREFLIGHT",
+        FlightPhase::Boarding => "BOARDING",
+        FlightPhase::Pushback => "PUSHBACK",
+        FlightPhase::TaxiOut => "TAXI_OUT",
+        FlightPhase::TakeoffRoll => "TAKEOFF_ROLL",
+        FlightPhase::Takeoff => "TAKEOFF",
         FlightPhase::Climb => "CLIMB",
         FlightPhase::Cruise => "CRUISE",
-        // v0.5.11: Holding-Phase aus AeroACARS — semantisch wie
-        // Cruise/Approach am Server, aber für Live-Map-Erkennung
-        // separat ausgewiesen.
         FlightPhase::Holding => "HOLDING",
         FlightPhase::Descent => "DESCENT",
         FlightPhase::Approach => "APPROACH",
         FlightPhase::Final => "FINAL",
         FlightPhase::Landing => "LANDING",
         FlightPhase::TaxiIn => "TAXI_IN",
-        FlightPhase::BlocksOn | FlightPhase::Arrived | FlightPhase::PirepSubmitted => "ON_BLOCK",
+        FlightPhase::BlocksOn => "BLOCKS_ON",
+        FlightPhase::Arrived => "ARRIVED",
+        FlightPhase::PirepSubmitted => "PIREP_SUBMITTED",
     }
 }
