@@ -12431,6 +12431,45 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            // v0.5.15: initialize file-based secrets storage BEFORE
+            // anything else touches the secrets API. We resolve the
+            // app data dir from the Tauri PathResolver. If this fails
+            // (extremely unlikely — only if the OS denies the user's
+            // own appdata dir), secret reads/writes will return
+            // SecretError::NotInitialized and the app degrades to
+            // "no persistent login" but keeps running.
+            match app.path().app_data_dir() {
+                Ok(dir) => {
+                    if let Err(e) = secrets::init(&dir) {
+                        tracing::error!(error = %e, "secrets init failed");
+                    } else {
+                        // One-shot migration of any pre-v0.5.15
+                        // credentials from the OS keyring (Apple
+                        // Keychain / Windows Credential Manager) to
+                        // our JSON file. Pilots see one final batch
+                        // of Keychain prompts on the upgrade run;
+                        // every subsequent launch is silent.
+                        let accounts = [
+                            "primary",          // phpVMS API key
+                            "mqtt-username",
+                            "mqtt-password",
+                            "mqtt-va",
+                            "mqtt-pilot-id",
+                            "mqtt-broker-url",
+                        ];
+                        let n = secrets::migrate_from_keyring(&accounts);
+                        if n > 0 {
+                            tracing::info!(
+                                migrated = n,
+                                "v0.5.15 keyring → file migration finished"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "could not resolve app_data_dir for secrets");
+                }
+            }
             // Resolve the activity-log persistence path now that we
             // have an AppHandle. After this, save_activity_log() can
             // run without a handle (uses the OnceLock cache).
