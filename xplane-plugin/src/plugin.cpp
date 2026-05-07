@@ -461,87 +461,87 @@ float flight_loop_cb(float, float, int, void*) noexcept {
 
     // -- Touchdown event packet (one-shot, frame-perfect) ---------------
     if (edge) {
-        // v0.5.11: AGL-derivative with strict guards (per pilot's
-        // 2026-05-07 deep analysis). Window-tier strategy mirrors the
-        // Tauri-client implementation in lib.rs:
+        // v0.5.13: Lua-style adaptive 30-sample AGL-Δ (LandingRate-1
+        // method by Dan Berry, 2014+). Replaces the v0.5.11 fixed
+        // time-tier approach (750ms/1s/1.5s/...) with a single
+        // sample-count window that adapts to flight-loop frequency
+        // automatically.
         //
-        //   * Window tiers (most preferred first):
-        //     750 ms / 1000 ms / 1500 ms / 2000 ms / 3000 ms / 12000 ms
-        //   * All tiers require AGL ≤ 5 ft at the touchdown frame
-        //     AND AGL ≤ 250 ft at window start (= sample is within
-        //     the actual touchdown footprint, not pre-flare descent)
+        //   * Take the LATEST 30 samples (or fewer if buffer not full)
+        //     — at 60 fps that's ~0.5s, at 30 fps ~1s, at 10 fps ~3s
+        //   * AGL guards identical to before:
+        //     - touchdown sample AGL ≤ 5 ft (or on_ground equivalent)
+        //     - window-start AGL ≤ 250 ft (no pre-flare contamination)
         //   * Result must be < 0 fpm (positive = unphysical)
         //
-        // Plugin's role here: first-class touchdown VS estimator
-        // running at flight-loop frequency (faster than the client's
-        // 50 Hz sampler). The client receives the result in the
-        // touchdown packet and uses it as path #2 in its priority
-        // chain (sampler_touchdown_vs_fpm). The client may STILL
-        // override with its own AGL-Δ estimate if it has more
-        // samples — that's by design (v0.5.11 client-wins
-        // architecture, plugin entmachten).
-        struct WindowTier { double ms; int min_samples; const char* label; };
-        static const WindowTier tiers[] = {
-            { 750.0,   5, "agl_750ms"        },
-            { 1000.0,  5, "agl_1000ms"       },
-            { 1500.0,  5, "agl_1500ms"       },
-            { 2000.0,  4, "agl_2000ms"       },
-            { 3000.0,  3, "agl_3000ms"       },
-            { 12000.0, 3, "agl_sparse_12s"   },
-        };
-        constexpr float TD_AGL_MAX_AT_TD_FT      = 5.0f;
-        constexpr float TD_AGL_MAX_AT_START_FT   = 250.0f;
+        // Pilot test 2026-05-07 (MYNN→MBGT, X-Plane v0.5.11): old
+        // time-tier method gave -394 fpm because 750ms tier had
+        // <5 samples (X-Plane RREF rate too low for that fps), 1500ms
+        // tier won and pulled in pre-flare data. Lua-style 30-sample
+        // adapts to this case with ~0.6s effective window → matches
+        // LandingRate-1.lua's 273 fpm.
+        constexpr int LUA_SAMPLE_COUNT = 30;
+        constexpr int LUA_MIN_SAMPLES  = 5;
+        constexpr float TD_AGL_MAX_AT_TD_FT    = 5.0f;
+        constexpr float TD_AGL_MAX_AT_START_FT = 250.0f;
 
         float captured_vs = 0.0f;
         const char* vs_source = "none";
         int vs_window_ms = 0;
         int vs_sample_count = 0;
 
-        for (const auto& t : tiers) {
-            const double window_start = sim_t - (t.ms / 1000.0);
-            float agl_sum = 0.0f;
-            int n = 0;
-            double earliest_t = 1e30;
-            double latest_t = -1e30;
-            float agl_at_first = 1e30f;
-            float agl_at_last = 0.0f;
-            for (size_t i = 0; i < g_vs_buffer_count; ++i) {
-                const VSSample& s = g_vs_buffer[i];
-                if (s.t_sec >= window_start && s.t_sec <= sim_t) {
-                    agl_sum += s.agl_ft;
-                    n++;
-                    if (s.t_sec < earliest_t) {
-                        earliest_t = s.t_sec;
-                        agl_at_first = s.agl_ft;
-                    }
-                    if (s.t_sec > latest_t) {
-                        latest_t = s.t_sec;
-                        agl_at_last = s.agl_ft;
-                    }
-                }
+        // Collect samples up to current sim_t (descending by time
+        // so we can take the LATEST N easily).
+        struct SampleRef { double t_sec; float agl_ft; };
+        SampleRef sorted[VS_BUFFER_CAP];
+        int sorted_n = 0;
+        for (size_t i = 0; i < g_vs_buffer_count; ++i) {
+            const VSSample& s = g_vs_buffer[i];
+            if (s.t_sec <= sim_t) {
+                sorted[sorted_n++] = { s.t_sec, s.agl_ft };
             }
-            if (n < t.min_samples) continue;
-            // Touchdown sample must really be at the ground.
-            if (agl_at_last > TD_AGL_MAX_AT_TD_FT) continue;
-            // Window-start must be near the ground (no high-altitude
-            // pre-flare contamination).
-            if (agl_at_first > TD_AGL_MAX_AT_START_FT) continue;
-            const float timespan = static_cast<float>(latest_t - earliest_t);
-            if (timespan < 0.2f) continue;
-            const float avg_agl = agl_sum / static_cast<float>(n);
-            const float agl_midpoint = agl_at_last - avg_agl;
-            const float fpm = (agl_midpoint / (timespan / 2.0f)) * 60.0f;
-            if (!std::isfinite(fpm) || fpm >= 0.0f) continue;
-            // Found a valid tier — accept and stop.
-            captured_vs = fpm;
-            vs_source = t.label;
-            vs_window_ms = static_cast<int>(t.ms);
-            vs_sample_count = n;
-            break;
+        }
+        // Simple insertion-sort by t_sec ascending (small N, ≤128).
+        for (int i = 1; i < sorted_n; ++i) {
+            SampleRef key = sorted[i];
+            int j = i - 1;
+            while (j >= 0 && sorted[j].t_sec > key.t_sec) {
+                sorted[j + 1] = sorted[j];
+                j--;
+            }
+            sorted[j + 1] = key;
         }
 
-        // Fallback: if NO tier produced a valid result, fall back to
-        // the low-AGL VS-min tracker (now AGL ≤ 250 ft only — see
+        if (sorted_n >= LUA_MIN_SAMPLES) {
+            const int take = (sorted_n < LUA_SAMPLE_COUNT)
+                ? sorted_n : LUA_SAMPLE_COUNT;
+            const SampleRef* recent = &sorted[sorted_n - take];
+            const SampleRef& first = recent[0];
+            const SampleRef& last = recent[take - 1];
+
+            const bool ok_td_agl = (last.agl_ft <= TD_AGL_MAX_AT_TD_FT);
+            const bool ok_start_agl = (first.agl_ft <= TD_AGL_MAX_AT_START_FT);
+            const float timespan = static_cast<float>(last.t_sec - first.t_sec);
+            if (ok_td_agl && ok_start_agl && timespan >= 0.2f) {
+                float agl_sum = 0.0f;
+                for (int i = 0; i < take; ++i) {
+                    agl_sum += recent[i].agl_ft;
+                }
+                const float avg_agl = agl_sum / static_cast<float>(take);
+                const float agl_midpoint = last.agl_ft - avg_agl;
+                const float fpm = (agl_midpoint / (timespan / 2.0f)) * 60.0f;
+                if (std::isfinite(fpm) && fpm < 0.0f) {
+                    captured_vs = fpm;
+                    vs_source = "lua_30_sample";
+                    vs_window_ms = static_cast<int>(timespan * 1000.0f);
+                    vs_sample_count = take;
+                }
+            }
+        }
+
+        // Fallback: if Lua-style estimate failed (very sparse buffer,
+        // pre-touchdown AGL spike etc.), fall back to the low-AGL
+        // VS-min tracker (now AGL ≤ 250 ft only — see
         // g_airborne_vs_min update above). Last resort.
         if (captured_vs == 0.0f && g_airborne_vs_min < 0.0f) {
             captured_vs = g_airborne_vs_min;

@@ -2304,6 +2304,84 @@ fn negative_only(value: Option<f32>) -> Option<f32> {
     value.filter(|v| v.is_finite() && *v < 0.0)
 }
 
+// ---- v0.5.13: Lua-style adaptive 30-sample AGL-Δ estimator ------------
+//
+// Direct port of LandingRate-1.lua's algorithm (Dan Berry, 2014+,
+// X-Plane.org "A New Landing Rate Display"). Matches what Volanta uses
+// internally for X-Plane touchdown capture.
+//
+// Key insight: instead of fixed time windows (750ms/1s/1.5s/...) that
+// can pick up pre-flare contamination on sparse RREF feeds, take a
+// FIXED COUNT of recent samples (30) and adapt the time window to
+// however dense the buffer is.
+//
+// Effect:
+//   * High-fps sim (60+ fps): 30 samples ≈ 0.5 s window — tight, captures
+//     just the flare's final phase
+//   * Mid-fps sim (30 fps): 30 samples ≈ 1 s window — Lua's reference point
+//   * Low-fps sim (10 fps): 30 samples ≈ 3 s window — wider window to
+//     compensate for sparse data
+//
+// AGL guards (TD ≤ 5 ft / on_ground=true, window-start ≤ 250 ft) are
+// identical to the time-tier estimator — they're what prevents
+// pre-flare descent contamination, regardless of window size.
+//
+// Used ONLY for the X-Plane priority path. MSFS keeps the older
+// time-tier `estimate_xplane_touchdown_vs_from_agl` as fallback (when
+// the latched MSFS SimVar is null) — that path is GEES-aligned and
+// validated against pilot reports; we don't change MSFS behaviour.
+const LUA_STYLE_SAMPLE_COUNT: usize = 30;
+const LUA_STYLE_MIN_SAMPLES: usize = 5;
+
+fn estimate_xplane_touchdown_vs_lua_style(
+    buffer: &std::collections::VecDeque<TelemetrySample>,
+    touchdown_at: DateTime<Utc>,
+) -> Option<TouchdownVsEstimate> {
+    // Collect samples up to (and including) touchdown_at, in chronological order.
+    let mut samples: Vec<&TelemetrySample> =
+        buffer.iter().filter(|s| s.at <= touchdown_at).collect();
+    samples.sort_by_key(|s| s.at);
+    let n = samples.len();
+    if n < LUA_STYLE_MIN_SAMPLES {
+        return None;
+    }
+    let take = n.min(LUA_STYLE_SAMPLE_COUNT);
+    let recent = &samples[n - take..];
+
+    // Touchdown sample (latest) must really be at the ground.
+    let last = *recent.last()?;
+    let is_at_touchdown =
+        last.on_ground || last.agl_ft <= TD_AGL_MAX_AT_TOUCHDOWN_FT;
+    if !is_at_touchdown {
+        return None;
+    }
+    // Window-start sample must already be in approach footprint
+    // (no high-altitude pre-flare contamination).
+    let first = *recent.first()?;
+    if first.agl_ft > TD_AGL_MAX_AT_WINDOW_START_FT {
+        return None;
+    }
+
+    let avg_agl: f32 =
+        recent.iter().map(|s| s.agl_ft).sum::<f32>() / take as f32;
+    let timespan_sec =
+        (last.at - first.at).num_milliseconds() as f32 / 1000.0;
+    if timespan_sec < 0.2 {
+        return None;
+    }
+    let agl_midpoint = last.agl_ft - avg_agl;
+    let fpm = (agl_midpoint / (timespan_sec / 2.0)) * 60.0;
+    if !fpm.is_finite() || fpm >= 0.0 {
+        return None;
+    }
+    Some(TouchdownVsEstimate {
+        fpm,
+        source: "lua_30_sample",
+        window_ms: (timespan_sec * 1000.0) as i64,
+        sample_count: take,
+    })
+}
+
 /// Compute population standard deviations of V/S and bank over the
 /// approach buffer. Returns `(None, None)` when fewer than 3 samples
 /// (insufficient signal). Single-pass formula (Welford's algorithm
@@ -7806,9 +7884,28 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                     Simulator::XPlane11 | Simulator::XPlane12
                 );
 
-                // AGL-derivative estimator runs once and is used by
-                // both paths (priority differs).
-                let agl_estimate = estimate_xplane_touchdown_vs_from_agl(
+                // v0.5.13: AGL-derivative estimators run once.
+                //
+                //   * `agl_estimate_xp` — Lua-style 30-sample window
+                //     (LandingRate-1 algorithm, Volanta-aligned).
+                //     Used as PRIMARY for X-Plane.
+                //   * `agl_estimate_msfs` — original time-tier window
+                //     (multi-tier 750ms/1s/1.5s/2s/3s/12s with
+                //     min-sample guards). Used as FALLBACK for MSFS
+                //     when the latched SimVar is null. v0.5.12-validated
+                //     against real pilot flights — leave alone.
+                //
+                // Both have identical AGL guards (TD ≤ 5 ft / on_ground
+                // = true, window-start ≤ 250 ft) — they differ only
+                // in WINDOW SIZING strategy. The Lua method adapts
+                // to sample density automatically; the time-tier
+                // method walks fixed time windows.
+                let agl_estimate_xp =
+                    estimate_xplane_touchdown_vs_lua_style(
+                        &stats.snapshot_buffer,
+                        actual_td_at,
+                    );
+                let agl_estimate_msfs = estimate_xplane_touchdown_vs_from_agl(
                     &stats.snapshot_buffer,
                     actual_td_at,
                 );
@@ -7834,46 +7931,44 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                 };
 
                 let touchdown_vs = if is_msfs {
-                    // MSFS: priority chain (validated against 11 real
-                    // pilot flights 2026-05-07 — Pete + Michael):
+                    // MSFS: priority chain (v0.5.12 — validated against
+                    // 11 real pilot flights, Pete + Michael):
                     //   1. Latched SimVar (PLANE TOUCHDOWN NORMAL VELOCITY)
-                    //      — gold standard when present, but only set
-                    //      in ~10% of MSFS-2024 flights observed
-                    //   2. AGL-Δ estimator with on_ground-aware guard —
-                    //      geometric truth, works with the MSFS AGL ≈
-                    //      9-14 ft sim-quirk (the relaxed guard above
-                    //      accepts on_ground=true)
-                    //   3. Buffered VS-min in tight window — last resort
+                    //   2. Time-tier AGL-Δ (UNCHANGED, GEES-aligned)
+                    //   3. Buffered VS-min — last resort
                     //
                     // EXPLICITLY NOT used for MSFS:
-                    //   * sampler_touchdown_vs_fpm — captures MSFS gear-
-                    //     contact rebound spikes (-1173 fpm phantom in
-                    //     Michael's LH595 DNAA→EDDF report 2026-05-07)
-                    //   * low_agl_vs_min_fpm — same risk, polluted by
-                    //     MSFS gear-bounce oscillation samples
+                    //   * sampler_touchdown_vs_fpm — gear-contact
+                    //     rebound spike contamination
+                    //   * low_agl_vs_min_fpm — same risk
+                    //   * Lua-style 30-sample estimator — that's
+                    //     X-Plane only by design
                     let result = negative_only(snap.touchdown_vs_fpm)
-                        .or_else(|| agl_estimate.map(|e| e.fpm))
+                        .or_else(|| agl_estimate_msfs.map(|e| e.fpm))
                         .or_else(|| negative_only(buffered_vs_min))
                         .unwrap_or(0.0);
                     tracing::info!(
                         sim = "msfs",
                         latched = ?snap.touchdown_vs_fpm,
-                        agl_estimate = ?agl_estimate.map(|e| e.fpm),
+                        agl_estimate = ?agl_estimate_msfs.map(|e| e.fpm),
                         buffer_min = ?buffered_vs_min,
                         chosen = result,
-                        "touchdown VS captured (MSFS path — sampler explicitly bypassed)"
+                        "touchdown VS captured (MSFS path — time-tier estimator + sampler bypassed)"
                     );
                     result
                 } else if is_xplane {
-                    // X-Plane: AGL-Δ is geometric truth, sampler is
-                    // backup for sparse-buffer cases.
-                    let result = agl_estimate
+                    // X-Plane (v0.5.13): Lua-style 30-sample AGL-Δ is
+                    // PRIMARY (LandingRate-1 algorithm, Volanta-aligned).
+                    // Adapts to sim framerate naturally — high-fps gets
+                    // tight 0.5 s windows, low-fps gets wider 2-3 s
+                    // windows. No fixed time-tier brittleness.
+                    let result = agl_estimate_xp
                         .map(|e| e.fpm)
                         .or_else(|| negative_only(stats.sampler_touchdown_vs_fpm))
                         .or_else(|| negative_only(buffered_vs_min))
                         .or_else(|| negative_only(stats.low_agl_vs_min_fpm))
                         .unwrap_or(0.0);
-                    if let Some(ref est) = agl_estimate {
+                    if let Some(ref est) = agl_estimate_xp {
                         tracing::info!(
                             sim = "xplane",
                             agl_fpm = est.fpm,
@@ -7881,7 +7976,7 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                             window_ms = est.window_ms,
                             sample_count = est.sample_count,
                             chosen = result,
-                            "touchdown VS captured (X-Plane path, AGL-Δ primary)"
+                            "touchdown VS captured (X-Plane Lua-style 30-sample primary)"
                         );
                     } else {
                         tracing::info!(
@@ -7897,8 +7992,10 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                 } else {
                     // Unknown sim — generic fallback, preserves prior
                     // behaviour for edge cases (Other/sim_set_kind=Off).
+                    // Uses time-tier MSFS-side estimator since it's
+                    // the more conservative of the two.
                     negative_only(snap.touchdown_vs_fpm)
-                        .or_else(|| agl_estimate.map(|e| e.fpm))
+                        .or_else(|| agl_estimate_msfs.map(|e| e.fpm))
                         .or_else(|| negative_only(stats.sampler_touchdown_vs_fpm))
                         .or_else(|| negative_only(buffered_vs_min))
                         .unwrap_or(0.0)

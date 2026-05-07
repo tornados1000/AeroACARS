@@ -4,6 +4,60 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.5.13] — 2026-05-07
+
+🎯 **X-Plane Touchdown jetzt bit-genau LandingRate-1-aligned (Lua adaptive 30-sample method).**
+
+Pilot-Bericht 2026-05-07: X-Plane-Flug MYNN→MBGT auf v0.5.11/v0.5.12 zeigte -394 fpm Touchdown — LandingRate-1.lua-Tool im selben Sim sagte 273 fpm. ~44% zu hoch.
+
+**Ursache:** Mein bisheriger Time-Tier-Estimator (750ms / 1s / 1.5s / 2s / 3s / 12s mit fixen Min-Sample-Counts) ist zu starr. Bei niedriger X-Plane-RREF-Rate fallen kurze Tiers wegen Sample-Underflow durch, längere Tiers gewinnen — und ziehen Pre-Flare-Sinkraten in die Touchdown-Berechnung mit rein.
+
+**Lua's Methode** (LandingRate-1, Dan Berry 2014+) macht's anders:
+```lua
+new_table("lrl_agl", 30)  -- 30 Samples, NICHT 1 Sekunde fix
+```
+Adaptives Fenster — bei 60 fps Render = ~0.5s, bei 30 fps = ~1s, bei 10 fps = ~3s. Selbstkalibrierend, robust gegen Framerate-Schwankungen.
+
+### 🐛 Behoben
+
+**X-Plane Touchdown-Capture komplett auf Lua-Style umgestellt.**
+
+| Sim | Algorithmus | Datei |
+|---|---|---|
+| **X-Plane** (NEU) | Lua-style 30-sample adaptive AGL-Δ | `lib.rs` + `plugin.cpp` |
+| MSFS (UNVERÄNDERT) | Time-tier estimator als Fallback nach latched SimVar | `lib.rs` |
+
+**Schlüssel-Änderungen für X-Plane:**
+- Neue Funktion `estimate_xplane_touchdown_vs_lua_style` — nimmt die letzten 30 Samples aus dem Sampler-Buffer, berechnet AGL-Avg-Midpoint-Rate exakt wie Lua's `lrl_agl` table
+- Plugin (`plugin.cpp`): Time-Tier-Loop entfernt, durch 30-Sample-Method ersetzt
+- AGL-Guards bleiben unverändert (TD ≤ 5 ft / on_ground=true, Window-Start ≤ 250 ft)
+- Plugin sendet weiter `captured_vs_source` Diagnose-Metadata, jetzt `"lua_30_sample"`
+
+### MSFS unverändert
+
+**Nichts MSFS-relevantes wurde angefasst.** v0.5.12-Behavior für MSFS bleibt 1:1:
+1. Latched SimVar (PLANE TOUCHDOWN NORMAL VELOCITY) — primary, GEES-aligned
+2. Time-tier AGL-Δ — fallback (separate Funktion `estimate_xplane_touchdown_vs_from_agl` bleibt erhalten)
+3. Buffer-Min — last resort
+
+**Sampler bleibt für MSFS explizit aus** (war v0.5.12-Fix gegen Spike-Contamination).
+
+### Validation
+
+| Flug | Sim | v0.5.12 | v0.5.13 (erwartet) |
+|---|---|---|---|
+| MYNN→MBGT (Pilot) | X-Plane 12 | -394 fpm | ~-273 fpm (matcht LandingRate-1.lua) |
+| 11 Flüge (Pete + Michael) | MSFS | korrekt seit v0.5.12 | unverändert korrekt |
+
+### 🛠 Intern
+
+- Tests: 87 grün
+- `agl_estimate_xp` (Lua-style) und `agl_estimate_msfs` (time-tier) koexistieren als getrennte Funktionen
+- Plugin baut clean auf Win/Mac/Linux via CI
+- Frontend: 0 Änderungen
+
+---
+
 ## [v0.5.12] — 2026-05-07
 
 🚨 **KRITISCHER MSFS-Hotfix — Touchdown-Capture wieder GEES-aligned wie pre-v0.5.x.**
