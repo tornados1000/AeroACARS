@@ -88,8 +88,20 @@ pub struct RunwayMatch {
     pub centerline_distance_m: f64,
     /// |centerline_distance_m| converted to feet — easier for pilots.
     pub centerline_distance_abs_ft: f64,
-    /// Distance from the threshold along the runway axis, in feet.
-    /// Negative would mean "before the threshold" (undershoot).
+    /// Signed great-circle along-track distance from the threshold,
+    /// in feet. Positive = touchdown PAST the threshold (the normal
+    /// case — pilot crossed the threshold on final and put it down
+    /// somewhere down the runway). Negative = touchdown BEFORE the
+    /// threshold (undershoot — pilot was still on the approach side
+    /// when the on-ground edge fired). Zero = touchdown exactly on
+    /// the threshold within float precision.
+    ///
+    /// v0.5.20: pre-v0.5.20 this field was the unsigned magnitude
+    /// only, so undershoots showed up as small positive values
+    /// indistinguishable from "landed right at the threshold". The
+    /// sign is computed by checking the bearing from threshold to
+    /// touchdown against the runway heading: within ±90° → positive,
+    /// outside ±90° → negative.
     pub touchdown_distance_from_threshold_ft: f64,
     /// "LEFT", "RIGHT", or "CENTER" (within 2 m of centerline).
     pub side: String,
@@ -436,14 +448,42 @@ pub fn lookup_runway(
         // (because we measure from threshold toward the far end).
         let xtd_m = (d_ab / EARTH_RADIUS_M).sin() * (theta_ac - theta_ab).sin();
         let xtd_m = xtd_m.asin() * EARTH_RADIUS_M;
-        // Along-track distance: how far along the centerline the
-        // touchdown projects from the threshold.
+        // Along-track distance magnitude: how far along the centerline
+        // the touchdown projects from the threshold.
         let cos_arg = (d_ab / EARTH_RADIUS_M).cos() / (xtd_m / EARTH_RADIUS_M).cos();
         // Clamp to [-1,1] — small floating-point drift can push it out
         // of range when the pilot lands ~exactly on the threshold.
         let cos_arg = cos_arg.clamp(-1.0, 1.0);
         let along_m = cos_arg.acos() * EARTH_RADIUS_M;
-        let along_ft = along_m * 3.280_839_895;
+        // v0.5.20: signed along-track. The acos() above always returns
+        // a non-negative value, so undershoots before the threshold
+        // and overshoots past the threshold both reported as positive
+        // distances pre-v0.5.20 — the doc-string promised negative =
+        // undershoot, but the math couldn't deliver that. Server-side
+        // analysis (Volanta-style "where on the runway did the pilot
+        // touch") needs the sign to distinguish "landed 4 m past
+        // threshold" (= chevron landing, dramatic but legal) from
+        // "touched 4 m short of threshold" (= undershoot, bad).
+        //
+        // Sign by bearing diff: if the bearing from threshold to
+        // touchdown is within ±90° of the runway heading, the
+        // touchdown is on the runway side of the threshold (positive,
+        // overshoot); otherwise it's on the approach side (negative,
+        // undershoot).
+        let mut bearing_diff = theta_ac - theta_ab;
+        // Normalise to (-π, π].
+        while bearing_diff > std::f64::consts::PI {
+            bearing_diff -= 2.0 * std::f64::consts::PI;
+        }
+        while bearing_diff <= -std::f64::consts::PI {
+            bearing_diff += 2.0 * std::f64::consts::PI;
+        }
+        let along_signed_m = if bearing_diff.abs() > std::f64::consts::FRAC_PI_2 {
+            -along_m
+        } else {
+            along_m
+        };
+        let along_ft = along_signed_m * 3.280_839_895;
 
         let centerline_distance_abs_ft = xtd_m.abs() * 3.280_839_895;
 
@@ -618,6 +658,34 @@ mod tests {
             + (bearing_rad.sin() * delta.sin() * phi1.cos())
                 .atan2(delta.cos() - phi1.sin() * phi2.sin());
         (phi2.to_degrees(), lam2.to_degrees())
+    }
+
+    #[test]
+    fn undershoot_before_threshold_is_negative() {
+        // v0.5.20: synthetic touchdown 200 m short of the threshold
+        // along the runway axis. Pre-v0.5.20 this returned +200 m
+        // (indistinguishable from a 200 m overshoot); v0.5.20 returns
+        // a signed value (~-656 ft).
+        //
+        // Constructed by walking 200 m in the OPPOSITE direction of
+        // the runway heading (= bearing + 180°) from the threshold.
+        let landing_bearing = (EDDP_26R_HEADING as f64).to_radians();
+        let approach_bearing = landing_bearing + std::f64::consts::PI;
+        let (lat, lon) = destination(
+            EDDP_26R_THR_LAT,
+            EDDP_26R_THR_LON,
+            approach_bearing,
+            200.0,
+        );
+        let m = lookup_runway(lat, lon, EDDP_26R_HEADING)
+            .expect("should still resolve to EDDP/26R (pilot mid-final, 200 m short)");
+        // 200 m → ~656.17 ft. Negative because pilot is on the
+        // approach side of the threshold.
+        assert!(
+            (m.touchdown_distance_from_threshold_ft + 656.17).abs() < 5.0,
+            "along-track = {} ft (expected ≈-656.17)",
+            m.touchdown_distance_from_threshold_ft
+        );
     }
 
     #[test]
