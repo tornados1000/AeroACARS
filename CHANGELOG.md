@@ -4,6 +4,45 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.5.28] — 2026-05-08
+
+🎯 **UX-Polish für VFR/Manual-Mode: klarere Button-Labels + IFR/VFR-Hinweis-Pill auf Bid-Cards.**
+
+Folgepatch zu v0.5.27. Funktionalitaet identisch, nur bessere Lesbarkeit + Hinweise. Kein Verhaltens-Aenderung — Pilot entscheidet weiter selbst (= keine harte Enforcement nach flight_type).
+
+### ✨ Neu
+
+**1. Button-Labels eindeutig:**
+- "Start Flight" → **"🛫 IFR Start (SimBrief)"**
+- "🛩 VFR/Manual-Mode" / "🛩 Manual-Override" → einheitlich **"🛩 VFR Start (manuell)"**
+
+**2. Hover-Tooltips erklaeren wann zu nutzen:**
+- IFR-Button: „Standard-Flug nach IFR-Regeln, basiert auf deinem SimBrief-OFP. Block-Fuel, Route, Weights und Alternates kommen aus dem OFP."
+- VFR-Button: „Manueller Flug-Start ohne SimBrief-OFP — z.B. fuer VFR, kleine Pisten oder Pattern-Training. Du waehlst Aircraft + Block-Fuel selbst. Auch nutzbar als Aircraft-Override fuer Bids mit SimBrief-OFP."
+
+**3. IFR/VFR-Hinweis-Pill auf jeder Bid-Card** (Header-Meta-Row):
+- **IFR-Pill** (gruen): bei flight_type ∈ {J, F, C, M, I, V, S, R} — Scheduled, Charter, Mil, Special
+- **VFR-Pill** (gelb): bei flight_type containing "VFR", oder ∈ {G, T, X} — General Aviation, Training, Test
+- Kein Pill: bei unbekanntem oder leerem flight_type
+
+Reine **Information** — KEINE Filter, KEINE Pflicht. Pilot kann auch IFR-Bid mit VFR-Manual-Mode fliegen wenn er will, oder VFR-Bid mit SimBrief-OFP. Trust-the-Pilot-Design.
+
+**4. Tooltip-Hint auf der Pill:**
+- IFR-Pill: „IFR-typischer Bid (Scheduled / Charter). Empfohlener Flow: SimBrief-OFP + 'IFR Start'-Button. Du kannst aber auch VFR/Manual fliegen."
+- VFR-Pill: „VFR-typischer Bid (GA / Training / Test). Empfohlener Flow: 'VFR Start (manuell)'-Button. Du kannst aber auch SimBrief nutzen falls vorhanden."
+
+### 🔧 Implementation
+
+- **BidsList.tsx**: neuer Helper `flightRulesHint(type)` mit Detection-Logik. Pill rendert nur wenn Hint != null. Button-Labels in JSX angepasst.
+- **App.css**: `.bid-card__rules-badge--ifr` (gruen) + `--vfr` (gelb) parallel zu existierendem type-badge.
+
+### ⚠ Hinweise
+
+- Wenn dein VA-flight_type-Schema nicht in {J,F,C,M,I,V,S,R,G,T,X} fällt: kein Hinweis-Pill. Zwei Optionen: phpVMS-Admin → Flight-Type-Codes auf ICAO-Standard setzen, ODER `flight_type` mit "VFR" / "IFR" als Substring (z.B. "VFR-Pattern" oder "IFR-Charter").
+- Detection-Pattern ist in `flightRulesHint()` lokalisiert — bei VA-spezifischen Konventionen einfach die Switch-Case erweitern.
+
+---
+
 ## [v0.5.27] — 2026-05-08
 
 🎯 **VFR/Manual-Flight-Mode — Flug-Start ohne SimBrief-OFP für VFR-Flüge, kleine Pisten, GA.**
