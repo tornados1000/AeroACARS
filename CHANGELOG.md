@@ -4,6 +4,36 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.5.37] — 2026-05-08
+
+🇮🇹 **Italienische Übersetzung + Fix für Sprach-Reset nach Update.**
+
+### 🇮🇹 Italiano (für Marco)
+
+- Volle Übersetzung des UI in Italienisch (`locales/it/common.json`, ~250 Keys)
+- Aviation-Begriffe korrekt: crociera, discesa, decollo, atterraggio, riattaccata, etc.
+- Standard-ICAO-Abkürzungen behalten (IAS, GS, AGL, MSL, V/S, kt, ft, fpm)
+- `LANGUAGE_LABELS`-Map exportiert für saubere Anzeige im Switcher
+
+### 🐞 Sprach-Reset-Bug
+
+User-Report: nach jedem App-Update fiel die Sprache auf Englisch zurück, obwohl Browser-Locale Deutsch war.
+
+**Root-Cause:** `i18next-browser-languagedetector` mit `caches: ["localStorage"]` schreibt nur dann nach localStorage wenn `i18n.changeLanguage()` explizit gerufen wird. Bei reiner Auto-Detection (Browser-Locale) bleibt der localStorage-Key leer → nach Update fängt die Detection wieder bei Null an, und WebView2 könnte die Locale anders berichten.
+
+**Fix:**
+- Beim Ersten-Run nach Auto-Detection: erkannte Sprache EXPLIZIT in `localStorage["aeroacars.lang"]` schreiben
+- Neue helper-Funktion `setLanguage(lang)` die `i18n.changeLanguage()` + `localStorage.setItem()` koppelt
+- SettingsPanel nutzt `setLanguage()` statt `changeLanguage()` direkt
+
+### 🆕 Sprach-Switcher
+
+SettingsPanel-Dropdown zeigt jetzt alle 3 Sprachen (DE, EN, IT) dynamisch aus `SUPPORTED_LANGUAGES`. Marco kann manuell auf Italienisch umschalten — Auswahl persistiert über App-Updates.
+
+Versions-Bump 0.5.36 → 0.5.37.
+
+---
+
 ## [v0.5.36] — 2026-05-08
 
 🛩 **VFR/Manual-Mode: Aircraft-Mismatch wird Warnung statt Block.**

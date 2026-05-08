@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useTranslation } from "react-i18next";
+import { setLanguage, SUPPORTED_LANGUAGES, LANGUAGE_LABELS, type SupportedLanguage } from "../i18n";
 import type { ActiveFlightInfo, SimKind, SimStatus } from "../types";
 import type { Theme } from "../theme";
 import { SimDebugPanel } from "./SimDebugPanel";
@@ -114,10 +115,11 @@ export function SettingsPanel({
           </span>
           <select
             value={language}
-            onChange={(e) => i18n.changeLanguage(e.target.value)}
+            onChange={(e) => setLanguage(e.target.value as SupportedLanguage)}
           >
-            <option value="de">{t("actions.language_de")}</option>
-            <option value="en">{t("actions.language_en")}</option>
+            {SUPPORTED_LANGUAGES.map((lng) => (
+              <option key={lng} value={lng}>{LANGUAGE_LABELS[lng]}</option>
+            ))}
           </select>
         </label>
 
