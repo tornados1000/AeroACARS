@@ -1244,6 +1244,26 @@ struct FlightStats {
     /// against a real AGL-Δ estimate.
     /// Reset on Approach entry so go-arounds don't carry stale data.
     low_agl_vs_min_fpm: Option<f32>,
+    // ─── v0.5.23 Touchdown-Forensik ───────────────────────────────────
+    //
+    // Bei jedem Touchdown laufen MSFS- und X-Plane-Schaetzer parallel
+    // (siehe lib.rs ~Zeile 8254). Wir merken uns hier ALLE relevanten
+    // Zwischenergebnisse damit der TouchdownPayload-Build sie ans
+    // aeroacars-live-Monitor weitergeben kann fuer Forensik-Vergleiche.
+    /// "msfs" / "xplane" / "other" — gestempelt im Touchdown-Frame.
+    landing_simulator: Option<&'static str>,
+    /// Lua-Style 30-Sample-Schaetzung in fpm. None wenn Pfad nicht lief.
+    landing_vs_estimate_xp_fpm: Option<i32>,
+    /// Time-Tier-Schaetzung in fpm. None wenn Pfad nicht lief.
+    landing_vs_estimate_msfs_fpm: Option<i32>,
+    /// Welcher Pfad hat den finalen vs_fpm geliefert.
+    landing_vs_source: Option<&'static str>,
+    /// X-Plane Gear-Sampler peak gear_normal_force_n. None auf MSFS.
+    landing_gear_force_peak_n: Option<f32>,
+    /// Lua-Schaetzer Window-Groesse in ms (None wenn Pfad nicht gewann).
+    landing_estimate_window_ms: Option<i32>,
+    /// Lua-Schaetzer Sample-Count im Window.
+    landing_estimate_sample_count: Option<u32>,
     /// Frozen subsample of the ring buffer covering ±2 s around touchdown,
     /// for V/S-curve reconstruction in the PIREP notes block. Captured
     /// once when the on-ground edge fires; surviving across a Tauri
@@ -6965,6 +6985,19 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                                 .map(|m| (m.touchdown_distance_from_threshold_ft as f32) * 0.3048),
                             runway_match_centerline_offset_m: rwy_match
                                 .map(|m| m.centerline_distance_m as f32),
+                            // v0.5.23: Touchdown-Forensik — alle Schaetzer-
+                            // Zwischenergebnisse fuer Server-seitige
+                            // Algorithmus-Vergleiche (siehe stats Felder
+                            // landing_vs_estimate_*_fpm + landing_vs_source).
+                            simulator: stats.landing_simulator
+                                .map(|s| s.to_string()),
+                            vs_estimate_xp_fpm: stats.landing_vs_estimate_xp_fpm,
+                            vs_estimate_msfs_fpm: stats.landing_vs_estimate_msfs_fpm,
+                            vs_source: stats.landing_vs_source
+                                .map(|s| s.to_string()),
+                            gear_force_peak_n: stats.landing_gear_force_peak_n,
+                            estimate_window_ms: stats.landing_estimate_window_ms,
+                            estimate_sample_count: stats.landing_estimate_sample_count,
                             // v0.5.22: feeds the live-monitor's "Bahn-
                             // Auslastung"-sub-score so it matches the
                             // in-app PIREP value 1:1.
@@ -8361,6 +8394,74 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                         low_agl_min = ?stats.low_agl_vs_min_fpm,
                         "touchdown VS — all sources failed or were positive, defaulting to 0"
                     );
+                }
+
+                // ─── v0.5.23 Touchdown-Forensik-Capture ──────────────
+                //
+                // Spiegel der Priority-Chain oben — bestimmt welcher Pfad
+                // den finalen `touchdown_vs` lieferte und merkt sich die
+                // Werte ALLER Pfade zum Vergleich. Der Streamer baut
+                // damit den TouchdownPayload und schickt es an aeroacars-
+                // live damit der VA-Owner Algorithmen-Disagreements
+                // forensisch auswerten kann.
+                let vs_source: &'static str = if is_msfs {
+                    if negative_only(snap.touchdown_vs_fpm).is_some() {
+                        "msfs_simvar_latched"
+                    } else if agl_estimate_msfs.is_some() {
+                        "agl_estimate_msfs"
+                    } else if negative_only(buffered_vs_min).is_some() {
+                        "buffer_min"
+                    } else {
+                        "fallback_zero"
+                    }
+                } else if is_xplane {
+                    if agl_estimate_xp.is_some() {
+                        "agl_estimate_xp"
+                    } else if negative_only(stats.sampler_touchdown_vs_fpm).is_some() {
+                        "sampler_gear_force"
+                    } else if negative_only(buffered_vs_min).is_some() {
+                        "buffer_min"
+                    } else if negative_only(stats.low_agl_vs_min_fpm).is_some() {
+                        "low_agl_vs_min"
+                    } else {
+                        "fallback_zero"
+                    }
+                } else {
+                    "other_fallback"
+                };
+                stats.landing_simulator = Some(if is_msfs {
+                    "msfs"
+                } else if is_xplane {
+                    "xplane"
+                } else {
+                    "other"
+                });
+                stats.landing_vs_estimate_xp_fpm =
+                    agl_estimate_xp.map(|e| e.fpm.round() as i32);
+                stats.landing_vs_estimate_msfs_fpm =
+                    agl_estimate_msfs.map(|e| e.fpm.round() as i32);
+                stats.landing_vs_source = Some(vs_source);
+                // gear_force_peak_n: nur X-Plane liefert den Wert ueber
+                // den Sampler-Pfad. snap.gear_normal_force_n im Touchdown-
+                // Frame ist die direkteste Quelle.
+                stats.landing_gear_force_peak_n = if is_xplane {
+                    snap.gear_normal_force_n
+                } else {
+                    None
+                };
+                // window_ms + sample_count: nur fuer den Pfad der wirklich
+                // gewann (= Lua bei XP, Time-Tier bei MSFS). Fallback-Pfade
+                // haben keine Window-Metrik.
+                if vs_source == "agl_estimate_xp" {
+                    if let Some(est) = agl_estimate_xp {
+                        stats.landing_estimate_window_ms = Some(est.window_ms as i32);
+                        stats.landing_estimate_sample_count = Some(est.sample_count as u32);
+                    }
+                } else if vs_source == "agl_estimate_msfs" {
+                    if let Some(est) = agl_estimate_msfs {
+                        stats.landing_estimate_window_ms = Some(est.window_ms as i32);
+                        stats.landing_estimate_sample_count = Some(est.sample_count as u32);
+                    }
                 }
 
                 stats.landing_rate_fpm = Some(touchdown_vs);

@@ -282,6 +282,51 @@ pub struct TouchdownPayload {
     /// — drives the "Spritverbrauch" sub-score. None when the bid had
     /// no SimBrief OFP attached (planned-burn unavailable).
     pub fuel_efficiency_pct: Option<f32>,
+    // ─── v0.5.23 Touchdown-Forensik ──────────────────────────────────
+    //
+    // Der Client berechnet bei jeder Landung BEIDE Schaetzer (Lua-30-
+    // Sample fuer X-Plane, Time-Tier fuer MSFS) parallel — vorher haben
+    // wir nur den finalen Wert publiziert. Mit diesen Feldern kann der
+    // Server-seitige Forensik-Workflow vergleichen wie weit die beiden
+    // Algorithmen auseinanderlagen + welcher Pfad gewonnen hat. Werte
+    // sind Option<...> mit skip_serializing_if damit alte Pilot-Clients
+    // (v0.5.22-) ohne diese Daten weiter funktionieren.
+    /// "msfs" / "xplane" / "other" — welcher Sim-Adapter den Snapshot
+    /// generiert hat. Identisch zum bestehenden simulator-Feld im
+    /// position-Payload, hier zusaetzlich ans Touchdown gepinnt damit
+    /// die Server-touchdowns-Tabelle ohne JOIN filtern kann.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub simulator: Option<String>,
+    /// Lua-Style 30-Sample-AGL-Δ-Schaetzung (Volanta/LandingRate-1-aligned).
+    /// Primaer fuer X-Plane, fuer MSFS als Vergleichswert mitgeschickt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vs_estimate_xp_fpm: Option<i32>,
+    /// Time-Tier-AGL-Δ-Schaetzung (750ms/1s/1.5s/2s/3s/12s window-progression).
+    /// Fallback fuer MSFS, fuer X-Plane als Vergleichswert mitgeschickt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vs_estimate_msfs_fpm: Option<i32>,
+    /// Welcher Pfad hat den finalen `vs_fpm` geliefert? Werte:
+    /// "msfs_simvar_latched" — PLANE TOUCHDOWN NORMAL VELOCITY direkt
+    /// "agl_estimate_msfs" — Time-Tier-Schaetzer
+    /// "agl_estimate_xp" — Lua-30-Sample-Schaetzer
+    /// "sampler_gear_force" — X-Plane Gear-Sampler (50Hz)
+    /// "buffer_min" — Buffer-Window-Scan (Last-Resort)
+    /// "low_agl_vs_min" — Approach-Tracker-Fallback
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vs_source: Option<String>,
+    /// X-Plane Gear-Sampler peak gear_normal_force_n im Touchdown-Frame.
+    /// Liefert MSFS nicht (= None auf MSFS).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gear_force_peak_n: Option<f32>,
+    /// Lua-Style-Schaetzer adaptive Window-Groesse in ms (= je nach
+    /// Sample-Density 500-3000 ms typisch). None wenn der Pfad nicht
+    /// gewonnen hat oder keine Samples vorhanden waren.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimate_window_ms: Option<i32>,
+    /// Wieviele Samples lagen im Berechnungs-Fenster. <10 = sparsam =
+    /// niedrige Konfidenz.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimate_sample_count: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize)]

@@ -210,3 +210,120 @@ ClientInfo {
 **Sichtbarkeit:** nur wenn `session.client_log_uploaded_at != null`. Sonst greyed-out "📥 Kein Log" mit Tooltip.
 
 **Endpoint:** `GET /api/sessions/:id/client-log` (Admin-Cookie-Auth).
+
+---
+
+# Touchdown-Detection-Algorithmen — Referenz
+
+> **Ziel:** sauber definieren was als Touchdown-V/S für jeden Sim gilt + welche Edge-Cases existieren + wie man Disagreements zwischen Algorithmen forensisch löst.
+> **Code:** [`client/src-tauri/src/lib.rs`](../client/src-tauri/src/lib.rs) ~Zeile 8200–8400 (`step_flight` touchdown-arm)
+> **Telemetrie ab v0.5.23:** TouchdownPayload schickt `simulator` + `vs_estimate_xp_fpm` + `vs_estimate_msfs_fpm` + `vs_source` + `gear_force_peak_n` + `estimate_window_ms` + `estimate_sample_count` an aeroacars-live damit der VA-Owner Algorithmen-Vergleiche im Diagnostics-Tab + LandingAnalysis-Modal sieht.
+
+## Decision-Tree pro Simulator
+
+### MSFS (Microsoft Flight Simulator 2020/2024)
+
+Priority-Chain — der erste non-null Wert gewinnt:
+
+```
+1. snap.touchdown_vs_fpm                    →  vs_source = "msfs_simvar_latched"
+   (PLANE TOUCHDOWN NORMAL VELOCITY SimVar — frame-genau im Touchdown-Frame)
+2. agl_estimate_msfs.fpm                    →  vs_source = "agl_estimate_msfs"
+   (Time-Tier 750ms/1s/1.5s/2s/3s/12s window-progression mit Min-Sample-Guards)
+3. buffered_vs_min                          →  vs_source = "buffer_min"
+   (Last-Resort Buffer-Window-Scan, AGL ≤ 250 ft Filter)
+4. (alle null) →  vs_source = "fallback_zero"
+```
+
+**Explizit NICHT für MSFS:**
+- `sampler_touchdown_vs_fpm` — gear-contact-Rebound-Spike kontaminiert den Wert (v0.5.12 validiert gegen 11 reale Pilot-Flüge)
+- `low_agl_vs_min_fpm` — gleiches Risiko
+- Lua-Style 30-Sample-Schaetzer — X-Plane-only by design
+
+**Bekannte Edge-Cases:**
+- *2026-05-07 LH595 DNAA→EDDF:* tatsächlich -419/-560 fpm (Volanta+LHA bestätigt), gemeldet -1173 fpm. Bug-Klasse: Cross-Contamination aus Refactor der nur X-Plane betreffen sollte. Behoben in v0.5.12.
+- *Phase H.4-Zeit:* "0-distance / 0 fuel" PIREPs bei Sim-Crash mid-flight. Manueller PIREP-Pfad umgeht das.
+
+### X-Plane (X-Plane 11/12)
+
+Priority-Chain:
+
+```
+1. agl_estimate_xp.fpm                      →  vs_source = "agl_estimate_xp"
+   (Lua-Style 30-Sample adaptive AGL-Δ — LandingRate-1.lua-Algorithmus,
+    Volanta-aligned. Window-Groesse adaptive: high-fps ≈ 0.5s, low-fps ≈ 2-3s)
+2. sampler_touchdown_vs_fpm                 →  vs_source = "sampler_gear_force"
+   (Sampler-side Touchdown-Edge bei `gear_normal_force_n > 1.0 N`,
+    50 Hz innerhalb 20 ms Edge-Detection)
+3. buffered_vs_min                          →  vs_source = "buffer_min"
+4. low_agl_vs_min_fpm                       →  vs_source = "low_agl_vs_min"
+   (AGL ≤ 250 ft Approach-Tracker, Reset bei Approach-Entry für Go-Arounds)
+5. (alle null) →  vs_source = "fallback_zero"
+```
+
+**Trigger für sampler-Pfad:** `gear_normal_force_n > 1.0 N`. Echte Touchdowns gehen blitzartig auf mehrere kN (60-300 t Airliner mit 1.0 g Bremsmoment ≥ 588 kN), 1.0 N ist Float-Noise-Filter.
+
+**Bekannte Edge-Cases:**
+- *2026-05-07 MYNN→MBGT:* X-Plane Lua-Tool sagte 273 fpm, AeroACARS sagte -394 fpm (~44% zu hoch). Ursache: Time-Tier-Estimator zu starr bei niedriger RREF-Rate. Behoben in v0.5.13 (Umstellung auf Lua-30-Sample-adaptive).
+- *2026-05-06 DAL93 EDDB→KJFK:* echter -300 fpm, AeroACARS scorte +35 fpm (smooth) weil Streamer 5 s nach Touchdown wachte und Buffer dann nur Rollout-Samples mit V/S≈0 enthielt. Behoben in v0.4.4 (Sampler-side Edge-Detection bei 50 Hz).
+
+## Forensik-Workflow für VA-Owner
+
+Bei verdächtigem Touchdown:
+
+1. **Webapp → Touchdowns → Filter „⚠ Disagreement"** zeigt alle Touchdowns wo `|vs_estimate_xp − vs_estimate_msfs| > 50 fpm`. Sortier nach `|Δ|` desc.
+
+2. **Klick auf Row** → LandingAnalysis-Modal → Card „🔬 Algorithmen-Forensik" zeigt:
+   - Final V/S + welcher Pfad gewann (`vs_source`)
+   - Beide Schaetzer-Ergebnisse separat
+   - Window-Groesse + Sample-Count (= Konfidenz-Indikator)
+   - Gear-Force-Peak (X-Plane only)
+
+3. **Wenn |Δ| > 100 fpm und beide Werte plausibel aussehen** → Edge-Case, lohnt sich anzuschauen.
+
+4. **Falls v0.5.23 Client-Log hochgeladen:** „📥 Client-Log" in PilotHistory → JSONL anschauen. Suche nach:
+   - `phase_changed` Events (gab's eine LANDING-Phase? Mehrfache Touch-and-Go?)
+   - `position`-Events um den Touchdown-Frame: rohe AGL-Verläufe, `gear_normal_force_n`, `on_ground`-Flanken
+   - `activity` Events (User-sichtbare Log-Zeilen — z.B. „SimConnect-Reconnect" könnte Sample-Lücke erklären)
+
+5. **Patch in [`lib.rs`](../client/src-tauri/src/lib.rs) testen** wenn klar ist welche Heuristik klemmt. Test-Cases mit gespeicherten JSONLs validieren (siehe `tests/` im recorder-Crate).
+
+## Server-seitige Forensik-Aggregate
+
+`GET /api/touchdowns/forensik?days=30` liefert pro Simulator:
+- `count` — Anzahl Touchdowns im Zeitraum
+- `avg_vs_fpm` — Mittel-V/S
+- `hard_landings` — Anzahl mit V/S < -600 fpm
+- `disagreements` — Anzahl mit `|xp − msfs| > 50 fpm`
+- `avg_disagreement_fpm` — Mittel-Delta zwischen den zwei Algorithmen
+
+Wird vom Touchdowns-Tab automatisch oben angezeigt (Card „🔬 Touchdown-Forensik nach Simulator"). Hoher `disagreements`-Anteil pro Sim = systematischer FSM-Edge-Case der noch nicht behoben ist.
+
+## SQL-Beispiele für tieferes Drill-Down
+
+```sql
+-- Top 20 Disagreements der letzten 30 Tage
+SELECT id, ts, simulator, vs_fpm, vs_estimate_xp_fpm, vs_estimate_msfs_fpm,
+       ABS(vs_estimate_xp_fpm - vs_estimate_msfs_fpm) AS delta,
+       vs_source, airport
+FROM touchdowns
+WHERE ts >= strftime('%s','now','-30 days')*1000
+  AND vs_estimate_xp_fpm IS NOT NULL
+  AND vs_estimate_msfs_fpm IS NOT NULL
+ORDER BY delta DESC
+LIMIT 20;
+
+-- vs_source-Distribution pro Sim (welcher Pfad gewinnt am häufigsten?)
+SELECT simulator, vs_source, COUNT(*) AS n
+FROM touchdowns
+WHERE ts >= strftime('%s','now','-30 days')*1000
+GROUP BY simulator, vs_source
+ORDER BY simulator, n DESC;
+
+-- Window-Konfidenz: wieviele Touchdowns hatten <10 Samples im Berechnungs-Fenster?
+SELECT simulator, COUNT(*) AS sparse
+FROM touchdowns
+WHERE estimate_sample_count < 10
+  AND ts >= strftime('%s','now','-30 days')*1000
+GROUP BY simulator;
+```
