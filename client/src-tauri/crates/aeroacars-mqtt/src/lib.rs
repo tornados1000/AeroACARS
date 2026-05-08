@@ -332,7 +332,57 @@ pub struct TouchdownPayload {
     /// niedrige Konfidenz.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimate_sample_count: Option<u32>,
+    // ─── v0.5.25 Approach-Stability v2 ────────────────────────────────
+    //
+    // Stable-Approach-Gate-konformes Stability-Maß (FAA AC 120-71B /
+    // EASA SUPP-32). Window: AGL ≤ 1000 ft. Filter: Vector-Window
+    // ausgeklammert. Ground-truth: Glide-Slope-Deviation statt
+    // statistische Variance.
+    /// Mittlere |actual_vs − target_vs(3°)| im 1000-ft-Gate.
+    /// 0 fpm = perfekt, > 200 fpm = unstabil.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approach_vs_deviation_fpm: Option<f32>,
+    /// Maximale Deviation unter 500 ft AGL — kritischste Phase.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approach_max_vs_deviation_below_500_fpm: Option<f32>,
+    /// Bank-Stddev im 1000-ft-Gate, gefiltert (Vector-Windows weg).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approach_bank_stddev_filtered_deg: Option<f32>,
+    /// True wenn unter 1500 ft AGL ATC-RWY-Wechsel beobachtet.
+    /// Auf der Webapp-Seite Hinweis-Pill, Score wird neutral-justiert.
+    #[serde(skip_serializing_if = "is_false")]
+    pub approach_runway_changed_late: bool,
+    /// Stable-Approach-Gate-Indikator: bei 1000 ft AGL erreicht?
+    /// (= vs_deviation < 200 fpm AND mean_bank < 5°)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approach_stable_at_gate: Option<bool>,
+    /// Sample-Count im 1000-ft-Window (Konfidenz-Indikator).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approach_window_sample_count: Option<u32>,
+    /// V/S-Jerk: mean |Δvs| sample-to-sample im Gate. Sim-/Aircraft-
+    /// agnostic (= jet, turboprop, GA gleichermassen). PRIMAERER
+    /// Stabilitaets-Indikator. < 100 fpm/tick = stable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approach_vs_jerk_fpm: Option<f32>,
+    /// IAS-Stddev im Gate-Window. Speed-Stability.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approach_ias_stddev_kt: Option<f32>,
+    /// Excessive Sink: ≥1 Sample mit V/S < -1000 fpm im Gate.
+    /// FAA Sink-Rate-Limit. Auto-Fail-Indikator.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approach_excessive_sink: Option<bool>,
+    /// Gear+Flaps am Gate-Eintritt in Landing-Konfig
+    /// (Gear≥99% AND Flaps≥70%).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approach_stable_config: Option<bool>,
+    /// HAT (Height Above Touchdown) statt AGL als Window-Filter genutzt.
+    /// True = arr_airport_elevation_ft bekannt → Mountain-Airport-tauglich.
+    /// False = AGL-Fallback (= im Tal-Anflug ueber Berge ggf. ungenau).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approach_used_hat: Option<bool>,
 }
+
+fn is_false(b: &bool) -> bool { !*b }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PirepPayload {

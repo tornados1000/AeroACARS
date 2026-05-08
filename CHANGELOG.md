@@ -4,6 +4,75 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.5.25] — 2026-05-08
+
+🎯 **Approach-Stability v2: Stable-Approach-Gate-konformes Stabilitäts-Maß. Pilot versteht endlich was der Score bedeutet.**
+
+### 🐛 Behoben
+
+**Approach-Stability-Algorithmus war inkorrekt für Real-World-Cases.**
+
+Pre-v0.5.25-Algorithmus berechnete `σ V/S` und `σ Bank` über das gesamte Approach+Final-Buffer-Window (= 5000 ft AGL bis Touchdown). Probleme:
+
+- **ATC-Vectoring-Turns** (Bank 20-30° auf Anweisung) wurden als Pilot-Instabilität bestraft
+- **Initial-Descent-Step-Downs** (Flaps-Stages, Speed-Down) erhöhten σ V/S obwohl Flugverhalten korrekt
+- **σ um Mittelwert** misst NICHT Glide-Slope-Abweichung — ein Pilot der konstant -1100 fpm hält (über Glide-Slope) bekommt perfekten σ-Score
+- **Mountain-Airports** (LSGS, LFKB) — AGL fluktuiert über Bergkämmen, Window-Filter falsch
+- **GA-Anflüge** wurden mit 3°-ILS-Schwellwerten verglichen — C172 auf 5° Visual-Approach falsch bewertet
+- **Späte RWY-Wechsel** (ATC ändert von 09L auf 09R bei 1200 ft AGL) bestraften Pilot für die ausgeführte Anweisung
+
+### ✨ Neu — Approach-Stability v2
+
+**HAT statt AGL als Window-Filter** (Mountain-Airport-tauglich)
+Höhenfilter über `MSL_altitude − arr_airport_elevation` statt `AGL`. AeroACARS-Client sucht arr-Airport-Elevation aus dem phpVMS-API-Cache (state.airports.elevation). Fallback auf AGL wenn unbekannt — `approach_used_hat`-Flag in PIREP zeigt welche Methode genutzt wurde.
+
+**5 Primär-Metriken (Score-relevant) im 1000-ft-Gate:**
+
+1. **V/S-Jerk** — mean `|Δvs|` sample-to-sample. **Sim/Aircraft-agnostisch** (Jet, Turboprop, GA gleichermaßen). Schwellwerte: < 100 fpm/tick = sehr stabil, > 300 fpm/tick = unstabil.
+
+2. **Bank σ (filtered)** — Standard-Deviation Bank, **Vector-Windows ausgenommen** (5 sec vor/nach RWY-Change). Pilot wird nicht für ATC-Turn bestraft.
+
+3. **IAS σ** — Speed-Stabilität. < 5 kt = on-target, > 15 kt = große Schwankungen.
+
+4. **Excessive-Sink-Flag** — `True` wenn ein Sample im Gate `V/S < -1000 fpm`. FAA-Limit-Verletzung (Pflicht-Go-Around).
+
+5. **Stable-Config-Flag** — Gear ≥ 99% AND Flaps ≥ 70% am Gate-Eintritt.
+
+**Composite Stable-At-Gate-Indikator:** `stable = jerk_ok AND bank_ok AND ias_ok AND !excessive_sink AND config_ok`. Pilot kriegt klares Boolean: ✓ STABLE GATE oder ⚠ UNSTABLE GATE.
+
+**Sekundär (informativ, nicht Score-relevant):**
+- V/S-Deviation vs 3°-ILS-Profil — relevant für ILS-Anflüge, bei GA/Visual nur informativ
+- Max V/S-Deviation unter 500 ft AGL — kritischste Phase
+- Late-RWY-Change-Detection — bestraft Pilot nicht, zeigt Hinweis-Pill
+
+### ✨ Neu — UX-Transparenz für Piloten
+
+**Neue ApproachStabilityCard im LandingAnalysis-Modal:**
+- Composite-Indicator-Pill ✓ STABLE oder ⚠ UNSTABLE direkt im Card-Header
+- Confidence-Hinweis (HAT vs. AGL, Sample-Count)
+- 7 MetricTiles mit individuellen Tone-Bewertungen + ausführliche Hover-Tooltips erklären was jede σ bedeutet + Schwellwerte
+- **Coaching-Section** mit konkreten Tipps wenn Score schlecht:
+  - „V/S-Jerk 350 fpm/tick — du hast die Sinkrate stark verändert. Stabiles Sinkprofil halten: kleine Korrekturen früh, nicht große Korrekturen spät."
+  - „Bank-σ 6.2° über 5° — späte Lineup-Korrekturen vermeiden, früh auf den Localizer einschneiden."
+  - „RWY-Wechsel unter 1500 ft AGL detektiert — wurdest nicht bestraft, aber im Real-Op: stabil-prüfen oder go-around."
+- Bei sauberem Anflug: ✨-Lob-Box
+
+### 🔧 Implementation
+
+- **Client (`lib.rs`)**: `ApproachBufferSample`-Struct erweitert um msl_ft / ias_kt / heading_true_deg / gear_position / flaps_position / selected_runway. `compute_approach_stability_v2(buf, arr_elevation)` implementiert HAT-Window + V/S-Jerk + IAS-σ + Excessive-Sink + Stable-Config. arr_airport_elevation_ft wird beim ersten Streamer-Tick aus dem state.airports-Cache (phpVMS-API) gelesen.
+- **MQTT-Payload (`aeroacars-mqtt`)**: TouchdownPayload um 5 Felder erweitert (`approach_vs_jerk_fpm`, `approach_ias_stddev_kt`, `approach_excessive_sink`, `approach_stable_config`, `approach_used_hat`).
+- **Server (`recorder`)**: 5 neue Spalten in `touchdowns`-Tabelle (idempotente ALTER), insertTouchdown extrahiert mit boolToInt-Helper, /api/touchdowns liefert sie typed.
+- **Webapp**: TouchdownDto erweitert. Neue ApproachStabilityCard als eigene Datei (`_ApproachStabilityCard.tsx`) mit responsivem 4-tile-Grid, Coaching-Texten, Late-RWY-Change-Pill.
+- DB-Backup pre-deploy: `aeroacars-live.db.backup-pre-approach-stability-v2`.
+
+### ⚠ Hinweise
+
+- Pre-v0.5.25-Touchdowns zeigen die alte σ-Auswertung als Fallback in der Card (mit Hinweis).
+- HAT-Window erfordert dass arr_airport_elevation_ft im phpVMS-API-Cache landete — passiert beim Bid-Pickup ohnehin via `airport_get`-Command. Wenn nicht: Fallback auf AGL mit Confidence-Warnung.
+- 3°-Glide-Slope-Target ist nur sekundär — der primäre Score (V/S-Jerk) funktioniert sim/aircraft-agnostisch und ist NICHT auf 3°-ILS-Profile zugeschnitten.
+
+---
+
 ## [v0.5.24] — 2026-05-08
 
 🎯 **Pitch-Sign-Fix für MSFS + frame-genaues Wheels-Up-Capture für Tail-Strike-Detection.** Plus Client-Version-Tag im MQTT-Stream für Version-Compliance-Tracking.

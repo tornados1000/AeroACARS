@@ -1244,6 +1244,58 @@ struct FlightStats {
     /// against a real AGL-Δ estimate.
     /// Reset on Approach entry so go-arounds don't carry stale data.
     low_agl_vs_min_fpm: Option<f32>,
+    // ─── v0.5.25 Approach-Stability v2 ─────────────────────────────────
+    //
+    // Pre-v0.5.25: einfache Standardabweichung ueber Approach+Final-
+    // Buffer (5000 ft AGL bis 0). Probleme:
+    //   - Vectoring-Bank-Spikes von ATC bestrafen Pilot fuer die
+    //     ausgefuehrte Anweisung
+    //   - Step-Down-Descents waehrend Initial-Approach (Flaps/Speed-
+    //     Down) verfaelschen V/S-Stddev
+    //   - σ um Mittelwert misst nicht Glide-Slope-Abweichung
+    //   - RWY-Wechsel mid-final bestraft Pilot fuer ATC-Action
+    //
+    // v0.5.25: scharfes Stable-Approach-Gate (= AGL ≤ 1000 ft) +
+    // Glide-Slope-Deviation + Vector-Window-Filter.
+    /// Mittlere Abweichung |actual_vs − target_vs(3°)| im 1000-ft-Gate.
+    approach_vs_deviation_fpm: Option<f32>,
+    /// Maximale Abweichung |actual_vs − target_vs(3°)| im LETZTEN
+    /// 500-ft-Gate (= unter 500 ft AGL). Critical-zone Indikator.
+    approach_max_vs_deviation_below_500_fpm: Option<f32>,
+    /// Bank-Stddev ueber 1000-ft-Gate, gefiltert: Samples aus Vector-
+    /// Windows (= 5 sec nach RWY-Change) ausgenommen.
+    approach_bank_stddev_filtered_deg: Option<f32>,
+    /// True wenn waehrend Approach/Final eine RWY-Aenderung beobachtet
+    /// wurde mit AGL < 1500 ft (= "late RWY change", Pilot wurde zu
+    /// Maneuver gezwungen, score-relevante Beruecksichtigung).
+    approach_runway_changed_late: bool,
+    /// True wenn beim Erreichen 1000 ft AGL: VS-Deviation < 200 fpm
+    /// AND Bank-Mittelwert < 5°. = Stable-Approach-Gate erreicht.
+    approach_stable_at_gate: Option<bool>,
+    /// Anzahl Samples die im 1000-ft-Window lagen (= Konfidenz-
+    /// Indikator, < 5 Samples = niedrige Konfidenz).
+    approach_window_sample_count: Option<u32>,
+    /// Arrival-Airport-Elevation aus phpVMS-Cache. Ermoeglicht HAT
+    /// (Height Above Touchdown) statt AGL fuer Stable-Approach-Gate-
+    /// Window. Kritisch fuer Mountain-Airports (LSGS, LFKB, …) wo AGL
+    /// ueber Bergrueeken fluktuiert. None → Fallback auf AGL (mit
+    /// niedrigerem Confidence-Score).
+    arr_airport_elevation_ft: Option<f32>,
+    /// V/S-Jerk: mean |Δvs| zwischen aufeinanderfolgenden Samples im
+    /// Gate. Sim-/Aircraft-agnostisches Stabilitaets-Maß (jet vs. GA).
+    /// < 100 fpm/tick = stable, > 300 fpm/tick = unstable.
+    approach_vs_jerk_fpm: Option<f32>,
+    /// IAS-Stddev im Gate-Window. Speed-Stability-Indikator.
+    /// < 5 kt = on-target, > 15 kt = unstabil.
+    approach_ias_stddev_kt: Option<f32>,
+    /// Excessive Sink Flag: True wenn IRGENDEIN Sample im Gate
+    /// V/S < -1000 fpm hatte. FAA Sink-Rate-Limit-Verletzung.
+    approach_excessive_sink: bool,
+    /// Stable-Configuration-Flag: Gear voll runter (≥99%) AND Flaps
+    /// in Landing-Position (≥70%) am Gate. None bei Konfig-Sample fehlt.
+    approach_stable_config: Option<bool>,
+    /// "Nutzte HAT statt AGL?" — fuer UI-Confidence-Indikator.
+    approach_used_hat: bool,
     // ─── v0.5.24 Takeoff-Edge-Capture (50Hz Sampler) ───────────────────
     //
     // Frueher: stats.takeoff_pitch_deg / takeoff_bank_deg wurden im
@@ -1314,7 +1366,13 @@ struct FlightStats {
     /// Approach + Final phases. Capped at ~120 entries (≈ 10-15 min
     /// of data at the position-streamer's 5-8 s cadence). Drained
     /// at the touchdown edge into stddev metrics.
-    approach_buffer: std::collections::VecDeque<(f32, f32)>,
+    /// Pre-v0.5.25: nur (vs_fpm, bank_deg). Ab v0.5.25 reicht ein
+    /// reicheres Sample fuer korrekte Stable-Approach-Gate-Auswertung
+    /// (siehe ApproachSample-Struct). Beide Felder bleiben in den
+    /// Touchdown-Stats gepflegt; die alten approach_*_stddev werden
+    /// fuer Backward-Compat weiter geliefert, das richtige
+    /// Stable-Approach-Maß ist `approach_vs_deviation_fpm`.
+    approach_buffer: std::collections::VecDeque<ApproachBufferSample>,
     /// V/S standard deviation (fpm) over the approach window.
     /// Lower = more stable. Computed once at touchdown.
     approach_vs_stddev_fpm: Option<f32>,
@@ -2119,10 +2177,50 @@ fn boeing_detent_rank(label: &str) -> u8 {
 /// Called every step_flight tick during Approach + Final phases. The
 /// buffer is capped at APPROACH_BUFFER_MAX so a 30-min hold doesn't
 /// blow up memory; oldest entries get dropped first.
+/// v0.5.25: erweitertes Approach-Sample mit allen Feldern die für
+/// korrekte Stable-Approach-Gate-Analyse gebraucht werden:
+///   * `agl_ft`: für Window-Filter (= nur AGL ≤ 1000 ft zählt fuer
+///     den Stable-Approach-Gate-Score, ueber 1000 ft ist Vectoring
+///     legitim und sollte nicht Pilot-bestrafen)
+///   * `gs_kt`: für Soll-Glide-Slope-Berechnung
+///     (target_vs ≈ gs_kt × 5.31 für 3°-Glide-Slope)
+///   * `selected_runway`: für Late-RWY-Change-Detection. Wenn ATC
+///     mid-final die Bahn wechselt, war Pilot zu Maneuver gezwungen,
+///     das ist nicht "instabil"
+///
+/// Andere Naming-Konvention als das `ApproachSample` aus dem
+/// `storage`-Crate (welches nur (vs_fpm, bank_deg) ist und an die
+/// PIREP-Notes-Sparkline serialisiert wird) — dieses hier ist das
+/// reichere internal Buffer-Sample.
+#[derive(Debug, Clone)]
+pub struct ApproachBufferSample {
+    pub at: DateTime<Utc>,
+    pub agl_ft: f32,
+    pub msl_ft: f32,
+    pub gs_kt: f32,
+    pub ias_kt: f32,
+    pub vs_fpm: f32,
+    pub bank_deg: f32,
+    pub heading_true_deg: f32,
+    pub gear_position: f32,
+    pub flaps_position: f32,
+    pub selected_runway: Option<String>,
+}
+
 fn push_approach_sample(stats: &mut FlightStats, snap: &SimSnapshot) {
-    stats
-        .approach_buffer
-        .push_back((snap.vertical_speed_fpm, snap.bank_deg));
+    stats.approach_buffer.push_back(ApproachBufferSample {
+        at: Utc::now(),
+        agl_ft: snap.altitude_agl_ft as f32,
+        msl_ft: snap.altitude_msl_ft as f32,
+        gs_kt: snap.groundspeed_kt,
+        ias_kt: snap.indicated_airspeed_kt,
+        vs_fpm: snap.vertical_speed_fpm,
+        bank_deg: snap.bank_deg,
+        heading_true_deg: snap.heading_deg_true,
+        gear_position: snap.gear_position,
+        flaps_position: snap.flaps_position,
+        selected_runway: snap.selected_runway.clone(),
+    });
     while stats.approach_buffer.len() > APPROACH_BUFFER_MAX {
         stats.approach_buffer.pop_front();
     }
@@ -2473,7 +2571,7 @@ fn estimate_xplane_touchdown_vs_lua_style(
 /// would be marginally more numerically stable but at this scale it
 /// makes no difference).
 fn compute_approach_stddev(
-    buf: &std::collections::VecDeque<(f32, f32)>,
+    buf: &std::collections::VecDeque<ApproachBufferSample>,
 ) -> (Option<f32>, Option<f32>) {
     let n = buf.len();
     if n < 3 {
@@ -2481,23 +2579,197 @@ fn compute_approach_stddev(
     }
     let mut sum_vs = 0.0_f64;
     let mut sum_bank = 0.0_f64;
-    for (vs, bank) in buf.iter() {
-        sum_vs += *vs as f64;
-        sum_bank += *bank as f64;
+    for s in buf.iter() {
+        sum_vs += s.vs_fpm as f64;
+        sum_bank += s.bank_deg as f64;
     }
     let mean_vs = sum_vs / n as f64;
     let mean_bank = sum_bank / n as f64;
     let mut sq_vs = 0.0_f64;
     let mut sq_bank = 0.0_f64;
-    for (vs, bank) in buf.iter() {
-        let dv = *vs as f64 - mean_vs;
-        let db = *bank as f64 - mean_bank;
+    for s in buf.iter() {
+        let dv = s.vs_fpm as f64 - mean_vs;
+        let db = s.bank_deg as f64 - mean_bank;
         sq_vs += dv * dv;
         sq_bank += db * db;
     }
     let var_vs = sq_vs / n as f64;
     let var_bank = sq_bank / n as f64;
     (Some(var_vs.sqrt() as f32), Some(var_bank.sqrt() as f32))
+}
+
+/// v0.5.25 Approach-Stability v2 — kompletter Result-Struct.
+#[derive(Debug, Clone, Default)]
+pub struct ApproachStabilityV2 {
+    pub vs_deviation_fpm: Option<f32>,
+    pub max_vs_deviation_below_500_fpm: Option<f32>,
+    pub bank_stddev_filtered_deg: Option<f32>,
+    pub runway_changed_late: bool,
+    pub stable_at_gate: Option<bool>,
+    pub window_sample_count: u32,
+    /// V/S-Jerk: mean |Δvs| sample-to-sample. Sim/Aircraft-agnostic.
+    pub vs_jerk_fpm: Option<f32>,
+    /// IAS-Stddev im Gate (Speed-Stability).
+    pub ias_stddev_kt: Option<f32>,
+    /// Mind. ein Sample im Gate hatte V/S < -1000 fpm.
+    pub excessive_sink: bool,
+    /// Gear+Flaps am 1000-ft-Sample in Landing-Konfig?
+    pub stable_config: Option<bool>,
+    /// HAT (statt AGL) als Window-Filter genutzt?
+    pub used_hat: bool,
+}
+
+/// v0.5.25: Stable-Approach-Gate-konformes Stability-Maß.
+///
+/// FAA AC 120-71B / EASA SUPP-32 definieren Stable-Approach-Gate als
+/// 1000 ft HAT (Height Above Touchdown). Innerhalb des Gates muessen
+/// alle Parameter im Toleranzband sein, sonst go-around.
+///
+/// Window-Logik:
+///   * Wenn `arr_airport_elevation_ft` bekannt: HAT = msl_ft − elevation,
+///     Filter auf HAT ≤ 1000 ft (= ueber Mountain-Airports korrekt)
+///   * Sonst: Fallback auf AGL ≤ 1000 ft (= AGL fluktuiert ueber Berg-
+///     ruecken aber funktioniert für Flachland-Airports)
+///
+/// Stability-Metrics (alle im Gate-Window):
+///   1. V/S-Jerk = mean |vs[i]−vs[i−1]| (PRIMAER, sim/aircraft-agnostic)
+///   2. Bank-σ filtered (Vector-Windows ausgenommen, 5s nach RWY-Change)
+///   3. IAS-σ (Speed-Stability)
+///   4. Excessive-Sink-Flag (≥1 Sample mit V/S < -1000 fpm)
+///   5. Stable-Config-Flag (Gear≥99% AND Flaps≥70% am gate-Eintritt)
+///
+/// Sekundaer (informativ, NICHT score-relevant):
+///   6. V/S-Deviation vs 3°-ILS-Profil (target_vs = -gs_kt × 5.31)
+///      — falsch fuer GA-Visual-Approach, deshalb nur informativ
+fn compute_approach_stability_v2(
+    buf: &std::collections::VecDeque<ApproachBufferSample>,
+    arr_elevation_ft: Option<f32>,
+) -> ApproachStabilityV2 {
+    let mut out = ApproachStabilityV2::default();
+
+    // 1) Window-Filter: HAT bevorzugt, AGL als Fallback.
+    let use_hat = arr_elevation_ft.is_some();
+    out.used_hat = use_hat;
+    let height_for = |s: &ApproachBufferSample| -> f32 {
+        match arr_elevation_ft {
+            Some(elev) => s.msl_ft - elev,
+            None => s.agl_ft,
+        }
+    };
+    let gate_samples: Vec<&ApproachBufferSample> = buf.iter()
+        .filter(|s| {
+            let h = height_for(s);
+            h > 0.0 && h <= 1000.0
+        })
+        .collect();
+    out.window_sample_count = gate_samples.len() as u32;
+    if gate_samples.len() < 3 {
+        return out;
+    }
+
+    // 2) RWY-Change-Detection ueber GANZEN Buffer.
+    let runway_changes: Vec<DateTime<Utc>> = {
+        let mut changes = Vec::new();
+        let mut prev_rwy: Option<&str> = None;
+        for s in buf.iter() {
+            let curr = s.selected_runway.as_deref();
+            if let (Some(p), Some(c)) = (prev_rwy, curr) {
+                if p != c {
+                    changes.push(s.at);
+                    if height_for(s) < 1500.0 {
+                        out.runway_changed_late = true;
+                    }
+                }
+            }
+            if curr.is_some() {
+                prev_rwy = curr;
+            }
+        }
+        changes
+    };
+    let in_vector_window = |t: DateTime<Utc>| -> bool {
+        runway_changes.iter().any(|&change| {
+            (t - change).num_milliseconds().abs() <= 5_000
+        })
+    };
+
+    // 3) V/S-Jerk (PRIMAER): mean |Δvs| sample-to-sample.
+    //    Sim/Aircraft-agnostic — funktioniert für Jet, Turboprop, GA gleich.
+    if gate_samples.len() >= 2 {
+        let mut jerk_sum = 0.0_f64;
+        for w in gate_samples.windows(2) {
+            jerk_sum += (w[1].vs_fpm - w[0].vs_fpm).abs() as f64;
+        }
+        out.vs_jerk_fpm = Some((jerk_sum / (gate_samples.len() - 1) as f64) as f32);
+    }
+
+    // 4) IAS-Stddev (Speed-Stability).
+    let n = gate_samples.len() as f64;
+    let mean_ias = gate_samples.iter().map(|s| s.ias_kt as f64).sum::<f64>() / n;
+    let var_ias = gate_samples.iter()
+        .map(|s| (s.ias_kt as f64 - mean_ias).powi(2))
+        .sum::<f64>() / n;
+    out.ias_stddev_kt = Some(var_ias.sqrt() as f32);
+
+    // 5) Excessive-Sink-Flag.
+    out.excessive_sink = gate_samples.iter().any(|s| s.vs_fpm < -1000.0);
+
+    // 6) Stable-Config: Gear+Flaps am 1000-ft-Sample (= aeltester
+    //    Sample im Gate, = der mit hoechster Hoehe).
+    if let Some(gate_entry) = gate_samples.iter()
+        .max_by(|a, b| height_for(a).partial_cmp(&height_for(b)).unwrap())
+    {
+        let gear_ok = gate_entry.gear_position >= 0.99;
+        let flaps_ok = gate_entry.flaps_position >= 0.70;
+        out.stable_config = Some(gear_ok && flaps_ok);
+    }
+
+    // 7) V/S-Deviation vs 3° ILS-Profil (sekundaer, nur informativ).
+    let mut sum_dev = 0.0_f64;
+    let mut max_dev_below_500 = 0.0_f32;
+    for s in &gate_samples {
+        let target_vs = -(s.gs_kt as f64) * 5.31;
+        let dev = (s.vs_fpm as f64 - target_vs).abs();
+        sum_dev += dev;
+        if height_for(s) <= 500.0 {
+            let dev_f32 = dev as f32;
+            if dev_f32 > max_dev_below_500 {
+                max_dev_below_500 = dev_f32;
+            }
+        }
+    }
+    let mean_dev = sum_dev / gate_samples.len() as f64;
+    out.vs_deviation_fpm = Some(mean_dev as f32);
+    if max_dev_below_500 > 0.0 {
+        out.max_vs_deviation_below_500_fpm = Some(max_dev_below_500);
+    }
+
+    // 8) Bank-Stddev filtered.
+    let bank_filtered: Vec<f32> = gate_samples
+        .iter()
+        .filter(|s| !in_vector_window(s.at))
+        .map(|s| s.bank_deg)
+        .collect();
+    if bank_filtered.len() >= 3 {
+        let n = bank_filtered.len() as f64;
+        let mean = bank_filtered.iter().map(|&b| b as f64).sum::<f64>() / n;
+        let var = bank_filtered.iter()
+            .map(|&b| (b as f64 - mean).powi(2))
+            .sum::<f64>() / n;
+        out.bank_stddev_filtered_deg = Some(var.sqrt() as f32);
+    }
+
+    // 9) Composite Stable-At-Gate Indikator.
+    //    PRIMARY-Maße: jerk < 100 AND bank_sd < 5 AND ias_sd < 10
+    //                AND no_excessive_sink AND stable_config
+    let jerk_ok = out.vs_jerk_fpm.map(|j| j < 100.0).unwrap_or(false);
+    let bank_ok = out.bank_stddev_filtered_deg.map(|b| b < 5.0).unwrap_or(true);
+    let ias_ok = out.ias_stddev_kt.map(|i| i < 10.0).unwrap_or(true);
+    let config_ok = out.stable_config.unwrap_or(true); // None = unbekannt, kein blocker
+    let stable = jerk_ok && bank_ok && ias_ok && !out.excessive_sink && config_ok;
+    out.stable_at_gate = Some(stable);
+
+    out
 }
 
 /// Map a numeric landing score (0-100, finer granularity than the
@@ -5051,9 +5323,9 @@ fn build_landing_record(
     let approach_samples = stats
         .approach_buffer
         .iter()
-        .map(|(vs, bank)| ApproachSample {
-            vs_fpm: *vs,
-            bank_deg: *bank,
+        .map(|s| ApproachSample {
+            vs_fpm: s.vs_fpm,
+            bank_deg: s.bank_deg,
         })
         .collect();
 
@@ -6864,6 +7136,29 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                 )
             };
             // Update running stats AND step the flight-phase FSM.
+            // v0.5.25: arr_airport_elevation_ft fuer HAT-basiertes
+            // Stable-Approach-Gate. Lazy lookup beim ersten Tick wo wir
+            // die Elevation noch nicht haben — phpVMS-API-Cache aus
+            // state.airports liefert sie sobald airport_get aufgerufen
+            // wurde (passiert beim Bid-Pickup ueblicherweise schon).
+            // Ohne Elevation: Fallback auf AGL-Filter, used_hat=false.
+            {
+                let mut stats_g = flight.stats.lock().expect("flight stats");
+                if stats_g.arr_airport_elevation_ft.is_none() {
+                    let app_state = app.state::<AppState>();
+                    let airports = app_state.airports.lock().expect("airports lock");
+                    if let Some(arr) = airports.get(&flight.arr_airport.to_uppercase()) {
+                        if let Some(elev) = arr.elevation {
+                            stats_g.arr_airport_elevation_ft = Some(elev as f32);
+                            tracing::info!(
+                                arr = %flight.arr_airport,
+                                elevation_ft = elev,
+                                "arr airport elevation cached for HAT-based Stable-Approach-Gate"
+                            );
+                        }
+                    }
+                }
+            }
             let phase_change = step_flight(&flight, &snap);
             // v0.4.0: Discord-Webhook-Posts für Takeoff + Landing.
             // Wir feuern fire-and-forget (tokio::spawn) damit der
@@ -7067,6 +7362,22 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                             gear_force_peak_n: stats.landing_gear_force_peak_n,
                             estimate_window_ms: stats.landing_estimate_window_ms,
                             estimate_sample_count: stats.landing_estimate_sample_count,
+                            // v0.5.25: Approach-Stability v2 — Stable-Approach-
+                            // Gate-konform mit HAT-statt-AGL, V/S-Jerk,
+                            // IAS-σ, Excessive-Sink, Stable-Config.
+                            approach_vs_deviation_fpm: stats.approach_vs_deviation_fpm,
+                            approach_max_vs_deviation_below_500_fpm: stats
+                                .approach_max_vs_deviation_below_500_fpm,
+                            approach_bank_stddev_filtered_deg: stats
+                                .approach_bank_stddev_filtered_deg,
+                            approach_runway_changed_late: stats.approach_runway_changed_late,
+                            approach_stable_at_gate: stats.approach_stable_at_gate,
+                            approach_window_sample_count: stats.approach_window_sample_count,
+                            approach_vs_jerk_fpm: stats.approach_vs_jerk_fpm,
+                            approach_ias_stddev_kt: stats.approach_ias_stddev_kt,
+                            approach_excessive_sink: Some(stats.approach_excessive_sink),
+                            approach_stable_config: stats.approach_stable_config,
+                            approach_used_hat: Some(stats.approach_used_hat),
                             // v0.5.22: feeds the live-monitor's "Bahn-
                             // Auslastung"-sub-score so it matches the
                             // in-app PIREP value 1:1.
@@ -8750,9 +9061,41 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                 // accumulated during Approach + Final. None when we
                 // have fewer than 3 samples (resumed flight,
                 // ultra-fast approach).
+                //
+                // v0.5.25: PLUS Stable-Approach-Gate-konforme v2-
+                // Auswertung (1000-ft-AGL-Window, Glide-Slope-Deviation,
+                // Vector-Window-Filter, Late-RWY-Change-Detection).
+                // Beide Werte werden mit-publiziert — pre-v0.5.25-
+                // Konsumenten weiter mit den σ-Werten, neue UI nutzt
+                // approach_vs_deviation_fpm fuer das echte Gate-Maß.
                 let (vs_sd, bank_sd) = compute_approach_stddev(&stats.approach_buffer);
                 stats.approach_vs_stddev_fpm = vs_sd;
                 stats.approach_bank_stddev_deg = bank_sd;
+                let stab_v2 = compute_approach_stability_v2(
+                    &stats.approach_buffer,
+                    stats.arr_airport_elevation_ft,
+                );
+                stats.approach_vs_deviation_fpm = stab_v2.vs_deviation_fpm;
+                stats.approach_max_vs_deviation_below_500_fpm = stab_v2.max_vs_deviation_below_500_fpm;
+                stats.approach_bank_stddev_filtered_deg = stab_v2.bank_stddev_filtered_deg;
+                stats.approach_runway_changed_late = stab_v2.runway_changed_late;
+                stats.approach_stable_at_gate = stab_v2.stable_at_gate;
+                stats.approach_vs_jerk_fpm = stab_v2.vs_jerk_fpm;
+                stats.approach_ias_stddev_kt = stab_v2.ias_stddev_kt;
+                stats.approach_excessive_sink = stab_v2.excessive_sink;
+                stats.approach_stable_config = stab_v2.stable_config;
+                stats.approach_used_hat = stab_v2.used_hat;
+                stats.approach_window_sample_count = Some(stab_v2.window_sample_count);
+                tracing::info!(
+                    pirep_id = %flight.pirep_id,
+                    vs_dev_fpm = ?stab_v2.vs_deviation_fpm,
+                    max_vs_dev_below_500 = ?stab_v2.max_vs_deviation_below_500_fpm,
+                    bank_sd_filtered = ?stab_v2.bank_stddev_filtered_deg,
+                    rwy_changed_late = stab_v2.runway_changed_late,
+                    stable_at_gate = ?stab_v2.stable_at_gate,
+                    samples = stab_v2.window_sample_count,
+                    "approach stability v2 computed"
+                );
 
                 // Reset rollout tracking. The Landing-phase arm below
                 // accumulates haversine distance from `(landing_lat,
