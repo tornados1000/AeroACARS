@@ -4,6 +4,62 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.5.35] — 2026-05-08
+
+🐞 **Touchdown-V/S Capture für GA + sparse-DataRef-Cases gefixt — Position-Sampling adaptiv unter 1000ft AGL.**
+
+### Hintergrund
+
+User-Report aus dem GSG-301 GA-Flug (Cessna 152 in X-Plane 12, Forensik-Log analysiert): peak_vs_fpm=-33 fpm gemeldet, peak_g_force=1.36 — passte nicht zueinander. Die echte TD-V/S war vermutlich -300 bis -400 fpm.
+
+**Root-Cause-Analyse aus dem JSONL:**
+- Position-Sampling auf **0.1 Hz** (= 10.4s Mean-Interval, 91% der Frames mit >10s Lücken)
+- 10s vor TD: AGL 145 ft, V/S **-360 fpm** (letzter airborne Sample)
+- TD-Frame: Lücke von 10.44s → kompletter Touchdown-Moment fiel durch
+- Lua-30-Sample-Estimator spannte das Fenster über den ganzen Approach (statt Flare) und gab geglätteten Mittelwert zurück
+
+### 🆕 Fix 1 — Adaptive Position-Rate
+
+`adaptive_tick_interval()`: Tick-Cadence je nach Phase + AGL:
+- Cruise/Climb/Descent: 3s (unverändert)
+- Approach/Final/Takeoff bei AGL <1000ft: **2s** (= 0.5 Hz)
+- AGL <500ft: **1s** (= 1 Hz)
+- AGL <100ft (Flare/Wheels-Up): **500ms** (= 2 Hz)
+
+### 🆕 Fix 2 — JSONL-Append pro Tick
+
+Vorher: JSONL-Append war IM phpVMS-OK-Branch → wurde nur bei erfolgreichem phpVMS-POST geschrieben (8-30s Cadence). Jetzt: nach MQTT-Publish, vor phpVMS-POST → jeder Tick im Log.
+
+### 🆕 Fix 3 — V/S-Estimator Sparse-Sampling-Fallback
+
+Neuer `last_low_agl_vs_fpm`-Tracker in FlightStats: speichert die letzte airborne V/S unter 500ft AGL mit Timestamp. Wird kontinuierlich pro Tick upgedated.
+
+X-Plane Priority-Chain neu:
+- Bevorzugt `agl_estimate_xp` falls Fenster <3s (= echte Flare)
+- Falls Fenster ≥3s = unplausible (= sparse-Sampling-Spread): verwendet `last_low_agl_vs_fpm` falls innerhalb 15s
+- Bei beiden vorhanden: nimmt den deeperen (= numerisch kleineren)
+
+Neue `vs_source`-Labels:
+- `agl_estimate_xp_or_last_low` (beide vorhanden, deeper gewählt)
+- `last_low_agl_vs` (Estimator implausibel, last_low gerettet)
+- `agl_estimate_xp_implausible_window` (last resort)
+
+### 🆕 Fix 4 — Go-Around-Detector empfindlicher
+
+- `GO_AROUND_AGL_RECOVERY_FT`: 200 → **150 ft** (sparse Sampling)
+- `GO_AROUND_MIN_VS_FPM`: 500 → **300 fpm** (slow GA Aircraft klettern selten >500fpm)
+
+### Erwartung für GA-Flüge ab v0.5.35
+
+Bei Cessna 152 in X-Plane mit Standard-DataRef-Rate:
+- Position-Frames im Final: 1 alle Sekunde (statt 1 alle 10s)
+- Touchdown-V/S richtig gefangen via `last_low_agl_vs_fpm` falls Lua-Estimator wegen Sim-FPS sparse läuft
+- Go-Around bei Cub/C152-Style climb-out korrekt detektiert
+
+Versions-Bump 0.5.34 → 0.5.35.
+
+---
+
 ## [v0.5.34] — 2026-05-08
 
 🛡 **JSONL-Forensik-Logs jetzt vollstaendig — alles was MQTT publiziert landet auch im Log.**

@@ -65,6 +65,36 @@ const RESUME_MAX_AGE_HOURS: i64 = 12;
 /// VPS handles it trivially even with 200 concurrent pilots.
 const MQTT_PUBLISH_INTERVAL_SECS: u64 = 3;
 
+/// v0.5.35: Adaptive Tick-Cadence. Standardmäßig 3s, aber unter
+/// 1000ft AGL im Approach/Final/Landing/Takeoff schneller — sonst
+/// verfehlt das Sampling den Touchdown bei langsamen GA-Flugzeugen
+/// (bei -360 fpm und 3s tickt = 18 ft Δ AGL pro Sample, knapp aber OK;
+/// bei 8s wären es 48 ft = TD-Moment fällt durch).
+fn adaptive_tick_interval(phase: FlightPhase, agl_ft: Option<f64>) -> Duration {
+    if let (Some(agl), true) = (
+        agl_ft,
+        matches!(
+            phase,
+            FlightPhase::Approach
+                | FlightPhase::Final
+                | FlightPhase::Landing
+                | FlightPhase::Takeoff
+                | FlightPhase::TakeoffRoll
+        ),
+    ) {
+        if agl < 100.0 {
+            return Duration::from_millis(500); // 2 Hz im Flare / Wheels-Up
+        }
+        if agl < 500.0 {
+            return Duration::from_secs(1); // 1 Hz unter 500ft
+        }
+        if agl < 1000.0 {
+            return Duration::from_secs(2); // 0.5 Hz unter 1000ft
+        }
+    }
+    Duration::from_secs(MQTT_PUBLISH_INTERVAL_SECS)
+}
+
 fn position_interval(phase: FlightPhase) -> Duration {
     let secs = match phase {
         // Brief, critical events — sample a touch faster so the touchdown
@@ -152,7 +182,12 @@ const TOUCH_AND_GO_AGL_THRESHOLD_FT: f32 = 100.0;
 const TOUCH_AND_GO_DWELL_SECS: i64 = 1;
 /// AGL increase from `lowest_agl_during_approach_ft` that signals a
 /// possible go-around in progress.
-const GO_AROUND_AGL_RECOVERY_FT: f32 = 200.0;
+///
+/// v0.5.35: 200 → 150 ft. Reason: bei sparse Sampling kann der erste
+/// Frame nach der lowest_agl-Marke schon 60+ Sekunden später sein —
+/// in der Zeit klettert ein C152 leicht 200+ ft. Niedrigerer Threshold
+/// fängt mehr GA-Versuche ein. Dwell-Check filtert noch False Positives.
+const GO_AROUND_AGL_RECOVERY_FT: f32 = 150.0;
 
 // ---- Holding-pattern detection (v0.5.11) ------------------------------
 //
@@ -181,7 +216,11 @@ const HOLDING_VS_THRESHOLD_FPM: f32 = 200.0;
 const GO_AROUND_DWELL_SECS: i64 = 8;
 /// Minimum positive V/S at which the GA detector accepts a sample
 /// as "actually climbing" (filters out flare round-out / level-off).
-const GO_AROUND_MIN_VS_FPM: f32 = 500.0;
+///
+/// v0.5.35: 500 → 300 fpm. Slow GA aircraft (Cessna 152, Piper Cub,
+/// taildraggers) klettern bei einem GA selten >500 fpm — der frühere
+/// Threshold übersah ihre Go-Arounds komplett.
+const GO_AROUND_MIN_VS_FPM: f32 = 300.0;
 /// AGL threshold above which we mark the flight as having actually
 /// flown. Powers the `was_airborne` gate that prevents both the
 /// Arrived-fallback and the divert-detection from firing pre-flight
@@ -1244,6 +1283,15 @@ struct FlightStats {
     /// against a real AGL-Δ estimate.
     /// Reset on Approach entry so go-arounds don't carry stale data.
     low_agl_vs_min_fpm: Option<f32>,
+    /// v0.5.35: V/S des letzten airborne Samples vor dem Touchdown
+    /// (mit Timestamp). Verwendet als robusten Fallback wenn der
+    /// Lua-30-Sample-Estimator wegen sparse Sampling versagt
+    /// (siehe GA-Flug-Bug 2026-05-08: Cessna 152 in X-Plane mit
+    /// 0.1 Hz DataRef-Update → Estimator gibt -33 fpm zurueck obwohl
+    /// das letzte airborne Sample -360 fpm bei AGL 145 ft hatte).
+    /// Wird waehrend Approach/Final/Landing kontinuierlich
+    /// upgedated. Reset on TakeoffRoll-Entry.
+    last_low_agl_vs_fpm: Option<(f32, DateTime<Utc>)>,
     // ─── v0.5.25 Approach-Stability v2 ─────────────────────────────────
     //
     // Pre-v0.5.25: einfache Standardabweichung ueber Approach+Final-
@@ -7403,6 +7451,14 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
                 if vs_corrected < curr_min {
                     stats.low_agl_vs_min_fpm = Some(vs_corrected);
                 }
+                // v0.5.35: speichere AUCH die letzte airborne V/S
+                // (= chronologisch jüngste, nicht das Minimum). Wird
+                // als Fallback genutzt wenn der Lua-30-Sample-Estimator
+                // wegen sparse Sampling versagt. AGL-Window 500ft
+                // (gross genug fuer GA mit langsamen DataRefs).
+                if snap.altitude_agl_ft <= 500.0 && vs_corrected < -20.0 {
+                    stats.last_low_agl_vs_fpm = Some((vs_corrected, Utc::now()));
+                }
             }
 
             // v0.4.4: Edge-Detection direkt im Sampler.
@@ -7601,9 +7657,19 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                 let stats = flight.stats.lock().expect("flight stats");
                 stats.phase
             };
-            // v0.5.21: loop runs at MQTT cadence (constant 3 s).
-            // phpVMS POST throttled separately further down.
-            tokio::time::sleep(Duration::from_secs(MQTT_PUBLISH_INTERVAL_SECS)).await;
+            // v0.5.35: loop runs at adaptive cadence — 3s in Cruise/Climb/etc,
+            // schneller (1s, 500ms) wenn der Pilot nah am Boden ist
+            // (Approach/Final/Landing/Takeoff unter 1000ft AGL).
+            // Verhindert dass der Touchdown-Moment in eine Sample-Lücke
+            // fällt — User-Report 2026-05-08: GA-Flug C152 hatte
+            // 10s Mean-Interval und peak_vs_fpm=-33 statt realer ~-350.
+            // phpVMS POST throttled separately further down (8-30s).
+            let tick_interval = {
+                let phase = flight.stats.lock().expect("flight stats").phase;
+                let agl = last_good_snap.as_ref().map(|s| s.altitude_agl_ft);
+                adaptive_tick_interval(phase, agl)
+            };
+            tokio::time::sleep(tick_interval).await;
             if flight.stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -8145,6 +8211,23 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                 }
             }
 
+            // v0.5.35: JSONL-Append jetzt PRO TICK (= 3s Cadence, oder
+            // adaptive bis zu 500ms unter AGL<100ft). Vorher war der
+            // Append nur INSIDE des phpVMS-OK-Branch — bei phpVMS-
+            // Throttle (8-30s im Approach) verlor der Forensik-Log
+            // 80% der Frames und der Touchdown-Moment fiel komplett
+            // in eine Lücke. User-Report von gsg/2 GA-Flug 2026-05-08:
+            // 0.1 Hz Sample-Rate, peak_vs_fpm=-33 fpm während realer TD
+            // bei vermutlich -350 fpm war.
+            record_event(
+                &app,
+                &flight.pirep_id,
+                &FlightLogEvent::Position {
+                    timestamp: Utc::now(),
+                    snapshot: snap.clone(),
+                },
+            );
+
             // v0.5.21: phpVMS POST throttled to phase-aware cadence
             // (`position_interval(phase)`, 4-30 s). The streamer-tick
             // itself runs at 3 s for MQTT — without this gate every
@@ -8190,16 +8273,9 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                             .unwrap_or(0) as u32;
                         stats.queued_position_count = queue_len;
                     }
-                    // Mirror the snapshot into the per-flight JSONL log
-                    // for offline replay / debugging. Best-effort.
-                    record_event(
-                        &app,
-                        &flight.pirep_id,
-                        &FlightLogEvent::Position {
-                            timestamp: Utc::now(),
-                            snapshot: snap.clone(),
-                        },
-                    );
+                    // v0.5.35: JSONL-Append wurde nach oben verschoben
+                    // (vor phpVMS-POST) damit jeder Tick im Log landet,
+                    // nicht nur die phpVMS-Success-Frames.
                 }
                 Err(ApiError::NotFound) => {
                     // phpVMS soft-deleted the PIREP under us (most likely
@@ -9106,6 +9182,7 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                 // Reset approach VS-min tracker (v0.5.5) for fresh
                 // approach measurement post-hold.
                 stats.low_agl_vs_min_fpm = None;
+                stats.last_low_agl_vs_fpm = None;
             } else if snap.bank_deg.abs() < 5.0 {
                 let exit = stats.holding_exit_pending_since.get_or_insert(now);
                 if (now - *exit).num_seconds() >= HOLDING_EXIT_DWELL_SECS {
@@ -9136,6 +9213,7 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                 // go-around (which routes Final → Climb → Approach again)
                 // gets a clean per-attempt picture.
                 stats.low_agl_vs_min_fpm = None;
+                stats.last_low_agl_vs_fpm = None;
             }
         }
         FlightPhase::Approach => {
@@ -9366,12 +9444,35 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                     // Adapts to sim framerate naturally — high-fps gets
                     // tight 0.5 s windows, low-fps gets wider 2-3 s
                     // windows. No fixed time-tier brittleness.
-                    let result = agl_estimate_xp
-                        .map(|e| e.fpm)
-                        .or_else(|| negative_only(stats.sampler_touchdown_vs_fpm))
-                        .or_else(|| negative_only(buffered_vs_min))
-                        .or_else(|| negative_only(stats.low_agl_vs_min_fpm))
-                        .unwrap_or(0.0);
+                    //
+                    // v0.5.35: Sanity-Check + Sparse-Sampling-Fallback.
+                    // Bug-Report 2026-05-08 (gsg/2 GA-Flug, Cessna 152):
+                    // bei sehr niedriger DataRef-Rate spannt das 30-Sample-
+                    // Fenster den ganzen Approach (10s+ window) statt der
+                    // Flare → estimator gibt geglätteten Mittelwert (-33 fpm)
+                    // statt echter TD-V/S (-360 fpm). Loesung:
+                    //   1. Estimator-Window > 3000ms = unplausibel (verwerfen)
+                    //   2. last_low_agl_vs_fpm (letztes airborne Sample
+                    //      <500ft AGL) als robuster Fallback — der wird
+                    //      pro Tick upgedated und ueberlebt sparse Sampling
+                    //   3. Wenn beide vorhanden: wähle den deeperen
+                    //      (= numerisch kleineren) — schuetzt vor
+                    //      Window-Spread-Artefakten
+                    let xp_est_plausible = agl_estimate_xp
+                        .filter(|e| e.window_ms < 3000)
+                        .map(|e| e.fpm);
+                    let last_low_recent = stats
+                        .last_low_agl_vs_fpm
+                        .filter(|(_, ts)| (Utc::now() - *ts).num_seconds() <= 15);
+                    let result = match (xp_est_plausible, last_low_recent) {
+                        (Some(est), Some((last, _))) => est.min(last),
+                        (Some(est), None) => est,
+                        (None, Some((last, _))) => last,
+                        (None, None) => negative_only(stats.sampler_touchdown_vs_fpm)
+                            .or_else(|| negative_only(buffered_vs_min))
+                            .or_else(|| negative_only(stats.low_agl_vs_min_fpm))
+                            .unwrap_or(0.0),
+                    };
                     if let Some(ref est) = agl_estimate_xp {
                         tracing::info!(
                             sim = "xplane",
@@ -9435,8 +9536,23 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                         "fallback_zero"
                     }
                 } else if is_xplane {
-                    if agl_estimate_xp.is_some() {
+                    // v0.5.35: Mirror der neuen Priority-Chain.
+                    // - "agl_estimate_xp_plausible" = Estimator-Window <3s
+                    // - "last_low_agl_vs" = letztes airborne Sample (sparse-Sampling-Rettung)
+                    // - "agl_estimate_xp_implausible" = Estimator-Window ≥3s, also wahrscheinlich Spread-Artifact (= reported als low confidence)
+                    let est_plausible = agl_estimate_xp.map(|e| e.window_ms < 3000).unwrap_or(false);
+                    let last_low_recent = stats.last_low_agl_vs_fpm
+                        .map(|(_, ts)| (Utc::now() - ts).num_seconds() <= 15)
+                        .unwrap_or(false);
+                    if est_plausible && last_low_recent {
+                        // Beide vorhanden — wir haben den deeperen genommen
+                        "agl_estimate_xp_or_last_low"
+                    } else if est_plausible {
                         "agl_estimate_xp"
+                    } else if last_low_recent {
+                        "last_low_agl_vs"
+                    } else if agl_estimate_xp.is_some() {
+                        "agl_estimate_xp_implausible_window"
                     } else if negative_only(stats.sampler_touchdown_vs_fpm).is_some() {
                         "sampler_gear_force"
                     } else if negative_only(buffered_vs_min).is_some() {
