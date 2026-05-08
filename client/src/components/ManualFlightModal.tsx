@@ -169,7 +169,24 @@ export function ManualFlightModal({ bid, simHint, onClose, onFlightStarted }: Pr
       onFlightStarted(result);
     } catch (err: unknown) {
       const ui = asUiError(err);
-      setError(`${ui.code}: ${ui.message}`);
+      // Map known backend error codes to localized messages — analog
+      // zu BidsList.tsx-IFR-Pfad. Fallback: rohe Server-Message.
+      const knownCodes = [
+        "no_sim_snapshot",
+        "not_on_ground",
+        "not_at_departure",
+        "missing_airline",
+        "missing_aircraft",
+        "flight_already_active",
+        "bid_not_found",
+        "aircraft_not_available",
+        "aircraft_mismatch",
+        "phpvms_error",
+      ];
+      const msg = knownCodes.includes(ui.code)
+        ? t(`flight.error.${ui.code}`)
+        : ui.message;
+      setError(msg);
       setStage("plan");
     }
   }
@@ -183,41 +200,42 @@ export function ManualFlightModal({ bid, simHint, onClose, onFlightStarted }: Pr
         onClick={(e) => e.stopPropagation()}
       >
         <header className="manual-modal__head">
-          <h3 id="manual-modal-title">
-            🛩 VFR / Manual-Mode — {t("bids.start_flight")}
-          </h3>
+          <h3 id="manual-modal-title">{t("manual_flight.title")}</h3>
           <div className="manual-modal__sub">
             {bid.flight.flight_number}
             {" · "}
             {bid.flight.dpt_airport_id} → {bid.flight.arr_airport_id}
             {" · "}
-            <span style={{ opacity: 0.7 }}>kein SimBrief-OFP</span>
+            <span style={{ opacity: 0.7 }}>{t("manual_flight.subtitle_no_ofp")}</span>
           </div>
         </header>
 
         {stage === "aircraft" && (
           <div className="manual-modal__body">
             <div className="manual-modal__section-title">
-              1. Aircraft auswählen
+              {t("manual_flight.step_aircraft")}
             </div>
             {loadingFleet ? (
-              <div className="manual-modal__loading">Lade gesamte Fleet…</div>
+              <div className="manual-modal__loading">{t("manual_flight.loading_fleet")}</div>
             ) : aircraftList && aircraftList.length === 0 ? (
               <div className="manual-modal__empty">
-                Keine Aircraft in deiner Fleet verfügbar — phpVMS-Endpoint /api/fleet nicht eingerichtet oder du hast keine Subfleet-Berechtigung. Sprich VA-Admin an.
+                {t("manual_flight.empty_fleet")}
               </div>
             ) : (
               <>
                 <input
                   type="search"
-                  placeholder="🔍 Suche nach ICAO / Registration / Name…"
+                  placeholder={t("manual_flight.search_placeholder")}
                   value={search}
                   onChange={(e) => setSearch(e.target.value)}
                   className="manual-modal__search"
                   autoFocus
                 />
                 <div style={{ fontSize: "0.78rem", color: "var(--text-dim)", marginBottom: 8 }}>
-                  {aircraftList?.length ?? 0} Aircraft gesamt · Aircraft am {bid.flight.dpt_airport_id} stehen oben in der Liste.
+                  {t("manual_flight.list_total", {
+                    count: aircraftList?.length ?? 0,
+                    airport: bid.flight.dpt_airport_id,
+                  })}
                 </div>
                 <div className="manual-modal__list">
                   {filtered.map((a) => {
@@ -268,7 +286,7 @@ export function ManualFlightModal({ bid, simHint, onClose, onFlightStarted }: Pr
                   })}
                   {filtered.length === 0 && (
                     <div className="manual-modal__empty">
-                      Kein Aircraft passt zu „{search}".
+                      {t("manual_flight.no_match", { search })}
                     </div>
                   )}
                 </div>
@@ -277,7 +295,7 @@ export function ManualFlightModal({ bid, simHint, onClose, onFlightStarted }: Pr
             {error && <div className="manual-modal__error">{error}</div>}
             <div className="manual-modal__actions">
               <button type="button" className="button" onClick={onClose}>
-                Abbrechen
+                {t("manual_flight.cancel")}
               </button>
               <button
                 type="button"
@@ -285,7 +303,7 @@ export function ManualFlightModal({ bid, simHint, onClose, onFlightStarted }: Pr
                 disabled={!selected}
                 onClick={proceedToPlan}
               >
-                Weiter →
+                {t("manual_flight.next")}
               </button>
             </div>
           </div>
@@ -294,7 +312,7 @@ export function ManualFlightModal({ bid, simHint, onClose, onFlightStarted }: Pr
         {(stage === "plan" || stage === "submitting") && selected && (
           <div className="manual-modal__body">
             <div className="manual-modal__section-title">
-              2. Flugplanung
+              {t("manual_flight.step_plan")}
             </div>
             <div style={{ marginBottom: 12, padding: "8px 10px", background: "rgba(103,232,249,0.08)", borderLeft: "3px solid #67e8f9", borderRadius: 4, fontSize: "0.85rem" }}>
               <strong>{selected.icao} {selected.registration}</strong>
@@ -303,7 +321,7 @@ export function ManualFlightModal({ bid, simHint, onClose, onFlightStarted }: Pr
 
             <div className="manual-modal__form">
               <label>
-                <span>Block-Fuel <strong style={{ color: "#fbbf24" }}>*</strong></span>
+                <span>{t("manual_flight.form.block_fuel")} <strong style={{ color: "#fbbf24" }}>*</strong></span>
                 <div className="manual-modal__input-with-unit">
                   <input
                     type="number"
@@ -311,16 +329,16 @@ export function ManualFlightModal({ bid, simHint, onClose, onFlightStarted }: Pr
                     step="1"
                     value={blockFuelKg}
                     onChange={(e) => setBlockFuelKg(e.target.value)}
-                    placeholder="z.B. 250"
+                    placeholder={t("manual_flight.form.block_fuel_placeholder")}
                     disabled={stage === "submitting"}
                   />
                   <span>kg</span>
                 </div>
-                <small>Wieviel Sprit hast du getankt? Pflicht für Fuel-Score.</small>
+                <small>{t("manual_flight.form.block_fuel_help")}</small>
               </label>
 
               <label>
-                <span>Erwartete Flugzeit <strong style={{ color: "#fbbf24" }}>*</strong></span>
+                <span>{t("manual_flight.form.flight_time")} <strong style={{ color: "#fbbf24" }}>*</strong></span>
                 <div className="manual-modal__input-with-unit">
                   <input
                     type="number"
@@ -328,16 +346,16 @@ export function ManualFlightModal({ bid, simHint, onClose, onFlightStarted }: Pr
                     step="1"
                     value={flightTimeMin}
                     onChange={(e) => setFlightTimeMin(e.target.value)}
-                    placeholder="z.B. 45"
+                    placeholder={t("manual_flight.form.flight_time_placeholder")}
                     disabled={stage === "submitting"}
                   />
                   <span>min</span>
                 </div>
-                <small>Geschätzte Gesamtzeit für ETA-Anzeige.</small>
+                <small>{t("manual_flight.form.flight_time_help")}</small>
               </label>
 
               <label>
-                <span>Cruise-Level <span style={{ color: "var(--fg-dim)" }}>(optional)</span></span>
+                <span>{t("manual_flight.form.cruise_level")} <span style={{ color: "var(--fg-dim)" }}>{t("manual_flight.optional")}</span></span>
                 <div className="manual-modal__input-with-unit">
                   <input
                     type="number"
@@ -345,41 +363,41 @@ export function ManualFlightModal({ bid, simHint, onClose, onFlightStarted }: Pr
                     step="500"
                     value={cruiseLevel}
                     onChange={(e) => setCruiseLevel(e.target.value)}
-                    placeholder="z.B. 4500"
+                    placeholder={t("manual_flight.form.cruise_level_placeholder")}
                     disabled={stage === "submitting"}
                   />
                   <span>ft</span>
                 </div>
-                <small>VFR typisch 2000-9500 ft.</small>
+                <small>{t("manual_flight.form.cruise_level_help")}</small>
               </label>
 
               <label>
-                <span>Route <span style={{ color: "var(--fg-dim)" }}>(optional)</span></span>
+                <span>{t("manual_flight.form.route")} <span style={{ color: "var(--fg-dim)" }}>{t("manual_flight.optional")}</span></span>
                 <input
                   type="text"
                   value={route}
                   onChange={(e) => setRoute(e.target.value)}
-                  placeholder="z.B. direct, oder LMV - VFR-N"
+                  placeholder={t("manual_flight.form.route_placeholder")}
                   disabled={stage === "submitting"}
                 />
-                <small>Free-text Beschreibung der geplanten Route.</small>
+                <small>{t("manual_flight.form.route_help")}</small>
               </label>
 
               <label>
-                <span>Alternate <span style={{ color: "var(--fg-dim)" }}>(optional)</span></span>
+                <span>{t("manual_flight.form.alternate")} <span style={{ color: "var(--fg-dim)" }}>{t("manual_flight.optional")}</span></span>
                 <input
                   type="text"
                   value={altAirport}
                   onChange={(e) => setAltAirport(e.target.value.toUpperCase())}
-                  placeholder="ICAO, z.B. EDDF"
+                  placeholder={t("manual_flight.form.alternate_placeholder")}
                   maxLength={4}
                   disabled={stage === "submitting"}
                 />
-                <small>Ausweich-Flughafen.</small>
+                <small>{t("manual_flight.form.alternate_help")}</small>
               </label>
 
               <label>
-                <span>ZFW (Zero Fuel Weight) <span style={{ color: "var(--fg-dim)" }}>(optional)</span></span>
+                <span>{t("manual_flight.form.zfw")} <span style={{ color: "var(--fg-dim)" }}>{t("manual_flight.optional")}</span></span>
                 <div className="manual-modal__input-with-unit">
                   <input
                     type="number"
@@ -387,12 +405,12 @@ export function ManualFlightModal({ bid, simHint, onClose, onFlightStarted }: Pr
                     step="10"
                     value={zfwKg}
                     onChange={(e) => setZfwKg(e.target.value)}
-                    placeholder="z.B. 800"
+                    placeholder={t("manual_flight.form.zfw_placeholder")}
                     disabled={stage === "submitting"}
                   />
                   <span>kg</span>
                 </div>
-                <small>Aircraft + Pilot + Pax + Cargo (ohne Sprit).</small>
+                <small>{t("manual_flight.form.zfw_help")}</small>
               </label>
             </div>
 
@@ -405,7 +423,7 @@ export function ManualFlightModal({ bid, simHint, onClose, onFlightStarted }: Pr
                 onClick={() => setStage("aircraft")}
                 disabled={stage === "submitting"}
               >
-                ← Zurück
+                {t("manual_flight.back")}
               </button>
               <button
                 type="button"
@@ -413,7 +431,7 @@ export function ManualFlightModal({ bid, simHint, onClose, onFlightStarted }: Pr
                 onClick={() => void submit()}
                 disabled={stage === "submitting"}
               >
-                {stage === "submitting" ? "Starte…" : "🛩 Flug starten"}
+                {stage === "submitting" ? t("manual_flight.submitting") : t("manual_flight.submit")}
               </button>
             </div>
           </div>

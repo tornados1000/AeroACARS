@@ -4,6 +4,46 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.5.33] — 2026-05-08
+
+🐞 **Aircraft-Picker funktioniert jetzt richtig: alle Flugzeuge, nur Ground+Active, voll DE+EN.**
+
+### 🐞 Behoben
+
+**Problem (v0.5.32):**
+v0.5.32 versuchte `/api/fleet/{id}/aircraft` aufzurufen — diesen Endpoint gibt es in phpVMS-V7 **nicht** (nur `/api/fleet/aircraft/{id}` für ein einzelnes Aircraft per ID). Resultat: alle per-Subfleet-Calls liefen ins 404, wurden „graceful skipped", Picker zeigte „Keine Aircraft in deiner Fleet verfügbar" trotz vorhandener Flugzeuge.
+
+**Fix in v0.5.33:**
+- `GET /api/fleet?limit=100&page=N` paginiert (verifiziert via offizielle phpVMS-Docs + Source-Code)
+- `SubfleetResource` enthaelt `aircraft`-Array bereits inline → kein N+1
+- Pages-Loop bis non-volle Page (Cap 50 Pages)
+- Neuer `SubfleetWithAircraft`-Typ mit `#[serde(default)] aircraft: Vec<AircraftDetails>`
+- `get_all_aircraft()` flatten ueber alle Subfleets
+
+### 🆕 Filter (Pilot-Wunsch)
+
+**Nur tatsächlich verfügbare Flugzeuge im Picker:**
+- `state == 0` (PARKED — nicht IN_USE / IN_AIR)
+- `status == "A"` (ACTIVE — nicht MAINTENANCE / STORED / RETIRED / SCRAPPED / WRITTEN_OFF)
+- Tracing-Log: `before=N after=M` für Diagnose
+
+### 🌍 Vollständige DE+EN-Lokalisierung
+
+**Neue i18n-Keys (35+):**
+- `manual_flight.*` — Header, Step-Titles, Loading, Empty, Search, List-Total, No-Match, Submit-Buttons, **alle 6 Form-Felder** (Block-Fuel, Flight-Time, Cruise-Level, Route, Alternate, ZFW) je mit Label + Placeholder + Help-Text
+- `bid_card.*` — VFR-Start-Button + Tooltip, komplette Hint-Box (Title + IFR/VFR-Zeilen)
+- `flight.error.*` (10 Codes) jetzt **auch im Manual-Modal** lokalisiert (war vorher roher Code wie `no_sim_snapshot: ...`)
+
+### ✏️ Sprache
+
+- „Aircraft" → „Flugzeug" überall im UI (DE)
+- „Aircraft" → „Aircraft" (EN, weil das im Englischen korrekt ist)
+- Empty-State-Meldung neu: nennt konkret die Filter-Gründe (Einsatz/Luft/Wartung)
+
+Versions-Bump 0.5.32 → 0.5.33.
+
+---
+
 ## [v0.5.32] — 2026-05-08
 
 🐞 **Aircraft-Picker zeigt jetzt einzelne Aircraft, nicht Subfleets.**

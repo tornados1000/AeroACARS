@@ -786,5 +786,53 @@
     "default_title": "Are you sure?",
     "confirm": "Confirm",
     "cancel": "Cancel"
+  },
+  "manual_flight": {
+    "title": "VFR / Manual mode — start flight",
+    "subtitle_no_ofp": "no SimBrief OFP",
+    "step_aircraft": "1. Select aircraft",
+    "step_plan": "2. Flight plan",
+    "loading_fleet": "Loading available aircraft…",
+    "empty_fleet": "No available aircraft found — all are currently in use, in air, or in maintenance. Try again later or talk to your VA admin.",
+    "list_total": "{{count}} aircraft total · Aircraft at {{airport}} are listed first.",
+    "search_placeholder": "🔍 Search by ICAO / registration / name…",
+    "no_match": "No aircraft matches \"{{search}}\".",
+    "submitting": "Starting…",
+    "back": "← Back",
+    "submit": "🛩 Start flight",
+    "cancel": "Cancel",
+    "next": "Next →",
+    "optional": "(optional)",
+    "form": {
+      "block_fuel": "Block fuel",
+      "block_fuel_placeholder": "e.g. 250",
+      "block_fuel_help": "How much fuel did you load? Required for fuel score.",
+      "flight_time": "Expected flight time",
+      "flight_time_placeholder": "e.g. 45",
+      "flight_time_help": "Estimated total time for ETA display.",
+      "cruise_level": "Cruise level",
+      "cruise_level_placeholder": "e.g. 4500",
+      "cruise_level_help": "VFR typical 2000-9500 ft.",
+      "route": "Route",
+      "route_placeholder": "e.g. direct, or LMV - VFR-N",
+      "route_help": "Free-text description of the planned route.",
+      "alternate": "Alternate",
+      "alternate_placeholder": "ICAO, e.g. EDDF",
+      "alternate_help": "Backup airport.",
+      "zfw": "ZFW (Zero Fuel Weight)",
+      "zfw_placeholder": "e.g. 800",
+      "zfw_help": "Aircraft + pilot + pax + cargo (without fuel)."
+    }
+  },
+  "bid_card": {
+    "vfr_start": "🛩 VFR start (manual)",
+    "vfr_start_tooltip": "Manual flight start without a SimBrief OFP — e.g. for VFR, small airfields, or pattern training. You pick aircraft + block fuel yourself. Also usable as an aircraft override for bids with a SimBrief OFP.",
+    "mode_hint_title": "💡 Which button do I use?",
+    "mode_hint_ifr_key": "IFR start",
+    "mode_hint_ifr_rule_strong": "ONLY with a SimBrief OFP",
+    "mode_hint_ifr_rule_rest": " (plan data comes from the OFP).",
+    "mode_hint_vfr_key": "VFR start",
+    "mode_hint_vfr_rule_strong": "ALSO WITHOUT a SimBrief OFP",
+    "mode_hint_vfr_rule_rest": " — you enter aircraft + block fuel yourself."
   }
 }

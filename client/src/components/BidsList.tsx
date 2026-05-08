@@ -638,9 +638,9 @@ export function BidsList({
                         type="button"
                         className="button"
                         onClick={() => setManualModalBid(bid)}
-                        title="Manueller Flug-Start ohne SimBrief-OFP — z.B. fuer VFR, kleine Pisten oder Pattern-Training. Du waehlst Aircraft + Block-Fuel selbst. Auch nutzbar als Aircraft-Override fuer Bids mit SimBrief-OFP."
+                        title={t("bid_card.vfr_start_tooltip")}
                       >
-                        🛩 VFR Start (manuell)
+                        {t("bid_card.vfr_start")}
                       </button>
                     )}
                   </div>
@@ -649,20 +649,20 @@ export function BidsList({
                   {!hasActiveFlight && (
                     <div className="bid-card__mode-hint">
                       <div className="bid-card__mode-hint-title">
-                        💡 Welchen Button nutzen?
+                        {t("bid_card.mode_hint_title")}
                       </div>
                       <div className="bid-card__mode-hint-row bid-card__mode-hint-row--ifr">
                         <span className="bid-card__mode-hint-icon">🛫</span>
-                        <span className="bid-card__mode-hint-key">IFR Start</span>
+                        <span className="bid-card__mode-hint-key">{t("bid_card.mode_hint_ifr_key")}</span>
                         <span className="bid-card__mode-hint-rule">
-                          <strong>NUR mit SimBrief-OFP</strong> (Plan-Daten kommen aus dem OFP).
+                          <strong>{t("bid_card.mode_hint_ifr_rule_strong")}</strong>{t("bid_card.mode_hint_ifr_rule_rest")}
                         </span>
                       </div>
                       <div className="bid-card__mode-hint-row bid-card__mode-hint-row--vfr">
                         <span className="bid-card__mode-hint-icon">🛩</span>
-                        <span className="bid-card__mode-hint-key">VFR Start</span>
+                        <span className="bid-card__mode-hint-key">{t("bid_card.mode_hint_vfr_key")}</span>
                         <span className="bid-card__mode-hint-rule">
-                          <strong>AUCH OHNE SimBrief-OFP</strong> — du gibst Aircraft + Block-Fuel selbst ein.
+                          <strong>{t("bid_card.mode_hint_vfr_rule_strong")}</strong>{t("bid_card.mode_hint_vfr_rule_rest")}
                         </span>
                       </div>
                     </div>

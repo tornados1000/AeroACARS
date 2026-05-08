@@ -5370,6 +5370,37 @@ async fn fleet_list_at_airport(
     let icao_upper = icao.trim().to_uppercase();
 
     let raw = client.get_all_aircraft().await?;
+    let total_before_filter = raw.len();
+
+    // v0.5.33: Filter — nur Aircraft die der Pilot tatsaechlich
+    // jetzt fliegen kann:
+    //   • state == 0 (PARKED — nicht IN_USE/IN_AIR)
+    //   • status == "A" (ACTIVE — nicht MAINTENANCE/STORED/RETIRED/etc.)
+    // phpVMS-Enums:
+    //   AircraftState:  0=PARKED, 1=IN_USE, 2=IN_AIR
+    //   AircraftStatus: A=ACTIVE, M=MAINTENANCE, S=STORED, R=RETIRED,
+    //                   C=SCRAPPED, W=WRITTEN_OFF
+    // Aircraft ohne `state`/`status` (legacy/incomplete data) werden
+    // konservativ DURCHGELASSEN — phpVMS lehnt beim Prefile ab falls
+    // die Aircraft tatsaechlich nicht verfuegbar ist.
+    let raw: Vec<_> = raw
+        .into_iter()
+        .filter(|a| {
+            let state_ok = a.state.map(|s| s == 0).unwrap_or(true);
+            let status_ok = a
+                .status
+                .as_deref()
+                .map(|s| s.eq_ignore_ascii_case("A"))
+                .unwrap_or(true);
+            state_ok && status_ok
+        })
+        .collect();
+    tracing::info!(
+        before = total_before_filter,
+        after = raw.len(),
+        "fleet_list_at_airport: state==0 && status==A filter applied"
+    );
+
     let mut entries: Vec<AircraftPickerEntry> = raw
         .into_iter()
         .map(|a| {

@@ -815,13 +815,22 @@ pub struct PirepSummary {
     pub arr_airport_id: Option<String>,
 }
 
-/// v0.5.32: Subfleet-Summary fuer `/api/fleet`. phpVMS-API gibt hier
-/// SUBFLEETS zurueck (nicht einzelne Aircraft) — Subfleet = Sammlung
-/// von Aircraft eines Typs (z.B. "DLH-A319-CFM-SL"). Wir brauchen die
-/// `id` um danach `/api/fleet/{id}/aircraft` abzufragen fuer die
-/// einzelnen Aircraft.
+/// v0.5.33: Subfleet mit nested Aircraft-Liste, wie phpVMS-V7
+/// SubfleetResource sie liefert (`/api/fleet`, `/api/user/fleet`).
+///
+/// **Korrektur ggü. v0.5.32**: Wir hatten faelschlich angenommen es
+/// gaebe einen `/api/fleet/{id}/aircraft`-Endpoint — den gibt es nicht.
+/// SubfleetResource enthaelt das Aircraft-Array bereits inline:
+///
+/// ```php
+/// // SubfleetResource::toArray
+/// $res['aircraft'] = AircraftResource::collection($this->aircraft);
+/// ```
+///
+/// Also: einmal `/api/user/fleet` abrufen, ueber alle Subfleets iterieren,
+/// `aircraft` flatten — fertig. Kein N+1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubfleetSummary {
+pub struct SubfleetWithAircraft {
     pub id: i64,
     #[serde(default)]
     pub name: Option<String>,
@@ -829,6 +838,11 @@ pub struct SubfleetSummary {
     pub icao: Option<String>,
     #[serde(default, rename = "type")]
     pub subfleet_type: Option<String>,
+    /// Nested Aircraft-Liste — bereits in der Subfleet-Response
+    /// enthalten. Default = leer falls phpVMS-Version das Feld
+    /// nicht liefert.
+    #[serde(default)]
+    pub aircraft: Vec<AircraftDetails>,
 }
 
 /// Subset of `GET /api/fleet/aircraft/{id}` we use for diagnostic purposes,
@@ -1253,39 +1267,72 @@ impl Client {
         self.get_data(&path).await
     }
 
-    /// v0.5.27: `GET /api/fleet` — komplette Fleet-Liste.
-    /// **WICHTIG**: phpVMS-API liefert hier SUBFLEETS, nicht einzelne
-    /// Aircraft! Subfleet = Sammlung von Aircraft eines Typs (z.B.
-    /// "DLH-A319-CFM-SL"). Fuer einzelne Aircraft siehe
-    /// `get_all_aircraft()` (= aggregiert ueber alle Subfleets).
-    pub async fn get_fleet(&self) -> Result<Vec<SubfleetSummary>, ApiError> {
-        self.get_data("/api/fleet").await
+    /// v0.5.33: `GET /api/fleet` — **alle** Subfleets ohne Rank-Filter.
+    ///
+    /// Wir verwenden bewusst NICHT `/api/user/fleet` — das wuerde via
+    /// `UserService::getAllowableSubfleets` nur Subfleets liefern die
+    /// der aktuelle Pilot-Rank fliegen darf. Stattdessen vertrauen wir
+    /// dem Pilot bei der Auswahl, und phpVMS lehnt beim Prefile ab
+    /// wenn er eine Aircraft ausserhalb seines Ranks waehlt.
+    ///
+    /// Jeder Subfleet enthaelt bereits eine nested `aircraft`-Liste
+    /// (siehe SubfleetResource::toArray). Paginiert — wir folgen
+    /// den Pages bis wir eine non-volle Page bekommen.
+    ///
+    /// **Korrektur ggü. v0.5.32**: Der vorherige Fix versuchte
+    /// `/api/fleet/{id}/aircraft` — diesen Endpoint gibt es in phpVMS-V7
+    /// **nicht** (nur `/api/fleet/aircraft/{id}` fuer ein einzelnes
+    /// Aircraft). Resultat war eine leere Picker-Liste.
+    pub async fn get_fleet(&self) -> Result<Vec<SubfleetWithAircraft>, ApiError> {
+        self.get_paginated_subfleets("/api/fleet").await
     }
 
-    /// v0.5.32: alle einzelnen Aircraft die der Pilot fliegen darf.
-    /// Aggregiert via N+1: erst Subfleets holen, dann pro Subfleet die
-    /// Aircraft-Liste. Phpvms-V7 enforced Subfleet-Rank-Restriktion
-    /// server-seitig, also kommen nur erlaubte Aircraft zurueck.
+    /// Hilfsfunktion: paginierten Subfleet-Endpoint komplett durchziehen.
     ///
-    /// Per-Subfleet-Failures werden geloggt aber nicht propagiert —
-    /// einzelne kaputte Subfleets sollten nicht den Aircraft-Picker
-    /// crashen.
-    pub async fn get_all_aircraft(&self) -> Result<Vec<AircraftDetails>, ApiError> {
-        let subfleets = self.get_fleet().await?;
+    /// Phpvms `paginate_limit` clamped `?limit=` auf
+    /// `phpvms.pagination.max` (default 100). Wir fragen mit limit=100
+    /// per Page und folgen den Pages so lange wir volle Pages bekommen.
+    /// Sicherheits-Cap bei 50 Pages = 5000 Subfleets.
+    async fn get_paginated_subfleets(
+        &self,
+        base_path: &str,
+    ) -> Result<Vec<SubfleetWithAircraft>, ApiError> {
+        const PAGE_LIMIT: usize = 100;
+        const MAX_PAGES: u32 = 50;
         let mut all = Vec::new();
-        for sf in subfleets {
-            let path = format!("/api/fleet/{}/aircraft", sf.id);
-            match self.get_data::<Vec<AircraftDetails>>(&path).await {
-                Ok(aircraft) => all.extend(aircraft),
-                Err(e) => {
-                    tracing::warn!(
-                        subfleet_id = sf.id,
-                        error = %e,
-                        "could not fetch aircraft for subfleet — skipping"
-                    );
-                }
+        for page in 1..=MAX_PAGES {
+            let path = format!("{base_path}?limit={PAGE_LIMIT}&page={page}");
+            let chunk: Vec<SubfleetWithAircraft> = self.get_data(&path).await?;
+            let n = chunk.len();
+            tracing::debug!(
+                page,
+                page_size = n,
+                cumulative = all.len() + n,
+                "fetched subfleet page"
+            );
+            all.extend(chunk);
+            if n < PAGE_LIMIT {
+                break; // letzte Page erreicht
             }
         }
+        Ok(all)
+    }
+
+    /// v0.5.32 (gefixt v0.5.33): alle einzelnen Aircraft die der Pilot
+    /// fliegen darf — flach. Liest `aircraft` aus jedem Subfleet
+    /// (bereits nested in der phpVMS-Response, kein N+1).
+    pub async fn get_all_aircraft(&self) -> Result<Vec<AircraftDetails>, ApiError> {
+        let subfleets = self.get_fleet().await?;
+        let total_subfleets = subfleets.len();
+        let mut all = Vec::new();
+        for sf in subfleets {
+            all.extend(sf.aircraft);
+        }
+        tracing::info!(
+            subfleets = total_subfleets,
+            aircraft = all.len(),
+            "get_all_aircraft completed"
+        );
         Ok(all)
     }
 }

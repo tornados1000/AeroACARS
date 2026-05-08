@@ -786,5 +786,53 @@
     "default_title": "Bist du sicher?",
     "confirm": "Bestätigen",
     "cancel": "Abbrechen"
+  },
+  "manual_flight": {
+    "title": "VFR / Manual-Mode — Flug starten",
+    "subtitle_no_ofp": "kein SimBrief-OFP",
+    "step_aircraft": "1. Flugzeug auswählen",
+    "step_plan": "2. Flugplanung",
+    "loading_fleet": "Verfügbare Flugzeuge werden geladen…",
+    "empty_fleet": "Keine verfügbaren Flugzeuge gefunden — alle sind gerade im Einsatz, in der Luft oder in Wartung. Versuch's später nochmal oder sprich den VA-Admin an.",
+    "list_total": "{{count}} Flugzeuge gesamt · Flugzeuge am {{airport}} stehen oben in der Liste.",
+    "search_placeholder": "🔍 Suche nach ICAO / Registration / Name…",
+    "no_match": "Kein Flugzeug passt zu „{{search}}\".",
+    "submitting": "Starte…",
+    "back": "← Zurück",
+    "submit": "🛩 Flug starten",
+    "cancel": "Abbrechen",
+    "next": "Weiter →",
+    "optional": "(optional)",
+    "form": {
+      "block_fuel": "Block-Fuel",
+      "block_fuel_placeholder": "z.B. 250",
+      "block_fuel_help": "Wieviel Sprit hast du getankt? Pflicht für Fuel-Score.",
+      "flight_time": "Erwartete Flugzeit",
+      "flight_time_placeholder": "z.B. 45",
+      "flight_time_help": "Geschätzte Gesamtzeit für ETA-Anzeige.",
+      "cruise_level": "Cruise-Level",
+      "cruise_level_placeholder": "z.B. 4500",
+      "cruise_level_help": "VFR typisch 2000-9500 ft.",
+      "route": "Route",
+      "route_placeholder": "z.B. direct, oder LMV - VFR-N",
+      "route_help": "Free-Text Beschreibung der geplanten Route.",
+      "alternate": "Alternate",
+      "alternate_placeholder": "ICAO, z.B. EDDF",
+      "alternate_help": "Ausweich-Flughafen.",
+      "zfw": "ZFW (Zero Fuel Weight)",
+      "zfw_placeholder": "z.B. 800",
+      "zfw_help": "Flugzeug + Pilot + Pax + Cargo (ohne Sprit)."
+    }
+  },
+  "bid_card": {
+    "vfr_start": "🛩 VFR Start (manuell)",
+    "vfr_start_tooltip": "Manueller Flug-Start ohne SimBrief-OFP — z.B. für VFR, kleine Pisten oder Pattern-Training. Du wählst Flugzeug + Block-Fuel selbst. Auch nutzbar als Flugzeug-Override für Bids mit SimBrief-OFP.",
+    "mode_hint_title": "💡 Welchen Button nutzen?",
+    "mode_hint_ifr_key": "IFR Start",
+    "mode_hint_ifr_rule_strong": "NUR mit SimBrief-OFP",
+    "mode_hint_ifr_rule_rest": " (Plan-Daten kommen aus dem OFP).",
+    "mode_hint_vfr_key": "VFR Start",
+    "mode_hint_vfr_rule_strong": "AUCH OHNE SimBrief-OFP",
+    "mode_hint_vfr_rule_rest": " — du gibst Flugzeug + Block-Fuel selbst ein."
   }
 }
