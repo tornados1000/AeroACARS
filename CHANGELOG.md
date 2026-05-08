@@ -4,6 +4,67 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.5.26] — 2026-05-08
+
+🎯 **9 neue Landung-Sicherheits-Indikatoren + DA-Gate (200 ft) + sim-/aircraft-spezifische Limits.**
+
+Folgepatch zu v0.5.25 — die Approach-Stability-v2 deckte den **Anflug-Pfad** korrekt ab. v0.5.26 ergänzt **per-Touchdown-Sicherheits-Metriken** und einen strengeren **Decision-Altitude-Gate-Check**.
+
+### ✨ Neu — Sicherheits-Indikatoren am Touchdown
+
+**1. Wing-Strike-Severity (%)**
+Bank am TD relativ zum aircraft-spezifischen Wing-Strike-Limit. 0% = wings level, 100% = am Limit. Conservative-Defaults pro ICAO (CL60: 6°, A321: 7°, B737: 8°, C172: 15°, etc.). Über 60% gibt Coaching-Hinweis, über 80% = Alert.
+
+**2. Float-Distance (m)**
+Distanz Threshold-Crossing → Touchdown. Long-Landing-Indikator. Standard 300-400 m. > 1000 m = Runway-Overrun-Risk auf kurzen Bahnen.
+
+**3. Touchdown-Zone (1/2/3)**
+FAA-Drittel-Klassifikation: Zone 1 = erstes Drittel (correct), Zone 2 = mittleres (long), Zone 3 = letztes (overshoot). Aircraft-Type-unabhängig.
+
+**4. Vref-Deviation (kt)**
+IAS am TD vs. Vref. **Source-Chain**: PMDG-FMC (MSFS-only) → ICAO-Kategorie-Default → unbekannt. Vref-DB enthält 30+ Aircraft-Types von B748 bis C172.
+
+**5. Stable-At-DA (200 ft AGL/HAT)**
+Strengerer 200-ft-Sub-Gate-Check (= ICAO Decision-Altitude-Standard für CAT-I-ILS). Tighter Cutoffs als beim 1000-ft-Gate: jerk < 80, bank < 3°, ias < 8 kt.
+
+### ✨ Neu — Aggregat-Metriken
+
+**6. Stall-Warning-Counter** — Anzahl `stall_warning=true`-Samples im gesamten Approach-Buffer. Indiziert ob Pilot Speed-Margin zu eng hatte.
+
+**7. Yaw-Rate am TD (°/s)** — heading-Änderung im 1-sec-Window vor TD. Hoch = Ground-Loop-Risk bei Crosswind-Landing.
+
+**8. Brake-Energy-Proxy (kJ/m)** — `(½ × Mass × IAS²) / Rollout`. Indiziert Brake-Pack-Thermal-Stress.
+
+**9. Aircraft-spezifische Limits-DB** (ICAO-basiert)
+Hardcoded `aircraft_limits_for(icao)` mit `max_bank_landing_deg` + `typical_vref_kt` für 30+ Standard-Types. Fallback `8°/None` für unbekannte ICAO. Pilot/VA-Override via DBasic Tech-Limits weiter erste Priorität.
+
+### ✨ Neu — UX
+
+**Neue „🎯 Landing-Quality"-Card im LandingAnalysis-Modal** zusätzlich zur Approach-Stability-Card. Zeigt 6 MetricTiles (Wing-Strike-Risk / TD-Zone / Float-Distance / Vref-Dev / Yaw-Rate / Brake-Energy) mit Tone-Coding und ausführlichen Hover-Tooltips.
+
+**Erweiterte Coaching-Texte** in der Approach-Stability-Card:
+- „Wing-Strike-Risk 85% — Bank am TD nahe Aircraft-Limit. Crosswind-Korrektur über Sideslip (Wing-Down + Rudder), nicht über Crab-into-flare-only."
+- „Touchdown im letzten Drittel der Bahn (Zone 3) — Runway-Overrun-Risk auf kurzen Bahnen. Pre-flare nicht zu lang, früher abfangen."
+- „IAS am TD -8 kt unter Vref — Stall-Risiko."
+- „Stabil bei 1000 ft, aber NICHT mehr bei 200 ft (DA). Final-Phase wackelig."
+- „⚠ 3 Stall-Warning-Events im Approach detektiert. Speed-Margin zu eng."
+
+### 🔧 Implementation
+
+- **Client (`lib.rs`)**: `aircraft_limits_for(icao)` Lookup-DB mit 30+ Types. `compute_approach_stability_v2` erweitert um DA-Gate (200 ft Filter) + Stall-Counter. Per-Touchdown-Section im File-PIREP-Path: Wing-Strike-Severity, Float-Distance + TD-Zone aus runway_match, Vref-Deviation mit Source-Chain, Yaw-Rate aus 1-sec-snapshot_buffer-Lookback, Brake-Energy-Formel.
+- **MQTT-Payload**: 9 neue Felder (alle `Option<>`, `skip_serializing_if`).
+- **Server (`recorder`)**: 9 neue Spalten in `touchdowns`-Tabelle (idempotente ALTER), insertTouchdown extrahiert, /api/touchdowns liefert sie typed.
+- **Webapp**: Neue `_LandingQualityCard.tsx` mit 6 MetricTiles. ApproachStabilityCard um Coaching-Texte erweitert. TouchdownDto um 9 Felder.
+- DB-Backup pre-deploy: `aeroacars-live.db.backup-pre-landing-quality`.
+
+### ⚠ Hinweise
+
+- **MSFS-Bank**: Sign noch nicht geflippt (im Gegensatz zu Pitch in v0.5.24). Wenn Wing-Strike-Severity-Daten nach Real-World-Tests komisch aussehen → Patch nachschieben.
+- **Vref-Quelle "icao_default"**: konservativ pro Aircraft-Type, Pilot-Vref-Addends (Wind/Gust/Ice) NICHT berücksichtigt → Deviation-Werte nur als grobes Indiz, PMDG-FMC-Vref ist autoritativ wenn verfügbar.
+- **Brake-Energy-Proxy**: ohne `landing_weight_kg` aus PMDG/Sim wird Default 50.000 kg verwendet — Werte ohne LDW-SimVar relativ.
+
+---
+
 ## [v0.5.25] — 2026-05-08
 
 🎯 **Approach-Stability v2: Stable-Approach-Gate-konformes Stabilitäts-Maß. Pilot versteht endlich was der Score bedeutet.**

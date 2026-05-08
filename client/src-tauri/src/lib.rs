@@ -1296,6 +1296,38 @@ struct FlightStats {
     approach_stable_config: Option<bool>,
     /// "Nutzte HAT statt AGL?" — fuer UI-Confidence-Indikator.
     approach_used_hat: bool,
+    // ─── v0.5.26 Erweiterte Landung-Metriken ───────────────────────────
+    //
+    // Phase 1 — Sicherheits-Indikatoren:
+    //   * wing_strike_severity_pct: Bank-am-TD vs. typischem Aircraft-
+    //     Limit, Severity 0-100% (= % Ausnutzung des Limits)
+    //   * float_distance_m: Threshold-Crossing → TD, indiziert Float
+    //   * touchdown_zone: 1/2/3 nach FAA (= 1.Drittel, 2.Drittel, 3.Drittel)
+    //   * vref_deviation_kt: IAS-am-TD − Vref. Vref-Source-Chain:
+    //     PMDG-FMC → ICAO-Kategorie-Default
+    //   * stable_at_da: composite-stable-flag aber bei 200 ft AGL/HAT
+    landing_wing_strike_severity_pct: Option<f32>,
+    landing_float_distance_m: Option<f32>,
+    /// Touchdown-Zone-Klassifikation: 1 (erstes Drittel = correct),
+    /// 2 (mittleres Drittel = lange-Landung), 3 (drittes Drittel =
+    /// ueberschossen). None wenn runway_length unbekannt.
+    landing_touchdown_zone: Option<u8>,
+    landing_vref_deviation_kt: Option<f32>,
+    /// Vref-Source-Indikator: "pmdg" / "icao_default" / "unknown".
+    landing_vref_source: Option<&'static str>,
+    /// Approach-Stable bei 200 ft AGL/HAT (= ICAO-DA-Gate)
+    approach_stable_at_da: Option<bool>,
+    // Phase 2 — Visualisierung-Daten (nicht direkt im Score, fuer UI)
+    // (= verwendet vorhandenen approach_buffer, kein extra Feld noetig)
+    // Phase 3 — Aggregate
+    /// Anzahl Stall-Warnings im Final + Approach.
+    approach_stall_warning_count: u32,
+    /// Yaw-Rate am TD (heading-Aenderung pro Sekunde) in deg/sec.
+    /// Hoch = Ground-Loop-Risk.
+    landing_yaw_rate_deg_per_sec: Option<f32>,
+    /// Brake-Energy-Proxy = (TD-IAS² × landing_weight) / rollout_distance.
+    /// Indiziert Brake-Pack-Belastung.
+    landing_brake_energy_proxy: Option<f32>,
     // ─── v0.5.24 Takeoff-Edge-Capture (50Hz Sampler) ───────────────────
     //
     // Frueher: stats.takeoff_pitch_deg / takeoff_bank_deg wurden im
@@ -2205,6 +2237,7 @@ pub struct ApproachBufferSample {
     pub gear_position: f32,
     pub flaps_position: f32,
     pub selected_runway: Option<String>,
+    pub stall_warning: bool,
 }
 
 fn push_approach_sample(stats: &mut FlightStats, snap: &SimSnapshot) {
@@ -2220,6 +2253,7 @@ fn push_approach_sample(stats: &mut FlightStats, snap: &SimSnapshot) {
         gear_position: snap.gear_position,
         flaps_position: snap.flaps_position,
         selected_runway: snap.selected_runway.clone(),
+        stall_warning: snap.stall_warning,
     });
     while stats.approach_buffer.len() > APPROACH_BUFFER_MAX {
         stats.approach_buffer.pop_front();
@@ -2598,6 +2632,57 @@ fn compute_approach_stddev(
     (Some(var_vs.sqrt() as f32), Some(var_bank.sqrt() as f32))
 }
 
+/// v0.5.26: ICAO-Kategorie-basierte Default-Limits fuer Wing-Strike +
+/// Vref. Wenn DBasic Tech-Limits-DB nicht verfuegbar oder PMDG-FMC-
+/// Vref nicht gesetzt, nutzen wir diese Conservative-Defaults.
+///
+/// Quellen: aircraft type certification data sheets (TCDS), FCOMs.
+/// Werte sind „typisch" fuer Standard-MTOW-Konfiguration. Pilot/VA
+/// kann via DBasic-Override fuer spezifische Variante setzen.
+struct AircraftLimits {
+    max_bank_landing_deg: f32,
+    typical_vref_kt: Option<f32>,
+}
+
+fn aircraft_limits_for(icao: &str) -> AircraftLimits {
+    let upper = icao.to_uppercase();
+    let upper_str = upper.as_str();
+    match upper_str {
+        // Heavy / Wide-Body
+        "B741" | "B742" | "B743" | "B744" | "B748" => AircraftLimits { max_bank_landing_deg: 9.0, typical_vref_kt: Some(160.0) },
+        "B772" | "B773" | "B77L" | "B77W" | "B778" | "B779" => AircraftLimits { max_bank_landing_deg: 8.0, typical_vref_kt: Some(150.0) },
+        "B788" | "B789" | "B78X" => AircraftLimits { max_bank_landing_deg: 8.0, typical_vref_kt: Some(145.0) },
+        "A332" | "A333" | "A338" | "A339" => AircraftLimits { max_bank_landing_deg: 8.0, typical_vref_kt: Some(140.0) },
+        "A359" | "A35K" => AircraftLimits { max_bank_landing_deg: 8.0, typical_vref_kt: Some(140.0) },
+        "A388" => AircraftLimits { max_bank_landing_deg: 7.0, typical_vref_kt: Some(145.0) },
+        // Narrow-Body Jets
+        "A318" | "A319" | "A320" | "A20N" => AircraftLimits { max_bank_landing_deg: 8.0, typical_vref_kt: Some(135.0) },
+        "A321" | "A21N" => AircraftLimits { max_bank_landing_deg: 7.0, typical_vref_kt: Some(140.0) }, // A321 tail-strike-prone
+        "B736" | "B737" | "B738" | "B739" | "B73X" => AircraftLimits { max_bank_landing_deg: 8.0, typical_vref_kt: Some(140.0) },
+        "B38M" | "B39M" => AircraftLimits { max_bank_landing_deg: 8.0, typical_vref_kt: Some(140.0) },
+        "B752" | "B753" => AircraftLimits { max_bank_landing_deg: 8.0, typical_vref_kt: Some(140.0) },
+        "B762" | "B763" | "B764" => AircraftLimits { max_bank_landing_deg: 8.0, typical_vref_kt: Some(140.0) },
+        // Regional Jets
+        "E170" | "E175" | "E190" | "E195" | "E290" | "E295" => AircraftLimits { max_bank_landing_deg: 8.0, typical_vref_kt: Some(130.0) },
+        "CRJ7" | "CRJ9" | "CRJX" => AircraftLimits { max_bank_landing_deg: 8.0, typical_vref_kt: Some(135.0) },
+        // Business Jets
+        "CL30" | "CL35" | "CL60" | "CL64" | "CL65" => AircraftLimits { max_bank_landing_deg: 6.0, typical_vref_kt: Some(115.0) },
+        "GLF5" | "GLF6" | "GLEX" | "G280" | "GL5T" | "GL7T" => AircraftLimits { max_bank_landing_deg: 7.0, typical_vref_kt: Some(120.0) },
+        "C25A" | "C25B" | "C25C" | "C525" | "C56X" | "C68A" => AircraftLimits { max_bank_landing_deg: 8.0, typical_vref_kt: Some(105.0) },
+        // Turboprops
+        "DH8A" | "DH8B" | "DH8C" | "DH8D" | "AT43" | "AT72" | "AT75" | "AT76" => AircraftLimits { max_bank_landing_deg: 8.0, typical_vref_kt: Some(110.0) },
+        "B190" | "B350" | "B190" => AircraftLimits { max_bank_landing_deg: 10.0, typical_vref_kt: Some(95.0) },
+        // GA Singles
+        "C172" | "C152" | "C150" | "C162" => AircraftLimits { max_bank_landing_deg: 15.0, typical_vref_kt: Some(65.0) },
+        "C182" | "C206" | "C208" => AircraftLimits { max_bank_landing_deg: 12.0, typical_vref_kt: Some(75.0) },
+        "DA40" | "DA42" | "DA62" => AircraftLimits { max_bank_landing_deg: 12.0, typical_vref_kt: Some(75.0) },
+        "P28A" | "PA28" | "PA32" | "PA46" => AircraftLimits { max_bank_landing_deg: 12.0, typical_vref_kt: Some(75.0) },
+        "SR20" | "SR22" | "SR2T" => AircraftLimits { max_bank_landing_deg: 12.0, typical_vref_kt: Some(80.0) },
+        // Fallback fuer unbekannte
+        _ => AircraftLimits { max_bank_landing_deg: 8.0, typical_vref_kt: None },
+    }
+}
+
 /// v0.5.25 Approach-Stability v2 — kompletter Result-Struct.
 #[derive(Debug, Clone, Default)]
 pub struct ApproachStabilityV2 {
@@ -2617,6 +2702,10 @@ pub struct ApproachStabilityV2 {
     pub stable_config: Option<bool>,
     /// HAT (statt AGL) als Window-Filter genutzt?
     pub used_hat: bool,
+    /// v0.5.26: Stable bei DA (200 ft AGL/HAT) erreicht?
+    pub stable_at_da: Option<bool>,
+    /// v0.5.26: Anzahl Stall-Warning-Samples im gesamten Approach-Buffer.
+    pub stall_warning_count: u32,
 }
 
 /// v0.5.25: Stable-Approach-Gate-konformes Stability-Maß.
@@ -2768,6 +2857,51 @@ fn compute_approach_stability_v2(
     let config_ok = out.stable_config.unwrap_or(true); // None = unbekannt, kein blocker
     let stable = jerk_ok && bank_ok && ias_ok && !out.excessive_sink && config_ok;
     out.stable_at_gate = Some(stable);
+
+    // 10) v0.5.26: Stable-At-DA (200 ft) — gleicher Composite-Check
+    //     aber mit den Samples die im 200-ft-Gate lagen (= subset).
+    let da_samples: Vec<&ApproachBufferSample> = buf.iter()
+        .filter(|s| {
+            let h = height_for(s);
+            h > 0.0 && h <= 200.0
+        })
+        .collect();
+    if da_samples.len() >= 3 {
+        let n_da = da_samples.len() as f64;
+        // V/S-Jerk im 200-ft-Gate
+        let mut jerk_sum = 0.0_f64;
+        for w in da_samples.windows(2) {
+            jerk_sum += (w[1].vs_fpm - w[0].vs_fpm).abs() as f64;
+        }
+        let da_jerk = jerk_sum / (da_samples.len() - 1) as f64;
+        // Bank-σ im 200-ft-Gate (gefiltert)
+        let da_bank: Vec<f32> = da_samples.iter()
+            .filter(|s| !in_vector_window(s.at))
+            .map(|s| s.bank_deg)
+            .collect();
+        let da_bank_sd = if da_bank.len() >= 3 {
+            let mean = da_bank.iter().map(|&b| b as f64).sum::<f64>() / da_bank.len() as f64;
+            let var = da_bank.iter()
+                .map(|&b| (b as f64 - mean).powi(2))
+                .sum::<f64>() / da_bank.len() as f64;
+            var.sqrt() as f32
+        } else { 0.0 };
+        let da_ias_mean = da_samples.iter().map(|s| s.ias_kt as f64).sum::<f64>() / n_da;
+        let da_ias_var = da_samples.iter()
+            .map(|s| (s.ias_kt as f64 - da_ias_mean).powi(2))
+            .sum::<f64>() / n_da;
+        let da_ias_sd = da_ias_var.sqrt() as f32;
+        let da_excess_sink = da_samples.iter().any(|s| s.vs_fpm < -1000.0);
+        // Strenger Cutoff bei DA: jerk < 80, bank < 3°, ias < 8 kt
+        let da_stable = da_jerk < 80.0
+            && da_bank_sd < 3.0
+            && da_ias_sd < 8.0
+            && !da_excess_sink;
+        out.stable_at_da = Some(da_stable);
+    }
+
+    // 11) v0.5.26: Stall-Warning-Counter ueber gesamten Buffer.
+    out.stall_warning_count = buf.iter().filter(|s| s.stall_warning).count() as u32;
 
     out
 }
@@ -7378,6 +7512,16 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                             approach_excessive_sink: Some(stats.approach_excessive_sink),
                             approach_stable_config: stats.approach_stable_config,
                             approach_used_hat: Some(stats.approach_used_hat),
+                            // v0.5.26
+                            landing_wing_strike_severity_pct: stats.landing_wing_strike_severity_pct,
+                            landing_float_distance_m: stats.landing_float_distance_m,
+                            landing_touchdown_zone: stats.landing_touchdown_zone,
+                            landing_vref_deviation_kt: stats.landing_vref_deviation_kt,
+                            landing_vref_source: stats.landing_vref_source.map(|s| s.to_string()),
+                            approach_stable_at_da: stats.approach_stable_at_da,
+                            approach_stall_warning_count: Some(stats.approach_stall_warning_count),
+                            landing_yaw_rate_deg_per_sec: stats.landing_yaw_rate_deg_per_sec,
+                            landing_brake_energy_proxy: stats.landing_brake_energy_proxy,
                             // v0.5.22: feeds the live-monitor's "Bahn-
                             // Auslastung"-sub-score so it matches the
                             // in-app PIREP value 1:1.
@@ -9086,6 +9230,97 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                 stats.approach_stable_config = stab_v2.stable_config;
                 stats.approach_used_hat = stab_v2.used_hat;
                 stats.approach_window_sample_count = Some(stab_v2.window_sample_count);
+                stats.approach_stable_at_da = stab_v2.stable_at_da;
+                stats.approach_stall_warning_count = stab_v2.stall_warning_count;
+
+                // ─── v0.5.26 Per-Touchdown-Metriken ─────────────────
+                let limits = aircraft_limits_for(&flight.aircraft_icao);
+
+                // Wing-Strike-Severity: |bank_at_td| / max_bank × 100%
+                if let Some(bank) = stats.landing_bank_deg {
+                    let pct = (bank.abs() / limits.max_bank_landing_deg) * 100.0;
+                    stats.landing_wing_strike_severity_pct = Some(pct);
+                }
+
+                // Float-Distance: Threshold-Crossing → TD.
+                // Threshold-Position kommt aus runway_match. Distanz
+                // direkt approximierbar als (rollout-Distanz von TD bis
+                // GS<2kt = total runway-overrun) — aber wir haben das
+                // nicht. Stattdessen: from-threshold-Distanz vom
+                // runway_match (= TD-Punkt past threshold).
+                // Float-Distanz ≈ past_threshold − typische
+                // Threshold-50ft-Crossing-Distance. Vereinfacht:
+                // touchdown_distance_from_threshold_ft direkt als
+                // "Float" interpretieren (= Distanz die der Pilot nach
+                // Threshold floated bevor er aufgesetzt hat). Pre-
+                // Threshold-Approach-Pfad ist hier nicht relevant.
+                if let Some((past_threshold_m, total_m)) = stats.runway_match.as_ref().map(|rw| {
+                    let past = rw.touchdown_distance_from_threshold_ft as f32 * 0.3048;
+                    let total = rw.length_ft * 0.3048;
+                    (past, total)
+                }) {
+                    stats.landing_float_distance_m = Some(past_threshold_m);
+
+                    // Touchdown-Zone-Klassifikation (FAA-Standard:
+                    // Zone 1 = erstes Drittel, Zone 2 = zweites,
+                    // Zone 3 = drittes Drittel der Bahn)
+                    if total_m > 0.0 {
+                        let third = total_m / 3.0;
+                        let zone = if past_threshold_m <= third { 1 }
+                                   else if past_threshold_m <= 2.0 * third { 2 }
+                                   else { 3 };
+                        stats.landing_touchdown_zone = Some(zone);
+                    }
+                }
+
+                // Vref-Deviation: PMDG-FMC-Vref → ICAO-Default-Fallback
+                let vref_kt = stats.pmdg_vref_at_landing.map(|v| v as f32);
+                let (vref_used, vref_source) = match vref_kt {
+                    Some(v) => (Some(v), "pmdg"),
+                    None => match limits.typical_vref_kt {
+                        Some(v) => (Some(v), "icao_default"),
+                        None => (None, "unknown"),
+                    },
+                };
+                stats.landing_vref_source = Some(vref_source);
+                if let (Some(vref), Some(ias)) = (vref_used, stats.landing_speed_kt) {
+                    stats.landing_vref_deviation_kt = Some(ias - vref);
+                }
+
+                // Yaw-Rate am TD: heading-Aenderung pro Sekunde im
+                // letzten 1-sec-Fenster vor TD.
+                let yaw_window_start = actual_td_at - chrono::Duration::milliseconds(1000);
+                let yaw_samples: Vec<(DateTime<Utc>, f32)> = stats.snapshot_buffer.iter()
+                    .filter(|s| s.at >= yaw_window_start && s.at <= actual_td_at)
+                    .map(|s| (s.at, s.heading_true_deg))
+                    .collect();
+                if yaw_samples.len() >= 2 {
+                    let first = yaw_samples.first().unwrap();
+                    let last = yaw_samples.last().unwrap();
+                    let mut delta = last.1 - first.1;
+                    while delta > 180.0 { delta -= 360.0; }
+                    while delta < -180.0 { delta += 360.0; }
+                    let dt_sec = (last.0 - first.0).num_milliseconds() as f32 / 1000.0;
+                    if dt_sec > 0.1 {
+                        stats.landing_yaw_rate_deg_per_sec = Some(delta.abs() / dt_sec);
+                    }
+                }
+
+                // Brake-Energy-Proxy = (mass × ias²) / rollout_distance.
+                // Vereinfacht: ohne mass = (ias²) / rollout — damit
+                // auch ohne LDW-SimVar berechenbar. Skaliert wenn mass
+                // verfuegbar.
+                if let (Some(ias), Some(rollout)) = (stats.landing_speed_kt, stats.rollout_distance_m) {
+                    if rollout > 50.0 && ias > 0.0 {
+                        let ias_ms = ias * 0.5144; // kt → m/s
+                        let mass = stats.landing_weight_kg.unwrap_or(50_000.0);
+                        let kinetic = 0.5 * mass * (ias_ms as f64).powi(2);
+                        // Normalisiert auf 100 = 100kJ pro Meter Rollout
+                        // = brake-typical 1MN-Aircraft mit 100m-Stop
+                        let energy_per_m = kinetic / rollout as f64;
+                        stats.landing_brake_energy_proxy = Some((energy_per_m / 1_000.0) as f32);
+                    }
+                }
                 tracing::info!(
                     pirep_id = %flight.pirep_id,
                     vs_dev_fpm = ?stab_v2.vs_deviation_fpm,

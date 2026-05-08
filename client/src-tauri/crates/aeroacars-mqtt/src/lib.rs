@@ -380,6 +380,35 @@ pub struct TouchdownPayload {
     /// False = AGL-Fallback (= im Tal-Anflug ueber Berge ggf. ungenau).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approach_used_hat: Option<bool>,
+    // ─── v0.5.26 Erweiterte Landung-Metriken ──────────────────────────
+    /// Wing-Strike-Severity: |bank_at_td| / aircraft_max_bank_deg × 100%.
+    /// 0% = wings level, 100% = am Limit. Aircraft-spezifisch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub landing_wing_strike_severity_pct: Option<f32>,
+    /// Distanz Threshold→Touchdown in Metern. Long-Landing-Indikator.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub landing_float_distance_m: Option<f32>,
+    /// Touchdown-Zone (1/2/3 nach FAA: erstes/zweites/drittes Drittel).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub landing_touchdown_zone: Option<u8>,
+    /// IAS-am-TD − Vref (positiv = zu schnell, negativ = zu langsam).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub landing_vref_deviation_kt: Option<f32>,
+    /// Vref-Quelle: "pmdg" / "icao_default" / "unknown".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub landing_vref_source: Option<String>,
+    /// Stable-Approach bei DA (= 200 ft AGL/HAT). Strenger als 1000-ft-Gate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approach_stable_at_da: Option<bool>,
+    /// Anzahl Stall-Warning-Samples im Approach-Buffer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approach_stall_warning_count: Option<u32>,
+    /// Yaw-Rate am Touchdown (deg/sec). Hoch = Ground-Loop-Risk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub landing_yaw_rate_deg_per_sec: Option<f32>,
+    /// Brake-Energy-Proxy in kJ/m. Hoch = brake-pack-thermal-stress.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub landing_brake_energy_proxy: Option<f32>,
 }
 
 fn is_false(b: &bool) -> bool { !*b }
