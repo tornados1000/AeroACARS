@@ -4,6 +4,29 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.5.36] — 2026-05-08
+
+🛩 **VFR/Manual-Mode: Aircraft-Mismatch wird Warnung statt Block.**
+
+User-Stance: „wir sollten dem Piloten vertrauen". Der bisherige Hard-Block beim Aircraft-Type-Mismatch im VFR/Manual-Modus widersprach dem — Pilot hat im Picker bewusst eine Aircraft gewählt, aber falls X-Plane die ICAO als `ATCCOM.AC_MODEL XXX.0.text` meldet oder Custom-Liveries den Title verändern, fiel der Loose-Match durch und der Start wurde geblockt.
+
+### 🆕 Was sich ändert
+
+- Backend: neuer Error-Code `aircraft_mismatch_warning` (statt `aircraft_mismatch`) im VFR-Pfad
+- ManualFlightPlan bekommt `acknowledge_aircraft_mismatch: bool` Feld
+- Erst-Versuch ohne Flag → liefert Warnung zurück
+- Modal zeigt **gelbes Warn-Banner** + **„Trotzdem starten"-Button**
+- Klick → Re-Submit mit `acknowledge=true` → Check wird übersprungen
+- Mismatch wird im Recorder weiter geloggt (für Forensik) aber blockt nicht
+
+### IFR-Mode unberührt
+
+`flight_start` (IFR mit SimBrief-OFP) liefert weiter den harten `aircraft_mismatch`-Error. Begründung: bei IFR ist der OFP die Source-of-Truth und ein Mismatch deutet auf einen Buchungs-Fehler hin.
+
+Versions-Bump 0.5.35 → 0.5.36.
+
+---
+
 ## [v0.5.35] — 2026-05-08
 
 🐞 **Touchdown-V/S Capture für GA + sparse-DataRef-Cases gefixt — Position-Sampling adaptiv unter 1000ft AGL.**

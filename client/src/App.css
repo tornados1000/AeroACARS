@@ -5859,6 +5859,26 @@ input:disabled {
   font-size: 0.85rem;
   margin-top: 12px;
 }
+/* v0.5.36: gelbes Warn-Banner für aircraft_mismatch_warning. Im
+ * Gegensatz zum roten Error-State erlaubt das Banner ein "Trotzdem
+ * starten" — der Pilot bestätigt die Diskrepanz und der Flug startet. */
+.manual-modal__warning {
+  padding: 10px 12px;
+  background: rgba(251, 191, 36, 0.12);
+  border-left: 3px solid #fbbf24;
+  border-radius: 4px;
+  color: #fcd34d;
+  font-size: 0.85rem;
+  margin-top: 12px;
+}
+.manual-modal__warning-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+  color: #fbbf24;
+}
+.manual-modal__warning-text {
+  color: #fde68a;
+}
 .manual-modal__actions {
   display: flex;
   justify-content: space-between;

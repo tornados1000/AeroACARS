@@ -5516,6 +5516,12 @@ pub struct ManualFlightPlan {
     /// Optional: geplanter Trip-Burn in kg (= planned_block - reserve - alternate).
     /// Wenn nicht gesetzt, fallback: 90% des block_fuel als Trip-Schaetzung.
     pub planned_burn_kg: Option<f32>,
+    /// v0.5.36: Pilot hat den Aircraft-Type-Mismatch akzeptiert
+    /// (= "trotzdem starten"-Button im Modal nach gelbem Warn-Banner).
+    /// Default false → erste Anfrage triggert die Warnung; nach Bestätigung
+    /// schickt das Frontend die gleiche Anfrage mit acknowledge=true.
+    #[serde(default)]
+    pub acknowledge_aircraft_mismatch: bool,
 }
 
 /// VFR/Manual-Flight-Start. Parallele Funktion zu flight_start aber
@@ -5621,20 +5627,34 @@ async fn flight_start_manual(
         .as_deref()
         .unwrap_or("")
         .to_string();
+    // v0.5.36: VFR/Manual-Mode → Aircraft-Mismatch ist eine WARNUNG,
+    // kein Hard-Block. Pilot hat im Picker bewusst eine Aircraft gewählt;
+    // wir vertrauen ihm. Auf Erst-Anfrage liefern wir den Mismatch als
+    // dedicated Error-Code "aircraft_mismatch_warning" zurück damit das
+    // Frontend ein gelbes Banner mit "Trotzdem starten"-Button zeigt.
+    // Beim zweiten Versuch mit acknowledge=true wird der Check übersprungen.
     if let (Some(expected), Some(actual)) = (expected_icao.as_ref(), sim_icao.as_ref()) {
         let title_supports_expected = title_mentions_icao(&sim_title, expected);
         let types_match_loose = aircraft_types_match(expected, actual);
         if !types_match_loose && !title_supports_expected {
-            let registration = expected_aircraft
-                .registration
-                .as_deref()
-                .unwrap_or("?");
-            return Err(UiError::new(
-                "aircraft_mismatch",
-                format!(
-                    "Aircraft mismatch: gewählt {expected} ({registration}), Sim hat {actual}. Lade den richtigen Aircraft-Type im Sim oder waehle ein anderes Aircraft.",
-                ),
-            ));
+            if !plan.acknowledge_aircraft_mismatch {
+                let registration = expected_aircraft
+                    .registration
+                    .as_deref()
+                    .unwrap_or("?");
+                return Err(UiError::new(
+                    "aircraft_mismatch_warning",
+                    format!(
+                        "Aircraft passt nicht: gewählt {expected} ({registration}), Sim hat {actual}. Trotzdem starten? (VFR-Mode vertraut deiner Wahl — der Sim-Type beeinflusst aber Score-Limits.)",
+                    ),
+                ));
+            }
+            // Acknowledged — log it for diagnostics but proceed
+            tracing::warn!(
+                expected = %expected,
+                actual = %actual,
+                "VFR/Manual: aircraft mismatch acknowledged by pilot — proceeding"
+            );
         }
     }
 

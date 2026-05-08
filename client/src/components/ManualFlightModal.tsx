@@ -42,6 +42,7 @@ interface ManualFlightPlan {
   alt_airport_id?: string;
   planned_zfw_kg?: number;
   planned_burn_kg?: number;
+  acknowledge_aircraft_mismatch?: boolean;
 }
 
 interface SimContextHint {
@@ -64,6 +65,9 @@ export function ManualFlightModal({ bid, simHint, onClose, onFlightStarted }: Pr
   const { t } = useTranslation();
   const [stage, setStage] = useState<Stage>("aircraft");
   const [error, setError] = useState<string | null>(null);
+  // v0.5.36: yellow warning banner für aircraft_mismatch_warning, mit
+  // "Trotzdem starten"-Button. Separater State von `error` (rote Bar).
+  const [warning, setWarning] = useState<string | null>(null);
 
   // Stage 1 — Aircraft-Picker
   const [aircraftList, setAircraftList] = useState<AircraftPickerEntry[] | null>(null);
@@ -132,10 +136,11 @@ export function ManualFlightModal({ bid, simHint, onClose, onFlightStarted }: Pr
   function proceedToPlan() {
     if (!selected) return;
     setError(null);
+    setWarning(null);
     setStage("plan");
   }
 
-  async function submit() {
+  async function submit(acknowledgeAircraftMismatch = false) {
     if (!selected) return;
     const blockFuel = parseFloat(blockFuelKg);
     const ftMin = parseInt(flightTimeMin, 10);
@@ -158,9 +163,11 @@ export function ManualFlightModal({ bid, simHint, onClose, onFlightStarted }: Pr
     if (altAirport.trim().length > 0) plan.alt_airport_id = altAirport.trim().toUpperCase();
     const zfw = parseFloat(zfwKg);
     if (Number.isFinite(zfw) && zfw > 0) plan.planned_zfw_kg = zfw;
+    if (acknowledgeAircraftMismatch) plan.acknowledge_aircraft_mismatch = true;
 
     setStage("submitting");
     setError(null);
+    setWarning(null);
     try {
       const result = await invoke<ActiveFlightInfo>("flight_start_manual", {
         bidId: bid.id,
@@ -169,6 +176,14 @@ export function ManualFlightModal({ bid, simHint, onClose, onFlightStarted }: Pr
       onFlightStarted(result);
     } catch (err: unknown) {
       const ui = asUiError(err);
+      // v0.5.36: aircraft_mismatch_warning ist KEIN Hard-Block — wir
+      // zeigen ein gelbes Warn-Banner mit "Trotzdem starten"-Button.
+      if (ui.code === "aircraft_mismatch_warning") {
+        setWarning(t("flight.error.aircraft_mismatch_warning"));
+        setError(null);
+        setStage("plan");
+        return;
+      }
       // Map known backend error codes to localized messages — analog
       // zu BidsList.tsx-IFR-Pfad. Fallback: rohe Server-Message.
       const knownCodes = [
@@ -187,6 +202,7 @@ export function ManualFlightModal({ bid, simHint, onClose, onFlightStarted }: Pr
         ? t(`flight.error.${ui.code}`)
         : ui.message;
       setError(msg);
+      setWarning(null);
       setStage("plan");
     }
   }
@@ -415,6 +431,14 @@ export function ManualFlightModal({ bid, simHint, onClose, onFlightStarted }: Pr
             </div>
 
             {error && <div className="manual-modal__error">{error}</div>}
+            {warning && (
+              <div className="manual-modal__warning">
+                <div className="manual-modal__warning-title">
+                  {t("manual_flight.warning_title")}
+                </div>
+                <div className="manual-modal__warning-text">{warning}</div>
+              </div>
+            )}
 
             <div className="manual-modal__actions">
               <button
@@ -425,14 +449,26 @@ export function ManualFlightModal({ bid, simHint, onClose, onFlightStarted }: Pr
               >
                 {t("manual_flight.back")}
               </button>
-              <button
-                type="button"
-                className="button button--primary"
-                onClick={() => void submit()}
-                disabled={stage === "submitting"}
-              >
-                {stage === "submitting" ? t("manual_flight.submitting") : t("manual_flight.submit")}
-              </button>
+              {warning ? (
+                <button
+                  type="button"
+                  className="button button--primary"
+                  onClick={() => void submit(true)}
+                  disabled={stage === "submitting"}
+                  style={{ background: "#fbbf24", borderColor: "#fbbf24", color: "#1f1f1f" }}
+                >
+                  {stage === "submitting" ? t("manual_flight.submitting") : t("manual_flight.start_anyway")}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="button button--primary"
+                  onClick={() => void submit(false)}
+                  disabled={stage === "submitting"}
+                >
+                  {stage === "submitting" ? t("manual_flight.submitting") : t("manual_flight.submit")}
+                </button>
+              )}
             </div>
           </div>
         )}

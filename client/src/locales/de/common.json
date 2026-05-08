@@ -779,6 +779,7 @@
       "bid_not_found": "Bid nicht gefunden — bitte aktualisieren.",
       "aircraft_not_available": "Flugzeug nicht verfügbar — Details siehe unten. Häufige Ursachen: das Flugzeug steht an einem anderen Flughafen, ist gerade „in use“ durch einen offenen PIREP, oder Ihr Rang hat keinen Zugriff. Aufräumen via phpVMS-Admin (PIREPs canceln + Aircraft-Standort prüfen).",
       "aircraft_mismatch": "Flugzeug-Typ passt nicht — Sie sitzen im falschen Flugzeug für diese Bid. Laden Sie den richtigen Typ im Simulator oder wählen Sie eine andere Bid.",
+      "aircraft_mismatch_warning": "Flugzeug-Typ passt nicht zur Picker-Wahl — Sim hat einen anderen Typ geladen. Im VFR-Mode kannst du trotzdem starten (deine Wahl wird respektiert), aber Score-Limits gelten weiterhin für den gewählten Typ.",
       "phpvms_error": "phpVMS hat den Flug abgelehnt — siehe Details."
     }
   },
@@ -798,6 +799,8 @@
     "search_placeholder": "🔍 Suche nach ICAO / Registration / Name…",
     "no_match": "Kein Flugzeug passt zu „{{search}}\".",
     "submitting": "Starte…",
+    "warning_title": "⚠ Achtung",
+    "start_anyway": "Trotzdem starten",
     "back": "← Zurück",
     "submit": "🛩 Flug starten",
     "cancel": "Abbrechen",
