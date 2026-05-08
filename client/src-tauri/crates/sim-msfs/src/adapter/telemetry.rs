@@ -1072,7 +1072,17 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
         altitude_agl_ft: t.altitude_agl_ft,
         heading_deg_true: t.heading_true_deg as f32,
         heading_deg_magnetic: t.heading_magnetic_deg as f32,
-        pitch_deg: t.pitch_deg as f32,
+        // v0.5.24: MSFS-SimConnect convention is INVERTED — `PLANE PITCH
+        // DEGREES` reports positive values when the nose is BELOW horizon.
+        // We negate here so downstream code (FSM phase transitions,
+        // tail-strike check, sampler capture, PIREP custom fields,
+        // analytics) sees the universal aviation convention: positive
+        // pitch = nose UP, like X-Plane reports natively.
+        // Without this, every MSFS PIREP had inverted pitch (e.g. an
+        // A321 rotation showed as -11.2° instead of +11.2°), which made
+        // tail-strike checks rely on abs() to mask the bug, but
+        // confused pilots reading the raw value in their PIREP detail.
+        pitch_deg: -(t.pitch_deg as f32),
         bank_deg: t.bank_deg as f32,
         vertical_speed_fpm: t.vertical_speed_fpm as f32,
         velocity_body_x_fps: Some(t.velocity_body_x_fps as f32),

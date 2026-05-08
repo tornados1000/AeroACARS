@@ -864,7 +864,14 @@ fn run_dispatch(
                                     // descent (negative) value at touchdown.
                                     snap.touchdown_vs_fpm =
                                         Some(-((td.vs_fps * 60.0).abs()) as f32);
-                                    snap.touchdown_pitch_deg = Some(td.pitch_deg as f32);
+                                    // v0.5.24: invert MSFS pitch — same
+                                    // convention bug as live PLANE PITCH
+                                    // DEGREES (positive=nose-down in
+                                    // MSFS, but universal aviation
+                                    // expects positive=nose-up). Without
+                                    // this an A321 flare with +5° real
+                                    // pitch was stored as -5° in PIREPs.
+                                    snap.touchdown_pitch_deg = Some(-(td.pitch_deg as f32));
                                     snap.touchdown_bank_deg = Some(td.bank_deg as f32);
                                     snap.touchdown_heading_mag_deg =
                                         Some(td.heading_mag_deg as f32);

@@ -4,6 +4,50 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.5.24] — 2026-05-08
+
+🎯 **Pitch-Sign-Fix für MSFS + frame-genaues Wheels-Up-Capture für Tail-Strike-Detection.** Plus Client-Version-Tag im MQTT-Stream für Version-Compliance-Tracking.
+
+### 🐛 Behoben
+
+**1. MSFS pitch-sign invertiert (= alle MSFS-Pilot-PIREPs hatten falsches Vorzeichen)**
+
+MSFS-SimConnect hat eine inverse Konvention: `PLANE PITCH DEGREES` reportet **positive Werte wenn die Nase UNTER dem Horizont** ist (= Universal-Aviation-Konvention macht es umgekehrt: positiv = nose-up). AeroACARS las den Wert ohne Sign-Flip und schrieb daher invertierte Werte in alle MSFS-Pilot-PIREPs:
+
+- A321-Flare bei +5° real → gespeichert als -5° (Pilot sieht „Nose-down landing" obwohl er normal flared)
+- A321-Rotation bei +11° real → gespeichert als -11°
+- Alle `Touchdown Sideslip`, `Landing Pitch`, `Takeoff Pitch` Custom-Fields betroffen
+
+phpVMS DisposableSpecial-Triggers nutzten `abs()` und maskierten den Bug an der Trigger-Stelle. Aber Pilot-PIREP-Detail-Views zeigten die unsinnigen negativen Werte. **Fix:** sign-flip im MSFS-Adapter-Boundary (`telemetry.rs::SimSnapshot{}`-Builder + `adapter.rs` Touchdown-Block-Reader). X-Plane bleibt unangetastet — dortige `sim/flightmodel/position/theta`-DataRef ist konventions-konform.
+
+**2. Takeoff-Pitch-Capture frame-genau (= Tail-Strike-Check präziser)**
+
+Bisher wurden `takeoff_pitch_deg` / `takeoff_bank_deg` im Streamer-Tick gestempelt — das ist 3-30s Cadence je nach Phase, also potenziell mehrere Sekunden NACH dem echten Wheels-Up-Frame. Bei diesen Sekunden hat das Aircraft schon weiter pitch-up rotiert (Initial-Climb), der gestempelte Wert war oft 2-3° höher als der eigentliche Rotations-Pitch.
+
+**Fix:** der bestehende 50Hz-Touchdown-Sampler-Task fängt jetzt auch den umgekehrten Edge ab (`prev_in_air=false → in_air_now=true` = Wheels-Up). Capture innerhalb 20ms im physischen Lift-Off-Frame. Phase-Transition-Code in `step_flight` verwendet `sampler_takeoff_pitch_deg.or(snap.pitch_deg)` als Priority-Chain — Sampler-Wert wins wenn vorhanden, sonst Streamer-Tick als Fallback. Wirkt beide Sims (X-Plane via `gear_normal_force_n` Edge, MSFS via `on_ground` Edge).
+
+Bei tail-strike-empfindlichen Aircraft wie der A321 (~9.7° max safe pitch) erspart das 2-3° False-Positive-Drift im phpVMS DisposableSpecial Tail-Strike-Check.
+
+### ✨ Neu
+
+**3. `client_version`-Field im MQTT-PositionPayload**
+
+Pro Position-Tick schickt der Client jetzt `client_version: "0.5.24"`. Der aeroacars-live-Monitor sieht damit pro Pilot welche Build-Version sendet — nützlich für:
+
+- Version-Compliance-Tracking („Pilot X läuft noch v0.5.15, hat den Numeric-Fix nicht")
+- Bug-Korrelation („alle disagreement-Touchdowns kommen von v0.5.18-")
+- Updater-Monitoring („wieviele % der Piloten sind auf der neuesten Version?")
+
+Server-seitig: das Field landet in `flights.last_position_json` (= im rohen JSON-Snapshot pro Pilot) und kann dort per `json_extract()` aggregiert werden. Native Tabellen-Spalte folgt in einem Server-Patch falls nötig.
+
+### ⚠ Hinweise
+
+- Existierende PIREPs werden NICHT retroaktiv korrigiert — nur neu eingehende MSFS-Touchdowns ab v0.5.24-Pilot-Version haben korrektes Pitch-Vorzeichen
+- DisposableSpecial-Tail-Strike-Triggers funktionieren weiterhin via `abs()` — Pre-v0.5.24-Daten triggern korrekt, Post-v0.5.24-Daten ebenfalls (MSFS-Werte jetzt mit positivem Vorzeichen)
+- Update via Auto-Updater empfohlen damit MSFS-Pilot-PIREPs ab sofort intuitive Pitch-Werte zeigen
+
+---
+
 ## [v0.5.23] — 2026-05-08
 
 🎯 **Forensik-Werkzeuge: aeroacars-live-Monitor sieht jetzt alles was der Client sieht.** Plus harte Fixes für Session-Splitting bei Hin/Rück-Flügen und leere ICAO-Felder.

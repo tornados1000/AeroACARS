@@ -183,6 +183,11 @@ struct PositionPayload {
     dep: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     arr: Option<String>,
+    /// v0.5.24: Client-Version damit der aeroacars-live-Monitor sieht
+    /// welcher Pilot mit welcher Build-Version sendet. Ermöglicht
+    /// Version-Compliance-Tracking (= "Pilot X läuft noch v0.5.16-Pre-
+    /// Numeric-Fix, Hard-Landing-Check failed silent").
+    client_version: &'static str,
 }
 
 /// Convert empty/whitespace-only strings to None — used at the JSON-edge
@@ -454,6 +459,7 @@ impl Handle {
             simulator: simulator_label(snap.simulator),
             dep: non_empty(&meta.dep_icao),
             arr: non_empty(&meta.arr_icao),
+            client_version: env!("CARGO_PKG_VERSION"),
         };
         match self.tx.try_send(Cmd::Position(Box::new(payload))) {
             Ok(()) => {}

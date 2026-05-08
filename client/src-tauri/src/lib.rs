@@ -1244,6 +1244,24 @@ struct FlightStats {
     /// against a real AGL-Δ estimate.
     /// Reset on Approach entry so go-arounds don't carry stale data.
     low_agl_vs_min_fpm: Option<f32>,
+    // ─── v0.5.24 Takeoff-Edge-Capture (50Hz Sampler) ───────────────────
+    //
+    // Frueher: stats.takeoff_pitch_deg / takeoff_bank_deg wurden im
+    // step_flight-Streamer-Tick (3-30s Cadence) gestempelt — also
+    // potenziell mehrere Sekunden NACH dem echten Wheels-Up-Frame.
+    // Resultat: Pitch wird zu hoch erfasst (= Initial-Climb-Pitch statt
+    // Rotations-Pitch), bei tail-strike-empfindlichen Aircraft wie der
+    // A321 ist das ein realistischer 2-3°-Versatz der False-Positive-
+    // Tail-Strike-Checks im phpVMS DisposableSpecial-Modul triggert.
+    //
+    // Neu: der 50Hz-Touchdown-Sampler wurde erweitert um auch die
+    // umgekehrte Edge (on_ground=true → false = Wheels-Up) zu fangen.
+    // Capture im Frame des physischen Lift-Off (binnen 20ms). Werden
+    // im step_flight-Phase-Transition als bevorzugte Quelle genutzt
+    // statt snap.pitch_deg.
+    sampler_takeoff_at: Option<DateTime<Utc>>,
+    sampler_takeoff_pitch_deg: Option<f32>,
+    sampler_takeoff_bank_deg: Option<f32>,
     // ─── v0.5.23 Touchdown-Forensik ───────────────────────────────────
     //
     // Bei jedem Touchdown laufen MSFS- und X-Plane-Schaetzer parallel
@@ -6598,6 +6616,29 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
                 }
             }
 
+            // v0.5.24: Takeoff-Edge (Wheels-Up) — opposite of touchdown.
+            // Wenn `prev_in_air=false` und jetzt `in_air_now=true`, ist
+            // der Flieger gerade abgehoben. Wir capturen Pitch + Bank
+            // exakt im Frame (50Hz, <20ms-Genauigkeit). Guard
+            // `sampler_takeoff_at.is_none()` verhindert Re-Trigger bei
+            // Touch-and-Go im Pattern (= zweiter Wheels-Up nach erstem
+            // Touchdown ueberschreibt nicht den initialen Takeoff-Wert).
+            let takeoff_edge_detected =
+                matches!(prev_in_air, Some(false)) && in_air_now;
+            if takeoff_edge_detected && stats.sampler_takeoff_at.is_none() {
+                stats.sampler_takeoff_at = Some(now);
+                stats.sampler_takeoff_pitch_deg = Some(snap.pitch_deg);
+                stats.sampler_takeoff_bank_deg = Some(snap.bank_deg);
+                tracing::info!(
+                    pirep_id = %flight.pirep_id,
+                    captured_pitch_deg = snap.pitch_deg,
+                    captured_bank_deg = snap.bank_deg,
+                    on_ground = snap.on_ground,
+                    fnrml_n = snap.gear_normal_force_n,
+                    "sampler-side takeoff edge detected (wheels-up frame)"
+                );
+            }
+
             if edge_detected && stats.sampler_touchdown_at.is_none() {
                 // Pitch-Korrektur: world-frame Y-Velocity → body-axial
                 // (xgs-Pattern). Bei typischem Touchdown-Pitch ~3-5°
@@ -7781,8 +7822,14 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                 // v0.5.16: capture pitch + bank for tail-strike /
                 // wing-strike maintenance detection (DisposableSpecial
                 // dmaintenance reads these as numeric custom fields).
-                stats.takeoff_pitch_deg = Some(snap.pitch_deg);
-                stats.takeoff_bank_deg = Some(snap.bank_deg);
+                // v0.5.24: prefer the 50Hz-sampler value (Wheels-Up-
+                // frame-genau) ueber den Streamer-Tick-Snapshot.
+                stats.takeoff_pitch_deg = stats
+                    .sampler_takeoff_pitch_deg
+                    .or(Some(snap.pitch_deg));
+                stats.takeoff_bank_deg = stats
+                    .sampler_takeoff_bank_deg
+                    .or(Some(snap.bank_deg));
                 if let Some(tw) = snap.total_weight_kg {
                     stats.takeoff_weight_kg = Some(tw as f64);
                 } else {
@@ -7907,8 +7954,14 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                 // v0.5.16: capture pitch + bank for tail-strike /
                 // wing-strike maintenance detection (DisposableSpecial
                 // dmaintenance reads these as numeric custom fields).
-                stats.takeoff_pitch_deg = Some(snap.pitch_deg);
-                stats.takeoff_bank_deg = Some(snap.bank_deg);
+                // v0.5.24: prefer the 50Hz-sampler value (Wheels-Up-
+                // frame-genau) ueber den Streamer-Tick-Snapshot.
+                stats.takeoff_pitch_deg = stats
+                    .sampler_takeoff_pitch_deg
+                    .or(Some(snap.pitch_deg));
+                stats.takeoff_bank_deg = stats
+                    .sampler_takeoff_bank_deg
+                    .or(Some(snap.bank_deg));
                 if let Some(tw) = snap.total_weight_kg {
                     stats.takeoff_weight_kg = Some(tw as f64);
                 } else {
@@ -7961,8 +8014,16 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                 // v0.5.16: capture pitch + bank for tail-strike /
                 // wing-strike maintenance detection (DisposableSpecial
                 // dmaintenance reads these as numeric custom fields).
-                stats.takeoff_pitch_deg = Some(snap.pitch_deg);
-                stats.takeoff_bank_deg = Some(snap.bank_deg);
+                // v0.5.24: prefer the 50Hz-sampler value (Wheels-Up-
+                // frame-genau) ueber den Streamer-Tick-Snapshot. Bei
+                // tail-strike-empfindlichen Aircraft wie A321 spart das
+                // 2-3° Pitch-Drift gegen den 3-30s-spaeter-Tick.
+                stats.takeoff_pitch_deg = stats
+                    .sampler_takeoff_pitch_deg
+                    .or(Some(snap.pitch_deg));
+                stats.takeoff_bank_deg = stats
+                    .sampler_takeoff_bank_deg
+                    .or(Some(snap.bank_deg));
                 // Prefer TOTAL WEIGHT (fuel + payload + empty); fall
                 // back to ZFW + fuel only when the SimVar isn't wired.
                 if let Some(tw) = snap.total_weight_kg {
