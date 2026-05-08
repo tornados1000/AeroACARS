@@ -5749,6 +5749,13 @@ async fn flight_end(
                     handle.pirep(pirep_payload);
                 }
             }
+            // v0.5.23 Forensik-Upload: gzip + POST des kompletten JSONL-
+            // Logfiles an aeroacars-live damit der VA-Owner ohne den
+            // Piloten zu kontaktieren das vollstaendige SimSnapshot-Log
+            // (80 Felder) + Activity-Log + PhaseChanged-Stream pro
+            // Session abrufen kann. Fire-and-forget, blockt PIREP-File
+            // nicht — Failure landet nur im Log.
+            spawn_flight_log_upload(&app, flight.pirep_id.clone());
             consume_bid_best_effort(&client, flight.bid_id).await;
             Ok(())
         }
@@ -6325,6 +6332,83 @@ async fn flight_resume_after_disconnect(
 /// the bounce rebound that the single 1 Hz sample was catching.
 ///
 /// Exits when `flight.stop` is set, just like the streamer.
+/// v0.5.23 Forensik-Upload. Spawnt einen async-Task der das per-Flug
+/// JSONL-Logfile `<app_data>/flight_logs/<pirep_id>.jsonl` gzippt und an
+/// aeroacars-live POSTet. Endpoint: `/api/flight-logs/upload`. Auth via
+/// HTTP Basic gegen die provisioned_pilots-Tabelle (gleiche Cred-Pair wie
+/// Mosquitto-MQTT-Login).
+///
+/// Failure-Modi (alle non-fatal):
+///   * Log-Datei nicht vorhanden — z.B. Recording war disabled oder
+///     PIREP wurde manuell gefilet ohne dass das Recorder-Modul den
+///     Flug initialisiert hat. → tracing::debug, kein Retry.
+///   * Keyring-Read fehlgeschlagen — auch non-fatal. Pilot kann beim
+///     naechsten App-Start neu provisionieren.
+///   * Server gibt non-2xx zurueck (401 / 403 / 5xx) — gelogged, keine
+///     Retry-Queue heute (kann spaeter mit Pending-Folder kommen).
+fn spawn_flight_log_upload(app: &AppHandle, pirep_id: String) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        // 1. Pfad zur JSONL-Datei zusammensetzen — gleiche Logik wie der
+        //    Recorder selbst (sanitize_pirep_id).
+        let app_data_dir = match app.path().app_data_dir() {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(error = %e, "log-upload: no app_data_dir");
+                return;
+            }
+        };
+        let safe_pirep = pirep_id
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect::<String>();
+        let log_path = app_data_dir
+            .join("flight_logs")
+            .join(format!("{safe_pirep}.jsonl"));
+        if !log_path.exists() {
+            tracing::debug!(path = ?log_path, "log-upload: file missing — skipping");
+            return;
+        }
+
+        // 2. MQTT-Credentials aus Keyring (= identisch zu HTTP-Basic).
+        let username = match secrets::load_api_key(MQTT_KEYRING_USERNAME) {
+            Ok(Some(u)) => u,
+            _ => {
+                tracing::warn!("log-upload: no MQTT username in keyring — skip");
+                return;
+            }
+        };
+        let password = match secrets::load_api_key(MQTT_KEYRING_PASSWORD) {
+            Ok(Some(p)) => p,
+            _ => {
+                tracing::warn!("log-upload: no MQTT password in keyring — skip");
+                return;
+            }
+        };
+
+        // 3. Hochladen.
+        match aeroacars_mqtt::log_upload::upload_flight_log(
+            &log_path,
+            &pirep_id,
+            &username,
+            &password,
+            None, // default endpoint = https://live.kant.ovh/api/flight-logs/upload
+        ).await {
+            Ok(stats) => tracing::info!(
+                pirep_id = %pirep_id,
+                raw_kb = stats.raw_size / 1024,
+                gzip_kb = stats.compressed_size / 1024,
+                "flight log uploaded",
+            ),
+            Err(e) => tracing::warn!(
+                pirep_id = %pirep_id,
+                error = %e,
+                "flight log upload failed (non-fatal)",
+            ),
+        }
+    });
+}
+
 fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
     tauri::async_runtime::spawn(async move {
         tracing::info!(pirep_id = %flight.pirep_id, "touchdown sampler started");

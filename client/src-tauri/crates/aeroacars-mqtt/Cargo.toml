@@ -17,6 +17,11 @@ tracing.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 reqwest.workspace = true
+# v0.5.23: gzip-Compression fuer Client-Log-Upload nach PIREP-File.
+# Transitive ueber andere Crates schon im Workspace, hier direkt deklariert.
+flate2 = "1"
+# Basic-Auth Encoding fuer den Upload-Endpoint. Auch transitive verfuegbar.
+base64 = "0.22"
 
 # rumqttc 0.24: async MQTT-Client. Features:
 # - websocket  → MQTT-over-WebSocket (für wss:// gegen Caddy)

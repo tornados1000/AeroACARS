@@ -33,6 +33,7 @@ use tracing::{debug, error, info, warn};
 use url::Url;
 
 pub mod provision;
+pub mod log_upload;
 
 const STATUS_ONLINE: &str = "online";
 const STATUS_OFFLINE: &str = "offline";

@@ -46,7 +46,9 @@ name = "aeroacars-mqtt"
 version = "0.5.22"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
+ "flate2",
  "reqwest 0.12.28",
  "rumqttc",
  "rustls 0.22.4",
