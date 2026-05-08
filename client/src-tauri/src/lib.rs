@@ -6414,17 +6414,45 @@ fn spawn_flight_log_upload(app: &AppHandle, pirep_id: String) {
             &password,
             None, // default endpoint = https://live.kant.ovh/api/flight-logs/upload
         ).await {
-            Ok(stats) => tracing::info!(
-                pirep_id = %pirep_id,
-                raw_kb = stats.raw_size / 1024,
-                gzip_kb = stats.compressed_size / 1024,
-                "flight log uploaded",
-            ),
-            Err(e) => tracing::warn!(
-                pirep_id = %pirep_id,
-                error = %e,
-                "flight log upload failed (non-fatal)",
-            ),
+            Ok(stats) => {
+                tracing::info!(
+                    pirep_id = %pirep_id,
+                    raw_kb = stats.raw_size / 1024,
+                    gzip_kb = stats.compressed_size / 1024,
+                    "flight log uploaded",
+                );
+                // v0.5.23: Pilot-UI-Feedback im Activity-Log damit der
+                // Pilot sieht dass der Upload geklappt hat. Detail-Spalte
+                // zeigt die Groessen-Statistik fuer Debugging.
+                log_activity_handle(
+                    &app,
+                    ActivityLevel::Info,
+                    "Flight log uploaded to live-tracking server",
+                    Some(format!(
+                        "{} KB raw → {} KB gzip ({}% Kompression)",
+                        stats.raw_size / 1024,
+                        stats.compressed_size / 1024,
+                        ((stats.compressed_size as f64 / stats.raw_size as f64) * 100.0) as i32,
+                    )),
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    pirep_id = %pirep_id,
+                    error = %e,
+                    "flight log upload failed (non-fatal)",
+                );
+                // Fehler ist non-fatal — JSONL bleibt lokal verfuegbar.
+                // Wir loggen mit ActivityLevel::Warn damit der Pilot
+                // weiss dass Forensik-Upload nicht klappte (= bei
+                // Bug-Reports den Pfad zur lokalen Datei nennen).
+                log_activity_handle(
+                    &app,
+                    ActivityLevel::Warn,
+                    "Flight log upload failed (non-fatal)",
+                    Some(format!("{} — Log liegt lokal in flight_logs/{}.jsonl", e, pirep_id)),
+                );
+            }
         }
     });
 }

@@ -4,6 +4,76 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.5.23] — 2026-05-08
+
+🎯 **Forensik-Werkzeuge: aeroacars-live-Monitor sieht jetzt alles was der Client sieht.** Plus harte Fixes für Session-Splitting bei Hin/Rück-Flügen und leere ICAO-Felder.
+
+### ✨ Neu
+
+**1. Auto-Upload des kompletten Flight-Logs nach PIREP-File**
+
+Nach erfolgreichem `file_pirep` lädt der Client das komplette JSONL-Logfile automatisch als gzip an aeroacars-live (`POST /api/flight-logs/upload`). Der VA-Owner kann es dann über den **„📥 Client-Log"-Button** in der History-Detail-View herunterladen — ohne den Piloten kontaktieren zu müssen.
+
+- Auth via dieselbe MQTT-Cred-Pair die schon in der Provisioning-Phase im OS-Keyring liegt — keine zusätzliche Konfiguration
+- Fire-and-forget — Failure ist non-fatal, JSONL bleibt lokal verfügbar
+- Pilot kriegt Activity-Log-Eintrag mit Größen-Statistik (z.B. „2342 KB raw → 412 KB gzip (18% Kompression)")
+- Bandwidth: typischer 2h-Flug ≈ 200-800 KB komprimiert
+- Server-Storage: Auto-Purge auf VPS nach 90 Tagen vorgesehen
+
+**Forensik-Wert:** der JSONL-Stream hat **mehr** als der MQTT-Server-Stream:
+- ≈80 SimSnapshot-Felder pro Position-Tick (statt ≈35 via MQTT)
+- Vollständiger User-Activity-Log
+- PhaseChanged-Events mit altitude/groundspeed-Kontext bei jeder FSM-Transition
+- Velocity-Body-Achsen, FCU-Setpoints, alle Lichter, COM/NAV-Radios, Autobrake, APU-State, Pushback-State, Seatbelts-/No-Smoking-Sign
+
+**2. Touchdown-Algorithmen-Forensik im aeroacars-live-Monitor**
+
+Bei jedem Touchdown laufen MSFS-Time-Tier- und X-Plane-Lua-30-Sample-Schätzer schon parallel — jetzt kriegt aeroacars-live alle Zwischenergebnisse und kann **Algorithmen-Disagreements** (= |xp_estimate − msfs_estimate| > 50 fpm) sichtbar machen für FSM-Edge-Case-Analyse.
+
+Neue Felder in TouchdownPayload:
+- `simulator`: „msfs" / „xplane" / „other"
+- `vs_estimate_xp_fpm`: Lua-30-Sample-Schätzung
+- `vs_estimate_msfs_fpm`: Time-Tier-Schätzung
+- `vs_source`: welcher Pfad gewann („msfs_simvar_latched" / „agl_estimate_msfs" / „agl_estimate_xp" / „sampler_gear_force" / „buffer_min" / „low_agl_vs_min")
+- `gear_force_peak_n`: X-Plane-Sampler-Wert
+- `estimate_window_ms`: Window-Größe des gewinnenden Schätzers
+- `estimate_sample_count`: Samples im Berechnungs-Fenster
+
+Webapp-seitig: Touchdowns-Tab kriegt **„🔬 Touchdown-Forensik nach Simulator"-Card** + Sim-Filter („MSFS / X-Plane / Alle") + **„⚠ Disagreement"**-Filter + LandingAnalysis-Modal kriegt **„🔬 Algorithmen-Forensik"-Card** mit beiden Schätzern nebeneinander.
+
+### 🐛 Behoben
+
+**3. MQTT-Identity-Felder nicht mehr als leere Strings serialisiert**
+
+PositionPayload-Felder `callsign` / `aircraft_icao` / `dep` / `arr` / `aircraft_registration` sind jetzt `Option<String>` mit `#[serde(skip_serializing_if = "Option::is_none")]`. Empty/whitespace-only Werte verschwinden komplett aus dem JSON statt als `""` gesendet zu werden.
+
+**Hintergrund:** phpVMS-API liefert manchmal leere ICAO-Codes (Aircraft ohne `icao_code`-Feld in der VA-DB). Wenn der Client diese als `""` serialisierte, überschrieb der Server-COALESCE-UPSERT den vorher korrekt akkumulierten Wert in `flights.aircraft_icao` mit `""`. Resultat: Sessions starteten mit `aircraft_icao = NULL` obwohl der Pilot tatsächlich einen ICAO-getaggten Flieger flog.
+
+### 🔬 Forensik-Workflow für VA-Owner (neu möglich ab v0.5.23)
+
+1. Webapp Touchdowns-Tab → Filter „⚠ Disagreement" zeigt alle Landungen wo MSFS- und X-Plane-Schätzer auseinanderlagen
+2. Klick auf Touchdown → 🔬-Card zeigt beide Werte + welcher gewann + Window-Konfidenz
+3. Wenn |Δ| > 100 fpm und beide plausibel → Edge-Case lohnt anzuschauen
+4. PilotHistory → Session-Detail → 📥 Client-Log → JSONL für rohe AGL-Samples + Activity-Log
+5. Patch in `lib.rs` + Test-Cases mit gespeicherten JSONLs validieren
+
+Vollständige Algorithmus-Referenz: [`docs/client-log-format.md`](docs/client-log-format.md).
+
+### 📊 Server-Side (aeroacars-live, parallel deployed)
+
+- DB-Schema: 3 neue Spalten in `flight_sessions` (client_log_path/size/uploaded_at) + 7 neue Spalten in `touchdowns` (simulator + 6 Forensik-Felder)
+- Migration v1: Backfill aircraft_icao aus flights-Tabelle für historische Sessions
+- Sustainable Session-Splitter mit drei orthogonalen Detektoren: Metadata-Mismatch / PIREP-Terminator / Phase-Regression — verhindert „Hin+Rück landet in einer Session"-Bug
+- Defense-in-depth: Server-seitiger `sanitizeStr` im flights-UPSERT als Fallback für alte Clients ohne v0.5.23-Fix
+
+### ⚠ Hinweise zum Update
+
+- Backward-kompatibel: alte Server (ohne neue Forensik-Felder) ignorieren die neuen Optional-Payload-Felder. Neue Server (= aeroacars-live ab heute) extrahieren typed.
+- Pilot-PCs ohne v0.5.23 schicken weiter PositionPayload mit `""` als Empty-Marker — Server-Defense fängt das ab.
+- Bestehende Sessions in der DB bleiben unverändert (Migration v1 fixt nur was sicher fixbar ist).
+
+---
+
 ## [v0.5.13] — 2026-05-07
 
 🎯 **X-Plane Touchdown jetzt bit-genau LandingRate-1-aligned (Lua adaptive 30-sample method).**
