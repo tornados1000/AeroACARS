@@ -4,6 +4,59 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.6.0] — 2026-05-10
+
+🏗 **Strukturelles Redesign: Streamer-Tick komplett vom phpVMS-IO entkoppelt.**
+
+### Warum
+
+Wir hatten in v0.5.x eine **Klasse von Bugs** angesammelt, die immer wieder dasselbe Symptom hatte: irgendwas im Streamer-Tick blockierte → Live-Map einfriert, JSONL-Loch, MQTT-Stille, im Extremfall Sim-Disconnect-Annahme weil die Heartbeats stalled. Jeder Hotfix hat den jeweils konkreten Hänger entkoppelt (v0.5.49: POST in `tokio::spawn`; v0.5.51: Drain in `tokio::spawn` mit Cap+Timeout). Aber die **Architektur selbst** — „der Streamer-Tick macht alles" — produzierte garantiert den nächsten Bug derselben Klasse.
+
+User-Wunsch nach v0.5.51: *„wir haben die ganze Nacht Zeit — neu denken kein bugfixing mehr — wie können wir das besser machen so das wir aber alle Daten behalten — hart denken !! Komplettes Redesign"*. Plus klare Ansage: keine Feature-Flag-Fallbacks, weil *„wenn der alte misst drin ist haben wir doch wieder das gleich Problem"*.
+
+### Was sich strukturell ändert
+
+**Vorher (v0.5.x):** Streamer-Tick (1 Loop, alle 0.5–3 s) machte Snapshot-Read **+** FSM-Step **+** JSONL-Write **+** MQTT-Publish **+** phpVMS-POST **+** Queue-Drain **+** Heartbeat **+** Persist-Stats. Jedes Sub-Step konnte den ganzen Tick blockieren. Workarounds: „Critical-Window" (AGL <1500 ft → POST pausieren), file-backed `position_queue.json` als Failover, jeder Failure-Path eigene Spawn-Logik.
+
+**Nachher (v0.6.0):**
+
+- **Streamer-Tick** macht nur noch: Snapshot lesen → FSM-Step → JSONL-Write → MQTT-Publish (non-blocking) → push in **Memory-Outbox**. Pures CPU + lokales File-IO. Blockiert *strukturell* nicht mehr auf phpVMS.
+- **`spawn_phpvms_position_worker`** ist ein eigener async Task pro Flug. Liest 3-sekündlich aus der Outbox, batched bis zu 50 Items, POST mit Per-Item-Timeout (5 s). Bei Failure: Item zurück in die Outbox + 10-sec-Backoff. Bei 404: PIREP wurde server-seitig gelöscht → Worker terminiert sauber.
+- **Memory-Outbox** (5000 Items max ≈ 8 h Cruise-Daten) ist die Single-Source-of-Truth für ungesendete Positions. Persistierung in `position_queue.json` nur noch lazy (Worker-Stop oder Backlog >500) für App-Restart-Recovery.
+- **50-Hz Touchdown-Sampler** (eigener Task seit v0.5.39) bleibt unverändert — der war nie das Problem.
+
+### Was raus ist
+
+- **Critical-Window-Pausierung im Streamer-Tick** — nicht mehr nötig, der Streamer macht eh kein phpVMS-IO mehr
+- **`drain_position_queue` + `spawn_position_queue_drain` + `enqueue_position_offline`** — die ganze File-Queue-Drain-Logik im Tick. Worker liest die Outbox direkt
+- **`queue_drain_in_flight: AtomicBool`** — Guard gegen parallele Drains, nicht mehr nötig
+- **`last_phpvms_post_at`-Tracking im Streamer** — Cadence-Steuerung sitzt jetzt im Worker
+- **`recorder_core.rs`-Skeleton** — initial als Komplett-Refactor-Modul angelegt, aber Targeted-Refactor (alles in `lib.rs`, nur die Workarounds raus, bewährter `step_flight` bleibt 1:1) hat sich als pragmatischer ohne Test-Suite herausgestellt
+
+### Datenintegrität
+
+JSONL ist wie vorher die Single-Source-of-Truth. Jede Position wird **vor** dem Outbox-Push in die JSONL geschrieben. Wenn der phpVMS-Worker stundenlang kein Netz hat: Outbox füllt bis 5000, ältere Items werden gedroppt aus dem Live-Stream — aber die JSONL hat sie alle, und der Forensik-Upload nach PIREP-Filing zieht sie nach.
+
+### Verhalten beim Cancel/Forget/Filing
+
+- **`flight_end` (Filing):** Outbox wird vor `stop=true` geleert. PIREP ist serverseitig akkzeptiert, weiteres POSTen ist sinnlos. Forensik-Upload (file_pirep-Anhang) enthält die JSONL mit allen Position-Events.
+- **`flight_cancel`:** Outbox wird vor `stop=true` geleert. Pilot will *explizit* nichts mehr senden.
+- **`flight_forget`:** Outbox geleert.
+- **`handle_remote_cancellation` (PIREP serverseitig weg):** Outbox geleert, Worker terminiert.
+
+### Geänderte Dateien
+
+- `client/src-tauri/src/lib.rs` — neue `ActiveFlight.position_outbox` (`Mutex<VecDeque<PositionEntry>>`) + `phpvms_worker_spawned`-Guard, neue `spawn_phpvms_position_worker` + `persist_outbox`-Helper, Streamer-Tick pusht in Outbox statt direktem POST, alle 3 Spawn-Sites (flight_start / flight_resume / flight_resume_after_disconnect) wired, alle 5 stop-Pfade (cancel/forget/end/end_with_overrides/remote_cancellation) clearen die Outbox vor stop=true
+- `client/src-tauri/src/recorder_core.rs` — gelöscht (Komplett-Refactor-Skeleton wurde nicht weiter verfolgt)
+- `client/src/components/LiveRecordingIndicator.tsx` — Stale-Threshold-Kommentar auf v0.6.0 aktualisiert (180 sec passt zur 3-sec-Worker-Tick + 5-sec-Per-Item-Timeout)
+- Versionen → **0.6.0** (Minor-Bump, weil internes Daten-/Worker-Modell sich ändert; UI + persistente Files bleiben backward-compatible)
+
+### Risiko
+
+Erstes Major-Refactor seit v0.5.0 ohne Test-Suite. Strategie: **Forward-only**, kein Feature-Flag-Fallback. Wenn ein Showstopper-Bug auftaucht, wird die v0.5.51-Tag als Hotfix-Basis genutzt.
+
+---
+
 ## [v0.5.51] — 2026-05-09
 
 🩹 **Hotfix: Live-Map endete am Touchdown statt am Gate (v0.5.45-Regression).**

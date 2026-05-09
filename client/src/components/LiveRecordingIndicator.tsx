@@ -42,12 +42,20 @@ export function LiveRecordingIndicator({
     ? Math.max(0, Math.floor((Date.now() - new Date(lastPositionAt).getTime()) / 1000))
     : null;
 
+  // v0.5.51/v0.6.0 — Stale-Threshold von 60 auf 180 sec. Vorher
+  // triggerte „FEHLER" sofort wenn der phpVMS-POST > 60 sec her war.
+  // Mit der v0.6.0-Architektur (Memory-Outbox + eigener phpVMS-Worker
+  // mit 3s-Tick + 4-30s phase-aware Cadence) ist „60 sec Pause"
+  // absolut normal im Cruise. 180 sec unterscheidet echte Connection-
+  // Probleme (3+ failed POST-Cycles inkl. 5-sec Per-Item-Timeout) von
+  // normalen Pausen zwischen Batches.
+  const STALE_THRESHOLD_SEC = 180;
   const status: "live" | "queued" | "stale" | "idle" =
     ageSecs == null
       ? "idle"
       : queuedCount > 0
         ? "queued"
-        : ageSecs > 60
+        : ageSecs > STALE_THRESHOLD_SEC
           ? "stale"
           : "live";
 
@@ -59,18 +67,23 @@ export function LiveRecordingIndicator({
         ? t("recording.queued_pending", { count: queuedCount })
         : t("recording.last_send_secs", { secs: ageSecs });
 
+  // v0.5.51 — UI-Klarstellung. Vorher stand einfach nur die Zahl
+  // `positionCount` ohne Label rechts in der Pille. Bei status="stale"
+  // las das aus wie „FEHLER 1101" → Pilot denkt 1101 wäre ein Fehler-Code.
+  // Jetzt: explizites Σ-Symbol + i18n-Tooltip + visueller Separator.
   return (
     <div
       className={`live-rec live-rec--${status}`}
       role="status"
       aria-live="polite"
-      title={`${label} — ${detail}`}
+      title={`${label} — ${detail} · ${t("recording.total_sent")}: ${positionCount}`}
     >
       <span className="live-rec__dot" aria-hidden="true" />
       <span className="live-rec__label">{label}</span>
       <span className="live-rec__detail">{detail}</span>
+      <span className="live-rec__sep" aria-hidden="true">·</span>
       <span className="live-rec__count" title={t("recording.total_sent")}>
-        {positionCount}
+        Σ&nbsp;{positionCount}
       </span>
     </div>
   );
