@@ -4,6 +4,84 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.5.39] — 2026-05-09
+
+🎯 **50-Hz-Touchdown-Forensik + Flare-Quality + Critical-Window-Priority.**
+
+### Hintergrund
+
+User-Vergleich vom DLH-1331-Flug (GMMN→EDDF, Fenix A321): AeroACARS meldete -205 fpm / 0.99G, Volanta -87 fpm / 1.14G, DLHv-Tool -96 fpm / 1.18G. Root-Cause-Analyse zeigte: ein 1.86-s-Loch im JSONL-Position-Stream genau im Touchdown-Moment, weil der Streamer-Tick im selben Loop phpVMS-POSTs ausführt (200-1500 ms HTTP-Latenz) und die adaptive 500-ms-Cadence stretcht. AeroACARS griff daher auf MSFS's instantaneous `TOUCHDOWN_VELOCITY` SimVar zurück, während Volanta/DLHv smoothed VS-Mittel über ~500-1000 ms verwenden — physikalisch repräsentativer für das was der Pilot fühlt.
+
+### 🆕 50-Hz-TouchdownWindow-Buffer-Dump
+
+`spawn_touchdown_sampler` läuft schon bei 50 Hz im RAM, puffert die letzten 5 s. Beim TD-Edge:
+
+1. Pre-TD-Buffer wird in einen separaten Post-Buffer kopiert (= vor Eviction geschützt)
+2. Sampler sammelt für TOUCHDOWN_POST_WINDOW_MS (10 s) weiter Post-TD-Samples
+3. Nach 10 s flusht der Sampler den gesamten Buffer (~750 Samples ≈ 40 KB) als ein einzelnes `TouchdownWindow`-Event in die JSONL — Lock wird vor dem File-IO released damit der Streamer-Tick nicht wartet
+
+Damit ist die Datenlücke geschlossen: 50 Hz-Auflösung über das gesamte ±10-s-Fenster um den TD.
+
+### 🎯 Landing-Critical-Window pausiert blockierende Network-IO
+
+Streamer-Tick checkt jetzt `landing_critical_until`:
+
+- Proaktiv gesetzt bei AGL <300 ft + Approach/Final/Landing-Phase (Window auf now+60 s, refreshed jeden Tick)
+- Sampler refresht beim TD-Edge auf TD+10 s
+
+Während dem Window:
+- phpVMS-POST übersprungen, Position direkt in die Offline-Queue
+- Queue-Drain übersprungen (mehrere POSTs auf einmal würden Tick blockieren)
+- MQTT-Publish (try_send, non-blocking) + JSONL-Append (lokales File-IO, ~ms) laufen normal weiter
+
+Beim ersten Tick außerhalb des Windows wird die Queue normal gedrained → phpVMS bekommt die Punkte mit ein paar Sekunden Verzögerung, dafür ist der Live-Track + Forensik-Log lückenlos.
+
+### 📊 Forensik-Analyzer auf dem Buffer
+
+Neue `compute_landing_analysis(samples, edge_at)` Funktion liefert:
+
+- **Multi-Window VS-Mittel** über 250/500/1000/1500 ms vor TD — 500 ms ≈ Volanta-Style, 1000 ms ≈ DLHv-Style
+- **VS am Edge** linear interpoliert auf den exakten on_ground-Edge zwischen zwei 20-ms-Samples
+- **Peak G post-TD** über 500 ms + 1000 ms = der echte Gear-Compression-Spike (löst das alte Problem dass `snap.g_force` im TD-Frame oft <1G liefert)
+- **Flare-Qualität** im 1900-ms-Window vor TD:
+  - `peak_vs_pre_flare_fpm`: steepste Sinkrate
+  - `vs_at_flare_end_fpm`: VS unmittelbar vor TD
+  - `flare_reduction_fpm`: Reduktion durch Flare (positiv = sanfter geworden)
+  - `flare_dvs_dt_fpm_per_sec`: Steigungs-Rate
+  - `flare_quality_score` 0..100: 100 = >400 fpm Reduktion + sanfter Endwert, 0 = keine Reduktion (Pilot zog zu spät oder gar nicht)
+  - `flare_detected`: bool, true wenn Reduktion >50 fpm
+- **Bounce-Profil**: Anzahl + Peak-AGL pro Excursion (>5 ft Mikro-Hopper-Filter)
+
+Wird als zweites Event `LandingAnalysis` direkt nach dem `TouchdownWindow` in die JSONL geschrieben.
+
+### 🔌 Live-Pfad: TouchdownPayload um 14 Forensik-Felder erweitert
+
+`aeroacars-mqtt::TouchdownPayload` bekommt alle Analyzer-Felder als Optional mit `skip_serializing_if = "Option::is_none"` damit alte Pilot-Clients (v0.5.38-) beim Live-Monitor weiter funktionieren. Werte werden vom Streamer-Tick aus `FlightStats.landing_analysis` (vom Sampler gesetzt) gelesen via `ana_f32/i32/u32/bool`-Helpers.
+
+Race-Case: Sampler braucht 10 s post-TD bis er fertig ist; wenn der Streamer-Tick vorher bereits TouchdownComplete sendet, sind die Felder None. Der nächste Refinement-Tick im Streamer-Loop bekommt die fertigen Daten, und der JSONL-Re-Importer im aeroacars-live Recorder backfillt fehlende Felder beim späteren Log-Upload (Match per `edge_at` ±15 s).
+
+### 📺 Live-Monitor zeigt die neue Forensik
+
+aeroacars-live Webapp `LandingAnalysis.tsx` bekommt eine neue cyan-Card **🎯 50-Hz-TouchdownWindow** die nur erscheint wenn der Pilot-Client v0.5.39+ liefert (`forensic_sample_count != null` als Feature-Detect):
+
+- Tabelle mit allen 5 V/S-Werten, jeweils gelabelt welcher dem Volanta-/DLHv-Display entspricht
+- Peak G post-TD 500 ms + 1000 ms separat
+- Eigener Flare-Block mit Score, Reduktion, dV/S/dt + FLARE/KEIN-FLARE Status-Flag
+- Bounce-Max-Höhe wenn Bounces
+
+### Was nicht geht
+
+Pre-v0.5.39-Logs bekommen die Forensik nicht — der Sampler emittierte `TouchdownWindow`/`LandingAnalysis` damals nicht. Für historische Landungen bleibt die alte Algorithmen-Forensik-Card (mit `vs_estimate_msfs`/`vs_estimate_xp`) bestehen.
+
+### Files
+
+- `client/src-tauri/src/lib.rs`: +492 Zeilen (Sampler-Erweiterung, Analyzer, Helpers, Streamer-Tick-Pause-Logik)
+- `client/src-tauri/crates/recorder/src/lib.rs`: +60 Zeilen (TouchdownWindow + LandingAnalysis Event-Varianten + TouchdownWindowSample Struct)
+- `client/src-tauri/crates/aeroacars-mqtt/src/lib.rs`: +57 Zeilen (TouchdownPayload-Erweiterung)
+- aeroacars-live: webapp `LandingAnalysis.tsx` neue Card + recorder `importer.ts` landing_analysis-Backfill
+
+---
+
 ## [v0.5.38] — 2026-05-09
 
 🟡🟠🔴 **Visual Stable-Approach-Advisory Banner im Cockpit-Tab.**
