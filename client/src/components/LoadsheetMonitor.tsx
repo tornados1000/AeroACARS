@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { invoke } from "@tauri-apps/api/core";
 import type { ActiveFlightInfo } from "../types";
 
 interface Props {
@@ -7,7 +8,7 @@ interface Props {
 }
 
 /**
- * Live-Loadsheet (v0.3.0 — überarbeitet).
+ * Live-Loadsheet (v0.3.0 — überarbeitet, v0.5.46 — OFP-Refresh inline).
  *
  * **Sichtbarkeit:** nur in Phase = `preflight` oder `boarding`.
  * Sobald Pushback / TaxiOut beginnt → komplett weg, weil dann der
@@ -25,6 +26,15 @@ interface Props {
  * **Δ-Anzeige:** kompakt inline (z.B. `TOW 64.544 kg (+227)`) statt
  * einer eigenen Spalte. Farbcode wie sonst: <5% grün, 5-10% gelb,
  * >10% rot. Bei Overweight (IST > MAX): rote Δ + ⚠.
+ *
+ * **v0.5.46 — OFP-Refresh-Button inline:** wenn der IST/SOLL-Vergleich
+ * ein "OFP-Outdated"-Muster zeigt (großer Block-Delta + ZFW-Match,
+ * typisch wenn der Pilot in PasStudio neu geplant hat aber AeroACARS
+ * noch den alten OFP hält), zeigen wir einen Refresh-Button direkt
+ * im Loadsheet-Card. Adrian (GSG) hatte sich beschwert dass die
+ * Loadsheet-Werte nach PasStudio-Update nicht aktuell sind — der
+ * Mechanismus existiert schon (Header-Button), aber der kontextuelle
+ * Hinweis direkt am Vergleich ist schlüssiger.
  */
 export function LoadsheetMonitor({ info }: Props) {
   const { t } = useTranslation();
@@ -32,6 +42,9 @@ export function LoadsheetMonitor({ info }: Props) {
   // React beim Re-Render wenn die Phase wechselt und der Component
   // mal mit/ohne useState aufgerufen wird.
   const [expanded, setExpanded] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshDone, setRefreshDone] = useState(false);
+  const [refreshErr, setRefreshErr] = useState<string | null>(null);
 
   // Sichtbar nur in den Boarding-Phasen — sobald TaxiOut beginnt,
   // ist das Loadsheet "abgeschlossen" und wir blenden's komplett aus.
@@ -59,7 +72,54 @@ export function LoadsheetMonitor({ info }: Props) {
     info.sim_zfw_kg != null && info.planned_zfw_kg != null
       ? info.sim_zfw_kg - info.planned_zfw_kg
       : null;
+
+  // v0.5.46 — OFP-Outdated-Heuristik (Adrian-Fix):
+  // Klassisches Muster wenn Pilot in PasStudio neu geplant hat:
+  //   - Fuel-Delta groß (>= 400 kg ODER >= 5 % vom Plan)
+  //   - ZFW-Delta klein (< 200 kg) — Pax/Cargo passen, nur Fuel weicht ab
+  //   - Plan-Block-Wert ist da (sonst kein OFP zum Refreshen)
+  // → Refresh-Hint zeigen + Button anbieten. Greift sowohl bei
+  //   Über- als auch bei Unter-Tankung gegenüber dem alten Plan.
+  const fuelDeltaPct =
+    fuelDelta != null && info.planned_block_fuel_kg && info.planned_block_fuel_kg > 0
+      ? Math.abs(fuelDelta / info.planned_block_fuel_kg) * 100
+      : null;
+  const fuelLooksOutdated =
+    fuelDelta != null &&
+    info.planned_block_fuel_kg != null &&
+    (Math.abs(fuelDelta) >= 400 || (fuelDeltaPct != null && fuelDeltaPct >= 5));
+  const zfwLooksMatching =
+    zfwDelta == null || Math.abs(zfwDelta) < 200;
+  const ofpLooksOutdated = fuelLooksOutdated && zfwLooksMatching;
+
   const hint = computeHint(fuelDelta, zfwDelta, t);
+  // Wenn OFP-Outdated erkannt wurde, übersteuern wir den normalen
+  // Hint mit dem expliziten Refresh-Hint — der ist actionable.
+  const effectiveHint = ofpLooksOutdated
+    ? t("cockpit.loadsheet.hint_ofp_outdated")
+    : hint;
+
+  async function handleRefreshOfp() {
+    if (refreshing) return;
+    setRefreshing(true);
+    setRefreshErr(null);
+    setRefreshDone(false);
+    try {
+      await invoke("flight_refresh_simbrief");
+      setRefreshDone(true);
+      // Auto-clear "✓ Done"-Hinweis nach 4 s, damit der UI-State
+      // nicht für immer "frisch" suggeriert.
+      setTimeout(() => setRefreshDone(false), 4000);
+    } catch (err: unknown) {
+      const msg =
+        typeof err === "object" && err !== null && "message" in err
+          ? String((err as { message: string }).message)
+          : String(err);
+      setRefreshErr(msg);
+    } finally {
+      setRefreshing(false);
+    }
+  }
 
   return (
     <section className="info-strip">
@@ -111,10 +171,45 @@ export function LoadsheetMonitor({ info }: Props) {
               />
             </div>
           </div>
-          {hint && (
+          {(effectiveHint || ofpLooksOutdated) && (
             <div className="info-strip__group">
               <h4 className="info-strip__group-label">&nbsp;</h4>
-              <div className="loadsheet__hint-inline">{hint}</div>
+              <div className="loadsheet__hint-inline">
+                {effectiveHint}
+                {/* v0.5.46 — Inline Refresh-Button bei OFP-Outdated.
+                    Bewusst direkt neben dem Hint, damit die Aktion
+                    am Ort des Problems sichtbar ist. */}
+                {ofpLooksOutdated && (
+                  <>
+                    {" "}
+                    <button
+                      type="button"
+                      className="loadsheet__refresh-btn"
+                      onClick={handleRefreshOfp}
+                      disabled={refreshing}
+                      title={t("cockpit.loadsheet.refresh_btn_hint")}
+                    >
+                      {refreshing
+                        ? t("cockpit.loadsheet.refresh_btn_busy")
+                        : t("cockpit.loadsheet.refresh_btn")}
+                    </button>
+                    {refreshDone && (
+                      <span className="loadsheet__refresh-done">
+                        {" "}
+                        {t("cockpit.loadsheet.refresh_btn_done")}
+                      </span>
+                    )}
+                    {refreshErr && (
+                      <span
+                        className="loadsheet__refresh-err"
+                        title={refreshErr}
+                      >
+                        {" "}⚠ {refreshErr}
+                      </span>
+                    )}
+                  </>
+                )}
+              </div>
             </div>
           )}
         </>

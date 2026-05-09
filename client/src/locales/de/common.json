@@ -237,7 +237,12 @@
       "hint_ready": "✓ Bereit für Pushback — Werte nahe Plan",
       "hint_fueling": "🛢 Tankvorgang läuft — noch {{missing}} kg fehlen",
       "hint_boarding": "👥 Boarding läuft — noch {{missing}} kg fehlen",
-      "hint_overfueled": "💡 +{{extra}} kg über Plan — höherer Burn unterwegs zu erwarten"
+      "hint_overfueled": "💡 +{{extra}} kg über Plan — höherer Burn unterwegs zu erwarten",
+      "hint_ofp_outdated": "📋 Block-Abweichung sieht nach OFP-Update in PasStudio/SimBrief aus — OFP neu laden?",
+      "refresh_btn": "OFP neu laden",
+      "refresh_btn_busy": "Lade…",
+      "refresh_btn_done": "✓ OFP aktualisiert",
+      "refresh_btn_hint": "Zieht den frischesten OFP von SimBrief und überschreibt die Plan-Werte"
     }
   },
   "recording": {

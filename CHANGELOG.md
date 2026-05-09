@@ -4,6 +4,51 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.5.46] — 2026-05-09
+
+🎯 **Adrian-Feedback umgesetzt — Approach-Stability-Filter + OFP-Refresh im Loadsheet-Card.**
+
+### Hintergrund
+
+Adrian (GSG-Pilot) hat zwei konkrete Pain-Points gemeldet:
+
+1. **Approach-Stability-Wert „V/S-Streuung 320 fpm"** — wird durch das Flare-Manöver in den letzten 3 Sekunden kaputtgemessen, weil dort die Sinkrate absichtlich aktiv reduziert wird. Plus alte Samples >1.500 ft AGL (Localizer-Intercept-Höhe) verfälschen die Statistik.
+2. **PasStudio-Loadsheet wird nicht erkannt** — wenn der Pilot in PasStudio neu plant und sich der Block-Fuel ändert, hält AeroACARS noch den alten OFP. Der Refresh-Button existiert zwar im ActiveFlight-Header, war aber nicht prominent genug.
+
+### 🆕 Zwei zusammengehörige Fixes
+
+**1. Approach-Stability-Filter (lib.rs `compute_approach_stddev` + `compute_approach_stability_v2`):**
+
+- AGL-Window: nur Samples > 0 ft und ≤ **1.500 ft AGL** (war zuvor unbegrenzt — alte Cruise-Samples wurden mitgezählt)
+- Flare-Cutoff: alle Samples in den **letzten 3 Sekunden vor Touchdown** werden ausgeschlossen
+- Konstanten neu: `APPROACH_STABILITY_AGL_CAP_FT = 1500.0`, `APPROACH_FLARE_CUTOFF_MS = 3000`
+- Greift in beiden Metriken: V/S-Stddev, Bank-Stddev, Stability-V2-Gate-Bewertung
+
+Effekt: Adrian's „320 fpm V/S-Streuung" wird realistischer (~80-150 fpm wie Volanta) — der Wert reflektiert jetzt die echte Anflug-Stabilität, nicht das Flare-Manöver.
+
+**2. OFP-Refresh-Button im Loadsheet-Card (LoadsheetMonitor.tsx):**
+
+- Heuristik „OFP veraltet": Block-Fuel-Delta ≥ 400 kg (oder ≥ 5 % vom Plan) UND ZFW-Delta < 200 kg → klassisches PasStudio-Update-Muster
+- Bei Treffer wird der normale Hint durch `📋 Block-Abweichung sieht nach OFP-Update in PasStudio/SimBrief aus — OFP neu laden?` übersteuert
+- Inline-Button **„OFP neu laden"** ruft das bestehende `flight_refresh_simbrief`-Command auf — zieht den frischesten Bid + OFP von SimBrief und überschreibt alle `planned_*`-Felder im aktiven Flug
+- Status-Feedback inline: Lade-Spinner, ✓-Bestätigung (Auto-clear nach 4 s), Fehler-Tooltip
+- DE/EN/IT i18n vollständig
+
+### Was Piloten merken
+
+- **Approach-Stability-Werte** beim Touchdown sind jetzt deutlich realistischer (Volanta-vergleichbar)
+- **Loadsheet-Card** während Boarding zeigt einen klaren Refresh-Button wenn der Plan veraltet aussieht — keine Diskussion mehr ob „PasStudio-Werte ankommen"
+
+### Geänderte Dateien
+
+- `client/src-tauri/src/lib.rs` — `compute_approach_stddev`, `compute_approach_stability_v2`, neue Konstanten + Call-Site
+- `client/src/components/LoadsheetMonitor.tsx` — OFP-Outdated-Heuristik + Inline-Refresh-Button
+- `client/src/locales/{de,en,it}/common.json` — 5 neue Keys unter `cockpit.loadsheet`
+- `client/src/App.css` — `.loadsheet__refresh-btn`, `.loadsheet__refresh-done`, `.loadsheet__refresh-err`
+- Versionen: `package.json`, `tauri.conf.json`, `Cargo.toml` → 0.5.46
+
+---
+
 ## [v0.5.45] — 2026-05-09
 
 🔧 **Sampler-Hardening: dichte Approach-Cadence + Phantom-TD-Fix + Resume-Schutz.**

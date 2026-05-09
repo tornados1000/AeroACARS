@@ -4826,6 +4826,45 @@ input:disabled {
   color: var(--text-muted);
   font-style: italic;
 }
+/* v0.5.46 — Inline-Refresh-Button im Loadsheet-Hint. Klein, dezent,
+   sichtbar genug dass der Pilot ihn klickt wenn der OFP-Outdated-Hint
+   triggert. Kein "shouty"-Button — wir wollen nicht den Hint optisch
+   überstrahlen, sondern einen handlungsbereiten Link bieten. */
+.loadsheet__refresh-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 500;
+  padding: 2px 8px;
+  margin-left: 4px;
+  background: var(--accent, #2563eb);
+  color: #fff;
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.loadsheet__refresh-btn:hover:not(:disabled) {
+  background: #1d4ed8;
+}
+.loadsheet__refresh-btn:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+.loadsheet__refresh-done {
+  font-size: 11px;
+  color: #34d399;
+  font-style: normal;
+  font-weight: 500;
+}
+.loadsheet__refresh-err {
+  font-size: 11px;
+  color: #f87171;
+  font-style: normal;
+  font-weight: 500;
+}
 .loadsheet__table {
   width: 100%;
   border-collapse: collapse;

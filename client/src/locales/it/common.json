@@ -237,7 +237,12 @@
       "hint_ready": "✓ Pronto per pushback — valori vicini al piano",
       "hint_fueling": "🛢 Rifornimento in corso — mancano ancora {{missing}} kg",
       "hint_boarding": "👥 Boarding in corso — mancano ancora {{missing}} kg",
-      "hint_overfueled": "💡 +{{extra}} kg sopra piano — consumo più alto in volo previsto"
+      "hint_overfueled": "💡 +{{extra}} kg sopra piano — consumo più alto in volo previsto",
+      "hint_ofp_outdated": "📋 Lo scostamento del block sembra un aggiornamento OFP in PasStudio/SimBrief — ricaricare l'OFP?",
+      "refresh_btn": "Ricarica OFP",
+      "refresh_btn_busy": "Caricamento…",
+      "refresh_btn_done": "✓ OFP aggiornato",
+      "refresh_btn_hint": "Recupera l'OFP più recente da SimBrief e sovrascrive i valori del piano"
     }
   },
   "recording": {

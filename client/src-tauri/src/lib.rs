@@ -2786,16 +2786,39 @@ fn estimate_xplane_touchdown_vs_lua_style(
 /// (insufficient signal). Single-pass formula (Welford's algorithm
 /// would be marginally more numerically stable but at this scale it
 /// makes no difference).
+/// v0.5.46: Window-Filter analog zu compute_approach_stability_v2.
+/// Adrian (User-Feedback 2026-05-09): "bei der Anflugstabilität wird noch
+/// der gerade Teil auf dem LOC ausgewertet, bevor es auf den G/S geht.
+/// Daher gibt es hier so schlechte Werte." Dazu Flare die letzten 3 sec
+/// vor TD (Pilot-Pull) faelschlich als Instabilitaet gewertet.
+///
+/// Filter:
+///   - AGL <= 1500 ft (LOC-Intercept ueber 1500ft ausgeschlossen)
+///   - ts <= TD - 3s wenn td_ts gegeben (Flare-Last-3s ausgeschlossen)
+const APPROACH_STABILITY_AGL_CAP_FT: f32 = 1500.0;
+const APPROACH_FLARE_CUTOFF_MS: i64 = 3000;
+
 fn compute_approach_stddev(
     buf: &std::collections::VecDeque<ApproachBufferSample>,
+    td_ts: Option<DateTime<Utc>>,
 ) -> (Option<f32>, Option<f32>) {
-    let n = buf.len();
+    let filtered: Vec<&ApproachBufferSample> = buf.iter()
+        .filter(|s| {
+            let in_agl_band = s.agl_ft > 0.0 && s.agl_ft <= APPROACH_STABILITY_AGL_CAP_FT;
+            let pre_flare = match td_ts {
+                Some(td) => (td - s.at).num_milliseconds() >= APPROACH_FLARE_CUTOFF_MS,
+                None => true,
+            };
+            in_agl_band && pre_flare
+        })
+        .collect();
+    let n = filtered.len();
     if n < 3 {
         return (None, None);
     }
     let mut sum_vs = 0.0_f64;
     let mut sum_bank = 0.0_f64;
-    for s in buf.iter() {
+    for s in &filtered {
         sum_vs += s.vs_fpm as f64;
         sum_bank += s.bank_deg as f64;
     }
@@ -2803,7 +2826,7 @@ fn compute_approach_stddev(
     let mean_bank = sum_bank / n as f64;
     let mut sq_vs = 0.0_f64;
     let mut sq_bank = 0.0_f64;
-    for s in buf.iter() {
+    for s in &filtered {
         let dv = s.vs_fpm as f64 - mean_vs;
         let db = s.bank_deg as f64 - mean_bank;
         sq_vs += dv * dv;
@@ -2915,6 +2938,7 @@ pub struct ApproachStabilityV2 {
 fn compute_approach_stability_v2(
     buf: &std::collections::VecDeque<ApproachBufferSample>,
     arr_elevation_ft: Option<f32>,
+    td_ts: Option<DateTime<Utc>>,
 ) -> ApproachStabilityV2 {
     let mut out = ApproachStabilityV2::default();
 
@@ -2927,10 +2951,19 @@ fn compute_approach_stability_v2(
             None => s.agl_ft,
         }
     };
+    // v0.5.46: zusaetzlicher Flare-Cutoff (Adrian-Feedback).
+    // Pilot-Pull in den letzten 3 sec vor TD ist ein Manoever, kein
+    // Stabilitaets-Indikator. Wenn td_ts None (= Berechnung mid-flight
+    // bevor TD erreicht), nur Hoehen-Filter.
     let gate_samples: Vec<&ApproachBufferSample> = buf.iter()
         .filter(|s| {
             let h = height_for(s);
-            h > 0.0 && h <= 1000.0
+            let in_height_band = h > 0.0 && h <= 1000.0;
+            let pre_flare = match td_ts {
+                Some(td) => (td - s.at).num_milliseconds() >= APPROACH_FLARE_CUTOFF_MS,
+                None => true,
+            };
+            in_height_band && pre_flare
         })
         .collect();
     out.window_sample_count = gate_samples.len() as u32;
@@ -10610,12 +10643,18 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                 // Beide Werte werden mit-publiziert — pre-v0.5.25-
                 // Konsumenten weiter mit den σ-Werten, neue UI nutzt
                 // approach_vs_deviation_fpm fuer das echte Gate-Maß.
-                let (vs_sd, bank_sd) = compute_approach_stddev(&stats.approach_buffer);
+                // v0.5.46: TD-Timestamp an Stability-Funktionen reichen damit
+                // die letzten 3 sec (Flare-Manoever) nicht als Instabilitaet
+                // gewertet werden (Adrian-Feedback). landing_at ist im
+                // Landing-Phase-Handler bereits gesetzt.
+                let td_ts = stats.landing_at;
+                let (vs_sd, bank_sd) = compute_approach_stddev(&stats.approach_buffer, td_ts);
                 stats.approach_vs_stddev_fpm = vs_sd;
                 stats.approach_bank_stddev_deg = bank_sd;
                 let stab_v2 = compute_approach_stability_v2(
                     &stats.approach_buffer,
                     stats.arr_airport_elevation_ft,
+                    td_ts,
                 );
                 stats.approach_vs_deviation_fpm = stab_v2.vs_deviation_fpm;
                 stats.approach_max_vs_deviation_below_500_fpm = stab_v2.max_vs_deviation_below_500_fpm;

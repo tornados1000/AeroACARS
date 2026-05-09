@@ -237,7 +237,12 @@
       "hint_ready": "✓ Ready for pushback — values close to plan",
       "hint_fueling": "🛢 Fuelling in progress — {{missing}} kg short",
       "hint_boarding": "👥 Boarding in progress — {{missing}} kg short",
-      "hint_overfueled": "💡 +{{extra}} kg above plan — expect higher burn"
+      "hint_overfueled": "💡 +{{extra}} kg above plan — expect higher burn",
+      "hint_ofp_outdated": "📋 Block deviation looks like an OFP update in PasStudio/SimBrief — reload OFP?",
+      "refresh_btn": "Reload OFP",
+      "refresh_btn_busy": "Loading…",
+      "refresh_btn_done": "✓ OFP updated",
+      "refresh_btn_hint": "Pulls the freshest OFP from SimBrief and overwrites the plan values"
     }
   },
   "recording": {
