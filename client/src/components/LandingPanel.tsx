@@ -2,6 +2,13 @@ import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { useConfirm } from "./ConfirmDialog";
+// v0.5.47 — Score-Modul ist jetzt zentral, identisch zu webapp/src/
+// components/landingScoring.ts. Dieselben Schwellen, Bands, Coach-Tipps
+// für Pilot-App und Live-Monitor.
+import {
+  computeSubScores as libComputeSubScores,
+  type SubScore as LibSubScore,
+} from "../lib/landingScoring";
 
 // ---- Types (mirror storage::LandingRecord on the Rust side) -------------
 
@@ -123,135 +130,26 @@ export interface SubScore {
   rationale: string;
 }
 
-function band(points: number): "good" | "ok" | "bad" {
-  if (points >= 85) return "good";
-  if (points >= 65) return "ok";
-  return "bad";
-}
-
-function scoreLandingRate(fpm: number): { points: number; rationale: string } {
-  const abs = Math.abs(fpm);
-  if (abs <= 100) return { points: 100, rationale: "smooth_touchdown" };
-  if (abs <= 240) return { points: 90, rationale: "firm_but_clean" };
-  if (abs <= 360) return { points: 75, rationale: "above_target" };
-  if (abs <= 600) return { points: 50, rationale: "hard_landing" };
-  if (abs <= 1000) return { points: 25, rationale: "very_hard" };
-  return { points: 0, rationale: "severe_inspection" };
-}
-
-function scoreGForce(g: number): { points: number; rationale: string } {
-  if (g <= 1.2) return { points: 100, rationale: "smooth_g" };
-  if (g <= 1.4) return { points: 95, rationale: "comfortable_g" };
-  if (g <= 1.7) return { points: 80, rationale: "noticeable_g" };
-  if (g <= 2.0) return { points: 60, rationale: "firm_g" };
-  if (g <= 2.6) return { points: 30, rationale: "hard_g" };
-  return { points: 0, rationale: "severe_g" };
-}
-
-function scoreBounces(n: number): { points: number; rationale: string } {
-  if (n === 0) return { points: 100, rationale: "clean_set" };
-  if (n === 1) return { points: 65, rationale: "one_bounce" };
-  if (n === 2) return { points: 35, rationale: "two_bounces" };
-  return { points: 0, rationale: "many_bounces" };
-}
-
-function scoreStability(vsStd: number): { points: number; rationale: string } {
-  if (vsStd <= 100) return { points: 100, rationale: "very_stable" };
-  if (vsStd <= 200) return { points: 85, rationale: "stable" };
-  if (vsStd <= 300) return { points: 65, rationale: "average_stability" };
-  if (vsStd <= 400) return { points: 45, rationale: "unstable_approach" };
-  return { points: 25, rationale: "very_unstable" };
-}
-
-function scoreRollout(usedPct: number): { points: number; rationale: string } {
-  if (usedPct <= 50) return { points: 100, rationale: "excellent_stop" };
-  if (usedPct <= 70) return { points: 85, rationale: "good_stop" };
-  if (usedPct <= 85) return { points: 65, rationale: "long_rollout" };
-  if (usedPct <= 95) return { points: 40, rationale: "very_long_rollout" };
-  return { points: 20, rationale: "marginal_runway" };
-}
-
-function scoreFuel(absPct: number): { points: number; rationale: string } {
-  if (absPct <= 5) return { points: 100, rationale: "on_plan" };
-  if (absPct <= 10) return { points: 85, rationale: "near_plan" };
-  if (absPct <= 20) return { points: 65, rationale: "off_plan" };
-  if (absPct <= 30) return { points: 45, rationale: "very_off_plan" };
-  return { points: 25, rationale: "way_off_plan" };
-}
+// v0.5.47 — Sub-Score-Berechnung delegiert an die zentrale Lib.
+// Webapp und Client nutzen jetzt dieselben Schwellen, Bands und
+// Coach-Tipps. SubScore (lokal) ist strukturidentisch zu LibSubScore.
 
 function computeSubScores(r: LandingRecord): SubScore[] {
-  const out: SubScore[] = [];
-
-  const rate = scoreLandingRate(r.landing_rate_fpm);
-  out.push({
-    key: "landing_rate",
-    points: rate.points,
-    value: `${r.landing_rate_fpm.toFixed(0)} fpm`,
-    band: band(rate.points),
-    rationale: rate.rationale,
+  // peak_vs_fpm wenn vorhanden bevorzugen (Sampler-recomputed Spitzenwert),
+  // sonst landing_rate_fpm (Edge-Sample). Spiegelt Webapp-Verhalten.
+  const peakVs = r.landing_peak_vs_fpm ?? r.landing_rate_fpm;
+  const subs: LibSubScore[] = libComputeSubScores({
+    vs_fpm: peakVs,
+    peak_g_load: r.landing_peak_g_force,
+    bounce_count: r.bounce_count,
+    approach_vs_stddev_fpm: r.approach_vs_stddev_fpm,
+    approach_bank_stddev_deg: r.approach_bank_stddev_deg,
+    rollout_distance_m: r.rollout_distance_m,
+    fuel_efficiency_pct: r.fuel_efficiency_pct,
   });
-
-  if (r.landing_peak_g_force != null) {
-    const g = scoreGForce(r.landing_peak_g_force);
-    out.push({
-      key: "g_force",
-      points: g.points,
-      value: `${r.landing_peak_g_force.toFixed(2)} G`,
-      band: band(g.points),
-      rationale: g.rationale,
-    });
-  }
-
-  const b = scoreBounces(r.bounce_count);
-  out.push({
-    key: "bounces",
-    points: b.points,
-    value: `${r.bounce_count}`,
-    band: band(b.points),
-    rationale: b.rationale,
-  });
-
-  if (r.approach_vs_stddev_fpm != null) {
-    const s = scoreStability(r.approach_vs_stddev_fpm);
-    out.push({
-      key: "stability",
-      points: s.points,
-      value: `${r.approach_vs_stddev_fpm.toFixed(0)} fpm σ`,
-      band: band(s.points),
-      rationale: s.rationale,
-    });
-  }
-
-  if (
-    r.runway_match &&
-    r.runway_match.length_ft > 0 &&
-    r.rollout_distance_m != null
-  ) {
-    const lengthM = r.runway_match.length_ft * 0.3048;
-    const usedPct = (r.rollout_distance_m / lengthM) * 100;
-    const ro = scoreRollout(usedPct);
-    out.push({
-      key: "rollout",
-      points: ro.points,
-      value: `${usedPct.toFixed(0)}% (${r.rollout_distance_m.toFixed(0)} m)`,
-      band: band(ro.points),
-      rationale: ro.rationale,
-    });
-  }
-
-  if (r.fuel_efficiency_pct != null) {
-    const f = scoreFuel(Math.abs(r.fuel_efficiency_pct));
-    const sign = r.fuel_efficiency_pct >= 0 ? "+" : "";
-    out.push({
-      key: "fuel",
-      points: f.points,
-      value: `${sign}${r.fuel_efficiency_pct.toFixed(1)}%`,
-      band: band(f.points),
-      rationale: f.rationale,
-    });
-  }
-
-  return out;
+  // SubScore-Lokaltyp ist eine Erweiterung von LibSubScore (gleiche
+  // Felder + nichts Neues) — direktes Cast ist sicher.
+  return subs as SubScore[];
 }
 
 /** Rationale → i18n key for the coach tip. We point straight at the
@@ -949,6 +847,66 @@ function CoachTip({ subs }: { subs: SubScore[] }) {
   );
 }
 
+// ---- Quick-Flag chips (v0.5.47) ---------------------------------------
+//
+// Auf-einen-Blick-Auffälligkeiten direkt unter dem Headline-Block.
+// Spiegelt die Chips aus webapp/src/components/LandingAnalysis.tsx
+// (B:124-133) — Pilot sieht im Client und im Live-Monitor exakt dieselben
+// Flags. Nur die wirklichen Auffälligkeiten anzeigen — keine "OK"-Chips.
+
+function QuickFlags({ record }: { record: LandingRecord }) {
+  const { t } = useTranslation();
+  const flags: { label: string; tone: "warn" | "err" }[] = [];
+
+  // HARD LANDING — V/S oder Peak-G erreichen Hard/Severe-Schwellen
+  // (gespiegelt aus landingScoring.ts T_VS_HARD_FPM / T_G_HARD).
+  const peakVs = record.landing_peak_vs_fpm ?? record.landing_rate_fpm;
+  const isHardVs = Math.abs(peakVs) >= 600;
+  const isHardG = (record.landing_peak_g_force ?? 0) >= 1.7;
+  if (isHardVs || isHardG) {
+    const severe = Math.abs(peakVs) >= 1000 || (record.landing_peak_g_force ?? 0) >= 2.1;
+    flags.push({
+      label: severe ? t("landing.flag.severe") : t("landing.flag.hard"),
+      tone: "err",
+    });
+  }
+
+  // BOUNCE × n
+  if (record.bounce_count > 0) {
+    flags.push({
+      label: `${t("landing.flag.bounce")} × ${record.bounce_count}`,
+      tone: record.bounce_count >= 2 ? "err" : "warn",
+    });
+  }
+
+  // OFF-CENTERLINE — > 5 m vom Centerline weg ist auffällig
+  if (record.runway_match && Math.abs(record.runway_match.centerline_distance_m) > 5) {
+    flags.push({
+      label: t("landing.flag.off_centerline"),
+      tone: "warn",
+    });
+  }
+
+  // UNSTABLE APPROACH — σ V/S > 400 (Score-Lib-Schwelle für "bad")
+  if ((record.approach_vs_stddev_fpm ?? 0) > 400) {
+    flags.push({
+      label: t("landing.flag.unstable_approach"),
+      tone: "warn",
+    });
+  }
+
+  if (flags.length === 0) return null;
+  return (
+    <div className="landing-flags">
+      {flags.map((f, i) => (
+        <span key={i} className={`landing-flag landing-flag--${f.tone}`}>
+          {f.label}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 // ---- Trend sparkline (last N landings) ---------------------------------
 
 function TrendSparkline({ records }: { records: LandingRecord[] }) {
@@ -1186,6 +1144,11 @@ function LandingDetail({
         </div>
       </div>
 
+      {/* v0.5.47 — Quick-Flag-Chips direkt unter dem Headline-Block.
+          Pilot sieht auf einen Blick was die Auffälligkeiten sind.
+          Webapp hat das schon; jetzt auch im Client für visuelle Parität. */}
+      <QuickFlags record={record} />
+
       {/* Score breakdown — most important new section */}
       <section className="landing-section">
         <h3>
@@ -1211,10 +1174,20 @@ function LandingDetail({
                 Mess-Methodik ist (interpoliert vs SimVar/Sampler-Best-Guess).
                 Plus 500-ms- und 1-s-Mean direkt darunter — Pilot sieht alle
                 drei VS-Mess-Methoden im gleichen Block. */}
+            {/* v0.5.47 — alle 50-Hz-Mittelwerte (Edge / 250 / 500 / 1000 /
+                1500 ms) auch im Client zeigen, identisch zur Webapp.
+                Pilot sieht im Client und im Live-Monitor exakt dieselbe
+                Reihenfolge mit denselben Werten. */}
             {record.vs_at_edge_fpm != null && (
               <div title={t("landing.vs_at_edge_hint") ?? undefined}>
                 <dt>{t("landing.vs_at_edge")}</dt>
                 <dd>{fmtNumber(record.vs_at_edge_fpm, 0, "fpm")}</dd>
+              </div>
+            )}
+            {record.vs_smoothed_250ms_fpm != null && (
+              <div title={t("landing.vs_smoothed_250ms_hint") ?? undefined}>
+                <dt>{t("landing.vs_smoothed_250ms")}</dt>
+                <dd>{fmtNumber(record.vs_smoothed_250ms_fpm, 0, "fpm")}</dd>
               </div>
             )}
             {record.vs_smoothed_500ms_fpm != null && (
@@ -1227,6 +1200,12 @@ function LandingDetail({
               <div title={t("landing.vs_smoothed_1000ms_hint") ?? undefined}>
                 <dt>{t("landing.vs_smoothed_1000ms")}</dt>
                 <dd>{fmtNumber(record.vs_smoothed_1000ms_fpm, 0, "fpm")}</dd>
+              </div>
+            )}
+            {record.vs_smoothed_1500ms_fpm != null && (
+              <div title={t("landing.vs_smoothed_1500ms_hint") ?? undefined}>
+                <dt>{t("landing.vs_smoothed_1500ms")}</dt>
+                <dd>{fmtNumber(record.vs_smoothed_1500ms_fpm, 0, "fpm")}</dd>
               </div>
             )}
             <div>
@@ -1248,6 +1227,12 @@ function LandingDetail({
               <div title={t("landing.peak_g_post_500ms_hint") ?? undefined}>
                 <dt>{t("landing.peak_g_post_500ms")}</dt>
                 <dd>{fmtNumber(record.peak_g_post_500ms, 2, "G")}</dd>
+              </div>
+            )}
+            {record.peak_g_post_1000ms != null && (
+              <div title={t("landing.peak_g_post_1000ms_hint") ?? undefined}>
+                <dt>{t("landing.peak_g_post_1000ms")}</dt>
+                <dd>{fmtNumber(record.peak_g_post_1000ms, 2, "G")}</dd>
               </div>
             )}
             <div>

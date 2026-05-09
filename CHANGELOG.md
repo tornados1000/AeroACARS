@@ -4,6 +4,61 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.5.47] — 2026-05-09
+
+🎯 **Web/Client-Parität — eine Wahrheit für Sub-Scores, Labels und Einheiten.**
+
+### Hintergrund
+
+User-Feedback: „die beiden Berechnungen im Web und in AeroACARS müssen gleich sein". Audit hat starke Drift aufgedeckt — Pilot-App (`LandingPanel.tsx`) und Live-Monitor (`LandingAnalysis.tsx`) hatten zwei separate Sub-Score-Tabellen mit unterschiedlichen Schwellen, Bands, Coach-Tipps und Rollout-Metriken. Derselbe Flug bekam je nach Plattform andere Teilnoten.
+
+### 🆕 Vier zusammengehörige Fixes
+
+**1. Score-Modul `client/src/lib/landingScoring.ts` portiert (1:1 vom Webapp):**
+- `computeSubScores()`, `aggregateSubScores()`, `classifyLanding()`, `band()`, `RATIONALE_LABELS`, `TIP_LABELS`, `SUB_LABELS` — alles aus einer Datei
+- `LandingPanel.tsx` löscht 7 lokale `score*`-Funktionen + lokales `band()` und delegiert an die Lib
+- Schwellwerte für V/S, G, Bounces, Stability, Rollout (jetzt absolute Meter wie Webapp), Fuel sind identisch
+- Coach-Tip-Logik nutzt den schwächsten Sub-Score wie im Webapp
+- Datei ist Quelle der Wahrheit — Änderungen MÜSSEN in beiden Repos parallel passieren
+
+**2. Label-Drift eliminiert (Webapp):**
+- `LandingAnalysis.tsx`: Touchdown-Tile „V/S" → „Sinkrate", „Peak G" → „Peak-G"
+- 50-Hz-Forensik-Card: „V/S am Edge", „V/S 250/500/1000/1500 ms-Mean", „Peak-G post-TD …" — alle V/S-Labels auf „Sinkrate" + Bindestrich-Konsistenz mit Pilot-App
+- Flare-Card: „V/S-Reduktion" → „Sinkraten-Reduktion", „dV/S/dt" → „dSinkrate/dt", „V/S End-of-Flare" → „Sinkrate End-of-Flare"
+- G-Tone-Schwellen folgen jetzt den `landingScoring.ts`-Bands (1.40 firm, 1.70 hard, 2.10 severe)
+
+**3. Einheiten-Konsistenz kg statt t (Webapp):**
+- LDW + Fuel @ Landing: vorher in `t` mit `/1000`-Trick, jetzt in `kg` mit Tausender-Trennzeichen — gleich zur Client-`ComparisonTable` im Reports-Tab
+
+**4. Fehlende 50-Hz-Felder im Client + Typo-Fix:**
+- Client zeigt jetzt zusätzlich `vs_smoothed_250ms_fpm`, `vs_smoothed_1500ms_fpm`, `peak_g_post_1000ms` (waren in `LandingRecord` vorhanden, aber nie gerendert)
+- DE-i18n-Typo `Flare-Qualitaet` → `Flare-Qualität`, `verfuegbar` → `verfügbar`, `fuer` → `für`
+- Alle Forensik-Labels in DE/EN/IT von „V/S" auf „Sinkrate" / „Sink rate" / „Rateo discesa" angeglichen
+
+**5. Quick-Flag-Chips auch im Client:**
+- Neuer `QuickFlags`-Component direkt unter dem Headline-Block: HARTE LANDUNG (≥600 fpm oder ≥1.7 G), SCHWERE LANDUNG (≥1000 fpm oder ≥2.1 G), BOUNCE × n, ABSEITS DER MITTELLINIE (>5 m), UNSTABILER ANFLUG (σ V/S > 400 fpm)
+- Spiegelt die Chip-Row aus dem Webapp-Header — Pilot sieht in beiden Plattformen dieselben Auffälligkeiten als erstes
+- DE/EN/IT i18n vollständig + neue CSS-Klassen
+
+### Was Piloten merken
+
+- **Sub-Score-Breakdown** im Client und Web zeigen jetzt für denselben Flug exakt dieselben Punkte — keine "Welcher Wert stimmt jetzt?"-Diskussionen mehr
+- **Labels** sind durchgängig „Sinkrate" (DE) / „Sink rate" (EN) / „Rateo discesa" (IT) statt mal „V/S" mal „Sinkrate"
+- **Einheiten** für LDW + Fuel-at-Landing sind in beiden Plattformen kg
+- **Auffälligkeiten** als Chip-Row direkt unter dem Headline auch in der Pilot-App
+- Touchdown-Tile-Färbung (Webapp) folgt jetzt den offiziellen Score-Bands
+
+### Geänderte Dateien
+
+- `client/src/lib/landingScoring.ts` — neu, Source-of-Truth für beide Plattformen
+- `client/src/components/LandingPanel.tsx` — `computeSubScores` delegiert an Lib, neue `QuickFlags`-Component, fehlende Forensik-Felder gerendert
+- `client/src/locales/{de,en,it}/common.json` — Typo-Fix, V/S → Sinkrate, neue 250/1500/1000ms-Keys, neue `landing.flag.*`-Keys
+- `client/src/App.css` — `.landing-flags`, `.landing-flag--warn`, `.landing-flag--err`
+- `aeroacars-live/webapp/src/components/LandingAnalysis.tsx` — Label-Drift, kg-Einheit, G-Schwellen
+- Versionen: `package.json`, `tauri.conf.json`, `Cargo.toml` → 0.5.47
+
+---
+
 ## [v0.5.46] — 2026-05-09
 
 🎯 **Adrian-Feedback umgesetzt — Approach-Stability-Filter + OFP-Refresh im Loadsheet-Card.**
