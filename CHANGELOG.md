@@ -24,19 +24,19 @@ In v0.6.0 initial: `MAX_BATCH=50` zog 50 Items aus der Outbox, aber dann lief ei
 
 **Fix:** Explizites `match` mit `tracing::warn!` bei Read-Failure und `deserialize_failed`-Counter im Success-Log.
 
-### 🟡 Bug #4 — Outbox-Cap-Drop war silent
+### 🟡 Bug #3 — Outbox-Cap-Drop war silent
 
 Wenn die Outbox > 5000 Items wuchs, wurden ältere Positions still gedroppt — kein Log, kein Activity-Feed-Eintrag. Nach 8h Netz-Outage auf einem Long-Haul: die Start-of-Flight Punkte (Departure-Climb, TOC) verschwinden aus dem Live-Map ohne Warnung. JSONL-Forensik bleibt komplett, aber der Pilot hat kein Signal warum sein Track kürzer wird.
 
 **Fix:** `tracing::warn!` pro Tick mit `dropped_this_tick`-Counter und expliziter Klarstellung dass JSONL-Forensik noch komplett ist.
 
-### 🟡 Bug — `persist_outbox` löschte Items von anderen pireps
+### 🟡 Bug #4 — `persist_outbox` löschte Items von anderen pireps
 
 Erste persist_outbox-Implementierung machte `queue.replace(&items)` mit nur den aktuellen pirep-items → wenn queue.json items von einem anderen pirep_id hatte (App-Crash mid-flight eines prior flights), wurden die zerstört. Plus: bei leerer Outbox returned die Funktion ohne write → ältere Items des aktuellen pireps blieben in queue.json und wurden beim nächsten Start als Duplikate re-posted.
 
 **Fix:** Read-modify-write Pattern — read all, filter aktuellen pirep raus, append outbox snapshot, write combined back. Auch leere Outbox triggert write (= file gelöscht wenn nichts mehr da).
 
-### 🔴 Bug — `position_interval(phase)` faelschlich entfernt → fix 3s im Worker statt phase-aware
+### 🔴 Bug #5 — `position_interval(phase)` faelschlich entfernt → fix 3s im Worker statt phase-aware
 
 In meinem ersten v0.6.1-Pass hatte ich die `position_interval(phase)`-Funktion gelöscht und den Worker auf fix 3s-Cadence umgestellt — mit der Begründung „eine fixe Cadence + Batching von 50 Items effektiver als Phase-aware". **Das war Quatsch.** Der Pilot hat mich darauf gestoßen.
 
@@ -50,13 +50,25 @@ In meinem ersten v0.6.1-Pass hatte ich die `position_interval(phase)`-Funktion g
 
 Plus: **Exponential Backoff non-blocking umgebaut.** Vorher war's `tokio::time::sleep(extra_secs).await` im Loop — blockte den responsive Stop-Check. Jetzt: `backoff_until: Option<Instant>` wird gesetzt, der Loop-Top-Check skipped bis dahin. Stop-Signal wird in jedem TICK=1s erkannt selbst während Backoff läuft.
 
+### 🔴 Bug #6 — Orphan-Persist-Race im Stop-Pfad
+
+Audit-Pass nach Bug #5 hat einen weiteren echten Bug gefunden: Stop-Pfade machen `outbox.clear()` gefolgt von `stop=true`. Zwischen diesen zwei Aufrufen kann der Streamer-Tick noch 1+ Items in die Outbox geschoben haben (Race-Window klein aber real). Worker sieht im nächsten Tick `stop=true` → ruft `persist_outbox` → die orphan items des cancelled/filed pireps landen in `position_queue.json` und rotten dort für immer (Worker-Init-Load filtert sie raus aber löscht sie nicht).
+
+**Fix:** Worker im stop-branch macht jetzt selbst nochmal `outbox.clear()` BEVOR er persist_outbox aufruft. Damit sind im persist_outbox-Snapshot null Items des aktuellen Pireps drin und nur items anderer pireps werden geschrieben. Semantisch korrekt für alle 5 Stop-Pfade: bei Cancel/Forget will der User explizit nichts mehr; bei Filing hat die JSONL alle Position-Events für Forensik-Upload; bei remote_cancellation würde der POST eh 404 zurückgeben.
+
+### 🟡 Bug #7 — `persist_outbox` Hysteresis bei steady-state Backlog
+
+Bei outbox.len() ≥ 500 wurde `persist_outbox` jeden TICK=1s aufgerufen. Bei steady-state outbox≈500 (langer Backlog der sich nicht abbaut, weil Streamer schneller pusht als Worker drainen kann): full file rewrite jede Sekunde, ~100KB+ pro Write.
+
+**Fix:** `last_persist_at: Option<Instant>` mit `PERSIST_COOLDOWN=30s` — Backlog-Persist nur wenn 30s seit letztem Persist verstrichen sind. Im stop-branch wird IMMER persistiert (ohne Cooldown-Check) damit der finale State raus geht.
+
 ### Spawn-Order konsistent
 
 In allen 3 Spawn-Sites (flight_start / flight_resume_after_disconnect / flight_resume_confirm) wird jetzt `spawn_phpvms_position_worker` ZUERST aufgerufen, dann der Streamer + Sampler. Hint an den Scheduler dass der Worker-Init-Load aus queue.json fertig sein soll bevor der Streamer fresh items pusht (chronologische Reihenfolge in der Outbox).
 
 ### Geänderte Dateien
 
-- `client/src-tauri/src/lib.rs` — Worker-Loop komplett überarbeitet (Batch-POST, BATCH_TIMEOUT=15s, requeue_batch-Helper, exponential backoff bei consecutive failures, queue-read-error logging, deserialize-counter, persist_outbox read-modify-write); Streamer-Tick: outbox-cap-drop logging; spawn-order in flight_start + flight_resume_after_disconnect umgedreht; `position_interval` entfernt; Worker-Docstring auf tatsächliches Verhalten umgestellt
+- `client/src-tauri/src/lib.rs` — Worker-Loop komplett überarbeitet (echtes Batch-POST mit BATCH_TIMEOUT=15s, requeue_batch-Helper mit reverse-iter push_front, non-blocking exponential backoff via backoff_until: Option<Instant>, queue-read-error logging, deserialize-counter, persist_outbox read-modify-write mit other-pirep-preservation, persist-hysteresis 30s cooldown bei steady-state backlog, orphan-persist-race fix via clear-before-persist im stop-branch, phase-aware POST-Cadence über position_interval(phase) + last_post_at-Tracking statt fix 3s); Streamer-Tick: outbox-cap-drop logging; spawn-order in flight_start + flight_resume_after_disconnect umgedreht
 - Versionen → 0.6.1
 
 ---
@@ -80,8 +92,8 @@ User-Wunsch nach v0.5.51: *„wir haben die ganze Nacht Zeit — neu denken kein
 **Nachher (v0.6.0):**
 
 - **Streamer-Tick** macht nur noch: Snapshot lesen → FSM-Step → JSONL-Write → MQTT-Publish (non-blocking) → push in **Memory-Outbox**. Pures CPU + lokales File-IO. Blockiert *strukturell* nicht mehr auf phpVMS.
-- **`spawn_phpvms_position_worker`** ist ein eigener async Task pro Flug. Liest 3-sekündlich aus der Outbox, batched bis zu 50 Items, POST mit Per-Item-Timeout (5 s). Bei Failure: Item zurück in die Outbox + 10-sec-Backoff. Bei 404: PIREP wurde server-seitig gelöscht → Worker terminiert sauber.
-- **Memory-Outbox** (5000 Items max ≈ 8 h Cruise-Daten) ist die Single-Source-of-Truth für ungesendete Positions. Persistierung in `position_queue.json` nur noch lazy (Worker-Stop oder Backlog >500) für App-Restart-Recovery.
+- **`spawn_phpvms_position_worker`** ist ein eigener async Task pro Flug. Tickt mit `TICK=1s` (responsive Stop-Check), POST-Cadence kommt aus `position_interval(phase)` (4-30s je nach Flugphase). Bis 50 Items pro Batch in einem HTTP-POST mit `BATCH_TIMEOUT=15s`. Bei Failure: KOMPLETTER Batch zurück in die Outbox + non-blocking exponential Backoff (3,6,12,24,48,60s gecapped). Bei 404: PIREP wurde server-seitig gelöscht → Worker terminiert sauber.
+- **Memory-Outbox** (5000 Items max ≈ 8 h Cruise-Daten) ist die Single-Source-of-Truth für ungesendete Positions. Persistierung in `position_queue.json` nur noch lazy (Worker-Stop oder Backlog ≥ 500 mit 30s-Hysteresis) für App-Restart-Recovery.
 - **50-Hz Touchdown-Sampler** (eigener Task seit v0.5.39) bleibt unverändert — der war nie das Problem.
 
 ### Was raus ist
@@ -107,7 +119,7 @@ JSONL ist wie vorher die Single-Source-of-Truth. Jede Position wird **vor** dem 
 
 - `client/src-tauri/src/lib.rs` — neue `ActiveFlight.position_outbox` (`Mutex<VecDeque<PositionEntry>>`) + `phpvms_worker_spawned`-Guard, neue `spawn_phpvms_position_worker` + `persist_outbox`-Helper, Streamer-Tick pusht in Outbox statt direktem POST, alle 3 Spawn-Sites (flight_start / flight_resume / flight_resume_after_disconnect) wired, alle 5 stop-Pfade (cancel/forget/end/end_with_overrides/remote_cancellation) clearen die Outbox vor stop=true
 - `client/src-tauri/src/recorder_core.rs` — gelöscht (Komplett-Refactor-Skeleton wurde nicht weiter verfolgt)
-- `client/src/components/LiveRecordingIndicator.tsx` — Stale-Threshold-Kommentar auf v0.6.0 aktualisiert (180 sec passt zur 3-sec-Worker-Tick + 5-sec-Per-Item-Timeout)
+- `client/src/components/LiveRecordingIndicator.tsx` — Stale-Threshold-Kommentar auf v0.6.0 aktualisiert (180 sec ist großzügig genug für die phase-aware POST-Cadence bis 30s im Cruise plus 1-2 Backoff-Cycles bei Connection-Issues)
 - Versionen → **0.6.0** (Minor-Bump, weil internes Daten-/Worker-Modell sich ändert; UI + persistente Files bleiben backward-compatible)
 
 ### Risiko

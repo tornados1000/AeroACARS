@@ -6621,9 +6621,11 @@ fn record_event(app: &AppHandle, pirep_id: &str, event: &FlightLogEvent) {
 ///   5. **Bei anderem Fehler / Timeout:** kompletter Batch zurueck in die
 ///      Outbox VORN (chronologische Reihenfolge erhalten via `push_front`
 ///      in reverse-iter); `consecutive_failures += 1`.
-///   6. **Persist-Trigger:** wenn Outbox > 500 items, `persist_outbox()`
-///      schreibt aktuellen Stand in `position_queue.json` (read-modify-write,
-///      bewahrt items anderer pireps).
+///   6. **Persist-Trigger:** wenn Outbox >= 500 items UND `last_persist_at`
+///      >= 30s her ist (Hysteresis), `persist_outbox()` schreibt aktuellen
+///      Stand in `position_queue.json` (read-modify-write, bewahrt items
+///      anderer pireps). Im stop-branch wird IMMER persistiert (ohne
+///      Cooldown-Check) via `persist_outbox_clearing()`.
 ///   7. **Exponential Backoff:** bei `consecutive_failures > 0` setzen wir
 ///      `backoff_until = now + min(60, 3 << (n-1))` Sekunden — verhindert
 ///      dass wir bei toter Verbindung jede TICK gegen die Wand laufen.
@@ -6713,11 +6715,33 @@ fn spawn_phpvms_position_worker(
                 }
             }
         }
+        // v0.6.1 — Hysteresis: minimum 30s zwischen persist_outbox-Aufrufen
+        // im normalen Backlog>500-Fall, damit wir bei steady-state outbox~500
+        // nicht jede TICK=1s die ganze position_queue.json neu schreiben.
+        // Beim Stop wird IMMER persistiert (final state).
+        let mut last_persist_at: Option<std::time::Instant> = None;
+        const PERSIST_COOLDOWN: Duration = Duration::from_secs(30);
         loop {
             tokio::time::sleep(TICK).await;
             if flight.stop.load(Ordering::Relaxed) {
-                // Final-Persist: alle noch in Outbox in position_queue.json
-                persist_outbox(&app, &flight);
+                // v0.6.1 KRITISCHER FIX — Orphan-Persist-Race:
+                // Stop-Pfade machen `outbox.clear() -> stop=true`. Zwischen
+                // diesen zwei Aufrufen kann der Streamer-Tick noch 1+ Items
+                // in die Outbox geschoben haben (Race-Window klein aber real).
+                //
+                // Wir benutzen hier `persist_outbox_clearing` welches clear+
+                // snapshot ATOMAR unter dem GLEICHEN Lock-Hold macht — kein
+                // Streamer-Push zwischen clear und snapshot moeglich.
+                //
+                // Semantik in allen 5 stop-Paths:
+                //   - flight_cancel/forget: User wollte explizit nichts mehr
+                //   - flight_end/end_with_overrides: PIREP ist gefiled, JSONL
+                //     hat alle Position-Events fuer Forensik-Upload
+                //   - handle_remote_cancellation: PIREP serverseitig weg, POST
+                //     wuerde eh 404 zurueckgeben
+                // → in keinem Fall wollen wir Items aus dem aktuellen Pirep
+                //   nach dem Stop noch persistieren.
+                persist_outbox_clearing(&app, &flight);
                 tracing::info!(pirep_id = %flight.pirep_id, "phpvms-position-worker stopped");
                 break;
             }
@@ -6822,8 +6846,20 @@ fn spawn_phpvms_position_worker(
                 let mut stats = flight.stats.lock().expect("flight stats");
                 stats.queued_position_count = total_after as u32;
             }
+            // Persist-Trigger mit Hysteresis: wenn Outbox >= 500 UND seit
+            // letztem persist >= PERSIST_COOLDOWN (30s) verstrichen sind.
+            // Verhindert dass wir bei steady-state outbox~500 jede TICK=1s
+            // die ganze position_queue.json neu schreiben (full file
+            // rewrite kann ~100KB+ sein bei vollem Backlog).
             if total_after >= 500 {
-                persist_outbox(&app, &flight);
+                let cooldown_ok = match last_persist_at {
+                    None => true,
+                    Some(t) => t.elapsed() >= PERSIST_COOLDOWN,
+                };
+                if cooldown_ok {
+                    persist_outbox(&app, &flight);
+                    last_persist_at = Some(std::time::Instant::now());
+                }
             }
             // Exponentieller Backoff bei consecutive failures (3s, 6s,
             // 12s, 24s, 48s, gecapped 60s). Statt blocking sleep setzen
@@ -6849,8 +6885,8 @@ fn spawn_phpvms_position_worker(
 /// erhaltener chronologischer Reihenfolge. Wird vom phpVMS-Worker
 /// aufgerufen wenn ein Batch-POST scheitert.
 ///
-/// **Wichtig:** `failed.into_iter().rev() + push_front` ergibt die
-/// originale Reihenfolge: failed=[a,b,c] -> push_front c, b, a ->
+/// **Wichtig:** `batch.into_iter().rev() + push_front` ergibt die
+/// originale Reihenfolge: batch=[a,b,c] -> push_front c, b, a ->
 /// outbox = [a, b, c, ...].
 fn requeue_batch(flight: &ActiveFlight, batch: Vec<api_client::PositionEntry>) {
     let mut outbox = flight.position_outbox.lock()
@@ -6875,16 +6911,35 @@ fn requeue_batch(flight: &ActiveFlight, batch: Vec<api_client::PositionEntry>) {
 /// rauslöschen), sonst werden ältere persistierte items beim nächsten
 /// App-Start re-loaded und re-posted (Duplikate auf der phpVMS Karte).
 fn persist_outbox(app: &AppHandle, flight: &ActiveFlight) {
+    persist_outbox_inner(app, flight, false);
+}
+
+/// v0.6.1 — Variante von persist_outbox die VOR dem Snapshot die Outbox
+/// atomar leert. Wird vom Worker-Stop-Branch aufgerufen damit es keinen
+/// Race gibt zwischen `outbox.clear()` und `persist_outbox()`-Lock-
+/// Reacquire (Streamer könnte zwischendurch noch was pushen → orphan).
+/// Mit `clear_first=true` passiert clear+snapshot unter EINEM Lock-Hold.
+fn persist_outbox_clearing(app: &AppHandle, flight: &ActiveFlight) {
+    persist_outbox_inner(app, flight, true);
+}
+
+fn persist_outbox_inner(app: &AppHandle, flight: &ActiveFlight, clear_first: bool) {
     let Some(queue) = open_position_queue(app) else {
         return;
     };
     // Aktuelle Outbox in Vec snapshotten — Lock so kurz wie möglich.
+    // Bei clear_first=true: erst clear, DANN snapshot — beides unter
+    // demselben Lock-Hold. Damit kann der Streamer zwischendurch nichts
+    // pushen das danach als orphan in queue.json landet.
     // Defensive: wenn serde_json::to_value tatsaechlich mal scheitern
     // sollte (PositionEntry derives Serialize, also extrem unwahrscheinlich),
     // skippen wir den Eintrag und loggen — besser als ein null-Item das
     // beim Re-Load deserialize-Failure produziert.
     let outbox_items: Vec<QueuedPosition> = {
-        let outbox = flight.position_outbox.lock().expect("position_outbox lock");
+        let mut outbox = flight.position_outbox.lock().expect("position_outbox lock");
+        if clear_first {
+            outbox.clear();
+        }
         outbox.iter().filter_map(|p| {
             match serde_json::to_value(p) {
                 Ok(v) => Some(QueuedPosition {
@@ -9656,11 +9711,12 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                 },
             );
 
-            // v0.6.0 — Position in Memory-Outbox pushen (Worker holt sie ab).
-            // Ein simpler ~1µs Mutex-Push, blockiert NIE — der phpVMS-Worker
-            // (3-sec Tick + Batch-POST bis 50 Items) bedient die Outbox
-            // entkoppelt. Bei Failure: Worker queued den ganzen batch zurück
-            // in die Outbox + bei Backlog>500 in `position_queue.json`.
+            // v0.6.0/v0.6.1 — Position in Memory-Outbox pushen (Worker holt
+            // sie ab). Ein simpler ~1µs Mutex-Push, blockiert NIE — der
+            // phpVMS-Worker (TICK=1s + phase-aware POST-Cadence 4-30s, batch
+            // bis 50 Items) bedient die Outbox entkoppelt. Bei Failure:
+            // Worker queued den ganzen batch zurueck in die Outbox + bei
+            // Backlog>=500 (mit 30s-Hysteresis) in `position_queue.json`.
             {
                 let mut outbox = flight.position_outbox.lock()
                     .expect("position_outbox lock");
