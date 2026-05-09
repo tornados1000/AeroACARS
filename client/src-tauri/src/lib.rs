@@ -5462,9 +5462,14 @@ async fn flight_start(
         }
     }
 
-    // v0.6.0 — phpVMS-Worker ZUERST damit der Init-Load aus
-    // position_queue.json fertig ist bevor der Streamer-Tick fresh
-    // items in die Outbox pusht (vermeidet Order-Race in der Outbox).
+    // v0.6.0/v0.6.1 — phpVMS-Worker zuerst aufrufen als Hint an den
+    // Scheduler dass sein Init-Load aus position_queue.json moeglichst
+    // vor dem ersten Streamer-Tick laeuft. **Keine harte Garantie** —
+    // tauri::async_runtime::spawn returnt sofort, beide tasks racen
+    // dann in der Tauri-Runtime. Ordering-Korrektheit fuer den Live-
+    // Map-Track auf phpVMS basiert eh auf dem `at`-Timestamp im
+    // PositionEntry-Body (server-seitig sortiert), nicht auf der
+    // Reihenfolge in der Memory-Outbox.
     spawn_phpvms_position_worker(app.clone(), Arc::clone(&flight), client.clone());
     spawn_position_streamer(app.clone(), Arc::clone(&flight), client.clone());
     spawn_touchdown_sampler(app.clone(), Arc::clone(&flight));
@@ -5972,8 +5977,9 @@ async fn flight_start_manual(
         save_active_flight(&app, &flight);
     }
 
-    // v0.6.0 — phpVMS-Worker ZUERST (Init-Load aus position_queue.json
-    // vor erstem Streamer-Push).
+    // v0.6.0/v0.6.1 — phpVMS-Worker zuerst spawnen (Hint, keine
+    // Garantie — siehe ausfuehrlichen Kommentar in flight_start).
+    // Ordering ist server-seitig durch PositionEntry.at sichergestellt.
     spawn_phpvms_position_worker(app.clone(), Arc::clone(&flight), client.clone());
     spawn_position_streamer(app.clone(), Arc::clone(&flight), client.clone());
     spawn_touchdown_sampler(app.clone(), Arc::clone(&flight));
@@ -6789,11 +6795,27 @@ fn persist_outbox(app: &AppHandle, flight: &ActiveFlight) {
         return;
     };
     // Aktuelle Outbox in Vec snapshotten — Lock so kurz wie möglich.
+    // Defensive: wenn serde_json::to_value tatsaechlich mal scheitern
+    // sollte (PositionEntry derives Serialize, also extrem unwahrscheinlich),
+    // skippen wir den Eintrag und loggen — besser als ein null-Item das
+    // beim Re-Load deserialize-Failure produziert.
     let outbox_items: Vec<QueuedPosition> = {
         let outbox = flight.position_outbox.lock().expect("position_outbox lock");
-        outbox.iter().map(|p| QueuedPosition {
-            pirep_id: flight.pirep_id.clone(),
-            position: serde_json::to_value(p).unwrap_or_default(),
+        outbox.iter().filter_map(|p| {
+            match serde_json::to_value(p) {
+                Ok(v) => Some(QueuedPosition {
+                    pirep_id: flight.pirep_id.clone(),
+                    position: v,
+                }),
+                Err(e) => {
+                    tracing::error!(
+                        pirep_id = %flight.pirep_id,
+                        error = ?e,
+                        "could not serialize PositionEntry for persist_outbox; skipping"
+                    );
+                    None
+                }
+            }
         }).collect()
     };
     // Bestehende queue.json lesen, items des aktuellen pirep
