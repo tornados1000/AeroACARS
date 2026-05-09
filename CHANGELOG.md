@@ -4,6 +4,30 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.5.42] — 2026-05-09
+
+🧹 **Smoothed VS filtert positive Werte raus — reine Sinkrate als Maß.**
+
+### Hintergrund
+
+Direkt nach v0.5.41 Feedback: in `compute_landing_analysis()` und im aeroacars-live FSM-Replay-Importer wurden ALLE airborne-Samples im Smoothing-Window gemittelt — auch solche mit positiver V/S (= Float-Effekt, Ground-Effect-Bumps, Ballooning kurz vor TD). Diese verfälschen den Mittelwert Richtung 0 und täuschen einen sanfteren Touchdown vor als physikalisch passiert ist.
+
+Volanta und DLHv filtern ähnlich — die zeigen die „reine Sinkrate" beim Touchdown, nicht den durchgemischten Mittelwert mit Float-Bumps.
+
+### Fix
+
+`mean_vs_window()` nimmt jetzt nur noch Samples mit `vs_fpm < 0` (= echte Sinkrate). Greift in:
+- `vs_smoothed_250ms_fpm` / 500ms / 1000ms / 1500ms im 50-Hz-Buffer-Analyzer
+- gleiches im aeroacars-live `importer.ts` für FSM-Replay von pre-v0.5.40 historische Logs
+
+`vs_at_edge_fpm` (linear interpoliert auf den exakten on_ground-Edge) bleibt unangetastet — das ist ein direkter Mess-Wert, kein Mittel.
+
+### Was sich für Piloten ändert
+
+Bei Landungen mit Float / Ballooning kurz vor TD wird der `vs_smoothed_500ms_fpm`-Wert jetzt etwas pessimistischer (= ehrlicher). Bei sauberen Approaches ohne Float-Bumps unverändert.
+
+---
+
 ## [v0.5.41] — 2026-05-09
 
 🎯 **Touchdown-Score nutzt jetzt 50-Hz `vs_at_edge` (= Volanta-equivalent), nicht mehr MSFS-SimVar.**

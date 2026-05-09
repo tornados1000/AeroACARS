@@ -7532,14 +7532,19 @@ fn compute_landing_analysis(
     }
     let edge_ms = edge_at.timestamp_millis();
 
-    // --- Multi-Window VS-Mittel (nur airborne-Samples vor Edge zählen) ---
+    // --- Multi-Window VS-Mittel (nur airborne-Samples vor Edge mit
+    // negativer V/S — das ist die "reine Sinkrate"). Positive Samples
+    // (= Float-Effekt, Ground-Effect-Bumps, Ballooning kurz vor TD)
+    // wuerden den Mittelwert sonst Richtung 0 verfaelschen und einen
+    // sanfteren Touchdown vortaeuschen als physikalisch passiert ist.
+    // Volanta/DLHv filtern aehnlich. ---
     let mean_vs_window = |window_ms: i64| -> Option<f32> {
         let lo = edge_ms - window_ms;
         let mut sum = 0.0_f64;
         let mut n = 0_u32;
         for s in samples {
             let ts = s.at.timestamp_millis();
-            if ts >= lo && ts <= edge_ms && !s.on_ground {
+            if ts >= lo && ts <= edge_ms && !s.on_ground && s.vs_fpm < 0.0 {
                 sum += s.vs_fpm as f64;
                 n += 1;
             }
