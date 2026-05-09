@@ -8815,12 +8815,30 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                 let app_state = app.state::<AppState>();
                     let mqtt = app_state.mqtt.lock().await;
                 if let Some(handle) = mqtt.as_ref() {
+                    // v0.5.44: aircraft_icao mit Fallback-Cascade.
+                    //
+                    // flight.aircraft_icao kommt aus phpVMS GET /aircraft/<id>
+                    // (siehe ActiveFlight-Init). Wenn der Pilot kein SimBrief
+                    // OFP hat oder das OFP keinen aircraft_id mitbringt, ist
+                    // das leer. Der Sim weiss aber das Aircraft (MSFS ATC
+                    // MODEL SimVar / X-Plane DataRef) — wir extrahieren da
+                    // den ICAO per Regex (z.B. "ATCCOM.AC_MODEL A321.0.text"
+                    // → "A321"). Damit Live-Monitor + Heatmap auch ohne OFP
+                    // den richtigen Type zeigen.
+                    let resolved_icao = if !flight.aircraft_icao.trim().is_empty() {
+                        flight.aircraft_icao.clone()
+                    } else {
+                        snap.aircraft_icao
+                            .as_deref()
+                            .and_then(extract_icao_code)
+                            .unwrap_or_default()
+                    };
                     let meta = aeroacars_mqtt::FlightMeta {
                         callsign: format_callsign(
                             &flight.airline_icao,
                             &flight.flight_number,
                         ),
-                        aircraft_icao: flight.aircraft_icao.clone(),
+                        aircraft_icao: resolved_icao,
                         dep_icao: flight.dpt_airport.clone(),
                         arr_icao: flight.arr_airport.clone(),
                         // v0.5.19: phpVMS-side registration overrides
@@ -9202,6 +9220,39 @@ fn current_premium_status(app: &AppHandle) -> sim_xplane::PremiumStatus {
 /// pro Tick zwischen 0 und N. Die Phase-FSM sieht dann zufällig false und
 /// blockiert Pushback→TaxiOut. Hier: gilt als "effektiv laufend" wenn
 /// snap.engines_running > 0 ODER der letzte >0-Reading <2 s her ist.
+/// v0.5.44: Extrahiert einen ICAO-Aircraft-Code aus dem rohen Sim-String.
+///
+/// MSFS liefert oft kuriose Werte fuer ATC MODEL — siehe importJsonl.ts
+/// cleanAircraftIcao mit dem gleichen Pattern:
+///   "ATCCOM.AC_MODEL A321.0.text" → "A321"
+///   "BoeingB738" → "B738"
+///   "FNX320"  → "A320" (matched in fallback)
+///   "A320"   → "A320"
+///
+/// Regex: \b([A-Z]\d{2,3}|[A-Z]{2,4}\d{0,3})\b — Boeing/Airbus-typische
+/// 4-Zeichen-Codes (B738, A320, C172, DA42, ...). Faellt bei keinem Match
+/// zurueck auf die ersten 8 Zeichen, gefiltert auf alphanumerisch.
+fn extract_icao_code(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() { return None; }
+    // Regex on-demand kompilieren — wird selten genutzt, nicht kritisch
+    // genug fuer eine static.
+    use regex::Regex;
+    let re = Regex::new(r"\b([A-Z]\d{2,3}|[A-Z]{2,4}\d{0,3})\b").ok()?;
+    if let Some(caps) = re.captures(raw) {
+        if let Some(m) = caps.get(1) {
+            return Some(m.as_str().to_string());
+        }
+    }
+    // Fallback: erste 8 alphanumerische Chars uppercase
+    let cleaned: String = raw.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect::<String>()
+        .to_uppercase();
+    if cleaned.is_empty() { None } else { Some(cleaned) }
+}
+
 fn engines_effectively_running(stats: &FlightStats, snap: &SimSnapshot, now: DateTime<Utc>) -> bool {
     if snap.engines_running > 0 { return true; }
     stats

@@ -4,6 +4,40 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.5.44] — 2026-05-09
+
+🛩 **Aircraft-Type-Fallback aus Sim-Snapshot — auch ohne SimBrief OFP gesetzt.**
+
+### Hintergrund
+
+User-Report: bei DLH 1731 (Lufthansa A320, D-AIUM) wurde im Live-Monitor nur die Registration „D-AIUM" angezeigt, der Aircraft-Type („A320") fehlte. Pattern bei mehreren Flügen ohne SimBrief OFP.
+
+### Root Cause
+
+`flight.aircraft_icao` wird in `lib.rs:4835` gesetzt aus:
+```rust
+let aircraft_icao = aircraft_details
+    .as_ref()
+    .and_then(|a| a.icao.clone())
+    .unwrap_or_default()  // ← "" wenn aircraft_details None
+```
+
+`aircraft_details` kommt aus `phpVMS.get_aircraft(simbrief.aircraft_id)`. Wenn der Pilot **kein SimBrief OFP** generiert hat (oder das OFP keinen `aircraft_id` enthielt), bleibt `aircraft_icao` leer. Der MQTT Position-Payload sendet dann `aircraft_icao: ""`.
+
+### Fix
+
+**Client (v0.5.44):** im Streamer-Tick wenn `flight.aircraft_icao` leer ist, fallback auf `snap.aircraft_icao` mit Regex-Extraktion. MSFS liefert oft kuriose Strings wie `"ATCCOM.AC_MODEL A321.0.text"` — der neue `extract_icao_code()` Helper extrahiert daraus `"A321"` per Regex `\b([A-Z]\d{2,3}|[A-Z]{2,4}\d{0,3})\b`.
+
+**Recorder (separater Fix, schon deployed):** `upsertFlightPosition` behandelt empty-Strings als NULL. Greift für **alle** pre-v0.5.44 Pilot-Clients sofort — das vorhandene Spalten-Wert wird nicht mehr durch leere Payloads überschrieben.
+
+### Was Piloten merken
+
+- **VAs ohne SimBrief-Setup** sehen jetzt den richtigen Aircraft-Type im Live-Monitor + auf der Karte (vorher nur Registration)
+- **Marker-Icon** auf der Live-Map zeigt das korrekte Flugzeug-SVG (vorher Default)
+- **PIREP Custom-Field „Aircraft Type"** wird gefüllt auch ohne SimBrief
+
+---
+
 ## [v0.5.43] — 2026-05-09
 
 🎯 **50-Hz-Forensik in der LandingPanel — Pilot sieht alles direkt in der App.**

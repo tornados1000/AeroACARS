@@ -15,7 +15,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.5.43"
+version = "0.5.44"
 edition = "2021"
 license = "MIT"
 authors = ["Thomas Kant <github@MANFahrer-GF>", "AeroACARS contributors"]
@@ -129,6 +129,11 @@ discord-rich-presence.workspace = true
 # Bundled CSV parser for the embedded ourairports runway table
 # (used by `src/runway.rs` to map a touchdown coord → runway).
 csv = "1.3"
+
+# v0.5.44: Regex fuer extract_icao_code — extrahiert MSFS-ATC-MODEL-Strings
+# wie "ATCCOM.AC_MODEL A321.0.text" zu "A321". regex ist eh schon als
+# transitive Dep im Tree (via tracing-subscriber + anderen).
+regex = "1"
 
 # In-process zip extraction for the X-Plane plugin auto-install
 # flow — pulls `AeroACARS-XPlane-Plugin-vX.Y.Z.zip` from the matching
