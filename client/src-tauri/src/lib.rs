@@ -874,6 +874,20 @@ struct PersistedFlightStats {
     holding_exit_pending_since: Option<DateTime<Utc>>,
     #[serde(default)]
     previous_phase_before_holding: Option<FlightPhase>,
+
+    // v0.5.45: Sampler-State persistieren damit App-Resume nach einem
+    // bereits-detektierten Touchdown nicht ein zweites Mal capturet
+    // (User-Report GSG 302 X-Plane DA40 Bush-Strip 2026-05-09: 1×
+    // flight_resumed nach erstem TD → Sampler hat beim echten Landing
+    // nochmal gefeuert weil Guard-State nach Resume None war).
+    #[serde(default)]
+    sampler_touchdown_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    sampler_takeoff_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    touchdown_window_dumped_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    landing_score_finalized: bool,
 }
 
 impl PersistedFlightStats {
@@ -945,6 +959,11 @@ impl PersistedFlightStats {
             holding_pending_since: stats.holding_pending_since,
             holding_exit_pending_since: stats.holding_exit_pending_since,
             previous_phase_before_holding: stats.previous_phase_before_holding,
+            // v0.5.45: Sampler-State persistieren gegen Resume-Re-Capture
+            sampler_touchdown_at: stats.sampler_touchdown_at,
+            sampler_takeoff_at: stats.sampler_takeoff_at,
+            touchdown_window_dumped_at: stats.touchdown_window_dumped_at,
+            landing_score_finalized: stats.landing_score_finalized,
         }
     }
 
@@ -1022,6 +1041,12 @@ impl PersistedFlightStats {
         stats.holding_pending_since = self.holding_pending_since;
         stats.holding_exit_pending_since = self.holding_exit_pending_since;
         stats.previous_phase_before_holding = self.previous_phase_before_holding;
+        // v0.5.45: Sampler-State restoren — verhindert Re-Capture nach Resume
+        // wenn der Touchdown vor dem Quit/Restart bereits gefeuert hat.
+        stats.sampler_touchdown_at = self.sampler_touchdown_at;
+        stats.sampler_takeoff_at = self.sampler_takeoff_at;
+        stats.touchdown_window_dumped_at = self.touchdown_window_dumped_at;
+        stats.landing_score_finalized = self.landing_score_finalized;
     }
 }
 
@@ -7924,7 +7949,17 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
             // `stats.sampler_touchdown_at.is_none()`-Guard: identisch
             // zur RREF-Edge — nur ein Capture pro Landing.
             if let Some(td) = current_premium_touchdown(&app) {
-                if stats.sampler_touchdown_at.is_none() {
+                // v0.5.45: Phase-Guard auch hier — wenn das X-Plane-Plugin
+                // ein Touchdown sendet aber wir sind nicht in Landing-Phase,
+                // ignorieren. Sollte selten passieren weil Plugin eigenen
+                // Edge-Detector hat, aber Konsistenz zur RREF-Edge.
+                let in_landing_phase = matches!(
+                    stats.phase,
+                    FlightPhase::Approach
+                        | FlightPhase::Final
+                        | FlightPhase::Landing
+                );
+                if stats.sampler_touchdown_at.is_none() && in_landing_phase {
                     stats.sampler_touchdown_at = Some(now);
                     stats.sampler_touchdown_vs_fpm = Some(td.captured_vs_fpm);
                     stats.sampler_touchdown_g_force = Some(td.captured_g_normal);
@@ -7974,7 +8009,21 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
                 );
             }
 
-            if edge_detected && stats.sampler_touchdown_at.is_none() {
+            // v0.5.45: Phase-Guard gegen Phantom-Touchdowns auf Bush-Strips.
+            // Bei unebenem Untergrund kann gear_normal_force_n < 1.0 N kurz
+            // unterschritten werden waehrend Taxi (DA40 auf X-Plane Bush-
+            // Strip 2026-05-09) — der Sampler interpretiert das sonst als
+            // Touchdown. TD-Edge nur akzeptieren wenn die FSM in einer
+            // Landing-relevanten Phase ist. Approach-Ausloeser AGL>1500ft
+            // ist OK (lange Endanflug-Bahnen), aber Taxi/Boarding/Cruise
+            // sind explizit ausgeschlossen.
+            let in_landing_phase = matches!(
+                stats.phase,
+                FlightPhase::Approach
+                    | FlightPhase::Final
+                    | FlightPhase::Landing
+            );
+            if edge_detected && stats.sampler_touchdown_at.is_none() && in_landing_phase {
                 // Pitch-Korrektur: world-frame Y-Velocity → body-axial
                 // (xgs-Pattern). Bei typischem Touchdown-Pitch ~3-5°
                 // ist cos(pitch)≈0.998, also <0.5% Unterschied. Bei
