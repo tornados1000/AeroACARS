@@ -4,6 +4,31 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.5.50] — 2026-05-09
+
+🚨 **Hotfix: macOS-Crash beim Startup nach v0.5.49-Update.**
+
+### Hintergrund
+
+Pilot-Report direkt nach v0.5.49-Release: „Auf Mac geht die Version sofort wieder zu nach dem Update — öffnet nicht mehr." App crashed unmittelbar beim Startup mit „no reactor running" panic.
+
+### Root-Cause
+
+`spawn_pirep_queue_worker` (neu in v0.5.49) nutzte `tokio::spawn` direkt — diese Funktion wird aber aus dem **synchronen `.setup()`-Closure** aufgerufen, wo auf macOS noch kein tokio-Runtime-Context aktiv ist. Auf Windows toleriert Tauri das (Runtime ist da früher initialisiert), auf macOS panic'd der Aufruf sofort.
+
+### 🆕 Fix
+
+- `spawn_pirep_queue_worker` nutzt jetzt `tauri::async_runtime::spawn` statt `tokio::spawn` — explizit Tauris managed Runtime, funktioniert in jedem Kontext auf allen Plattformen
+- Alle anderen `tokio::spawn`-Sites bleiben unverändert (sind in async fn-Kontexten, da gibt's keinen Bug)
+
+### Sofort-Maßnahmen
+
+- v0.5.49 zu Draft demoted, v0.5.48 wurde zwischenzeitlich wieder Latest
+- Mac-Piloten die schon v0.5.49 installiert hatten und nicht mehr starten können: v0.5.48-DMG manuell drüberinstallieren, dann auf v0.5.50-Auto-Update warten
+- Windows-Piloten waren NICHT betroffen — der Bug war macOS-spezifisch
+
+---
+
 ## [v0.5.49] — 2026-05-09
 
 🛡 **„Fehler 1236"-Fix — HTTP-Härtung + entkoppelter Streamer + PIREP-Offline-Queue.**

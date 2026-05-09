@@ -6231,7 +6231,15 @@ fn is_transient_pirep_error(e: &ApiError) -> bool {
 /// manuell). Loggt Success/Failure als Activity-Events damit der Pilot
 /// im Cockpit-Activity-Panel sehen kann was passiert.
 fn spawn_pirep_queue_worker(app: AppHandle) {
-    tokio::spawn(async move {
+    // v0.5.50 — `tauri::async_runtime::spawn` statt `tokio::spawn`.
+    // Diese Funktion wird aus dem synchronen `.setup()`-Closure
+    // aufgerufen — auf macOS ist da noch kein tokio-Runtime-Context
+    // aktiv, weshalb `tokio::spawn` in v0.5.49 mit „no reactor running"
+    // panic'd und die App sofort nach Update-Restart geschlossen wurde
+    // (Pilot-Report: Mac öffnet nicht mehr nach v0.5.49-Update).
+    // `tauri::async_runtime::spawn` nutzt explizit Tauris managed Runtime
+    // und funktioniert auch im Setup-Context auf allen Plattformen.
+    tauri::async_runtime::spawn(async move {
         const TICK: std::time::Duration = std::time::Duration::from_secs(60);
         const MAX_ATTEMPTS: u32 = 50;
         loop {
