@@ -133,6 +133,21 @@ pub enum FlightLogEvent {
         edge_at: DateTime<Utc>,
         samples: Vec<TouchdownWindowSample>,
     },
+    /// v0.5.39: berechnete Forensik-Metriken aus dem TouchdownWindow-Buffer.
+    /// Wird IMMER zusammen mit dem TouchdownWindow-Event geschrieben, direkt
+    /// danach. Gibt:
+    ///   - Multi-Window-VS-Mittel (250/500/1000/1500 ms vor TD-Edge) =
+    ///     Volanta-/DLHv-equivalente Werte
+    ///   - Peak-G post-TD im 500-ms-Fenster (Gear-Compression-Spike)
+    ///   - Flare-Qualität: dVS/dt + Reduktions-Score + Pilot-flare-detected?
+    ///   - Bounce-Profile: Anzahl + Peak-AGL + Dauer pro Excursion
+    /// Format = serde_json::Value damit das Schema mitwachsen kann ohne
+    /// alte Logs unparseable zu machen.
+    LandingAnalysis {
+        timestamp: DateTime<Utc>,
+        edge_at: DateTime<Utc>,
+        analysis: serde_json::Value,
+    },
     /// PIREP filed (clean or manual) or cancelled. Closes the log.
     FlightEnded {
         timestamp: DateTime<Utc>,

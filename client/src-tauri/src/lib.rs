@@ -7442,6 +7442,233 @@ fn spawn_flight_log_upload(app: &AppHandle, pirep_id: String) {
     });
 }
 
+/// v0.5.39: Forensik-Bewertung der Landung aus dem 50-Hz-Sample-Buffer
+/// um den TD-Edge. Gibt JSON-Map zurück, die im LandingAnalysis-Event in
+/// die JSONL geschrieben + im MQTT-Touchdown-Payload mit-publisht wird.
+///
+/// Berechnete Felder:
+///   - vs_at_edge_fpm           — interpolierte VS exakt am on_ground-Edge
+///   - vs_smoothed_250ms_fpm    — Mean über letzte 250 ms vor Edge
+///   - vs_smoothed_500ms_fpm    — 500 ms (= Volanta-Style)
+///   - vs_smoothed_1000ms_fpm   — 1000 ms (= DLHv-Style)
+///   - vs_smoothed_1500ms_fpm   — 1500 ms
+///   - peak_g_post_500ms        — Max G im 500 ms post-Edge (Gear-Spike)
+///   - peak_g_post_1000ms       — Max G im 1000 ms post-Edge
+///   - peak_vs_pre_flare_fpm    — steepste Sinkrate in [-2000, -100 ms]
+///   - vs_at_flare_end_fpm      — VS bei -100 ms (kurz vor TD)
+///   - flare_reduction_fpm      — peak_vs_pre_flare - vs_at_flare_end
+///   - flare_dvs_dt_fpm_per_sec — Steigungs-Rate der VS-Reduktion
+///   - flare_quality_score      — 0..100, höher = besser geflared
+///   - flare_detected           — bool, true wenn signifikante Reduktion
+///   - bounce_count             — Anzahl on_ground=False Excursionen post-TD
+///   - bounce_max_agl_ft        — höchster Bounce
+///   - sample_count             — Anzahl Samples im Buffer
+///   - pre_edge_sample_count    — davon vor Edge (= Pre-TD-Coverage)
+///   - post_edge_sample_count   — davon nach Edge
+fn compute_landing_analysis(
+    samples: &[TouchdownWindowSample],
+    edge_at: DateTime<Utc>,
+) -> serde_json::Value {
+    use serde_json::json;
+    if samples.is_empty() {
+        return json!({ "error": "empty_buffer" });
+    }
+    let edge_ms = edge_at.timestamp_millis();
+
+    // --- Multi-Window VS-Mittel (nur airborne-Samples vor Edge zählen) ---
+    let mean_vs_window = |window_ms: i64| -> Option<f32> {
+        let lo = edge_ms - window_ms;
+        let mut sum = 0.0_f64;
+        let mut n = 0_u32;
+        for s in samples {
+            let ts = s.at.timestamp_millis();
+            if ts >= lo && ts <= edge_ms && !s.on_ground {
+                sum += s.vs_fpm as f64;
+                n += 1;
+            }
+        }
+        if n > 0 { Some((sum / n as f64) as f32) } else { None }
+    };
+    let vs_250 = mean_vs_window(250);
+    let vs_500 = mean_vs_window(500);
+    let vs_1000 = mean_vs_window(1000);
+    let vs_1500 = mean_vs_window(1500);
+
+    // --- Interpolated VS am Edge ---
+    // Finde das Sample-Paar (last airborne, first on_ground) das den Edge
+    // umschließt; lineare Interpolation der VS auf edge_ms.
+    let mut last_air: Option<&TouchdownWindowSample> = None;
+    let mut first_ground: Option<&TouchdownWindowSample> = None;
+    for s in samples {
+        if !s.on_ground {
+            last_air = Some(s);
+        } else if last_air.is_some() && first_ground.is_none() {
+            first_ground = Some(s);
+            break;
+        }
+    }
+    let vs_at_edge = match (last_air, first_ground) {
+        (Some(a), Some(g)) => {
+            let t_a = a.at.timestamp_millis() as f64;
+            let t_g = g.at.timestamp_millis() as f64;
+            let t_edge = edge_ms as f64;
+            if (t_g - t_a).abs() < 1e-6 {
+                Some(a.vs_fpm)
+            } else {
+                let alpha = ((t_edge - t_a) / (t_g - t_a)).clamp(0.0, 1.0);
+                Some((a.vs_fpm as f64 + (g.vs_fpm as f64 - a.vs_fpm as f64) * alpha) as f32)
+            }
+        }
+        _ => None,
+    };
+
+    // --- Peak G post-TD (Gear-Compression sucht nach Edge) ---
+    let peak_g_window = |window_ms: i64| -> Option<f32> {
+        let hi = edge_ms + window_ms;
+        let mut peak = 0.0_f32;
+        let mut found = false;
+        for s in samples {
+            let ts = s.at.timestamp_millis();
+            if ts >= edge_ms && ts <= hi {
+                if s.g_force > peak { peak = s.g_force; }
+                found = true;
+            }
+        }
+        if found { Some(peak) } else { None }
+    };
+    let pg_500 = peak_g_window(500);
+    let pg_1000 = peak_g_window(1000);
+
+    // --- Flare-Analyse ---
+    // Window: [-2000 ms, -100 ms] vor Edge. Suche steepste Sinkrate +
+    // VS-Wert kurz vor Edge.
+    let flare_lo = edge_ms - 2000;
+    let flare_hi = edge_ms - 100;
+    let mut peak_vs_pre: Option<f32> = None;     // most negative
+    let mut vs_at_flare_end: Option<f32> = None; // VS am ts nahe -100ms
+    let mut min_dist_to_end = i64::MAX;
+    let mut earliest_in_window: Option<&TouchdownWindowSample> = None;
+    for s in samples {
+        let ts = s.at.timestamp_millis();
+        if ts >= flare_lo && ts <= flare_hi && !s.on_ground {
+            // Pitch-korrigierte VS verwenden — bei steilem Flare wichtig
+            let pitch_rad = (s.pitch_deg as f64) * std::f64::consts::PI / 180.0;
+            let vs_corrected = (s.vs_fpm as f64 * pitch_rad.cos()) as f32;
+            if peak_vs_pre.map(|p| vs_corrected < p).unwrap_or(true) {
+                peak_vs_pre = Some(vs_corrected);
+            }
+            let dist_to_end = (flare_hi - ts).abs();
+            if dist_to_end < min_dist_to_end {
+                min_dist_to_end = dist_to_end;
+                vs_at_flare_end = Some(vs_corrected);
+            }
+            if earliest_in_window.map(|e| ts < e.at.timestamp_millis()).unwrap_or(true) {
+                earliest_in_window = Some(s);
+            }
+        }
+    }
+
+    // Reduktion: positive Zahl = Flare hat Sinkrate verkleinert
+    let flare_reduction = match (peak_vs_pre, vs_at_flare_end) {
+        (Some(p), Some(v)) => Some(v - p),
+        _ => None,
+    };
+    // dVS/dt grob: (vs_at_flare_end - vs_at_flare_start) / window_dt
+    let flare_dvs_dt = match (earliest_in_window, vs_at_flare_end) {
+        (Some(start), Some(end_vs)) => {
+            let dt_sec = (flare_hi - start.at.timestamp_millis()) as f64 / 1000.0;
+            if dt_sec > 0.1 {
+                let pitch_rad = (start.pitch_deg as f64) * std::f64::consts::PI / 180.0;
+                let start_vs = (start.vs_fpm as f64 * pitch_rad.cos()) as f32;
+                Some(((end_vs - start_vs) as f64 / dt_sec) as f32)
+            } else { None }
+        }
+        _ => None,
+    };
+
+    // Score: 0..100 basierend auf Reduktion + finalem VS-Wert
+    // - 100: Reduktion >400 fpm UND finaler VS >-150 fpm (großer Flare, sanft)
+    // -  80: Reduktion >300 fpm
+    // -  60: Reduktion >200 fpm
+    // -  40: Reduktion >100 fpm
+    // -  20: Reduktion >0 fpm
+    // -   0: keine Reduktion oder Sinkrate stieg sogar (= keine Flare)
+    let (flare_score, flare_detected) = match flare_reduction {
+        Some(red) => {
+            let red = red as f64;
+            let final_vs = vs_at_flare_end.unwrap_or(0.0) as f64;
+            let base: f64 = if red > 400.0 { 100.0 }
+                else if red > 300.0 { 80.0 }
+                else if red > 200.0 { 60.0 }
+                else if red > 100.0 { 40.0 }
+                else if red > 0.0 { 20.0 }
+                else { 0.0 };
+            // Bonus für sanften Final-VS, Malus für noch steile Sinkrate am Ende
+            let adj: f64 = if final_vs > -150.0 { 0.0 }
+                else if final_vs > -300.0 { -10.0 }
+                else if final_vs > -500.0 { -20.0 }
+                else { -30.0 };
+            let score = (base + adj).max(0.0).min(100.0) as i32;
+            (Some(score), Some(red > 50.0))
+        }
+        None => (None, None),
+    };
+
+    // --- Bounce-Profile ---
+    // Post-TD: zähle on_ground=False Excursionen mit AGL-Höhe.
+    let mut bounces = 0_u32;
+    let mut bounce_max_agl: f32 = 0.0;
+    let mut in_bounce = false;
+    let mut current_bounce_max: f32 = 0.0;
+    for s in samples {
+        let ts = s.at.timestamp_millis();
+        if ts < edge_ms { continue; }
+        if !s.on_ground {
+            if !in_bounce {
+                in_bounce = true;
+                current_bounce_max = s.agl_ft;
+            } else if s.agl_ft > current_bounce_max {
+                current_bounce_max = s.agl_ft;
+            }
+        } else if in_bounce {
+            // Nur als Bounce zählen wenn die Excursion >5 ft AGL erreichte
+            // (sonst Mikro-Hüpfer durch Sim-Float-Noise)
+            if current_bounce_max >= 5.0 {
+                bounces += 1;
+                if current_bounce_max > bounce_max_agl {
+                    bounce_max_agl = current_bounce_max;
+                }
+            }
+            in_bounce = false;
+            current_bounce_max = 0.0;
+        }
+    }
+
+    let pre_count = samples.iter().filter(|s| s.at.timestamp_millis() < edge_ms).count();
+    let post_count = samples.len() - pre_count;
+
+    json!({
+        "vs_at_edge_fpm": vs_at_edge,
+        "vs_smoothed_250ms_fpm": vs_250,
+        "vs_smoothed_500ms_fpm": vs_500,
+        "vs_smoothed_1000ms_fpm": vs_1000,
+        "vs_smoothed_1500ms_fpm": vs_1500,
+        "peak_g_post_500ms": pg_500,
+        "peak_g_post_1000ms": pg_1000,
+        "peak_vs_pre_flare_fpm": peak_vs_pre,
+        "vs_at_flare_end_fpm": vs_at_flare_end,
+        "flare_reduction_fpm": flare_reduction,
+        "flare_dvs_dt_fpm_per_sec": flare_dvs_dt,
+        "flare_quality_score": flare_score,
+        "flare_detected": flare_detected,
+        "bounce_count": bounces,
+        "bounce_max_agl_ft": if bounce_max_agl > 0.0 { Some(bounce_max_agl) } else { None },
+        "sample_count": samples.len(),
+        "pre_edge_sample_count": pre_count,
+        "post_edge_sample_count": post_count,
+    })
+}
+
 /// v0.5.39: Beim TD-Edge — Pre-TD-Buffer (snapshot_buffer, ~5 s @ 50 Hz)
 /// in den post_touchdown_buffer kopieren und das Landing-Critical-Window
 /// öffnen. Der Sampler füllt den Buffer in den nächsten Iterationen mit
@@ -7758,6 +7985,8 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
             drop(stats);
             if let Some((edge_at, samples)) = dump_payload {
                 let count = samples.len();
+                // Forensik-Analyse vor dem Move ins Event berechnen
+                let analysis = compute_landing_analysis(&samples, edge_at);
                 record_event(
                     &app,
                     &flight.pirep_id,
@@ -7767,11 +7996,26 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
                         samples,
                     },
                 );
+                record_event(
+                    &app,
+                    &flight.pirep_id,
+                    &FlightLogEvent::LandingAnalysis {
+                        timestamp: now,
+                        edge_at,
+                        analysis: analysis.clone(),
+                    },
+                );
+                let flare_score = analysis.get("flare_quality_score")
+                    .and_then(|v| v.as_i64()).unwrap_or(-1);
+                let smooth_500 = analysis.get("vs_smoothed_500ms_fpm")
+                    .and_then(|v| v.as_f64()).unwrap_or(f64::NAN);
                 tracing::info!(
                     pirep_id = %flight.pirep_id,
                     sample_count = count,
                     window_ms = TOUCHDOWN_POST_WINDOW_MS,
-                    "touchdown window buffer flushed to flight log"
+                    flare_score = flare_score,
+                    smooth_500ms_fpm = smooth_500,
+                    "touchdown window + analysis flushed"
                 );
             }
         }
