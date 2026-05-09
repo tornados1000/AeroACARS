@@ -6621,11 +6621,12 @@ fn record_event(app: &AppHandle, pirep_id: &str, event: &FlightLogEvent) {
 ///   5. **Bei anderem Fehler / Timeout:** kompletter Batch zurueck in die
 ///      Outbox VORN (chronologische Reihenfolge erhalten via `push_front`
 ///      in reverse-iter); `consecutive_failures += 1`.
-///   6. **Persist-Trigger:** wenn Outbox >= 500 items UND `last_persist_at`
-///      >= 30s her ist (Hysteresis), `persist_outbox()` schreibt aktuellen
-///      Stand in `position_queue.json` (read-modify-write, bewahrt items
-///      anderer pireps). Im stop-branch wird IMMER persistiert (ohne
-///      Cooldown-Check) via `persist_outbox_clearing()`.
+///   6. **Persist-Trigger:** alle 30s (`PERSIST_INTERVAL`) wenn Outbox
+///      nicht leer ist, `persist_outbox()` schreibt aktuellen Stand in
+///      `position_queue.json` (read-modify-write, bewahrt items anderer
+///      pireps). Begrenzt Crash-Verlust auf max ~30s. Im stop-branch
+///      wird IMMER persistiert via `persist_outbox_clearing()` (atomar
+///      clear+snapshot unter einem Lock-Hold).
 ///   7. **Exponential Backoff:** bei `consecutive_failures > 0` setzen wir
 ///      `backoff_until = now + min(60, 3 << (n-1))` Sekunden — verhindert
 ///      dass wir bei toter Verbindung jede TICK gegen die Wand laufen.
@@ -6715,12 +6716,24 @@ fn spawn_phpvms_position_worker(
                 }
             }
         }
-        // v0.6.1 — Hysteresis: minimum 30s zwischen persist_outbox-Aufrufen
-        // im normalen Backlog>500-Fall, damit wir bei steady-state outbox~500
-        // nicht jede TICK=1s die ganze position_queue.json neu schreiben.
-        // Beim Stop wird IMMER persistiert (final state).
+        // v0.6.1 — Persist-Strategie: Abwägung zwischen Crash-Recovery
+        // (oft persistieren = wenig Datenverlust bei Hardkill) vs. Disk-IO
+        // (selten persistieren = weniger File-Rewrites).
+        //
+        // Strategie: alle PERSIST_INTERVAL=30s wenn Outbox NICHT leer ist.
+        // Begrenzt Crash-Verlust auf max 30s an positions, unabhängig
+        // vom Backlog. Bei großem Backlog (>500) ist das die gleiche
+        // 30s-Cadence — ein zusätzlicher „Backlog-Schutz" wäre redundant
+        // (würde die Cooldown verletzen oder dieselbe 30s-Cadence haben).
+        //
+        // Beim Stop wird IMMER persistiert (final state, ohne Cooldown,
+        // via persist_outbox_clearing das atomar clear+snapshot macht).
+        //
+        // Worst-case Datenverlust für phpVMS Live-Map bei Hardkill:
+        // ~30s an positions (= 1-10 Items je nach Phase). JSONL-SoT bleibt
+        // unabhängig komplett (per-event-write).
         let mut last_persist_at: Option<std::time::Instant> = None;
-        const PERSIST_COOLDOWN: Duration = Duration::from_secs(30);
+        const PERSIST_INTERVAL: Duration = Duration::from_secs(30);
         loop {
             tokio::time::sleep(TICK).await;
             if flight.stop.load(Ordering::Relaxed) {
@@ -6846,15 +6859,27 @@ fn spawn_phpvms_position_worker(
                 let mut stats = flight.stats.lock().expect("flight stats");
                 stats.queued_position_count = total_after as u32;
             }
-            // Persist-Trigger mit Hysteresis: wenn Outbox >= 500 UND seit
-            // letztem persist >= PERSIST_COOLDOWN (30s) verstrichen sind.
-            // Verhindert dass wir bei steady-state outbox~500 jede TICK=1s
-            // die ganze position_queue.json neu schreiben (full file
-            // rewrite kann ~100KB+ sein bei vollem Backlog).
-            if total_after >= 500 {
+            // Persist-Trigger: alle PERSIST_INTERVAL (30s) wenn die Outbox
+            // nicht leer ist. Das begrenzt den Crash-Verlust für phpVMS
+            // Live-Map auf max ~30s an Positions (= 1-10 Items je nach
+            // Phase), unabhängig davon wie groß der Backlog ist.
+            //
+            // Wichtig: NICHT persistieren wenn outbox leer ist — sonst
+            // schreiben wir bei jedem Cooldown-Ablauf sinnlos eine leere
+            // file (im Cruise mit gutem Netz wäre das ständig der Fall:
+            // Worker drained alle Items → outbox leer → Cooldown abgelaufen
+            // → wir würden alle 30s eine leere persist machen).
+            //
+            // Im Stop-Branch wird via persist_outbox_clearing IMMER
+            // geschrieben damit die finale leere file rauskommt + Items
+            // anderer pireps erhalten bleiben.
+            //
+            // Worst-case Datenverlust bei Hardkill: ~30s an positions.
+            // JSONL-SoT bleibt komplett (per-event-write).
+            if total_after > 0 {
                 let cooldown_ok = match last_persist_at {
                     None => true,
-                    Some(t) => t.elapsed() >= PERSIST_COOLDOWN,
+                    Some(t) => t.elapsed() >= PERSIST_INTERVAL,
                 };
                 if cooldown_ok {
                     persist_outbox(&app, &flight);
@@ -9731,7 +9756,6 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                     outbox.pop_front();
                     dropped_this_tick += 1;
                 }
-                let queued_count = outbox.len() as u32;
                 drop(outbox);
                 if dropped_this_tick > 0 {
                     // Warn pro Tick — auf einem dauerhaft toten Netz koennte
@@ -9746,8 +9770,24 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                          (JSONL forensics still complete; check phpVMS connectivity)"
                     );
                 }
-                let mut stats = flight.stats.lock().expect("flight stats");
-                stats.queued_position_count = queued_count;
+                // v0.6.1 — KEIN queued_position_count-Update hier!
+                //
+                // Semantik in v0.5.x: queued_position_count zeigte echten
+                // BACKLOG (failed POSTs in der file-queue). Im normalen
+                // Cruise = 0. Pilot interpretiert >0 als „Verbindungs-
+                // Problem".
+                //
+                // Wenn wir hier outbox.len() schreiben würden: Streamer
+                // pusht alle ~3s, Worker drained nur alle 30s im Cruise
+                // -> outbox.len() ist 29 von 30 Sekunden > 0 -> Indikator
+                // zeigt durchgehend „queued (offline)" obwohl alles ok.
+                //
+                // Stattdessen: nur der Worker setzt queued_position_count
+                // im success-Pfad (= was nach Drain noch übrig ist) bzw.
+                // failure-Pfad (= was nach Requeue drin steht). Im Cruise:
+                // nach erfolgreichem Drain ist outbox leer -> count=0.
+                // Bei Network-Down: Requeue lässt Backlog wachsen -> count
+                // steigt korrekt.
             }
 
             // Periodically flush running stats to disk so a Tauri restart

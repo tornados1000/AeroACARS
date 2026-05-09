@@ -54,13 +54,31 @@ Plus: **Exponential Backoff non-blocking umgebaut.** Vorher war's `tokio::time::
 
 Audit-Pass nach Bug #5 hat einen weiteren echten Bug gefunden: Stop-Pfade machen `outbox.clear()` gefolgt von `stop=true`. Zwischen diesen zwei Aufrufen kann der Streamer-Tick noch 1+ Items in die Outbox geschoben haben (Race-Window klein aber real). Worker sieht im nächsten Tick `stop=true` → ruft `persist_outbox` → die orphan items des cancelled/filed pireps landen in `position_queue.json` und rotten dort für immer (Worker-Init-Load filtert sie raus aber löscht sie nicht).
 
-**Fix:** Worker im stop-branch macht jetzt selbst nochmal `outbox.clear()` BEVOR er persist_outbox aufruft. Damit sind im persist_outbox-Snapshot null Items des aktuellen Pireps drin und nur items anderer pireps werden geschrieben. Semantisch korrekt für alle 5 Stop-Pfade: bei Cancel/Forget will der User explizit nichts mehr; bei Filing hat die JSONL alle Position-Events für Forensik-Upload; bei remote_cancellation würde der POST eh 404 zurückgeben.
+**Fix (initial):** Worker im stop-branch macht selbst nochmal `outbox.clear()` BEVOR er persist_outbox aufruft. **3rd-Audit hat das aber als nicht-atomar erkannt** — clear() droppt den Lock am Semicolon, persist_outbox acquired ihn wieder = Microsekunden-Race-Window bleibt. **Echter Fix:** neue Funktion `persist_outbox_clearing()` die clear+snapshot ATOMAR unter dem GLEICHEN Lock-Hold macht. Race-Window strukturell zu.
 
-### 🟡 Bug #7 — `persist_outbox` Hysteresis bei steady-state Backlog
+Semantisch korrekt für alle 5 Stop-Pfade: bei Cancel/Forget will der User explizit nichts mehr; bei Filing hat die JSONL alle Position-Events für Forensik-Upload; bei remote_cancellation würde der POST eh 404 zurückgeben.
 
-Bei outbox.len() ≥ 500 wurde `persist_outbox` jeden TICK=1s aufgerufen. Bei steady-state outbox≈500 (langer Backlog der sich nicht abbaut, weil Streamer schneller pusht als Worker drainen kann): full file rewrite jede Sekunde, ~100KB+ pro Write.
+### 🟡 Bug #7 — UX-Regression: queued_position_count bedeutete in v0.5.x „echter Backlog", in v0.6.0/v0.6.1 anfangs „alles in der Outbox"
 
-**Fix:** `last_persist_at: Option<Instant>` mit `PERSIST_COOLDOWN=30s` — Backlog-Persist nur wenn 30s seit letztem Persist verstrichen sind. Im stop-branch wird IMMER persistiert (ohne Cooldown-Check) damit der finale State raus geht.
+In v0.5.51: `queued_position_count` zeigte nur stuck items (failed POSTs in der file-queue) → 0 unter normalen Bedingungen → Indikator zeigte „live" im Cruise.
+
+In v0.6.0/v0.6.1 anfangs: Streamer pusht alle ~3s in die Memory-Outbox UND setzte sofort `queued_position_count = outbox.len()`. Worker drained nur alle 30s im Cruise. Resultat: Outbox 29 von 30 Sekunden > 0 → Indikator zeigt durchgehend „queued (offline)" obwohl alles funktioniert.
+
+**Fix:** Streamer-Tick setzt `queued_position_count` NICHT mehr. Nur der Worker setzt es nach jedem POST (success → outbox.len() = was nach Drain übrig ist; failure → outbox.len() = was nach Requeue drin steht). Im Cruise: nach success ist outbox leer → count=0 → Indikator zeigt korrekt „live".
+
+### 🔴 Bug #8 — Hardkill-Datenverlust für phpVMS Live-Map (v0.6.0/v0.6.1 anfangs: bis zu 499 Items weg)
+
+In v0.5.51 lief der phpVMS-POST inline im Streamer-Tick → bei Hardkill mid-flight verlor man max 1-2 Positions für die Live-Map (rest war eh schon gepostet).
+
+In v0.6.0/v0.6.1 anfangs: Persist nur bei Outbox >= 500 mit 30s-Cooldown. Bei Hardkill mit Backlog=499 und letzter persist 29s her: bis zu **499 positions verloren** für phpVMS Live-Map (JSONL-Forensik bleibt komplett, aber phpVMS hat sie nicht). Realistisch im Cruise: 30-60 Items pro Hardkill-Event verloren.
+
+**Fix:** Persist-Trigger drastisch verschärft. Statt „nur bei Backlog >= 500" jetzt: **alle 30s wenn Outbox nicht leer**. Begrenzt Crash-Verlust auf ~30s an positions (= 1-10 Items je nach Phase) statt potenziell 499. Im Stop-Branch wird weiterhin IMMER persistiert (atomar via `persist_outbox_clearing`).
+
+### 🟡 Bug #9 — `persist_outbox` Hysteresis bei steady-state Backlog (subsumed in #8)
+
+Bei outbox.len() >= 500 wurde `persist_outbox` jeden TICK=1s aufgerufen. Bei steady-state outbox≈500: full file rewrite jede Sekunde, ~100KB+ pro Write.
+
+**Fix:** `last_persist_at: Option<Instant>` mit `PERSIST_INTERVAL=30s`. Mit dem #8-Fix automatisch behoben weil dieselbe 30s-Cadence jetzt für ALLE Persists gilt (nicht nur backlog-getriggerte).
 
 ### Spawn-Order konsistent
 
