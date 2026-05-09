@@ -11,8 +11,10 @@ import { ActivityLogPanel } from "./components/ActivityLogPanel";
 import { AboutPanel } from "./components/AboutPanel";
 import { LandingPanel } from "./components/LandingPanel";
 import { UpdateButton } from "./components/UpdateButton";
+import { UpdateBanner } from "./components/UpdateBanner";
 import { LiveRecordingIndicator } from "./components/LiveRecordingIndicator";
 import { useSimSession } from "./hooks/useSimSession";
+import { useUpdateChecker } from "./hooks/useUpdateChecker";
 import type { ActiveFlightInfo, LoginResult, Profile } from "./types";
 
 type SessionStatus =
@@ -247,6 +249,11 @@ function App() {
     null,
   );
 
+  // v0.5.48: Zentraler Update-Checker. Beide UI-Komponenten — der
+  // Header-Button und das große Banner — konsumieren denselben State,
+  // damit nicht doppelt gegen GitHub gepollt wird.
+  const updateChecker = useUpdateChecker();
+
   useEffect(() => {
     applyTheme(theme);
   }, [theme]);
@@ -368,13 +375,21 @@ function App() {
 
   return (
     <main className="app">
+      {/* v0.5.48 — großes Update-Banner ÜBER dem Header. Wird vom
+          Hook + UpdateBanner-Komponente nur eingeblendet wenn (a)
+          Update >= 3 Tage gesehen, (b) kein aktiver Flug, (c) nicht
+          gerade snoozed. Sonst rendert die Komponente selbst null. */}
+      <UpdateBanner
+        checker={updateChecker}
+        activePhase={activeFlight?.phase ?? null}
+      />
       <header className="app__header">
         <div className="app__brand">
           <h1>{t("app.name")}</h1>
           <p className="tagline">{t("app.tagline")}</p>
         </div>
         <div className="app__status-pills">
-          <UpdateButton />
+          <UpdateButton checker={updateChecker} />
           <span
             className={`status-pill status-pill--${
               phpvmsConnected ? "online" : "offline"

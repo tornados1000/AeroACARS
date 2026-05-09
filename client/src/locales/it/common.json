@@ -260,6 +260,16 @@
       "refresh_btn_hint": "Recupera l'OFP più recente da SimBrief e sovrascrive i valori del piano"
     }
   },
+  "update": {
+    "button_label": "Aggiornamento disponibile",
+    "button_title": "Aggiornamento disponibile — v{{version}}",
+    "modal_title": "Aggiornamento disponibile — v{{version}}",
+    "install_now": "Installa ora",
+    "later": "Più tardi",
+    "snooze_hint": "Il banner è nascosto per 4 ore — il pulsante nell'header rimane visibile",
+    "banner_title": "Nuova versione v{{version}} disponibile",
+    "banner_subtitle": "Sei su una versione precedente da qualche giorno. L'installazione richiede meno di un minuto e l'app si riavvia automaticamente."
+  },
   "recording": {
     "status": {
       "live": "LIVE",

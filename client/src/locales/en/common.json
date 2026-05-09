@@ -260,6 +260,16 @@
       "refresh_btn_hint": "Pulls the freshest OFP from SimBrief and overwrites the plan values"
     }
   },
+  "update": {
+    "button_label": "Update available",
+    "button_title": "Update available — v{{version}}",
+    "modal_title": "Update available — v{{version}}",
+    "install_now": "Install now",
+    "later": "Later",
+    "snooze_hint": "Banner is hidden for 4 hours — the header button stays visible",
+    "banner_title": "New version v{{version}} is available",
+    "banner_subtitle": "You've been on an older version for a few days. Install takes less than a minute and the app restarts automatically."
+  },
   "recording": {
     "status": {
       "live": "LIVE",

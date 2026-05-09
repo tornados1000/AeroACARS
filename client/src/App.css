@@ -179,6 +179,104 @@ body {
   font-size: 13px;
   line-height: 1;
 }
+/* v0.5.48 — Eskalations-Stages.
+   - pulse (>= 24 h ignoriert): sanfte Pulse-Animation, Pilot soll
+     den Button nicht weiter übersehen.
+   - escalated (>= 72 h): zusätzlicher cyan-Glow + stärkere Pulsation.
+     Parallel rendert UpdateBanner das große Banner. Wir lassen den
+     Button trotzdem leuchten damit Pilot direkt klicken kann. */
+@keyframes update-button-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(37, 99, 235, 0.55); }
+  50%      { box-shadow: 0 0 0 6px rgba(37, 99, 235, 0); }
+}
+@keyframes update-button-glow {
+  0%, 100% { box-shadow: 0 0 8px 1px rgba(6, 182, 212, 0.5); }
+  50%      { box-shadow: 0 0 14px 3px rgba(6, 182, 212, 0.8); }
+}
+.update-button--pulse {
+  animation: update-button-pulse 2.4s ease-in-out infinite;
+}
+.update-button--escalated {
+  background: #06b6d4;
+  border-color: #06b6d4;
+  animation: update-button-glow 2s ease-in-out infinite;
+}
+.update-button--escalated:hover {
+  background: #0891b2;
+  border-color: #0891b2;
+}
+
+/* v0.5.48 — Großes Update-Banner über dem Header. Vollbreit, cyan
+   akzentuiert, drei klare Aktionen. Pilot sieht das nur wenn das
+   Update >= 3 Tage ignoriert wurde UND er gerade nicht aktiv fliegt
+   (siehe UpdateBanner.tsx Phase-Logik). */
+.update-banner {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 18px;
+  background: linear-gradient(90deg,
+    rgba(6, 182, 212, 0.18) 0%,
+    rgba(6, 182, 212, 0.10) 100%);
+  border-bottom: 1px solid rgba(6, 182, 212, 0.45);
+  color: var(--text);
+}
+.update-banner__icon {
+  font-size: 22px;
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: rgba(6, 182, 212, 0.22);
+  color: #06b6d4;
+  flex-shrink: 0;
+}
+.update-banner__text {
+  flex: 1;
+  min-width: 0;
+}
+.update-banner__title {
+  font-weight: 600;
+  font-size: 14px;
+  line-height: 1.25;
+}
+.update-banner__subtitle {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+.update-banner__progress {
+  font-size: 12px;
+  color: #06b6d4;
+  font-weight: 500;
+  margin-top: 4px;
+  font-variant-numeric: tabular-nums;
+}
+.update-banner__actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+/* Im Banner ist der Primary-Button cyan statt blau für Konsistenz mit
+   dem Banner-Akzent. */
+.update-banner .button--primary {
+  background: #06b6d4;
+  border-color: #06b6d4;
+}
+.update-banner .button--primary:hover:not(:disabled) {
+  background: #0891b2;
+  border-color: #0891b2;
+}
+.update-banner .button--ghost {
+  background: transparent;
+  border: 1px solid rgba(6, 182, 212, 0.5);
+  color: var(--text);
+}
+.update-banner .button--ghost:hover:not(:disabled) {
+  background: rgba(6, 182, 212, 0.1);
+}
 
 .update-modal__backdrop {
   position: fixed;

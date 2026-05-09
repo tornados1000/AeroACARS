@@ -1,94 +1,50 @@
-import { useEffect, useState } from "react";
-import { check, Update } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/plugin-process";
+import { useState } from "react";
+import { useTranslation } from "react-i18next";
+import type { UseUpdateCheckerResult } from "../hooks/useUpdateChecker";
 
 /**
- * Compact "Update available" button — sits inline in the app header
- * next to the status pills, opens a modal with release notes +
- * install action when clicked.
+ * Inline „Update verfügbar"-Button im App-Header.
  *
- * Replaces the previous full-width `UpdateBanner` design that pushed
- * all page content down. Pilots prefer the inline button: less
- * invasive, more polished, dismissible just by ignoring it.
+ * v0.5.48: Source-of-Truth für Update-State ist jetzt der zentrale
+ * `useUpdateChecker`-Hook (in App.tsx aufgerufen). Diese Komponente
+ * konsumiert das Ergebnis. Visuelle Eskalation:
  *
- * Renders nothing when:
- *   * No update was found (network error, GitHub down, or already
- *     on the latest version)
- *   * The pilot dismissed the prompt for this session.
+ * - `fresh` (< 24 h gesehen): dezenter Button wie bisher
+ * - `pulse` (≥ 24 h ignoriert): Button bekommt sanfte Pulse-Animation
+ *   damit der Pilot ihn nicht weiter übersieht
+ * - `banner` (≥ 72 h ignoriert): Button glüht zusätzlich + dauerhafte
+ *   Pulsation. Parallel macht UpdateBanner das große Banner — Button
+ *   bleibt aber sichtbar damit der Pilot direkt installieren kann
+ *
+ * Renders nichts wenn Hook `stage === "none"` meldet.
  */
-export function UpdateButton() {
-  const [update, setUpdate] = useState<Update | null>(null);
+export function UpdateButton({ checker }: { checker: UseUpdateCheckerResult }) {
+  const { t } = useTranslation();
+  const { update, stage, installing, progress, installAndRelaunch } = checker;
   const [open, setOpen] = useState(false);
-  const [installing, setInstalling] = useState(false);
-  const [progress, setProgress] = useState<string | null>(null);
 
-  useEffect(() => {
-    let cancelled = false;
-    void (async () => {
-      try {
-        const u = await check();
-        if (!cancelled && u) setUpdate(u);
-      } catch {
-        // Silent: offline / GitHub down. Pilot can manually retry
-        // by restarting the app.
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  if (!update || stage === "none") return null;
 
-  if (!update) return null;
-
-  async function handleInstall() {
-    if (!update || installing) return;
-    setInstalling(true);
-    setProgress("Lädt Update herunter…");
-    try {
-      let downloaded = 0;
-      let total = 0;
-      await update.downloadAndInstall((event) => {
-        switch (event.event) {
-          case "Started":
-            total = event.data.contentLength ?? 0;
-            setProgress(
-              total > 0
-                ? `Download: 0 / ${(total / 1_048_576).toFixed(1)} MB`
-                : "Download startet…",
-            );
-            break;
-          case "Progress":
-            downloaded += event.data.chunkLength;
-            setProgress(
-              total > 0
-                ? `Download: ${(downloaded / 1_048_576).toFixed(1)} / ${(total / 1_048_576).toFixed(1)} MB`
-                : `Download: ${(downloaded / 1_048_576).toFixed(1)} MB`,
-            );
-            break;
-          case "Finished":
-            setProgress("Installiere — App startet gleich neu…");
-            break;
-        }
-      });
-      await relaunch();
-    } catch (err) {
-      setProgress(`Fehler: ${err}`);
-      setInstalling(false);
-    }
-  }
+  const cls = [
+    "update-button",
+    stage === "pulse" ? "update-button--pulse" : "",
+    stage === "banner" ? "update-button--escalated" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   return (
     <>
       <button
         type="button"
-        className="update-button"
+        className={cls}
         onClick={() => setOpen(true)}
-        title={`Update verfügbar — v${update.version}`}
+        title={t("update.button_title", { version: update.version })}
       >
         <span className="update-button__icon" aria-hidden="true">
           ⬇
         </span>
-        <span>Update verfügbar</span>
+        <span>{t("update.button_label")}</span>
       </button>
 
       {open && (
@@ -103,7 +59,7 @@ export function UpdateButton() {
             onClick={(e) => e.stopPropagation()}
           >
             <h3 id="update-modal-title" className="update-modal__title">
-              Update verfügbar — v{update.version}
+              {t("update.modal_title", { version: update.version })}
             </h3>
             {update.body && (
               <p className="update-modal__notes">{update.body}</p>
@@ -115,10 +71,10 @@ export function UpdateButton() {
               <button
                 type="button"
                 className="button button--primary"
-                onClick={() => void handleInstall()}
+                onClick={() => void installAndRelaunch()}
                 disabled={installing}
               >
-                {installing ? "…" : "Jetzt installieren"}
+                {installing ? "…" : t("update.install_now")}
               </button>
               <button
                 type="button"
@@ -126,7 +82,7 @@ export function UpdateButton() {
                 onClick={() => setOpen(false)}
                 disabled={installing}
               >
-                Später
+                {t("update.later")}
               </button>
             </div>
           </div>

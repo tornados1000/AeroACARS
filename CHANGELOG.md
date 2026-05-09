@@ -4,6 +4,62 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.5.48] — 2026-05-09
+
+🔔 **Update-Banner mit Eskalations-Stufen + 4 h Re-Check während die App läuft.**
+
+### Hintergrund
+
+User-Report: Pilot hängt seit Tagen auf v0.5.22 und bekommt keinen Update-Hinweis. Root-Cause-Analyse: der Tauri-Updater hat einen Check beim App-Start gemacht, das war's. Pilot der die App 8 h fürs Cruise offen hatte, sah nichts. Plus der Header-Button war zu dezent — leicht zu übersehen wenn man ihn beim Start nicht sofort registriert hat.
+
+### 🆕 Neuer `useUpdateChecker`-Hook + Eskalations-Logik
+
+**Polling-Strategie:**
+- **Beim App-Start** wie bisher (1× sofort)
+- **Während App läuft** alle **4 Stunden** ein leiser Re-Check (lange Cruise-Sessions)
+- **Bei Window-Focus** Re-Check wenn letzter Check > 30 min her (Pilot wechselt vom Sim zurück zur App)
+- **Nie öfter** — GitHub-Rate-Limit + Sim-FPS schonen
+
+**Eskalations-Stufen am UI:**
+
+| Update-Alter | Anzeige |
+|---|---|
+| `fresh` (< 24 h) | Header-Button wie bisher (dezent) |
+| `pulse` (≥ 24 h ignoriert) | Button bekommt sanfte Pulse-Animation |
+| `banner` (≥ 72 h ignoriert) | Großes Banner oben in der App + Button glüht cyan |
+
+**Neuer `UpdateBanner`-Component:** voll-breit oben in der App, **drei Bedingungen** müssen ALLE für die Anzeige stimmen:
+1. Stage = `banner` (3+ Tage alt)
+2. Pilot ist NICHT in einer aktiv-fliegenden Phase (Pushback / Taxi / Cruise / Approach / Landing / Taxi-In / Blocks-On werden alle ausgeschlossen — niemals einen Pilot mid-flight stören)
+3. Pilot hat das Banner nicht mit „Später" weggeklickt (4 h Snooze, danach kommt es wieder)
+
+**localStorage-State:**
+- `aeroacars.update.first_seen.{version}` — wann das Update zuerst erkannt wurde (für Stage-Berechnung)
+- `aeroacars.update.dismissed_until` — Snooze-Ablauf-Timestamp
+- `aeroacars.update.last_check_at` — letzter erfolgreicher Check (für Focus-Re-Check-Throttle)
+
+Alte first-seen-Einträge anderer Versionen werden automatisch aufgeräumt damit localStorage nicht voll läuft.
+
+### Was Piloten merken
+
+- **Lange Sessions:** Update das während des Cruise erscheint, wird ohne App-Restart erkannt — beim nächsten Tab-Switch zur App-Fenster gleich angezeigt
+- **Ignorierte Updates:** Button glüht nach 24 h sanft, nach 72 h zusätzlich großes Banner — schwer zu übersehen aber nicht penetrant
+- **Mid-Flight-Schutz:** Banner wird NIE während Pushback/Taxi/Cruise/Approach/Landing eingeblendet. Nur Header-Button bleibt — Pilot bestimmt selbst wann er installiert
+- **Snooze:** „Später" am Banner versteckt es für 4 h. Pilot wird danach noch einmal erinnert. Header-Button bleibt sichtbar
+- **DE/EN/IT** vollständig
+
+### Geänderte Dateien
+
+- `client/src/hooks/useUpdateChecker.ts` — neu, zentrale Quelle für Update-State
+- `client/src/components/UpdateButton.tsx` — konsumiert jetzt den Hook + Stage-Aware-CSS-Klassen
+- `client/src/components/UpdateBanner.tsx` — neu, große Eskalation
+- `client/src/App.tsx` — Hook gemountet, Banner gerendert mit Phase-Awareness
+- `client/src/App.css` — `.update-button--pulse`, `.update-button--escalated`, `.update-banner*`
+- `client/src/locales/{de,en,it}/common.json` — neuer `update`-Namespace
+- Versionen: `package.json`, `tauri.conf.json`, `Cargo.toml` → 0.5.48
+
+---
+
 ## [v0.5.47] — 2026-05-09
 
 🎯 **Web/Client-Parität — eine Wahrheit für Sub-Scores, Labels und Einheiten.**
