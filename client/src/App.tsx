@@ -37,6 +37,19 @@ const AUTO_DELETE_LOGS_DAYS = 30;
 const RELEASE_NOTES_LAST_SEEN_KEY = "aeroacars.releaseNotes.lastSeenVersion";
 
 const MINIMIZE_TO_TRAY_KEY = "aeroacars.minimizeToTray";
+const APPROACH_ADVISORIES_KEY = "aeroacars.approachAdvisories";
+
+/** v0.5.38: Stable-Approach-Banner im Cockpit-Tab. Default ON ("1"
+ *  bedeutet aktiv; nur explizites "0" oder leerer Storage-Wert beim
+ *  ersten Run setzt OFF — wir wollen Default ON für Safety). */
+function loadApproachAdvisories(): boolean {
+  const v = localStorage.getItem(APPROACH_ADVISORIES_KEY);
+  return v === null ? true : v === "1";
+}
+
+function saveApproachAdvisories(value: boolean): void {
+  localStorage.setItem(APPROACH_ADVISORIES_KEY, value ? "1" : "0");
+}
 
 /** Default OFF on both platforms — most pilots expect "X = quit"
  *  even on Mac. The setting hint explains why someone might want it
@@ -137,6 +150,9 @@ function App() {
   );
   const [minimizeToTray, setMinimizeToTray] = useState<boolean>(
     () => loadMinimizeToTray(),
+  );
+  const [approachAdvisoriesEnabled, setApproachAdvisoriesEnabled] = useState<boolean>(
+    () => loadApproachAdvisories(),
   );
 
   // Sync the minimize-to-tray flag to the Rust backend whenever it
@@ -477,6 +493,7 @@ function App() {
           simSnapshot={simSnapshot}
           onSwitchToBriefing={() => setTab("briefing")}
           autoFile={autoFile}
+          approachAdvisoriesEnabled={approachAdvisoriesEnabled}
         />
       )}
 
@@ -524,6 +541,11 @@ function App() {
           onMinimizeToTrayChange={(next) => {
             setMinimizeToTray(next);
             saveMinimizeToTray(next);
+          }}
+          approachAdvisoriesEnabled={approachAdvisoriesEnabled}
+          onApproachAdvisoriesEnabledChange={(next) => {
+            setApproachAdvisoriesEnabled(next);
+            saveApproachAdvisories(next);
           }}
           theme={theme}
           onThemeChange={setTheme}

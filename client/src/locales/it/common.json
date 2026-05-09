@@ -789,6 +789,15 @@
     "confirm": "Conferma",
     "cancel": "Annulla"
   },
+  "approach_advisory": {
+    "gate1000_unstable": "🟡 Avvicinamento instabile — gate 1000 ft",
+    "gate500_unstable": "🟠 Avvicinamento stabilizzato fallito — gate 500 ft",
+    "da200_go_around": "🔴 Riattaccata consigliata — gate 200 ft",
+    "sink_rate_pull_up": "🔴 Rateo di discesa! Cabra!",
+    "hard_landing": "🛬 Atterraggio duro rilevato",
+    "settings_label": "Mostra avvisi di avvicinamento",
+    "settings_hint": "Mostra in cockpit un avviso colorato quando l'avvicinamento viola i criteri FAA Stable-Approach (V/S, bank, configurazione) — a 1000 ft, 500 ft e 200 ft AGL. Più un avviso di rateo discesa sotto i 100 ft e un avviso di atterraggio duro dopo il touchdown. Solo visivo, nessun suono."
+  },
   "manual_flight": {
     "title": "Modalità VFR / manuale — avvia volo",
     "subtitle_no_ofp": "nessun OFP SimBrief",

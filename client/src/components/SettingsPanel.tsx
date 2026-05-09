@@ -39,6 +39,9 @@ interface Props {
    *  backend so the close-handler reads it directly. */
   minimizeToTray: boolean;
   onMinimizeToTrayChange: (next: boolean) => void;
+  /** v0.5.38: Stable-Approach-Banner im Cockpit-Tab. Default ON. */
+  approachAdvisoriesEnabled: boolean;
+  onApproachAdvisoriesEnabledChange: (next: boolean) => void;
   theme: Theme;
   onThemeChange: (next: Theme) => void;
   /** Latest sim telemetry — surfaced in the debug section when the
@@ -60,6 +63,8 @@ export function SettingsPanel({
   onAutoDeleteFlightLogsChange,
   minimizeToTray,
   onMinimizeToTrayChange,
+  approachAdvisoriesEnabled,
+  onApproachAdvisoriesEnabledChange,
   theme,
   onThemeChange,
   simStatus,
@@ -185,6 +190,19 @@ export function SettingsPanel({
               Startet einen Flug automatisch, sobald das Flugzeug am
               Departure-Airport eines deiner Bids steht (≤ 5 km, On-Ground,
               Engines aus). Watcher tickt alle 3 s.
+            </span>
+          </span>
+        </label>
+        <label className="settings__checkbox">
+          <input
+            type="checkbox"
+            checked={approachAdvisoriesEnabled}
+            onChange={(e) => onApproachAdvisoriesEnabledChange(e.target.checked)}
+          />
+          <span>
+            <strong>{t("approach_advisory.settings_label")}</strong>
+            <span className="settings__row-hint">
+              {t("approach_advisory.settings_hint")}
             </span>
           </span>
         </label>

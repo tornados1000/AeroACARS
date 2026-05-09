@@ -788,6 +788,15 @@
     "confirm": "Confirm",
     "cancel": "Cancel"
   },
+  "approach_advisory": {
+    "gate1000_unstable": "🟡 Approach unstable — 1000 ft gate",
+    "gate500_unstable": "🟠 Stable approach failed — 500 ft gate",
+    "da200_go_around": "🔴 Go-around recommended — 200 ft gate",
+    "sink_rate_pull_up": "🔴 Sink rate! Pull up!",
+    "hard_landing": "🛬 Hard landing detected",
+    "settings_label": "Show approach advisories",
+    "settings_hint": "Shows a colored advisory in the cockpit when the approach violates FAA Stable-Approach criteria (V/S, bank, configuration) — at 1000 ft, 500 ft and 200 ft AGL. Plus a sink rate warning below 100 ft and a hard-landing hint after touchdown. Visual only, no sound."
+  },
   "manual_flight": {
     "title": "VFR / Manual mode — start flight",
     "subtitle_no_ofp": "no SimBrief OFP",

@@ -788,6 +788,15 @@
     "confirm": "Bestätigen",
     "cancel": "Abbrechen"
   },
+  "approach_advisory": {
+    "gate1000_unstable": "🟡 Anflug instabil — 1000 ft Gate",
+    "gate500_unstable": "🟠 Stable Approach failed — 500 ft Gate",
+    "da200_go_around": "🔴 Durchstarten empfohlen — 200 ft Gate",
+    "sink_rate_pull_up": "🔴 Sinkrate! Hochziehen!",
+    "hard_landing": "🛬 Harte Landung erkannt",
+    "settings_label": "Anflug-Warnungen anzeigen",
+    "settings_hint": "Zeigt im Cockpit eine farbige Warnung wenn der Anflug die FAA-Stable-Approach-Kriterien (V/S, Bank, Konfiguration) verletzt — bei 1000 ft, 500 ft und 200 ft AGL. Plus Sinkrate-Warnung unter 100 ft und Hard-Landing-Hinweis nach Touchdown. Visuell, kein Sound."
+  },
   "manual_flight": {
     "title": "VFR / Manual-Mode — Flug starten",
     "subtitle_no_ofp": "kein SimBrief-OFP",

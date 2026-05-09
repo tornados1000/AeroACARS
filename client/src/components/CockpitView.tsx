@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { ActiveFlightInfo, LoginResult, SimSnapshot } from "../types";
 import { ResumeFlightBanner } from "./ResumeFlightBanner";
 import { ActiveFlightPanel } from "./ActiveFlightPanel";
+import { StableApproachBanner } from "./StableApproachBanner";
 // v0.3.0: LoadsheetMonitor wird jetzt direkt im ActiveFlightPanel
 // gerendert (zwischen InfoStrip und WeatherBriefing), damit das
 // Loadsheet visuell zum aktiven Flug gehört statt als getrennte
@@ -22,6 +23,8 @@ interface Props {
    *  Settings → Filing. When false the pilot has to click
    *  "Flug beenden" themselves. */
   autoFile: boolean;
+  /** v0.5.38: Stable-Approach-Banner anzeigen. Default ON. */
+  approachAdvisoriesEnabled: boolean;
 }
 
 /**
@@ -40,6 +43,7 @@ export function CockpitView({
   simSnapshot,
   onSwitchToBriefing,
   autoFile,
+  approachAdvisoriesEnabled,
 }: Props) {
   const { t } = useTranslation();
   // v0.4.2: Snapshot der gerade gefilten Flugdaten — wird beim
@@ -162,6 +166,16 @@ export function CockpitView({
           onResolved={() => setActiveFlight(null)}
         />
       )}
+
+      {/* v0.5.38: Visual Stable-Approach-Advisory. Steht ÜBER dem
+          ActiveFlightPanel sodass es bei jedem Flugzustand sichtbar
+          ist. Banner blendet sich selbst aus wenn der Anflug stabil
+          ist — null Visual-Footprint im Normal-Fall. */}
+      <StableApproachBanner
+        activeFlight={activeFlight}
+        simSnapshot={simSnapshot}
+        enabled={approachAdvisoriesEnabled}
+      />
 
       {!activeFlight.was_just_resumed && (
         <ActiveFlightPanel

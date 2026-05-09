@@ -4,6 +4,40 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.5.38] — 2026-05-09
+
+🟡🟠🔴 **Visual Stable-Approach-Advisory Banner im Cockpit-Tab.**
+
+### Hintergrund
+
+User-Report aus dem GSG-301 GA-Flug: Pilot hatte instabilen Anflug (Bank ±7° unter 200 ft AGL, V/S -625 fpm bei 330 ft AGL), hätte durchstarten sollen, hat aber durchgezogen → -900 fpm Hard Landing. AeroACARS hat das **nicht** in real-time geflagged — Pilot bekam keine Warnung dass die Approach-Kriterien verletzt wurden.
+
+### 🆕 Visual Banner
+
+Neue `<StableApproachBanner>` Komponente im Cockpit-Tab. Zeigt während Approach/Final/Landing eine farbige Warnung wenn FAA-Stable-Approach-Kriterien (AC 120-71B) verletzt sind:
+
+| Phase | Schwelle | Severity |
+|---|---|---|
+| 1000 ft AAL | Bank > 5° **oder** V/S außerhalb [-1100,-300] **oder** Konfig nicht gesetzt | 🟡 Warn |
+| 500 ft AAL | Bank > 5° **oder** V/S < -1000 | 🟠 Alert |
+| 200 ft AAL | Bank > 5° **oder** V/S < -800 | 🔴 Crit (mit Pulse-Animation) |
+| Sub-100 ft V/S<-700 | Hard Landing imminent | 🔴 Crit |
+| Post-TD V/S<-600 | Hard Landing detected | 🔴 8s sichtbar |
+
+Banner blendet sich automatisch ein/aus wenn Kriterium wechselt. Kein Sound (User-Wunsch — Voice-Advisory wurde verworfen).
+
+### ⚙ Settings-Toggle
+
+`Settings → PIREP-Filing → Anflug-Warnungen anzeigen` (Default: **ON**). Kann pro Pilot deaktiviert werden falls die Banner stören.
+
+### 🌍 i18n
+
+Banner-Texte voll lokalisiert in DE/EN/IT.
+
+Versions-Bump 0.5.37 → 0.5.38.
+
+---
+
 ## [v0.5.37] — 2026-05-08
 
 🇮🇹 **Italienische Übersetzung + Fix für Sprach-Reset nach Update.**
