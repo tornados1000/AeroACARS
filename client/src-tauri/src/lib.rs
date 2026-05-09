@@ -65,11 +65,22 @@ const RESUME_MAX_AGE_HOURS: i64 = 12;
 /// VPS handles it trivially even with 200 concurrent pilots.
 const MQTT_PUBLISH_INTERVAL_SECS: u64 = 3;
 
-/// v0.5.35: Adaptive Tick-Cadence. Standardmäßig 3s, aber unter
-/// 1000ft AGL im Approach/Final/Landing/Takeoff schneller — sonst
-/// verfehlt das Sampling den Touchdown bei langsamen GA-Flugzeugen
-/// (bei -360 fpm und 3s tickt = 18 ft Δ AGL pro Sample, knapp aber OK;
-/// bei 8s wären es 48 ft = TD-Moment fällt durch).
+/// v0.5.35: Adaptive Tick-Cadence. Standardmäßig 3s, aber im
+/// Approach/Final/Landing/Takeoff schneller — sonst verfehlt das
+/// Sampling den Touchdown bei langsamen GA-Flugzeugen.
+///
+/// v0.5.45: Schwellen verschoben damit der mittlere Approach
+/// (1000-2000 ft AGL) nicht mehr auf 3s default faellt. Volanta/DLHv
+/// messen konstant bei 1 Hz oder hoeher — bei -800 fpm und 3s
+/// Lücke verlieren wir 42 ft Δ AGL zwischen Samples (User-Report
+/// DLH 1731 / CFG 9746 LDZA→EDDM, Sample-Cadence 3.5s im Final).
+///
+/// Neue Skala:
+///   AGL <100 ft   → 500 ms (2 Hz)   — Flare / Wheels-Up
+///   AGL <500 ft   → 750 ms (1.3 Hz) — kurz vor TD
+///   AGL <1500 ft  → 1000 ms (1 Hz)  — Final-Approach (war: 1000-500ft = 1s)
+///   AGL <2000 ft  → 1500 ms         — kurz vor Final
+///   sonst         → 3000 ms (default)
 fn adaptive_tick_interval(phase: FlightPhase, agl_ft: Option<f64>) -> Duration {
     if let (Some(agl), true) = (
         agl_ft,
@@ -86,10 +97,13 @@ fn adaptive_tick_interval(phase: FlightPhase, agl_ft: Option<f64>) -> Duration {
             return Duration::from_millis(500); // 2 Hz im Flare / Wheels-Up
         }
         if agl < 500.0 {
-            return Duration::from_secs(1); // 1 Hz unter 500ft
+            return Duration::from_millis(750); // 1.3 Hz kurz vor TD
         }
-        if agl < 1000.0 {
-            return Duration::from_secs(2); // 0.5 Hz unter 1000ft
+        if agl < 1500.0 {
+            return Duration::from_secs(1); // 1 Hz im Final-Approach
+        }
+        if agl < 2000.0 {
+            return Duration::from_millis(1500); // 0.67 Hz im spaeten Approach
         }
     }
     Duration::from_secs(MQTT_PUBLISH_INTERVAL_SECS)
@@ -8768,9 +8782,19 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
             //
             // Window wird hier proaktiv refreshed; der Sampler refresht es
             // beim TD-Edge selbst, was effektiv 10 s post-TD garantiert.
+            // v0.5.45: AGL-Schwelle von 300 ft auf 1500 ft erweitert.
+            // User-Report DLH 1731 / CFG 9746: Sample-Cadence im Final
+            // (700-1500 ft AGL) war 3.5s statt der geplanten 1-2s, weil
+            // phpVMS-POST jeden Tick mit-lief und die adaptive Cadence
+            // stretcht. Mit 1500-ft-Schwelle pausiert phpVMS-POST schon
+            // ab Final-Approach → die JSONL/MQTT-Cadence ist dann nur
+            // noch durch adaptive_tick_interval begrenzt (1s ab 1500 ft).
+            // phpVMS sieht die Punkte ein paar Sekunden verzoegert,
+            // wird beim ersten Tick AUSSERHALB des Windows in Batch
+            // gedrained — fuer Live-Map (MQTT) keine Verzoegerung.
             let in_critical_window = {
                 let mut stats = flight.stats.lock().expect("flight stats");
-                let agl_low = snap.altitude_agl_ft < 300.0
+                let agl_low = snap.altitude_agl_ft < 1500.0
                     && !snap.on_ground
                     && matches!(
                         current_phase,
