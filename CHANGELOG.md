@@ -4,7 +4,56 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
-## [v0.6.0] — 2026-05-10
+## [v0.6.1] — 2026-05-10
+
+🩹 **Audit-Fixes vor v0.6.0-Rollout — der phpVMS-Worker batched jetzt wirklich.**
+
+### Hintergrund
+
+v0.6.0 wurde gebaut + auf GitHub-Releases gepusht, aber NICHT als „Latest" markiert (Pilot-Schutz). Independent-Code-Review hat Bugs gefunden, die in v0.6.0 selbst noch drin waren. Statt v0.6.0 mit Bugs als Latest zu setzen, wurde v0.6.0 zum Draft demoted und v0.5.51 blieb Latest, bis v0.6.1 mit den Fixes raus ist. **v0.6.0 wird nie als Latest released — Piloten gehen direkt von v0.5.51 auf v0.6.1.**
+
+### 🔴 Bug #1 — phpVMS-Worker postete Items SINGLE-FILE statt batched
+
+In v0.6.0 initial: `MAX_BATCH=50` zog 50 Items aus der Outbox, aber dann lief ein `for position in batch { client.post_positions(&[position.clone()]).await }` — also 50 separate HTTP-Calls. Bei 50ms RTT = 2.5 s pro Drain statt einer 70ms-Anfrage. Bei 5-sec Per-Item-Timeout auf einer flaky Verbindung: bis zu 250 s pro Drain. Hätte den ganzen Sinn des Refactors halb umsonst gemacht.
+
+**Fix:** Echter Batch-POST — `client.post_positions(&flight.pirep_id, &batch)` als ein einziger HTTP-Call. Per-Item-Timeout (5s) auf Per-Batch-Timeout (15s) umgestellt. Bei Failure geht der KOMPLETTE Batch zurück in die Outbox via neue `requeue_batch`-Helper (push_front in reverse-iter erhält chronologische Reihenfolge).
+
+### 🟡 Bug #2 — `position_queue.json`-Read-Errors silent geswallowed
+
+`if let Ok(items) = q.read_all()` im Worker-Init verschluckte File-Read-Errors. Wenn die queue.json nach einem Power-Cut korrupt ist, sind alle persistierten Positions stillschweigend weg — kein Log, kein Indikator.
+
+**Fix:** Explizites `match` mit `tracing::warn!` bei Read-Failure und `deserialize_failed`-Counter im Success-Log.
+
+### 🟡 Bug #4 — Outbox-Cap-Drop war silent
+
+Wenn die Outbox > 5000 Items wuchs, wurden ältere Positions still gedroppt — kein Log, kein Activity-Feed-Eintrag. Nach 8h Netz-Outage auf einem Long-Haul: die Start-of-Flight Punkte (Departure-Climb, TOC) verschwinden aus dem Live-Map ohne Warnung. JSONL-Forensik bleibt komplett, aber der Pilot hat kein Signal warum sein Track kürzer wird.
+
+**Fix:** `tracing::warn!` pro Tick mit `dropped_this_tick`-Counter und expliziter Klarstellung dass JSONL-Forensik noch komplett ist.
+
+### 🟡 Bug — `persist_outbox` löschte Items von anderen pireps
+
+Erste persist_outbox-Implementierung machte `queue.replace(&items)` mit nur den aktuellen pirep-items → wenn queue.json items von einem anderen pirep_id hatte (App-Crash mid-flight eines prior flights), wurden die zerstört. Plus: bei leerer Outbox returned die Funktion ohne write → ältere Items des aktuellen pireps blieben in queue.json und wurden beim nächsten Start als Duplikate re-posted.
+
+**Fix:** Read-modify-write Pattern — read all, filter aktuellen pirep raus, append outbox snapshot, write combined back. Auch leere Outbox triggert write (= file gelöscht wenn nichts mehr da).
+
+### 🟢 Phase-aware-Cadence-Mythos im Docstring + position_interval entfernt
+
+Worker-Docstring claimte „phase-aware (4-30s) batched" — beides war false (3s fix + Single-Item). Docstring auf Wahrheit umgestellt (3-sec Tick + Batch-POST + Exponential Backoff). `position_interval(phase)`-Funktion entfernt (war nur noch im Worker als Log-Garnierung gemacht — die echte Cadence-Steuerung sitzt im AGL-basierten Streamer-Tick + Worker-Backoff).
+
+### Spawn-Order konsistent
+
+In allen 3 Spawn-Sites (flight_start / flight_resume_after_disconnect / flight_resume_confirm) wird jetzt `spawn_phpvms_position_worker` ZUERST aufgerufen, dann der Streamer + Sampler. Hint an den Scheduler dass der Worker-Init-Load aus queue.json fertig sein soll bevor der Streamer fresh items pusht (chronologische Reihenfolge in der Outbox).
+
+### Geänderte Dateien
+
+- `client/src-tauri/src/lib.rs` — Worker-Loop komplett überarbeitet (Batch-POST, BATCH_TIMEOUT=15s, requeue_batch-Helper, exponential backoff bei consecutive failures, queue-read-error logging, deserialize-counter, persist_outbox read-modify-write); Streamer-Tick: outbox-cap-drop logging; spawn-order in flight_start + flight_resume_after_disconnect umgedreht; `position_interval` entfernt; Worker-Docstring auf tatsächliches Verhalten umgestellt
+- Versionen → 0.6.1
+
+---
+
+## [v0.6.0] — 2026-05-10 (DRAFT — never released)
+
+> **Note:** v0.6.0 wurde gebaut, aber wegen den in v0.6.1 gefixten Bugs nie als „Latest" promoted. Piloten ziehen direkt v0.5.51 → v0.6.1. Der Architektur-Beschrieb unten ist der Stand wie er in v0.6.1 ausgeliefert wird.
 
 🏗 **Strukturelles Redesign: Streamer-Tick komplett vom phpVMS-IO entkoppelt.**
 

@@ -117,39 +117,15 @@ fn adaptive_tick_interval(phase: FlightPhase, agl_ft: Option<f64>) -> Duration {
     Duration::from_secs(MQTT_PUBLISH_INTERVAL_SECS)
 }
 
-fn position_interval(phase: FlightPhase) -> Duration {
-    let secs = match phase {
-        // Brief, critical events — sample a touch faster so the touchdown
-        // point and the actual liftoff don't get smeared between two posts.
-        FlightPhase::Takeoff | FlightPhase::Landing => 5,
-        // Boarding + Pushback need fast ticks because a real pushback
-        // can be over in 8–15 s; if the streamer only fires every 10 s
-        // we miss the entire phase between two snapshots and the
-        // dashboard jumps straight from Boarding to Taxi.
-        FlightPhase::Boarding | FlightPhase::Pushback => 4,
-        // On the ground (taxi, takeoff roll) — 10 s is plenty;
-        // movements are slow and the live map just needs a clean trail.
-        FlightPhase::TaxiOut | FlightPhase::TakeoffRoll | FlightPhase::TaxiIn => 10,
-        // Approach / final — pilot wants the inbound track precise (ILS,
-        // localizer, glideslope) without overdoing samples.
-        FlightPhase::Approach | FlightPhase::Final => 8,
-        // Climb / descent: moderate change rate.
-        FlightPhase::Climb | FlightPhase::Descent => 10,
-        // Cruise: long straight legs, sparse samples are enough — capped
-        // at 30 s so the live map never goes more than half a minute stale.
-        FlightPhase::Cruise => 30,
-        // v0.5.11: Holding — same cadence as Cruise (slow track update,
-        // we're circling at constant altitude).
-        FlightPhase::Holding => 30,
-        // Parked / pre-/post-flight — keep a 30 s heartbeat so phpVMS
-        // sees the PIREP is alive while the pilot files.
-        FlightPhase::Preflight
-        | FlightPhase::BlocksOn
-        | FlightPhase::Arrived
-        | FlightPhase::PirepSubmitted => 30,
-    };
-    Duration::from_secs(secs)
-}
+// v0.6.0: `position_interval(phase)` ist entfallen — die Cadence-Steuerung
+// hat sich aufgeteilt:
+//  - Streamer-Tick laeuft adaptive nach AGL (500ms im Final, bis 3s im
+//    Cruise). Phase ist hier nicht mehr direkt der Treiber, weil der Tick
+//    eh nur in die Outbox pusht (kein HTTP-IO).
+//  - phpVMS-Worker laeuft mit fixer 3-sec-Cadence + Exponential-Backoff
+//    bei Failures. Phase ist nicht mehr Teil der Throttle-Logik weil eine
+//    fixe Cadence + Batching von 50 Items effektiver ist als Phase-aware
+//    Single-Item-POSTs.
 
 /// Minimum great-circle distance between two consecutive samples before we
 /// add it to the running total. Filters out GPS jitter while parked.
@@ -5486,10 +5462,12 @@ async fn flight_start(
         }
     }
 
+    // v0.6.0 — phpVMS-Worker ZUERST damit der Init-Load aus
+    // position_queue.json fertig ist bevor der Streamer-Tick fresh
+    // items in die Outbox pusht (vermeidet Order-Race in der Outbox).
+    spawn_phpvms_position_worker(app.clone(), Arc::clone(&flight), client.clone());
     spawn_position_streamer(app.clone(), Arc::clone(&flight), client.clone());
     spawn_touchdown_sampler(app.clone(), Arc::clone(&flight));
-    // v0.6.0 — neuer phpVMS-Worker, eigenstaendig vom Streamer-Tick
-    spawn_phpvms_position_worker(app.clone(), Arc::clone(&flight), client.clone());
 
     // Fire an explicit "Phase: Boarding" entry into phpVMS' acars/logs
     // for the PIREP detail's Fluglogbuch tab. The streamer only emits
@@ -5994,10 +5972,11 @@ async fn flight_start_manual(
         save_active_flight(&app, &flight);
     }
 
+    // v0.6.0 — phpVMS-Worker ZUERST (Init-Load aus position_queue.json
+    // vor erstem Streamer-Push).
+    spawn_phpvms_position_worker(app.clone(), Arc::clone(&flight), client.clone());
     spawn_position_streamer(app.clone(), Arc::clone(&flight), client.clone());
     spawn_touchdown_sampler(app.clone(), Arc::clone(&flight));
-    // v0.6.0 — neuer phpVMS-Worker, eigenstaendig vom Streamer-Tick
-    spawn_phpvms_position_worker(app.clone(), Arc::clone(&flight), client.clone());
     clear_activity_log_for_new_flight(&app);
 
     let info = flight_info(flight.as_ref());
@@ -6577,18 +6556,38 @@ fn record_event(app: &AppHandle, pirep_id: &str, event: &FlightLogEvent) {
 /// Das war der Ursprung der Bug-Klasse „Streamer hängt auf phpVMS"
 /// (Pilot-Reports v0.5.45-v0.5.51).
 ///
-/// Jetzt: separater eigenständiger Worker. Tickt phase-aware (4-30s):
-///   1. Liest alle gepufferten Positions aus `flight.position_outbox`
-///   2. Persistente Queue (`position_queue.json`) drainen falls nicht leer
-///   3. Batch-POST mit Per-Item-Timeout (5s)
-///   4. Bei Failure: Items zurück in Queue/Outbox
+/// Jetzt: separater eigenständiger Worker mit fester 3-sec-Cadence:
+///
+///   1. **Init-Load (einmalig beim Spawn):** items aus `position_queue.json`
+///      die zur aktuellen `pirep_id` gehoeren in die Memory-Outbox laden
+///      (Recovery nach App-Restart).
+///   2. **Loop alle 3s:** bis zu `MAX_BATCH=50` items aus der Outbox draining,
+///      als EIN Batch-POST an `client.post_positions(pirep_id, &batch)`
+///      mit `BATCH_TIMEOUT=15s`.
+///   3. **Bei Erfolg:** `last_position_at` + `queued_position_count`
+///      updaten, Backoff-Counter resetten.
+///   4. **Bei 404:** PIREP serverseitig weg, `handle_remote_cancellation`
+///      + Worker terminiert sauber.
+///   5. **Bei anderem Fehler / Timeout:** kompletter Batch zurueck in die
+///      Outbox VORN (chronologische Reihenfolge erhalten via `push_front`
+///      in reverse-iter); `consecutive_failures += 1`.
+///   6. **Persist-Trigger:** wenn Outbox > 500 items, `persist_outbox()`
+///      schreibt aktuellen Stand in `position_queue.json` (read-modify-write,
+///      bewahrt items anderer pireps).
+///   7. **Exponential Backoff:** bei `consecutive_failures > 0` extra
+///      sleep `min(60, 3 << (n-1))` Sekunden — verhindert dass wir bei
+///      tote Verbindung jede 3s gegen die Wand laufen.
 ///
 /// **Streamer-Tick MUSS NIE warten** — der pusht nur in die Outbox-
-/// VecDeque (= ein schneller Mutex-Push, ~1µs).
+/// VecDeque (= ein schneller `std::sync::Mutex`-Push, ~1µs, kein
+/// `.await` involviert).
 ///
-/// **Persistenz:** wenn der Worker drained, schreibt er den verbleibenden
-/// Stand in `position_queue.json`. Damit überlebt ein App-Quit ohne
-/// Datenverlust für phpVMS — die Forensik im JSONL ist eh komplett.
+/// **Persistenz:** beim Stop schreibt der Worker den finalen Outbox-
+/// Stand in `position_queue.json` (read-modify-write). Beim naechsten
+/// App-Start wird das vom neuen Worker im Init-Load (Schritt 1) wieder
+/// reingeladen. Datenverlust nur wenn `phpvms_worker_spawned` panics —
+/// dann sind die in-memory items weg, aber JSONL-Forensik ist komplett
+/// und der Forensik-Upload nach PIREP-Filing bringt sie zurueck.
 fn spawn_phpvms_position_worker(
     app: AppHandle,
     flight: Arc<ActiveFlight>,
@@ -6599,27 +6598,51 @@ fn spawn_phpvms_position_worker(
         return;
     }
     tauri::async_runtime::spawn(async move {
-        const PER_ITEM_TIMEOUT: Duration = Duration::from_secs(5);
+        // Per-Batch-Timeout: 50 Items + retries vom HTTP-Client koennen
+        // schon mal 10s dauern. 15s ist grosszuegig genug, ohne den Tick
+        // bei toter Verbindung minutenlang zu blockieren.
+        const BATCH_TIMEOUT: Duration = Duration::from_secs(15);
         const TICK: Duration = Duration::from_secs(3);
         const MAX_BATCH: usize = 50;
+        // Exponentiel-Backoff bei consecutive failures: 3s, 6s, 12s,
+        // 24s, 48s, gecapped bei 60s. Reset bei erstem Erfolg.
+        let mut consecutive_failures: u32 = 0;
         tracing::info!(pirep_id = %flight.pirep_id, "phpvms-position-worker started");
-        // Initial: alte persistente Queue laden falls vorhanden
+        // Initial: alte persistente Queue laden falls vorhanden.
+        // Errors NICHT mehr silent swallowen — wenn die Datei korrupt
+        // ist, soll der Pilot das im Log sehen.
         if let Some(q) = open_position_queue(&app) {
-            if let Ok(items) = q.read_all() {
-                if !items.is_empty() {
+            match q.read_all() {
+                Ok(items) if !items.is_empty() => {
                     let mut outbox = flight.position_outbox.lock()
                         .expect("position_outbox lock");
+                    let mut recovered = 0usize;
+                    let mut deserialize_failed = 0usize;
                     for item in items {
                         if item.pirep_id == flight.pirep_id {
-                            if let Ok(p) = serde_json::from_value::<api_client::PositionEntry>(item.position) {
-                                outbox.push_back(p);
+                            match serde_json::from_value::<api_client::PositionEntry>(item.position) {
+                                Ok(p) => {
+                                    outbox.push_back(p);
+                                    recovered += 1;
+                                }
+                                Err(_) => deserialize_failed += 1,
                             }
                         }
                     }
                     tracing::info!(
                         pirep_id = %flight.pirep_id,
-                        recovered = outbox.len(),
+                        recovered,
+                        deserialize_failed,
                         "loaded persisted positions into outbox on worker-start"
+                    );
+                }
+                Ok(_) => {} // empty queue, normal
+                Err(e) => {
+                    tracing::warn!(
+                        pirep_id = %flight.pirep_id,
+                        error = ?e,
+                        "queue.json read failed during worker init — \
+                         persisted positions for this PIREP are lost"
                     );
                 }
             }
@@ -6632,19 +6655,14 @@ fn spawn_phpvms_position_worker(
                 tracing::info!(pirep_id = %flight.pirep_id, "phpvms-position-worker stopped");
                 break;
             }
-            // Phase-aware throttle: phpVMS muss nicht jede 3s POSTen
-            // wenn der Pilot in Cruise ist
+            // Phase wird nur fuer Logs verwendet — die echte Cadence-
+            // Limitierung sitzt im TICK + im Backoff-Counter.
             let phase = {
                 let stats = flight.stats.lock().expect("flight stats");
                 stats.phase
             };
-            let interval = position_interval(phase);
-            // Skip wenn unsere TICK kleiner ist als das phase-Intervall
-            // erfordert — wird beim nächsten Tick versucht.
-            // (Aktuell TICK=3s und position_interval=4-30s, also throttle
-            // hier per modulo-zähler statt per komplexem timer)
-            // Vereinfacht: wenn interval > 3s, alle N Ticks 1× POST
-            // Item aus Outbox ziehen
+            // Bis MAX_BATCH Items aus der Outbox ziehen — std::sync::Mutex,
+            // synchroner Block, kein await innen.
             let batch: Vec<api_client::PositionEntry> = {
                 let mut outbox = flight.position_outbox.lock()
                     .expect("position_outbox lock");
@@ -6654,114 +6672,153 @@ fn spawn_phpvms_position_worker(
             if batch.is_empty() {
                 continue;
             }
-            // Throttle: nur POSTen wenn interval seit letztem POST verstrichen
-            // (wir tracken last_phpvms_post_at NICHT separat — phase-interval
-            // ist nur eine grobe Limitierung. Bei dichter Approach-Cadence
-            // wollen wir lieber öfter POSTen damit Live-Map aktuell bleibt)
             tracing::debug!(
                 pirep_id = %flight.pirep_id,
                 batch_size = batch.len(),
                 phase = ?phase,
-                interval_secs = interval.as_secs(),
                 "phpvms-worker batch POST"
             );
-            // POST mit per-item-Timeout
-            let mut failed: Vec<api_client::PositionEntry> = Vec::new();
-            for position in batch {
-                let positions_slice = vec![position.clone()];
-                let post_fut = client.post_positions(&flight.pirep_id, &positions_slice);
-                match tokio::time::timeout(PER_ITEM_TIMEOUT, post_fut).await {
-                    Ok(Ok(())) => {
-                        // success — update last_position_at + queued_count
+            // ECHT BATCHED POST: ein HTTP-Call mit allen N positionen
+            // im JSON-Body. War vorher (v0.6.0 initial) ein Loop mit
+            // einem POST pro Item — bei 50 items × 50ms RTT = 2.5s pro
+            // Drain statt einer 70ms-Anfrage. Der phpVMS-Endpoint
+            // /acars/position akzeptiert positions: [...] als Array.
+            let post_fut = client.post_positions(&flight.pirep_id, &batch);
+            match tokio::time::timeout(BATCH_TIMEOUT, post_fut).await {
+                Ok(Ok(())) => {
+                    // Success: stats updaten, backoff reset.
+                    {
                         let mut stats = flight.stats.lock().expect("flight stats");
                         stats.last_position_at = Some(Utc::now());
+                        // queued_count = was noch in der outbox steht
+                        let outbox_len = flight.position_outbox.lock()
+                            .expect("position_outbox lock").len();
+                        stats.queued_position_count = outbox_len as u32;
                     }
-                    Ok(Err(ApiError::NotFound)) => {
-                        // PIREP wurde server-seitig gelöscht
-                        handle_remote_cancellation(
-                            &app,
-                            &flight,
-                            "phpvms-worker POST",
-                        );
-                        // Stop the worker — kein Sinn weiter zu POSTen
-                        flight.phpvms_worker_spawned.store(false, Ordering::SeqCst);
-                        return;
-                    }
-                    Ok(Err(e)) => {
-                        // Andere Failure — push back in failed
-                        tracing::warn!(
-                            pirep_id = %flight.pirep_id,
-                            error = %e,
-                            "phpvms-worker POST failed; queueing back"
-                        );
-                        failed.push(position);
-                    }
-                    Err(_timeout) => {
-                        tracing::warn!(
-                            pirep_id = %flight.pirep_id,
-                            "phpvms-worker POST timed out (5s); queueing back"
-                        );
-                        failed.push(position);
-                    }
+                    consecutive_failures = 0;
+                }
+                Ok(Err(ApiError::NotFound)) => {
+                    // PIREP serverseitig geloescht — terminiert sauber.
+                    handle_remote_cancellation(
+                        &app,
+                        &flight,
+                        "phpvms-worker POST",
+                    );
+                    flight.phpvms_worker_spawned.store(false, Ordering::SeqCst);
+                    return;
+                }
+                Ok(Err(e)) => {
+                    // Andere Failure — KOMPLETTE batch zurueck in die outbox.
+                    tracing::warn!(
+                        pirep_id = %flight.pirep_id,
+                        error = %e,
+                        batch_size = batch.len(),
+                        "phpvms-worker batch POST failed; queueing entire batch back"
+                    );
+                    requeue_batch(&flight, batch);
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                }
+                Err(_timeout) => {
+                    tracing::warn!(
+                        pirep_id = %flight.pirep_id,
+                        batch_size = batch.len(),
+                        "phpvms-worker batch POST timed out (15s); queueing back"
+                    );
+                    requeue_batch(&flight, batch);
+                    consecutive_failures = consecutive_failures.saturating_add(1);
                 }
             }
-            // Failed items zurück in outbox (vor andere damit Reihenfolge stimmt).
-            // **Wichtig:** MutexGuard MUSS vor dem await gedroppt sein
-            // (std::sync::MutexGuard ist nicht Send → tokio kann den
-            // task nicht zwischen worker threads scheduln).
-            let failed_count = failed.len();
-            let total_after = if !failed.is_empty() {
-                let mut outbox = flight.position_outbox.lock()
-                    .expect("position_outbox lock");
-                for position in failed.into_iter().rev() {
-                    outbox.push_front(position);
-                }
-                let total = outbox.len();
-                drop(outbox);
-                total
-            } else {
-                flight.position_outbox.lock().expect("position_outbox lock").len()
-            };
+            // Outbox-Groesse + Persist-Check (ausserhalb der lock-Bloecke).
+            let total_after = flight.position_outbox.lock()
+                .expect("position_outbox lock").len();
             {
                 let mut stats = flight.stats.lock().expect("flight stats");
                 stats.queued_position_count = total_after as u32;
             }
-            // Wenn outbox sehr groß wird (z.B. 500+ Items): persist
-            // präventiv in position_queue.json
             if total_after >= 500 {
                 persist_outbox(&app, &flight);
             }
-            // Bei vielen Failures kurz warten damit wir nicht ewig
-            // gegen tote Verbindung hämmern (lock ist hier garantiert
-            // gedroppt — siehe Block oben).
-            if failed_count >= 5 {
-                tokio::time::sleep(Duration::from_secs(10)).await;
+            // Exponentieller Backoff bei consecutive failures (3s, 6s,
+            // 12s, 24s, 48s, gecapped 60s). Verhindert dass wir bei
+            // tote Verbindung jede 3s gegen die Wand laufen.
+            if consecutive_failures > 0 {
+                let extra_sleep = (3u64 << (consecutive_failures - 1).min(5)).min(60);
+                tracing::debug!(
+                    pirep_id = %flight.pirep_id,
+                    consecutive_failures,
+                    extra_sleep_secs = extra_sleep,
+                    "phpvms-worker backoff after failures"
+                );
+                tokio::time::sleep(Duration::from_secs(extra_sleep)).await;
             }
         }
     });
 }
 
+/// v0.6.0 — Helper: failed batch zurueck in die Outbox VORN, mit
+/// erhaltener chronologischer Reihenfolge. Wird vom phpVMS-Worker
+/// aufgerufen wenn ein Batch-POST scheitert.
+///
+/// **Wichtig:** `failed.into_iter().rev() + push_front` ergibt die
+/// originale Reihenfolge: failed=[a,b,c] -> push_front c, b, a ->
+/// outbox = [a, b, c, ...].
+fn requeue_batch(flight: &ActiveFlight, batch: Vec<api_client::PositionEntry>) {
+    let mut outbox = flight.position_outbox.lock()
+        .expect("position_outbox lock");
+    for position in batch.into_iter().rev() {
+        outbox.push_front(position);
+    }
+}
+
 /// v0.6.0 — Helper: persistiert die Outbox in `position_queue.json`.
 /// Wird beim Worker-Stop und bei großem Outbox-Backlog aufgerufen.
+///
+/// **Read-modify-write Pattern:** queue.json kann items von anderen
+/// pirep_ids enthalten (z.B. nach App-Crash mid-flight eines prior
+/// flights, der noch nicht aufgeräumt wurde). Wir lesen alles, filtern
+/// die items des aktuellen pirep raus (= „outbox ist die einzige
+/// Wahrheit für diesen pirep"), hängen die aktuelle outbox-snapshot
+/// dran, und schreiben das kombinierte Set zurück.
+///
+/// **Empty-outbox-Behandlung:** WICHTIG — wenn die outbox leer ist,
+/// MÜSSEN wir trotzdem die queue.json updaten (= aktuelle pirep-items
+/// rauslöschen), sonst werden ältere persistierte items beim nächsten
+/// App-Start re-loaded und re-posted (Duplikate auf der phpVMS Karte).
 fn persist_outbox(app: &AppHandle, flight: &ActiveFlight) {
     let Some(queue) = open_position_queue(app) else {
         return;
     };
-    let outbox = flight.position_outbox.lock().expect("position_outbox lock");
-    let items: Vec<QueuedPosition> = outbox.iter().map(|p| QueuedPosition {
-        pirep_id: flight.pirep_id.clone(),
-        position: serde_json::to_value(p).unwrap_or_default(),
-    }).collect();
-    drop(outbox);
-    if items.is_empty() {
-        return;
-    }
-    if let Err(e) = queue.replace(&items) {
+    // Aktuelle Outbox in Vec snapshotten — Lock so kurz wie möglich.
+    let outbox_items: Vec<QueuedPosition> = {
+        let outbox = flight.position_outbox.lock().expect("position_outbox lock");
+        outbox.iter().map(|p| QueuedPosition {
+            pirep_id: flight.pirep_id.clone(),
+            position: serde_json::to_value(p).unwrap_or_default(),
+        }).collect()
+    };
+    // Bestehende queue.json lesen, items des aktuellen pirep
+    // ausfiltern (= überschreiben), Items anderer pireps behalten.
+    let existing_other_pirep: Vec<QueuedPosition> = match queue.read_all() {
+        Ok(items) => items.into_iter()
+            .filter(|i| i.pirep_id != flight.pirep_id)
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = ?e, "could not read existing queue; will overwrite");
+            Vec::new()
+        }
+    };
+    let outbox_count = outbox_items.len();
+    let other_count = existing_other_pirep.len();
+    let mut combined = existing_other_pirep;
+    combined.extend(outbox_items);
+    if let Err(e) = queue.replace(&combined) {
         tracing::warn!(error = ?e, "could not persist outbox to position_queue.json");
     } else {
         tracing::info!(
             pirep_id = %flight.pirep_id,
-            count = items.len(),
+            outbox_persisted = outbox_count,
+            kept_from_other_pireps = other_count,
+            total_in_file = combined.len(),
             "outbox persisted to position_queue.json"
         );
     }
@@ -9409,27 +9466,6 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                 }
             }
 
-            // v0.5.39: Landing-Critical-Window-Detection.
-            //
-            // Wenn der Flieger gerade landet (= AGL <300 ft + Approach/
-            // Final/Landing-Phase) ODER der Sampler grade ein TD-Edge
-            // detektiert hat (in dem Fall hat der Sampler selber das
-            // Window für TOUCHDOWN_POST_WINDOW_MS gesetzt), pausiert der
-            // Streamer-Tick alle blockierenden Netzwerk-IO. Grund:
-            // phpVMS-POST kann 200-1500 ms dauern, was den Sampler-
-            // Zeit verstreicht ohne dass eine neue Position rausgeht.
-            // Genau im TD-Moment fehlen dann wertvolle Frames.
-            //
-            // Während dem Window:
-            //   - Queue-Drain übersprungen (eine Charge älterer Positions
-            //     POSTet sonst BLOCKIEREND vor jedem Tick)
-            //   - Position-POST übersprungen, stattdessen direkt in die
-            //     Offline-Queue (= geht raus auf den nächsten Tick AUSSERHALB
-            //     des Windows in einer Batch-Drain).
-            //   - JSONL-Append + MQTT-Publish (try_send, non-blocking) laufen
-            //     weiter — das sind die Datenquellen, keine Blocker.
-            //
-            // Window wird hier proaktiv refreshed; der Sampler refresht es
             // v0.6.0 — Critical-Window + In-Tick-Drain komplett entfernt.
             //
             // Vorher (v0.5.39-v0.5.51): Streamer-Tick hatte komplexe
@@ -9516,20 +9552,38 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
 
             // v0.6.0 — Position in Memory-Outbox pushen (Worker holt sie ab).
             // Ein simpler ~1µs Mutex-Push, blockiert NIE — der phpVMS-Worker
-            // bedient die Outbox phase-aware (4-30s Cadence) und batched.
-            // Bei Failure: Worker queued das Item zurück in die Outbox + bei
-            // Backlog>500 in `position_queue.json`.
+            // (3-sec Tick + Batch-POST bis 50 Items) bedient die Outbox
+            // entkoppelt. Bei Failure: Worker queued den ganzen batch zurück
+            // in die Outbox + bei Backlog>500 in `position_queue.json`.
             {
                 let mut outbox = flight.position_outbox.lock()
                     .expect("position_outbox lock");
                 outbox.push_back(position.clone());
                 // Cap auf 5000 — das sind ca. 8 Stunden Cruise-Daten.
-                // Wenn die Verbindung so lange tot ist, war's nicht zu retten.
+                // Wenn die Verbindung so lange tot ist: aelteste positions
+                // werden aus dem Live-Stream gedroppt (Live-Map verliert
+                // Anfang des Tracks), aber die JSONL-SoT hat sie alle —
+                // Forensik-Upload nach PIREP-Filing zieht sie nach.
+                let mut dropped_this_tick = 0u32;
                 while outbox.len() > 5000 {
                     outbox.pop_front();
+                    dropped_this_tick += 1;
                 }
                 let queued_count = outbox.len() as u32;
                 drop(outbox);
+                if dropped_this_tick > 0 {
+                    // Warn pro Tick — auf einem dauerhaft toten Netz koennte
+                    // das jede Sekunde feuern, aber das ist genau das Signal
+                    // das wir wollen: „Backlog ist voll, Daten gehen aus dem
+                    // Live-Stream verloren". JSONL-Forensik bleibt komplett.
+                    tracing::warn!(
+                        pirep_id = %flight.pirep_id,
+                        dropped_this_tick,
+                        outbox_cap = 5000u32,
+                        "outbox cap reached — oldest positions dropped from live-stream \
+                         (JSONL forensics still complete; check phpVMS connectivity)"
+                    );
+                }
                 let mut stats = flight.stats.lock().expect("flight stats");
                 stats.queued_position_count = queued_count;
             }
