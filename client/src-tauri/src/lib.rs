@@ -1400,6 +1400,14 @@ struct FlightStats {
     /// Bei FALSE_EDGE → cleared (ignored, weiter nach naechstem Edge suchen).
     /// Spec: docs/spec/touchdown-forensics-v2.md Sektion 4.
     pending_td_at: Option<DateTime<Utc>>,
+    /// v0.7.0 (Round-3 P2 fix): wenn das X-Plane-Plugin den Edge ausloest
+    /// (current_premium_touchdown() ist drain pattern via take()), speichern
+    /// wir die Premium-VS/G hier zusammen mit pending_td_at.
+    /// Vorher (Bug): Premium wurde beim Edge konsumiert, beim spaeteren
+    /// VALIDATED-Block war es None → Premium-Override fiel still aus.
+    /// Jetzt: Premium-VS/G ueberlebt die 1.1s-Validation-Latenz im Pending-State.
+    pending_td_premium_vs: Option<f32>,
+    pending_td_premium_g: Option<f32>,
     /// v0.5.5: running peak-descent VS tracker. Updated every sampler
     /// tick while AGL ≤ 250 ft (low-altitude / final approach territory).
     /// Picks the most negative pitch-corrected VS seen ONLY in the
@@ -8913,8 +8921,12 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
                     && in_landing_phase
                 {
                     stats.pending_td_at = Some(now);
-                    // Premium VS/G werden in der pending-validation-Phase als
-                    // Override genutzt, falls VALIDATED. Hier nur loggen:
+                    // Round-3 P2 fix: Premium-Werte direkt im pending-state
+                    // sichern. take_premium_touchdown() ist ein drain — beim
+                    // spaeteren VALIDATED-Block waere current_premium_touchdown()
+                    // schon None, der Override wuerde still ausfallen.
+                    stats.pending_td_premium_vs = Some(td.captured_vs_fpm);
+                    stats.pending_td_premium_g = Some(td.captured_g_normal);
                     tracing::info!(
                         pirep_id = %flight.pirep_id,
                         captured_vs_fpm = td.captured_vs_fpm,
@@ -9036,15 +9048,18 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
                                     "v0.7.0 TD candidate VALIDATED — promoting to sampler_touchdown"
                                 );
                                 stats.sampler_touchdown_at = Some(pending_at);
-                                // P1: Premium-VS-override falls Plugin den
-                                // candidate ausgeloest hat (frame-perfekter
-                                // Wert vom X-Plane-Plugin)
-                                let premium_vs = current_premium_touchdown(&app)
-                                    .map(|td| td.captured_vs_fpm);
-                                stats.sampler_touchdown_vs_fpm = premium_vs.or(Some(impact_vs));
-                                stats.sampler_touchdown_g_force = Some(result.g_force_peak_in_window);
+                                // Round-3 P2 fix: Premium-VS aus pending-state
+                                // (wurde beim Premium-Edge gespeichert weil
+                                // take_premium_touchdown() drain ist).
+                                stats.sampler_touchdown_vs_fpm =
+                                    stats.pending_td_premium_vs.or(Some(impact_vs));
+                                stats.sampler_touchdown_g_force = stats
+                                    .pending_td_premium_g
+                                    .or(Some(result.g_force_peak_in_window));
                                 open_touchdown_capture_window(&mut stats, pending_at);
                                 stats.pending_td_at = None;
+                                stats.pending_td_premium_vs = None;
+                                stats.pending_td_premium_g = None;
 
                                 // v0.7.0 P2 fix — emit TouchdownDetected mit
                                 // den ECHTEN Werten aus compute_landing_rate-
@@ -9094,11 +9109,15 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
                                     "v0.7.0 TD candidate FALSE_EDGE — ignoring, continue watching"
                                 );
                                 stats.pending_td_at = None;
+                                stats.pending_td_premium_vs = None;
+                                stats.pending_td_premium_g = None;
                             }
                         }
                     } else {
                         // Kein sample ab pending_at gefunden — Buffer-Drift, ignore
                         stats.pending_td_at = None;
+                        stats.pending_td_premium_vs = None;
+                        stats.pending_td_premium_g = None;
                     }
                 }
             }
