@@ -1,6 +1,6 @@
 # Touchdown-Forensik v2 — Architektur-Spec für v0.7.0
 
-**Status:** Draft v2.3 (post drittem VA-Owner Review — fast approved) — final review pending
+**Status:** v2.3 — **Approved for implementation** (VA-Owner sign-off after 3 review rounds, commit 9e663c2)
 **Cutoff:** Forward-only — gilt für Flüge mit `forensics_version: 2` Marker (rolled out ab dem v0.7.0-Release).
 
 ---
@@ -791,4 +791,4 @@ JSONL hat trotzdem alle Samples für spätere Forensik.
 
 ---
 
-**Ende Spec v2.3.** Status: fast approved (drittes Review hat keine Architekturblocker mehr gefunden, nur 3 Konsistenz-Korrekturen die jetzt eingearbeitet sind). Bitte finaler Approve.
+**Ende Spec v2.3.** Status: **Approved for v0.7.0 implementation** (VA-Owner sign-off). Implementation startet nach Sektion 11, Reihenfolge: Backend (A-J) → Replay-Acceptance (L) → Frontend (K) → Release (M, N).
