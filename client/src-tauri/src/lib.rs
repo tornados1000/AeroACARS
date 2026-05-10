@@ -37,8 +37,8 @@ use serde::{Deserialize, Serialize};
 use metar::{MetarError, MetarSnapshot};
 use recorder::{FlightLogEvent, FlightOutcome, FlightRecorder, TouchdownWindowSample};
 use storage::{
-    ApproachSample, LandingProfilePoint, LandingRecord, LandingRunwayMatch, LandingStore,
-    PositionQueue, QueuedPosition,
+    ApproachSample, GateWindow, LandingProfilePoint, LandingRecord, LandingRunwayMatch,
+    LandingStore, PositionQueue, QueuedPosition,
 };
 use sim_core::{FlightPhase, SimKind, SimSnapshot, Simulator};
 // v0.7.0 — re-export fuer Replay-Acceptance-Tests in tests/touchdown_v2_replay.rs
@@ -6494,6 +6494,138 @@ fn actual_burn_for_record(stats: &FlightStats) -> Option<f32> {
     }
 }
 
+/// v0.7.1 Round-2 Helper: berechnet den gewichteten Aggregate-Master-
+/// Score aus stats. Single-Source-of-Truth fuer alle phpVMS-/PIREP-/
+/// MQTT-/UI-Pfade — vermeidet die Inkonsistenz dass App/Web "77/100"
+/// zeigt aber phpVMS "60/100" speichert.
+///
+/// Returns None wenn keine Sub-Scores berechnet werden konnten
+/// (= Touchdown-Daten fehlen voellig). Caller sollte dann auf
+/// stats.landing_score.numeric() fallback'en.
+fn compute_aggregate_master_score(stats: &FlightStats) -> Option<u8> {
+    let actual_burn = actual_burn_for_record(stats);
+    let scoring_input = landing_scoring::LandingScoringInput {
+        vs_fpm: stats.landing_peak_vs_fpm.or(stats.landing_rate_fpm),
+        peak_g_load: stats.landing_peak_g_force,
+        bounce_count: Some(stats.bounce_count as u32),
+        approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
+        approach_bank_stddev_deg: stats.approach_bank_stddev_deg,
+        rollout_distance_m: stats.rollout_distance_m.map(|m| m as f32),
+        planned_burn_kg: stats.planned_burn_kg,
+        actual_trip_burn_kg: actual_burn,
+        planned_zfw_kg: stats.planned_zfw_kg,
+        planned_tow_kg: stats.planned_tow_kg,
+        ..Default::default()
+    };
+    let subs = landing_scoring::compute_sub_scores(&scoring_input);
+    landing_scoring::aggregate_master_score(&subs)
+}
+
+/// v0.7.1 Round-2: Aggregate-Score → Label-Mapping. Damit
+/// score_label und score_numeric semantisch zueinander passen.
+/// Nutzt die gleichen Schwellen wie LandingScore::numeric()
+/// (100/80/60/30/0 → smooth/acceptable/firm/hard/severe).
+fn aggregate_score_label(aggregate: u8) -> &'static str {
+    if aggregate >= 90 {
+        "smooth"
+    } else if aggregate >= 70 {
+        "acceptable"
+    } else if aggregate >= 45 {
+        "firm"
+    } else if aggregate >= 15 {
+        "hard"
+    } else {
+        "severe"
+    }
+}
+
+/// v0.7.1 Round-2: leitet GateWindow-Werte aus den ApproachSamples ab.
+/// Damit die UI-Tooltip-Aussage "Bewertet werden Anflug-Samples
+/// zwischen X und Y ft AGL" wirklich auf den ECHTEN bewerteten
+/// Bereich verweist und nicht nur auf die Crate-Konstanten.
+///
+/// Returns None wenn keine Samples die `is_scored_gate=true` Flag haben
+/// (z.B. fuer pre-v0.7.1-PIREPs ohne die Felder).
+///
+/// Tuple-Format weil es zwei verschiedene GateWindow-Structs gibt
+/// (storage + aeroacars-mqtt) — Caller baut den passenden Type.
+fn extract_gate_window_values(
+    approach_samples: &[ApproachSample],
+) -> Option<(i64, i64, f32, f32, u32)> {
+    let scored: Vec<&ApproachSample> = approach_samples
+        .iter()
+        .filter(|s| s.is_scored_gate.unwrap_or(false))
+        .collect();
+    if scored.is_empty() {
+        return None;
+    }
+    let start = scored.first()?;
+    let end = scored.last()?;
+    Some((
+        start.t_ms.unwrap_or(0) as i64,
+        end.t_ms.unwrap_or(0) as i64,
+        start.agl_ft.unwrap_or(0.0),
+        end.agl_ft.unwrap_or(0.0),
+        scored.len() as u32,
+    ))
+}
+
+fn build_storage_gate_window(approach_samples: &[ApproachSample]) -> Option<GateWindow> {
+    extract_gate_window_values(approach_samples).map(|(s, e, sh, eh, n)| GateWindow {
+        start_at_ms: s,
+        end_at_ms: e,
+        start_height_ft: sh,
+        end_height_ft: eh,
+        sample_count: n,
+    })
+}
+
+/// v0.7.1 Round-2: GateWindow direkt aus stats.approach_buffer +
+/// stats.landing_at fuer den MQTT-Pfad (build_landing_record schon
+/// hat approach_samples lokal, aber der PIREP-Payload-Builder nicht).
+/// Berechnet die gleichen is_scored_gate-Flags wie in
+/// build_landing_record (height in 0..=1000 ft AGL minus letzte 3s
+/// vor TD) und liefert das resultierende Window.
+fn build_mqtt_gate_window_from_stats(
+    stats: &FlightStats,
+) -> Option<aeroacars_mqtt::GateWindow> {
+    use landing_scoring::gate::{
+        STABILITY_GATE_FLARE_CUTOFF_MS, STABILITY_GATE_MAX_HEIGHT_FT,
+        STABILITY_GATE_MIN_HEIGHT_FT,
+    };
+    let td_ts = stats.landing_at?;
+    let scored: Vec<(&ApproachBufferSample, i32)> = stats
+        .approach_buffer
+        .iter()
+        .filter_map(|s| {
+            let height = s.agl_ft;
+            let in_height_band = height > STABILITY_GATE_MIN_HEIGHT_FT
+                && height <= STABILITY_GATE_MAX_HEIGHT_FT;
+            let dt_ms = (s.at - td_ts).num_milliseconds() as i32;
+            let ms_before_td = (-dt_ms) as i64;
+            let in_flare =
+                ms_before_td >= 0 && ms_before_td < STABILITY_GATE_FLARE_CUTOFF_MS;
+            if in_height_band && !in_flare {
+                Some((s, dt_ms))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if scored.is_empty() {
+        return None;
+    }
+    let (start, start_t) = scored.first()?;
+    let (end, end_t) = scored.last()?;
+    Some(aeroacars_mqtt::GateWindow {
+        start_at_ms: *start_t as i64,
+        end_at_ms: *end_t as i64,
+        start_height_ft: start.agl_ft,
+        end_height_ft: end.agl_ft,
+        sample_count: scored.len() as u32,
+    })
+}
+
 /// v0.7.1 (Spec F4 + P2.2-D): atomic write of landing rate + confidence
 /// + source.
 ///
@@ -6531,16 +6663,13 @@ fn build_landing_record(
 ) -> Option<LandingRecord> {
     let touchdown_at = stats.landing_at?;
     let landing_rate_fpm = stats.landing_rate_fpm?;
-    let score = stats.landing_score?;
-    // v0.7.1 P1.3-Fix: score_numeric kommt aus aggregate_master_score
-    // (gewichteter Mittelwert der Sub-Scores aus der landing-scoring
-    // Crate). Damit fliessen Fuel-/Loadsheet-/Stability-/Rollout-Werte
-    // genauso ein wie VS+G — Spar-Piloten und VFR-Piloten profitieren
-    // sichtbar im Hauptscore. Fallback auf score.numeric() (Touchdown-
-    // Klassifikation) wenn keine Sub-Scores berechnet werden konnten
-    // (= Schutz fuer pre-v0.7.1-Pfad in Tests/Edge-Cases).
-    // sub_scores werden weiter unten gebaut — wir muessen sie hier
-    // schon mal berechnen damit wir den Aggregate-Score haben.
+    let touchdown_class = stats.landing_score?;
+    // v0.7.1 P1.3-Fix + Round-2 P2-Fix: score_numeric UND score_label
+    // beide aus dem Aggregate-Score, damit sie semantisch zueinander
+    // passen. Vorher: "SMOOTH · 77/100" (Label aus Touchdown-Klasse,
+    // Zahl aus Aggregate) — fuer Pilot verwirrend.
+    // Fallback auf Touchdown-Klassifikation wenn keine Sub-Scores
+    // berechnet werden konnten (Edge-Case Schutz).
     let scoring_input = landing_scoring::LandingScoringInput {
         vs_fpm: stats.landing_peak_vs_fpm.or(stats.landing_rate_fpm),
         peak_g_load: stats.landing_peak_g_force,
@@ -6559,7 +6688,10 @@ fn build_landing_record(
         landing_scoring::aggregate_master_score(&computed_sub_scores);
     let score_numeric = aggregate_master
         .map(|m| m as i32)
-        .unwrap_or_else(|| score.numeric());
+        .unwrap_or_else(|| touchdown_class.numeric());
+    let score_label = aggregate_master
+        .map(|m| aggregate_score_label(m))
+        .unwrap_or_else(|| touchdown_class.label());
     let grade = letter_grade(score_numeric);
 
     // Compute fuel-efficiency once so the Landing tab doesn't have to
@@ -6643,6 +6775,10 @@ fn build_landing_record(
             }
         })
         .collect();
+    // v0.7.1 Round-2 P2-Fix: gate_window VOR dem LandingRecord-Init
+    // berechnen damit approach_samples noch verfügbar ist (wird unten
+    // ins Record gemoved).
+    let gate_window = build_storage_gate_window(&approach_samples);
 
     Some(LandingRecord {
         pirep_id: flight.pirep_id.clone(),
@@ -6659,7 +6795,7 @@ fn build_landing_record(
         sim_kind: sim_kind_label.map(|s| s.to_string()),
 
         score_numeric,
-        score_label: score.label().to_string(),
+        score_label: score_label.to_string(),
         grade_letter: grade.to_string(),
 
         landing_rate_fpm,
@@ -6737,7 +6873,10 @@ fn build_landing_record(
         // im Storage-Schema `Option<bool>` fuer backward-compat — wir
         // wrappen Some() unconditional.
         approach_excessive_sink: Some(stats.approach_excessive_sink),
-        gate_window: None, // Phase 3: aus stab_v2-Compute befuellen
+        // v0.7.1 Round-2 P2-Fix: gate_window oben berechnet aus den
+        // approach_samples — UI-Tooltip kann jetzt die echten
+        // Boundaries zeigen statt nur die Crate-Konstanten.
+        gate_window,
         // P1.5 + Phase 2 F1/F2/F3 + P1.3-Fix: sub_scores wurden oben
         // schon berechnet damit aggregate_master_score → score_numeric
         // gehen kann. Hier nur noch durchreichen, NICHT erneut rechnen.
@@ -7464,7 +7603,17 @@ async fn flight_end(
         // but on the native column phpVMS shows on the PIREP
         // overview.
         let landing_rate = stats.landing_rate_fpm.map(|v| v as f64);
-        let score = stats.landing_score.map(|s| s.numeric());
+        // v0.7.1 P1 (Round-2 Review): phpVMS bekommt jetzt den
+        // GLEICHEN gewichteten Aggregate-Score wie App/Web/MQTT
+        // (siehe build_landing_record P1.3-Fix). Vorher landete der
+        // alte Touchdown-Klassifikator-Score (vs/g/bounces only) im
+        // phpVMS-Datensatz waehrend App "77/100" zeigte und phpVMS
+        // "60/100" — Score-Vertragsbruch.
+        // Fallback: stats.landing_score.numeric() wenn Crate keinen
+        // Aggregate liefert (z.B. komplett leerer Sub-Score-Vec).
+        let score = compute_aggregate_master_score(&stats)
+            .map(|m| m as i32)
+            .or_else(|| stats.landing_score.map(|s| s.numeric()));
         let distance_nm = stats.distance_nm;
         let fields = build_pirep_fields(&flight, &stats);
         let mut notes = build_pirep_notes(&flight, &stats);
@@ -7920,7 +8069,12 @@ async fn flight_end(
                             approach_ias_stddev_kt: stats.approach_ias_stddev_kt,
                             approach_stable_config: stats.approach_stable_config,
                             approach_excessive_sink: Some(stats.approach_excessive_sink),
-                            gate_window: None, // Phase 3
+                            // v0.7.1 Round-2 P2-Fix: gate_window jetzt
+                            // aus den echten Approach-Samples + TD-
+                            // Timestamp gerechnet (gleiche Formel wie
+                            // build_landing_record). Web/Monitor sehen
+                            // jetzt die echten Window-Boundaries.
+                            gate_window: build_mqtt_gate_window_from_stats(&stats),
                             // P1.5 + Phase 2 (F1/F2/F3) + P1.3-Fix:
                             // bereits oben berechnet, hier nur durchreichen.
                             sub_scores: payload_sub_scores,
@@ -12863,13 +13017,23 @@ fn build_pirep_fields(
     }
 
     // ---- Touchdown analysis ----
-    if let Some(score) = stats.landing_score {
-        let grade = letter_grade(score.numeric());
-        // "A+ (smooth) — 100/100" — combines all three views into one
-        // glanceable line instead of three duplicate fields.
+    // v0.7.1 Round-2 P2-Fix: "Landing Score" Custom-Field nutzt jetzt
+    // den Aggregate-Master-Score (gleicher Wert wie App/Web/MQTT/
+    // phpVMS-native). Vorher zeigte es den Touchdown-Klassifikator-
+    // Score — Pilot sah in der phpVMS-Detailansicht zwei verschiedene
+    // Zahlen ("Score: 77/100" oben, "Landing Score: A+ (smooth) —
+    // 100/100" unten). Fallback auf Touchdown-Klassifikation wenn
+    // Crate keinen Aggregate liefert.
+    if let Some(touchdown_class) = stats.landing_score {
+        let aggregate = compute_aggregate_master_score(stats);
+        let (label, numeric) = match aggregate {
+            Some(m) => (aggregate_score_label(m), m as i32),
+            None => (touchdown_class.label(), touchdown_class.numeric()),
+        };
+        let grade = letter_grade(numeric);
         f.insert(
             "Landing Score".into(),
-            format!("{} ({}) — {}/100", grade, score.label(), score.numeric()),
+            format!("{} ({}) — {}/100", grade, label, numeric),
         );
     }
     if let Some(rate) = stats.landing_rate_fpm {
@@ -13706,21 +13870,28 @@ fn announce_landing_score(app: &AppHandle, flight: &ActiveFlight) -> Option<Stri
     } else {
         String::new()
     };
-    // Drop the lock before logging so log_activity_handle can
-    // grab the activity_log mutex without deadlocking via
-    // re-entrant borrow.
+    // v0.7.1 Round-2 P2-Fix: zeige sowohl die Touchdown-Klasse (was
+    // den Aufprall-Charakter beschreibt) als auch den Aggregate-
+    // Master-Score (das was App/Web/phpVMS jetzt anzeigen). Damit
+    // ist klar dass "Touchdown: smooth" nicht das gleiche ist wie
+    // "Master 77/100" — Pilot sieht beide Begriffe ohne Verwechslung.
+    let aggregate_master = compute_aggregate_master_score(&stats);
     drop(stats);
-    let grade = letter_grade(score.numeric());
+    let touchdown_grade = letter_grade(score.numeric());
+    let master_text = match aggregate_master {
+        Some(m) => format!("Master {}/100", m),
+        None => format!("Score {}/100", score.numeric()),
+    };
     log_activity_handle(
         app,
         level,
-        format!("Touchdown: {} ({})", grade, score.label()),
+        format!("Touchdown: {} ({})", touchdown_grade, score.label()),
         Some(format!(
-            "V/S {:.0} fpm, G {:.2}{} — Score {}/100",
+            "V/S {:.0} fpm, G {:.2}{} — {}",
             peak_vs, // signed: negative = descent, matches the PIREP
             peak_g,
             bounce_part,
-            score.numeric(),
+            master_text,
         )),
     );
     record_event(
@@ -13738,13 +13909,13 @@ fn announce_landing_score(app: &AppHandle, flight: &ActiveFlight) -> Option<Stri
     let mut stats = flight.stats.lock().expect("flight stats");
     stats.landing_score_announced = true;
     Some(format!(
-        "Touchdown {} ({}) — V/S {:.0} fpm, G {:.2}{}, score {}/100",
-        grade,
+        "Touchdown {} ({}) — V/S {:.0} fpm, G {:.2}{}, {}",
+        touchdown_grade,
         score.label(),
         peak_vs,
         peak_g,
         bounce_part,
-        score.numeric(),
+        master_text,
     ))
 }
 
