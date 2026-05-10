@@ -174,6 +174,38 @@ pub enum FlightLogEvent {
         timestamp: DateTime<Utc>,
         payload: serde_json::Value,
     },
+    /// v0.7.0 (Forensik v2): emittiert pro VALIDATED contact_frame
+    /// (= Layer 2 PASS in touchdown_v2). Enthaelt strukturierte Daten
+    /// mit forensics_version=2 marker damit aeroacars-live + zukuenftige
+    /// Re-Analyzer wissen: dieses Event kommt aus der v2-Pipeline.
+    ///
+    /// **Unterschied zu TouchdownComplete (legacy):**
+    ///   - TouchdownComplete kann von der alten Single-Shot-Pipeline kommen
+    ///   - TouchdownDetected kommt nur von touchdown_v2::validate_candidate
+    ///   - Pro Episode kann es 1+ TouchdownDetected geben (Multi-TD Support
+    ///     bei T&G/Bounce — wenn der Sampler reset macht)
+    ///   - is_final wird beim PIREP-Filing nachgereicht via LandingFinalized
+    ///
+    /// Spec: docs/spec/touchdown-forensics-v2.md Sektion 7.2.
+    TouchdownDetected {
+        timestamp: DateTime<Utc>,
+        forensics_version: u8,
+        contact_at: DateTime<Utc>,
+        impact_at: DateTime<Utc>,
+        vs_fpm: f32,
+        confidence: String,
+        source: String,
+        sim: String,
+    },
+    /// v0.7.0 (Forensik v2): emittiert beim PIREP-Filing/Cancel mit dem
+    /// finalen Score. Markiert die letzte LandingEpisode als "die Landung"
+    /// (= Multi-TD lifecycle: erst hier ist klar welche Episode gilt).
+    LandingFinalized {
+        timestamp: DateTime<Utc>,
+        forensics_version: u8,
+        final_vs_fpm: Option<f32>,
+        final_score: Option<String>,
+    },
 }
 
 /// Eine einzelne 50-Hz-Probe aus dem Touchdown-Window-Buffer. Felder

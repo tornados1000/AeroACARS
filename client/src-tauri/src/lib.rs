@@ -1392,6 +1392,14 @@ struct FlightStats {
     sampler_touchdown_at: Option<DateTime<Utc>>,
     sampler_touchdown_vs_fpm: Option<f32>,
     sampler_touchdown_g_force: Option<f32>,
+    /// v0.7.0 (Forensik v2 P0 fix): wenn der Sampler ein TD-Edge detected,
+    /// wird er hier zwischengespeichert (nicht direkt sampler_touchdown_at).
+    /// Ein subsequent Sampler-Tick (mind. 1.1 sec spaeter) ruft
+    /// `touchdown_v2::validate_candidate` mit den post-edge samples auf.
+    /// Bei VALIDATED → kopiert nach sampler_touchdown_at + open capture window.
+    /// Bei FALSE_EDGE → cleared (ignored, weiter nach naechstem Edge suchen).
+    /// Spec: docs/spec/touchdown-forensics-v2.md Sektion 4.
+    pending_td_at: Option<DateTime<Utc>>,
     /// v0.5.5: running peak-descent VS tracker. Updated every sampler
     /// tick while AGL ≤ 250 ft (low-altitude / final approach territory).
     /// Picks the most negative pitch-corrected VS seen ONLY in the
@@ -7677,6 +7685,24 @@ async fn flight_end(
                     handle.pirep(pirep_payload);
                 }
             }
+            // v0.7.0 — emit landing_finalized mit dem finalen Score
+            // (Spec docs/spec/touchdown-forensics-v2.md Sektion 7.2).
+            // Aktuell: nimmt den letzten validated TD-Score (single-shot
+            // bis Multi-TD-Episodes voll integriert sind in v0.7.1+).
+            let (final_vs, final_score_label) = {
+                let s = flight.stats.lock().expect("flight stats");
+                (s.landing_rate_fpm, s.landing_score.map(|sc| format!("{:?}", sc)))
+            };
+            record_event(
+                &app,
+                &flight.pirep_id,
+                &FlightLogEvent::LandingFinalized {
+                    timestamp: Utc::now(),
+                    forensics_version: touchdown_v2::FORENSICS_VERSION,
+                    final_vs_fpm: final_vs,
+                    final_score: final_score_label,
+                },
+            );
             // v0.5.23 Forensik-Upload: gzip + POST des kompletten JSONL-
             // Logfiles an aeroacars-live damit der VA-Owner ohne den
             // Piloten zu kontaktieren das vollstaendige SimSnapshot-Log
@@ -8933,7 +8959,126 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
                     | FlightPhase::Final
                     | FlightPhase::Landing
             );
-            if edge_detected && stats.sampler_touchdown_at.is_none() && in_landing_phase {
+            // v0.7.0 — P0 Fix: Edge-Detection setzt jetzt nur `pending_td_at`.
+            // Die echte Validation (touchdown_v2::validate_candidate) folgt 1.1 sec
+            // spaeter wenn genug post-edge samples im Buffer sind. False-edges
+            // (= Float-Streifschuesse wie bei DAH 3181 sample 125) werden dann
+            // verworfen, der Sampler beobachtet weiter den naechsten Edge.
+            //
+            // Vorher (Bug): erster Edge wurde direkt als TD akzeptiert. DAH 3181
+            // Float-Streifschuss mit vs=+104 fpm wurde gescort, der echte TD
+            // 4 sec spaeter wurde ignoriert (single-shot is_none() Guard).
+            if edge_detected && stats.sampler_touchdown_at.is_none()
+                && stats.pending_td_at.is_none() && in_landing_phase {
+                stats.pending_td_at = Some(now);
+                tracing::info!(
+                    pirep_id = %flight.pirep_id,
+                    edge_at = %now,
+                    edge_agl_ft = snap.altitude_agl_ft,
+                    edge_vs_fpm = snap.vertical_speed_fpm,
+                    edge_gear_force_n = ?snap.gear_normal_force_n,
+                    "v0.7.0 TD-edge candidate detected — pending validation in 1.1s"
+                );
+            }
+
+            // v0.7.0 — Pending Validation: 1.1 sec nach edge die post-edge samples
+            // sind im snapshot_buffer (TOUCHDOWN_BUFFER_SECS=5sec cutoff = "now-5s",
+            // edge bei "now-1.1s" → samples [now-1.1s, now] sind drin).
+            if let Some(pending_at) = stats.pending_td_at {
+                let elapsed_ms = (now - pending_at).num_milliseconds();
+                if elapsed_ms >= 1100 {
+                    // Convert snapshot_buffer (TelemetrySample) zu Vec<TouchdownWindowSample>
+                    let v2_samples: Vec<TouchdownWindowSample> = stats
+                        .snapshot_buffer
+                        .iter()
+                        .copied()
+                        .map(TouchdownWindowSample::from)
+                        .collect();
+                    // Find candidate sample (first sample at >= pending_at)
+                    let cand_idx = v2_samples.iter().position(|s| s.at >= pending_at);
+                    if let Some(idx) = cand_idx {
+                        let cand_sample = &v2_samples[idx];
+                        let candidate = touchdown_v2::TdCandidate {
+                            edge_sample_index: idx,
+                            edge_at: cand_sample.at,
+                            edge_agl_ft: cand_sample.agl_ft,
+                            edge_vs_fpm: cand_sample.vs_fpm,
+                            edge_gear_force_n: cand_sample.gear_normal_force_n,
+                            edge_g_force: cand_sample.g_force,
+                            edge_total_weight_kg: cand_sample.total_weight_kg,
+                        };
+                        // Compute impact_frame fuer A3/B4 (vs_negative_at_impact)
+                        let impact_for_validation = touchdown_v2::compute_impact_frame(
+                            &v2_samples, candidate.edge_at,
+                        );
+                        let impact_vs = impact_for_validation
+                            .as_ref().map(|r| r.impact_vs_fpm).unwrap_or(0.0);
+                        // sim from snap (Simulator → SimKind)
+                        let sim = match snap.simulator {
+                            Simulator::Msfs2020 => SimKind::Msfs2020,
+                            Simulator::Msfs2024 => SimKind::Msfs2024,
+                            Simulator::XPlane11 => SimKind::XPlane11,
+                            Simulator::XPlane12 => SimKind::XPlane12,
+                            _ => SimKind::Off,
+                        };
+                        let validation = touchdown_v2::validate_candidate(
+                            &candidate, &v2_samples, sim, impact_vs,
+                        );
+                        match validation {
+                            touchdown_v2::ValidationResult::Validated { result } => {
+                                tracing::info!(
+                                    pirep_id = %flight.pirep_id,
+                                    edge_at = %pending_at,
+                                    impact_vs = impact_vs,
+                                    "v0.7.0 TD candidate VALIDATED — promoting to sampler_touchdown"
+                                );
+                                stats.sampler_touchdown_at = Some(pending_at);
+                                stats.sampler_touchdown_vs_fpm = Some(impact_vs);
+                                stats.sampler_touchdown_g_force = Some(result.g_force_peak_in_window);
+                                open_touchdown_capture_window(&mut stats, pending_at);
+                                stats.pending_td_at = None;
+                                // v0.7.0 — emit strukturiertes touchdown_detected event
+                                // Drop stats lock kurz fuer record_event (synchronous JSONL).
+                                let impact_at_v = impact_for_validation
+                                    .as_ref().map(|r| r.impact_at).unwrap_or(pending_at);
+                                drop(stats);
+                                record_event(
+                                    &app,
+                                    &flight.pirep_id,
+                                    &FlightLogEvent::TouchdownDetected {
+                                        timestamp: now,
+                                        forensics_version: touchdown_v2::FORENSICS_VERSION,
+                                        contact_at: pending_at,
+                                        impact_at: impact_at_v,
+                                        vs_fpm: impact_vs,
+                                        confidence: format!("{:?}", result.sim),
+                                        source: "vs_at_impact_frame".to_string(),
+                                        sim: format!("{:?}", result.sim),
+                                    },
+                                );
+                                stats = flight.stats.lock().expect("flight stats");
+                            }
+                            touchdown_v2::ValidationResult::FalseEdge { reason, .. } => {
+                                tracing::warn!(
+                                    pirep_id = %flight.pirep_id,
+                                    edge_at = %pending_at,
+                                    impact_vs = impact_vs,
+                                    reason = ?reason,
+                                    "v0.7.0 TD candidate FALSE_EDGE — ignoring, continue watching"
+                                );
+                                stats.pending_td_at = None;
+                            }
+                        }
+                    } else {
+                        // Kein sample ab pending_at gefunden — Buffer-Drift, ignore
+                        stats.pending_td_at = None;
+                    }
+                }
+            }
+
+            // Legacy-Pfad fuer Capture-Window-Setup (=Pre-Buffer einkopieren) bleibt
+            // unveraendert — wird jetzt nur fuer VALIDATED candidates aufgerufen.
+            if false {
                 // Pitch-Korrektur: world-frame Y-Velocity → body-axial
                 // (xgs-Pattern). Bei typischem Touchdown-Pitch ~3-5°
                 // ist cos(pitch)≈0.998, also <0.5% Unterschied. Bei

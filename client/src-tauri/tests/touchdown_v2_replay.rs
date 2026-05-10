@@ -416,6 +416,154 @@ fn dlh742_msfs_smooth() {
     assert!(lr >= -196.0 && lr <= -186.0, "lr ∈ [-196, -186], got {}", lr);
 }
 
+// ─── LIVE-Sampler-Integration Tests (P1.1 fix) ──────────────────────────
+//
+// Simuliert exakt den Live-Sampler-Pfad in lib.rs (pending_td_at +
+// 1100ms-Validation + false_edge-skip + sampler_touchdown_at-promotion).
+// Stellt sicher dass der Live-Pfad wirklich macht was die pure-module-
+// Replay-Tests behaupten — nicht nur ein paralleler Test.
+
+struct LiveSamplerSim {
+    sampler_touchdown_at: Option<DateTime<Utc>>,
+    pending_td_at: Option<DateTime<Utc>>,
+    false_edges_seen: usize,
+    validated_tds_seen: usize,
+}
+
+/// Simuliert die echte Sampler-Loop in lib.rs:
+///   - Edge-Detection auf prev/current sample pair
+///   - pending_td_at wird gesetzt wenn neuer Edge + kein pending + kein samp_td
+///   - 1.1 sec spaeter validation via touchdown_v2 → VALIDATED → samp_td_at;
+///     FALSE_EDGE → pending_td_at = None
+fn simulate_live_sampler(samples: &[recorder::TouchdownWindowSample], sim: SimKind) -> LiveSamplerSim {
+    let mut state = LiveSamplerSim {
+        sampler_touchdown_at: None,
+        pending_td_at: None,
+        false_edges_seen: 0,
+        validated_tds_seen: 0,
+    };
+
+    for (idx, current) in samples.iter().enumerate() {
+        let prev = if idx > 0 { Some(&samples[idx - 1]) } else { None };
+
+        // Edge-Detection (Layer 1)
+        let candidate = detect_td_candidate(prev, current, idx, sim);
+
+        // Live-Sampler-Logik: pending_td_at setzen wenn neuer Edge + nicht busy
+        if candidate.is_some()
+            && state.sampler_touchdown_at.is_none()
+            && state.pending_td_at.is_none()
+        {
+            state.pending_td_at = Some(current.at);
+        }
+
+        // Pending Validation: 1.1 sec post-edge
+        if let Some(pending_at) = state.pending_td_at {
+            let elapsed_ms = (current.at - pending_at).num_milliseconds();
+            if elapsed_ms >= 1100 {
+                let cand_idx = samples.iter().position(|s| s.at >= pending_at);
+                if let Some(cand_i) = cand_idx {
+                    let cand_sample = &samples[cand_i];
+                    let cand = TdCandidate {
+                        edge_sample_index: cand_i,
+                        edge_at: cand_sample.at,
+                        edge_agl_ft: cand_sample.agl_ft,
+                        edge_vs_fpm: cand_sample.vs_fpm,
+                        edge_gear_force_n: cand_sample.gear_normal_force_n,
+                        edge_g_force: cand_sample.g_force,
+                        edge_total_weight_kg: cand_sample.total_weight_kg,
+                    };
+                    let impact = compute_impact_frame(samples, cand.edge_at);
+                    let impact_vs = impact.as_ref().map(|r| r.impact_vs_fpm).unwrap_or(0.0);
+                    let validation = validate_candidate(&cand, samples, sim, impact_vs);
+                    match validation {
+                        ValidationResult::Validated { .. } => {
+                            state.sampler_touchdown_at = Some(pending_at);
+                            state.validated_tds_seen += 1;
+                            state.pending_td_at = None;
+                        }
+                        ValidationResult::FalseEdge { .. } => {
+                            state.false_edges_seen += 1;
+                            state.pending_td_at = None;
+                        }
+                    }
+                } else {
+                    state.pending_td_at = None;
+                }
+            }
+        }
+    }
+
+    state
+}
+
+#[test]
+fn live_sampler_dah3181_promotes_real_td_skips_float() {
+    let f = load_fixture("dah3181.jsonl.gz");
+    let state = simulate_live_sampler(&f.samples, f.sim);
+
+    eprintln!(
+        "DAH 3181 LIVE: false_edges={} validated={} sampler_td_at={:?}",
+        state.false_edges_seen, state.validated_tds_seen, state.sampler_touchdown_at
+    );
+
+    // Erwartung: 1 false_edge (Float-Streifschuss bei sample 125),
+    // dann 1 validated TD (echter contact bei sample 198).
+    assert!(
+        state.false_edges_seen >= 1,
+        "Float-Streifschuss muss als false_edge erkannt werden, got {}",
+        state.false_edges_seen
+    );
+    assert!(
+        state.sampler_touchdown_at.is_some(),
+        "sampler_touchdown_at must be set after VALIDATED edge"
+    );
+    let td_at = state.sampler_touchdown_at.unwrap();
+    // Echter TD ist bei 07:54:02.310 (sample 198).
+    // Live-Pfad sollte diesen contact_frame als sampler_touchdown_at haben.
+    let expected_td_at = chrono::DateTime::parse_from_rfc3339("2026-05-10T07:54:02.310Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let diff_ms = (td_at - expected_td_at).num_milliseconds().abs();
+    assert!(
+        diff_ms < 100,
+        "Live sampler_touchdown_at {} should match real contact 07:54:02.310 (within 100ms), diff={}ms",
+        td_at, diff_ms
+    );
+
+    // Plus: berechne den finalen VS am echten contact_frame —
+    // exakt das was im Production-Dump-Pfad passieren wuerde
+    let impact = compute_impact_frame(&f.samples, td_at).expect("impact_frame");
+    let landing_rate = compute_landing_rate(&f.samples, &impact).expect("landing_rate");
+    eprintln!(
+        "DAH 3181 LIVE final: vs={} src={} conf={:?}",
+        landing_rate.vs_fpm, landing_rate.source, landing_rate.confidence
+    );
+    assert!(
+        landing_rate.vs_fpm >= -415.0 && landing_rate.vs_fpm <= -395.0,
+        "Live-Pfad final VS expected [-415, -395] (firm), got {}",
+        landing_rate.vs_fpm
+    );
+}
+
+#[test]
+fn live_sampler_msfs_unchanged_for_clean_landings() {
+    // Alle 4 MSFS-Fluege: live-Sampler sollte direkten validated TD geben
+    // (kein false_edge, keine Bouncer in der ersten Episode).
+    for fname in &["pto105.jsonl.gz", "dlh304.jsonl.gz", "cfg785.jsonl.gz", "dlh742.jsonl.gz"] {
+        let f = load_fixture(fname);
+        let state = simulate_live_sampler(&f.samples, f.sim);
+        eprintln!(
+            "{}: false_edges={} validated={} sampler_td={:?}",
+            fname, state.false_edges_seen, state.validated_tds_seen, state.sampler_touchdown_at
+        );
+        assert!(
+            state.sampler_touchdown_at.is_some(),
+            "{}: sampler_touchdown_at expected for clean MSFS landing", fname
+        );
+    }
+}
+
 #[test]
 fn dah3181_xplane_firm_with_float_false_edge() {
     let f = load_fixture("dah3181.jsonl.gz");

@@ -264,38 +264,56 @@ fn evaluate_gear_force_test(
 ) -> (bool, Option<f32>, Option<u64>) {
     let window_end = edge_at + Duration::milliseconds(500);
 
-    // Sammle alle Samples im Window mit gear_force >= threshold
-    let above: Vec<&TouchdownWindowSample> = samples
+    // Sammle alle Samples im Window in Reihenfolge (sorted nach `at`).
+    let in_window: Vec<&TouchdownWindowSample> = samples
         .iter()
         .filter(|s| s.at >= edge_at && s.at <= window_end)
-        .filter(|s| {
-            s.gear_normal_force_n
-                .map(|f| f.is_finite() && f >= threshold_n)
-                .unwrap_or(false)
-        })
         .collect();
 
-    let peak_in_window = samples
+    let peak_in_window = in_window
         .iter()
-        .filter(|s| s.at >= edge_at && s.at <= window_end)
         .filter_map(|s| s.gear_normal_force_n)
         .filter(|f| f.is_finite())
-        .fold(None::<f32>, |acc, f| {
-            Some(acc.map(|a| a.max(f)).unwrap_or(f))
-        });
+        .fold(None::<f32>, |acc, f| Some(acc.map(|a| a.max(f)).unwrap_or(f)));
 
-    if above.len() < 2 {
-        return (false, peak_in_window, Some(0));
+    // P2-Fix: Suche den LAENGSTEN CONTINUOUS RUN von samples mit
+    // gear_force >= threshold. Reset bei Gap (= sample mit force < threshold
+    // ODER missing force value).
+    //
+    // Vorher (BUG): erste/letzte above-sample-Span - das counted Spans mit
+    // Luecken in der Mitte als sustained, was die Spec widerspricht.
+    let mut best_run_ms: u64 = 0;
+    let mut best_run_count: usize = 0;
+    let mut current_run_start: Option<DateTime<Utc>> = None;
+    let mut current_run_count: usize = 0;
+
+    for s in &in_window {
+        let above = s
+            .gear_normal_force_n
+            .map(|f| f.is_finite() && f >= threshold_n)
+            .unwrap_or(false);
+        if above {
+            if current_run_start.is_none() {
+                current_run_start = Some(s.at);
+                current_run_count = 1;
+            } else {
+                current_run_count += 1;
+            }
+            // Update best wenn dieser run laenger
+            let run_ms = (s.at - current_run_start.unwrap()).num_milliseconds().max(0) as u64;
+            if run_ms > best_run_ms || (run_ms == best_run_ms && current_run_count > best_run_count) {
+                best_run_ms = run_ms;
+                best_run_count = current_run_count;
+            }
+        } else {
+            // Gap → reset current run
+            current_run_start = None;
+            current_run_count = 0;
+        }
     }
 
-    // Continuous duration (Timestamps): max gap zwischen consecutive samples
-    // muss klein bleiben damit "sustained" ehrlich gemeint ist.
-    // Hier vereinfacht: span vom ersten bis letzten above-sample.
-    let first = above.first().unwrap();
-    let last = above.last().unwrap();
-    let sustained_ms = (last.at - first.at).num_milliseconds().max(0) as u64;
-
-    (sustained_ms >= 60 && above.len() >= 2, peak_in_window, Some(sustained_ms))
+    let pass = best_run_ms >= 60 && best_run_count >= 2;
+    (pass, peak_in_window, Some(best_run_ms))
 }
 
 /// peak g_force im Window [edge_at, edge_at + 500ms]
@@ -810,6 +828,69 @@ mod tests {
             current_gs_kt: 130.0,
         };
         assert_eq!(classify_episode(s), EpisodeClass::GoAround);
+    }
+
+    fn make_sample(at_ms: i64, gear_n: Option<f32>) -> TouchdownWindowSample {
+        let at = DateTime::<Utc>::from_timestamp_millis(at_ms).unwrap();
+        TouchdownWindowSample {
+            at,
+            vs_fpm: -200.0,
+            g_force: 1.2,
+            on_ground: true,
+            agl_ft: 1.0,
+            heading_true_deg: 0.0,
+            groundspeed_kt: 100.0,
+            indicated_airspeed_kt: 100.0,
+            lat: 0.0,
+            lon: 0.0,
+            pitch_deg: 0.0,
+            bank_deg: 0.0,
+            gear_normal_force_n: gear_n,
+            total_weight_kg: Some(73000.0), // A320-ish → threshold ≈ 21478 N
+        }
+    }
+
+    #[test]
+    fn gear_force_continuous_pass_when_sustained() {
+        // 5 samples a 20ms (= 80ms span), alle ueber threshold (50000 N > 21478)
+        let samples: Vec<TouchdownWindowSample> = (0..5)
+            .map(|i| make_sample(1000 + i * 20, Some(50000.0)))
+            .collect();
+        let edge_at = samples[0].at;
+        let (pass, peak, sustained) = evaluate_gear_force_test(&samples, edge_at, 21478.0);
+        assert!(pass, "5 consecutive samples should pass");
+        assert_eq!(peak, Some(50000.0));
+        assert!(sustained.unwrap() >= 60);
+    }
+
+    #[test]
+    fn gear_force_continuous_fail_with_gap_in_middle() {
+        // P2-Fix: Sample 0 above, 1 below, 2 above → run-laenge = 1 sample.
+        // Vorher (BUG) waere span 0→2 = 40ms = pass. Jetzt: korrekt fail.
+        let samples = vec![
+            make_sample(1000, Some(50000.0)),  // above
+            make_sample(1020, Some(100.0)),    // below threshold (gap!)
+            make_sample(1040, Some(50000.0)),  // above wieder
+        ];
+        let edge_at = samples[0].at;
+        let (pass, _peak, sustained) = evaluate_gear_force_test(&samples, edge_at, 21478.0);
+        // Best run hat nur 1 sample bzw 0ms span -> fail
+        assert!(!pass, "gap in middle must NOT count as sustained, got sustained={:?}", sustained);
+    }
+
+    #[test]
+    fn gear_force_continuous_pass_when_long_run_after_gap() {
+        // Sample 0 above (single), gap, dann 5 samples sustained → pass
+        let mut samples = vec![
+            make_sample(1000, Some(50000.0)),  // single above
+            make_sample(1020, Some(100.0)),    // gap
+        ];
+        for i in 0..5 {
+            samples.push(make_sample(1100 + i * 20, Some(50000.0)));
+        }
+        let edge_at = samples[0].at;
+        let (pass, _peak, _sustained) = evaluate_gear_force_test(&samples, edge_at, 21478.0);
+        assert!(pass, "long sustained run after gap should pass");
     }
 
     #[test]
