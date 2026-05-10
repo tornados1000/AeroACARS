@@ -13,9 +13,12 @@
 //!   die in den Real-Logs gefunden wurden
 //!
 //! Anonymisierte Fixtures aus tests/fixtures/phase_*.jsonl.gz:
-//!   - phase_uro913_arrived_fallback_rolling.jsonl.gz
-//!   - phase_pto105_holding_pending_leak.jsonl.gz
-//!   - phase_dlh742_valid_holding.jsonl.gz (positiv-Beleg fuer §13.9)
+//!   - phase_arrived_fallback_rolling.jsonl.gz   (TEST001 — URO913-Klasse)
+//!   - phase_holding_pending_leak.jsonl.gz       (TEST002 — PTO105-Klasse)
+//!   - phase_valid_holding.jsonl.gz              (TEST003 — DLH742 positiv-Beleg §13.9)
+//!
+//! Die Dateinamen tragen bewusst KEINE Real-Callsigns mehr — anonymisierte
+//! Fixtures sollen auch im Dateinamen kein PII tragen.
 
 use aeroacars_app_lib::{
     arrived_fallback_conditions_basic, should_reset_holding_pending, PublicSimKind,
@@ -139,7 +142,7 @@ fn fixture_uro913_shows_engines_off_while_rolling() {
     // Damit ist sichergestellt: der Real-Bug existiert in den Fixture-Daten und der
     // Code-Fix (arrived_fallback_conditions_basic mit gs<1) wuerde ihn jetzt blocken.
     let events = read_jsonl_gz(&fixture_path(
-        "phase_uro913_arrived_fallback_rolling.jsonl.gz",
+        "phase_arrived_fallback_rolling.jsonl.gz",
     ));
     assert!(!events.is_empty(), "fixture leer");
 
@@ -182,7 +185,7 @@ fn fixture_pto105_shows_short_holding_episode() {
     // mit ungewoehnlich kurzer Holding-Dauer (< 90s, der erwarteten Dwell).
     // Das ist das Bug-Symptom — echtes Holding muesste >= 90s sein.
     let events = read_jsonl_gz(&fixture_path(
-        "phase_pto105_holding_pending_leak.jsonl.gz",
+        "phase_holding_pending_leak.jsonl.gz",
     ));
     assert!(!events.is_empty(), "PTO105 fixture leer");
 
@@ -251,9 +254,9 @@ fn fixtures_contain_no_real_pirep_ids() {
         "1ao7k8Rd0q0jDoDx", // DLH742 original
     ];
     for fname in &[
-        "phase_uro913_arrived_fallback_rolling.jsonl.gz",
-        "phase_pto105_holding_pending_leak.jsonl.gz",
-        "phase_dlh742_valid_holding.jsonl.gz",
+        "phase_arrived_fallback_rolling.jsonl.gz",
+        "phase_holding_pending_leak.jsonl.gz",
+        "phase_valid_holding.jsonl.gz",
     ] {
         let events = read_jsonl_gz(&fixture_path(fname));
         let raw = serde_json::to_string(&events).unwrap();
@@ -270,21 +273,22 @@ fn fixtures_contain_no_real_pirep_ids() {
 
 #[test]
 fn fixtures_contain_no_real_airlines_or_routes() {
-    // Echte Airline-ICAOs und Routen-ICAOs aus den Real-Logs.
-    // Anonymisierte Fixtures benutzen "TEST" + "XXXX/YYYY" — Real-Werte
-    // duerfen nicht durchsickern.
+    // Echte Airline-ICAOs, Routen-ICAOs UND Flugnummern aus den Real-Logs.
+    // Anonymisierte Fixtures benutzen "TEST" + "XXXX/YYYY" + "TEST00X" —
+    // Real-Werte duerfen nicht durchsickern (auch nicht im flight_number).
     const REAL_AIRLINE_ROUTES: &[&str] = &[
         "URO", "ZWWW", "EHBK", // URO913
         "PTO", "EDLV", "EHEH", // PTO105 (PTO als Airline + Route-ICAOs)
         "DLH", "EDDM", "RJBB", // DLH742
     ];
+    const REAL_FLIGHT_NUMBERS: &[&str] = &["URO913", "PTO105", "DLH742"];
     for fname in &[
-        "phase_uro913_arrived_fallback_rolling.jsonl.gz",
-        "phase_pto105_holding_pending_leak.jsonl.gz",
-        "phase_dlh742_valid_holding.jsonl.gz",
+        "phase_arrived_fallback_rolling.jsonl.gz",
+        "phase_holding_pending_leak.jsonl.gz",
+        "phase_valid_holding.jsonl.gz",
     ] {
         let events = read_jsonl_gz(&fixture_path(fname));
-        // Pruefe nur die flight_started Events (haben airline/route Felder)
+        // Pruefe nur die flight_started Events (haben airline/route/flight_number Felder)
         for ev in &events {
             if ev["type"] != "flight_started" {
                 continue;
@@ -292,6 +296,7 @@ fn fixtures_contain_no_real_airlines_or_routes() {
             let airline = ev["airline_icao"].as_str().unwrap_or("");
             let dpt = ev["dpt_airport"].as_str().unwrap_or("");
             let arr = ev["arr_airport"].as_str().unwrap_or("");
+            let flight_number = ev["flight_number"].as_str().unwrap_or("");
             for term in REAL_AIRLINE_ROUTES {
                 assert_ne!(
                     airline, *term,
@@ -309,11 +314,26 @@ fn fixtures_contain_no_real_airlines_or_routes() {
                     fname, arr
                 );
             }
+            for fn_real in REAL_FLIGHT_NUMBERS {
+                assert_ne!(
+                    flight_number, *fn_real,
+                    "Fixture {} hat echte flight_number={} (PII-Leak!)",
+                    fname, flight_number
+                );
+            }
             // Plus Airline muss explizit "TEST" sein (anonymisiertes Marker)
             assert_eq!(
                 airline, "TEST",
                 "Fixture {} flight_started.airline_icao muss 'TEST' sein, ist '{}'",
                 fname, airline
+            );
+            // Plus flight_number muss neutralem TEST00X-Schema folgen
+            assert!(
+                flight_number.starts_with("TEST"),
+                "Fixture {} flight_started.flight_number muss mit 'TEST' beginnen, \
+                 ist '{}'",
+                fname,
+                flight_number
             );
         }
     }
@@ -325,9 +345,9 @@ fn fixtures_have_exactly_one_flight_started() {
     // (anonymisiert + Original). Hier sicherstellen dass es jetzt
     // genau EINER ist pro Fixture.
     for fname in &[
-        "phase_uro913_arrived_fallback_rolling.jsonl.gz",
-        "phase_pto105_holding_pending_leak.jsonl.gz",
-        "phase_dlh742_valid_holding.jsonl.gz",
+        "phase_arrived_fallback_rolling.jsonl.gz",
+        "phase_holding_pending_leak.jsonl.gz",
+        "phase_valid_holding.jsonl.gz",
     ] {
         let events = read_jsonl_gz(&fixture_path(fname));
         let n = events.iter().filter(|e| e["type"] == "flight_started").count();
@@ -343,7 +363,7 @@ fn fixtures_have_exactly_one_flight_started() {
 fn fixture_dlh742_valid_holding_episode() {
     // Positiv-Beleg: DLH742 hat ein ECHTES Holding (~109s) das gewuenscht
     // erkannt werden soll. Mit dem Fix darf das nicht beschaedigt werden.
-    let events = read_jsonl_gz(&fixture_path("phase_dlh742_valid_holding.jsonl.gz"));
+    let events = read_jsonl_gz(&fixture_path("phase_valid_holding.jsonl.gz"));
     assert!(!events.is_empty(), "DLH742 fixture leer");
 
     let holding_entries: Vec<_> = events
