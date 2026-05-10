@@ -144,19 +144,28 @@ export function ManualFlightModal({ bid, simHint, onClose, onFlightStarted }: Pr
     if (!selected) return;
     const blockFuel = parseFloat(blockFuelKg);
     const ftMin = parseInt(flightTimeMin, 10);
-    const zfw = parseFloat(zfwKg);
     if (!Number.isFinite(blockFuel) || blockFuel <= 0) {
-      setError("Block-Fuel muss eine positive Zahl sein");
+      setError(t("flight.error.invalid_block_fuel"));
       return;
     }
     if (!Number.isFinite(ftMin) || ftMin <= 0) {
-      setError("Erwartete Flugzeit muss eine positive Zahl sein");
+      setError(t("flight.error.invalid_flight_time"));
       return;
     }
-    // v0.5.42: ZFW ist jetzt Pflicht (analog Backend-Validation).
-    if (!Number.isFinite(zfw) || zfw <= 0) {
-      setError("ZFW (Zero Fuel Weight) ist Pflicht — bitte das geplante Gewicht ohne Treibstoff in kg eintragen.");
-      return;
+    // v0.7.1 Phase 2 F1 (Spec docs/spec/v0.7.1-landing-ux-fairness.md):
+    // ZFW ist NICHT mehr Pflicht. Leerlassen → VFR/Manual ohne
+    // Loadsheet-Wertung (sub_loadsheet wird skipped). Eingegeben +
+    // <= 0 → Eingabefehler-Schutz (gleiche Bedingung wie Backend
+    // lib.rs:5829-5837 → Err invalid_zfw_value).
+    let zfw: number | undefined;
+    const zfwTrimmed = zfwKg.trim();
+    if (zfwTrimmed.length > 0) {
+      const parsed = parseFloat(zfwTrimmed);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        setError(t("flight.error.invalid_zfw_value"));
+        return;
+      }
+      zfw = parsed;
     }
     const plan: ManualFlightPlan = {
       aircraft_id: selected.id,
@@ -425,15 +434,20 @@ export function ManualFlightModal({ bid, simHint, onClose, onFlightStarted }: Pr
               </label>
 
               <label>
-                {/* v0.5.42: ZFW ist Pflicht — gleicher Required-Stern wie
-                    Block-Fuel + Flugzeit. Ohne ZFW kein Loadsheet-Score. */}
-                <span>{t("manual_flight.form.zfw")} <span style={{ color: "var(--err)" }}>*</span></span>
+                {/* v0.7.1 Phase 2 F1: ZFW ist NICHT mehr Pflicht.
+                    Leerlassen = VFR/Manual ohne Loadsheet-Wertung
+                    (sub_loadsheet skipped). Eingegeben + > 0 = wie bisher. */}
+                <span>
+                  {t("manual_flight.form.zfw")}{" "}
+                  <span style={{ color: "var(--muted, #888)", fontWeight: 400 }}>
+                    ({t("manual_flight.form.optional")})
+                  </span>
+                </span>
                 <div className="manual-modal__input-with-unit">
                   <input
                     type="number"
                     min="0"
                     step="10"
-                    required
                     value={zfwKg}
                     onChange={(e) => setZfwKg(e.target.value)}
                     placeholder={t("manual_flight.form.zfw_placeholder")}
@@ -441,7 +455,7 @@ export function ManualFlightModal({ bid, simHint, onClose, onFlightStarted }: Pr
                   />
                   <span>kg</span>
                 </div>
-                <small>{t("manual_flight.form.zfw_help")}</small>
+                <small>{t("manual_flight.form.zfw_help_optional")}</small>
               </label>
             </div>
 
@@ -465,18 +479,22 @@ export function ManualFlightModal({ bid, simHint, onClose, onFlightStarted }: Pr
                 {t("manual_flight.back")}
               </button>
               {(() => {
-                // v0.5.42: Submit deaktivieren wenn eines der Pflichtfelder
-                // leer/ungültig ist — Block-Fuel, Flugzeit, ZFW. Verhindert
-                // dass der User mit leerer Form klickt und einen Backend-
-                // Validation-Roundtrip provoziert (der vorher als Lock-
-                // Konflikt verkleidet zurückkam).
+                // v0.7.1 Phase 2 F1: Submit deaktivieren wenn Block-Fuel
+                // oder Flugzeit ungueltig sind. ZFW ist OPTIONAL — leer
+                // ist OK (VFR/Manual ohne Loadsheet-Wertung), ein
+                // angegebener Wert <= 0 ist Eingabefehler (Backend wird
+                // mit invalid_zfw_value antworten).
                 const bf = parseFloat(blockFuelKg);
                 const ft = parseInt(flightTimeMin, 10);
-                const z = parseFloat(zfwKg);
+                const zfwTrimmed = zfwKg.trim();
+                const zfwParsed = zfwTrimmed.length > 0 ? parseFloat(zfwTrimmed) : NaN;
+                const zfwInvalid =
+                  zfwTrimmed.length > 0 &&
+                  (!Number.isFinite(zfwParsed) || zfwParsed <= 0);
                 const formInvalid =
                   !Number.isFinite(bf) || bf <= 0 ||
                   !Number.isFinite(ft) || ft <= 0 ||
-                  !Number.isFinite(z) || z <= 0;
+                  zfwInvalid;
                 const isSubmitting = stage === "submitting";
                 if (warning) {
                   return (

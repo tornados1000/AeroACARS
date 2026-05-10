@@ -202,6 +202,20 @@
       "source": "Fonte: {{source}}",
       "source_unknown": "Fonte: non disponibile"
     },
+    "chart_zone": {
+      "vorlauf": "Pre-gate",
+      "gate": "Valutato",
+      "flare": "Flare",
+      "tooltip": "Vengono valutati i campioni tra 0 e 1000 ft AGL. Gli ultimi 3 secondi prima del touchdown (manovra di flare) sono esclusi — il flare viene valutato nel proprio blocco."
+    },
+    "skipped_label": "non valutato",
+    "skipped_reason": {
+      "no_planned_burn": "Nessun trip-burn OFP pianificato — non valutato (nessuna penalità).",
+      "no_actual_burn": "Trip-burn reale non misurabile (dati carburante mancanti).",
+      "no_planned_zfw": "Nessun ZFW inserito — VFR/manuale senza valutazione del loadsheet (nessuna penalità).",
+      "no_planned_tow": "Nessun TOW pianificato — valutazione loadsheet saltata (nessuna penalità).",
+      "fallback": "Non valutato."
+    },
     "confidence": {
       "high": "Confidenza: Alta",
       "medium": "Confidenza: Media",
@@ -919,7 +933,9 @@
       "alternate_help": "Aeroporto di riserva.",
       "zfw": "ZFW (Zero Fuel Weight)",
       "zfw_placeholder": "es. 800",
-      "zfw_help": "Obbligatorio. Velivolo + pilota + pax + carico (senza carburante). Necessario per loadsheet score e confronto ZFW con il sim."
+      "zfw_help": "Obbligatorio. Velivolo + pilota + pax + carico (senza carburante). Necessario per loadsheet score e confronto ZFW con il sim.",
+      "zfw_help_optional": "Opzionale. Velivolo + pilota + pax + carico (senza carburante). Lascia vuoto per voli VFR/manuali senza valutazione del loadsheet — lo score viene allora calcolato senza la componente loadsheet/massa (nessuna penalità).",
+      "optional": "opzionale"
     }
   },
   "bid_card": {

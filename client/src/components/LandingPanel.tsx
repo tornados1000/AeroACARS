@@ -114,6 +114,9 @@ export interface LandingRecord {
 
   /// UX-Cutoff. 0/fehlt = pre-v0.7.1, 1+ = v0.7.1 Sub-Scores aktiv.
   ux_version?: number;
+  /// Touchdown-Forensik-Version (P2.4-Fix: sauber im Record statt
+  /// UI zwingt den Wert zu raten). 1 = legacy, 2 = touchdown_v2.
+  forensics_version?: number;
   /// Confidence-Tagging vom Touchdown-v2-Cascade.
   /// "High" | "Medium" | "Low" | "VeryLow"
   landing_confidence?: string | null;
@@ -189,10 +192,19 @@ export interface SubScore {
   points: number;
   /** Pre-formatted value to show on the card ("379 fpm", "1.10 G", …). */
   value: string;
-  /** "good" | "ok" | "bad" — drives the colour band. */
-  band: "good" | "ok" | "bad";
+  /** "good" | "ok" | "bad" | "skipped" — drives the colour band.
+   *  v0.7.1 (P1.2-Fix): "skipped" als visuell graue Variante damit
+   *  "nicht bewertet" sichtbar bleibt (Loadsheet/Fuel ohne Plan). */
+  band: "good" | "ok" | "bad" | "skipped";
   /** Why we awarded this score (one short sentence). */
   rationale: string;
+  /** v0.7.1 (P1.2-Fix): true wenn dieser Sub-Score nicht bewertet wurde
+   *  (z.B. VFR ohne ZFW → loadsheet skipped, ohne planned_burn → fuel
+   *  skipped). UI rendert eine "nicht bewertet"-Karte statt der Karte
+   *  ganz auszublenden. */
+  skipped?: boolean;
+  /** Skip-Reason fuer i18n-Key landing.skipped_reason.* */
+  skipReason?: string;
 }
 
 // v0.5.47 — Sub-Score-Berechnung delegiert an die zentrale Lib.
@@ -201,29 +213,32 @@ export interface SubScore {
 
 /// v0.7.1 Phase 3 (Spec §3.5 Legacy-Schutz):
 ///   - ux_version >= 1 → gespeicherte sub_scores aus dem Record nutzen
-///     (kein Recompute), damit Werte konsistent zum PIREP-Payload sind
+///     (kein Recompute), damit Werte konsistent zum PIREP-Payload sind.
+///     SKIPPED Sub-Scores BLEIBEN drin und werden als "nicht bewertet"
+///     mit grauem Band gerendert (P1.2-Fix).
 ///   - ux_version < 1 → Legacy-Pfad mit libComputeSubScores (nur fuer
 ///     pre-v0.7.1-PIREPs als Backward-Compat)
 ///   - bei v0.7.1+ ohne sub_scores (sollte nie passieren) → Legacy-Pfad
 function getSubScores(r: LandingRecord): SubScore[] {
   const ux = r.ux_version ?? 0;
   if (ux >= 1 && r.sub_scores && r.sub_scores.length > 0) {
-    // Phase 3: vom Backend (landing-scoring Crate) berechnete Sub-Scores
-    // direkt verwenden. SubScoreEntry ist Wire-Format-kompatibel zu
-    // SubScore (key, points, value, band, rationale via rationale_key).
-    return r.sub_scores
-      .filter((s) => !s.skipped) // skipped Sub-Scores werden separat als "nicht bewertet" gerendert
-      .map((s) => {
-        const band: SubScore["band"] =
-          s.band === "good" || s.band === "ok" || s.band === "bad" ? s.band : "ok";
-        return {
-          key: s.key,
-          points: s.points ?? s.score,
-          value: s.value ?? "",
-          band,
-          rationale: (s.rationale_key ?? "").replace(/^landing\.rat\./, ""),
-        };
-      });
+    // Phase 3 (P1.2-Fix): skipped sind sichtbar als "nicht bewertet"
+    return r.sub_scores.map((s) => {
+      const band: SubScore["band"] =
+        s.band === "good" || s.band === "ok" || s.band === "bad"
+          ? s.band
+          : ("skipped" as unknown as SubScore["band"]);
+      return {
+        key: s.key,
+        points: s.points ?? s.score,
+        // skipped → menschlicher String statt leer
+        value: s.skipped ? "" : (s.value ?? ""),
+        band,
+        rationale: (s.rationale_key ?? "").replace(/^landing\.rat\./, ""),
+        skipped: s.skipped,
+        skipReason: s.reason,
+      };
+    });
   }
   // Legacy-Pfad fuer pre-v0.7.1-PIREPs (forward-compat)
   const peakVs = r.landing_peak_vs_fpm ?? r.landing_rate_fpm;
@@ -765,8 +780,8 @@ function ApproachChart({ samples }: { samples: ApproachSample[] }) {
   const { t } = useTranslation();
   if (samples.length < 3) return null;
   const w = 600;
-  const h = 140;
-  const pad = { top: 12, right: 12, bottom: 22, left: 40 };
+  const h = 160;
+  const pad = { top: 12, right: 12, bottom: 38, left: 40 };
   const innerW = w - pad.left - pad.right;
   const innerH = h - pad.top - pad.bottom;
   const vss = samples.map((s) => s.vs_fpm);
@@ -781,6 +796,59 @@ function ApproachChart({ samples }: { samples: ApproachSample[] }) {
   // Stable-target band: -1000 to -500 fpm is the typical glide-slope V/S range
   const bandTop = y(-500);
   const bandBottom = y(-1000);
+
+  // v0.7.1 F5/F6 (P2.5-Fix): Zonen-Annotation. Wenn die neuen
+  // is_scored_gate/is_flare-Flags vorhanden sind (v0.7.1+ PIREPs),
+  // farbige Hintergrund-Bands rendern damit Pilot sieht welche Samples
+  // wirklich in den sub_stability-Score eingehen. Spec §3.4: Gate =
+  // 0-1000 ft AGL minus letzte 3s vor TD.
+  const hasZones = samples.some((s) => s.is_scored_gate != null);
+  const buildZones = () => {
+    if (!hasZones) return null;
+    type Zone = { start: number; end: number; kind: "vorlauf" | "gate" | "flare" };
+    const zones: Zone[] = [];
+    let i = 0;
+    while (i < samples.length) {
+      const s = samples[i]!;
+      const kind: Zone["kind"] = s.is_flare
+        ? "flare"
+        : s.is_scored_gate
+          ? "gate"
+          : "vorlauf";
+      let j = i;
+      while (
+        j + 1 < samples.length &&
+        ((samples[j + 1]!.is_flare ? "flare"
+          : samples[j + 1]!.is_scored_gate ? "gate"
+          : "vorlauf") === kind)
+      ) {
+        j++;
+      }
+      zones.push({ start: i, end: j, kind });
+      i = j + 1;
+    }
+    return zones.map((z, idx) => {
+      const x = pad.left + z.start * xStep;
+      const wWidth = (z.end - z.start + 1) * xStep;
+      const fill =
+        z.kind === "gate"
+          ? "rgba(56, 189, 248, 0.12)" // blau = bewertet
+          : z.kind === "flare"
+            ? "rgba(234, 179, 8, 0.15)" // gelb = Flare
+            : "rgba(120, 120, 120, 0.07)"; // grau = Vorlauf
+      return (
+        <rect
+          key={`zone-${idx}`}
+          x={x}
+          y={pad.top}
+          width={wWidth}
+          height={innerH}
+          fill={fill}
+        />
+      );
+    });
+  };
+
   return (
     <svg
       className="landing-chart"
@@ -797,6 +865,8 @@ function ApproachChart({ samples }: { samples: ApproachSample[] }) {
         fill="rgba(255,255,255,0.02)"
         stroke="rgba(255,255,255,0.15)"
       />
+      {/* v0.7.1 F5: Vorlauf/Gate/Flare-Zonen-Highlight */}
+      {buildZones()}
       {/* Stable target band */}
       <rect
         x={pad.left}
@@ -812,12 +882,26 @@ function ApproachChart({ samples }: { samples: ApproachSample[] }) {
       <text x={pad.left - 4} y={y(vMin) + 4} textAnchor="end" fontSize="10" fill="currentColor">
         {vMin.toFixed(0)}
       </text>
-      <text x={pad.left} y={h - 6} fontSize="10" fill="currentColor">
+      <text x={pad.left} y={h - 22} fontSize="10" fill="currentColor">
         {t("landing.approach_start")}
       </text>
-      <text x={pad.left + innerW} y={h - 6} textAnchor="end" fontSize="10" fill="currentColor">
+      <text x={pad.left + innerW} y={h - 22} textAnchor="end" fontSize="10" fill="currentColor">
         {t("landing.touchdown")}
       </text>
+      {/* v0.7.1 F5: Legende fuer Zonen — nur wenn v0.7.1+ Daten da sind */}
+      {hasZones && (
+        <g fontSize="9" fill="currentColor">
+          <rect x={pad.left} y={h - 13} width={8} height={8} fill="rgba(120,120,120,0.4)" />
+          <text x={pad.left + 11} y={h - 6}>{t("landing.chart_zone.vorlauf")}</text>
+          <rect x={pad.left + 70} y={h - 13} width={8} height={8} fill="rgba(56,189,248,0.4)" />
+          <text x={pad.left + 81} y={h - 6}>{t("landing.chart_zone.gate")}</text>
+          <rect x={pad.left + 140} y={h - 13} width={8} height={8} fill="rgba(234,179,8,0.4)" />
+          <text x={pad.left + 151} y={h - 6}>{t("landing.chart_zone.flare")}</text>
+        </g>
+      )}
+      {hasZones && (
+        <title>{t("landing.chart_zone.tooltip")}</title>
+      )}
     </svg>
   );
 }
@@ -886,30 +970,65 @@ function ScoreBreakdown({ subs }: { subs: SubScore[] }) {
   if (subs.length === 0) return null;
   return (
     <div className="landing-subscores">
-      {subs.map((s) => (
-        <div
-          key={s.key}
-          className={`landing-subscore landing-subscore--${s.band}`}
-        >
-          <div className="landing-subscore__head">
-            <span className="landing-subscore__label">
-              {t(`landing.sub.${s.key}`)}
-              <InfoBadge explanation={t(`landing.info.${s.key}`)} />
-            </span>
-            <span className="landing-subscore__points">{s.points} PTS</span>
-          </div>
-          <div className="landing-subscore__value">{s.value}</div>
-          <div className="landing-subscore__bar">
+      {subs.map((s) => {
+        // v0.7.1 P1.2-Fix: skipped wird sichtbar als "nicht bewertet"
+        // (graue Variante, keine Punkte/Wert/Rationale).
+        if (s.skipped) {
+          const reasonKey = s.skipReason
+            ? `landing.skipped_reason.${s.skipReason}`
+            : "landing.skipped_reason.fallback";
+          return (
             <div
-              className="landing-subscore__fill"
-              style={{ width: `${s.points}%` }}
-            />
+              key={s.key}
+              className="landing-subscore landing-subscore--skipped"
+              style={{ opacity: 0.65 }}
+            >
+              <div className="landing-subscore__head">
+                <span className="landing-subscore__label">
+                  {t(`landing.sub.${s.key}`)}
+                  <InfoBadge explanation={t(`landing.info.${s.key}`)} />
+                </span>
+                <span
+                  className="landing-subscore__points"
+                  style={{ fontStyle: "italic", fontSize: "0.75rem" }}
+                >
+                  {t("landing.skipped_label")}
+                </span>
+              </div>
+              <div
+                className="landing-subscore__rationale"
+                style={{ fontStyle: "italic" }}
+              >
+                {t(reasonKey)}
+              </div>
+            </div>
+          );
+        }
+        return (
+          <div
+            key={s.key}
+            className={`landing-subscore landing-subscore--${s.band}`}
+          >
+            <div className="landing-subscore__head">
+              <span className="landing-subscore__label">
+                {t(`landing.sub.${s.key}`)}
+                <InfoBadge explanation={t(`landing.info.${s.key}`)} />
+              </span>
+              <span className="landing-subscore__points">{s.points} PTS</span>
+            </div>
+            <div className="landing-subscore__value">{s.value}</div>
+            <div className="landing-subscore__bar">
+              <div
+                className="landing-subscore__fill"
+                style={{ width: `${s.points}%` }}
+              />
+            </div>
+            <div className="landing-subscore__rationale">
+              {t(`landing.rat.${s.rationale}`)}
+            </div>
           </div>
-          <div className="landing-subscore__rationale">
-            {t(`landing.rat.${s.rationale}`)}
-          </div>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -919,9 +1038,13 @@ function ScoreBreakdown({ subs }: { subs: SubScore[] }) {
 function CoachTip({ subs }: { subs: SubScore[] }) {
   const { t } = useTranslation();
   if (subs.length === 0) return null;
+  // v0.7.1 P1.2-Fix: skipped Sub-Scores nicht als "schwaechster"
+  // Punkt im Coach-Tip nutzen (sie sind nicht bewertet, nicht schlecht).
+  const scored = subs.filter((s) => !s.skipped);
+  if (scored.length === 0) return null;
   // Sort ascending, the lowest sub-score is the area to improve. If
   // everything is ≥ 90, surface the genuine "good landing" message.
-  const sorted = [...subs].sort((a, b) => a.points - b.points);
+  const sorted = [...scored].sort((a, b) => a.points - b.points);
   const worst = sorted[0];
   const tipKey = coachTipKey(worst.rationale);
   return (
@@ -1233,14 +1356,13 @@ function LandingDetail({
               fpm ({personalBest.dpt_airport} → {personalBest.arr_airport})
             </div>
           )}
-          {/* v0.7.1 Phase 3 F4: Forensik-v2 Badge mit Confidence-Pill.
-              Bedingung im Component (P1.1-C: ux_version >= 1 AND
-              forensics_version >= 2). v0.7.1+ PIREPs haben implizit
-              forensics_version >= 2 weil touchdown_v2 seit v0.7.0
-              aktiv ist — wir setzen 2 als Default fuer ux >= 1. */}
+          {/* v0.7.1 Phase 3 F4 + P2.4-Fix: Forensik-v2 Badge mit
+              Confidence-Pill. Bedingung im Component (P1.1-C:
+              ux_version >= 1 AND forensics_version >= 2). Beide
+              Werte kommen jetzt sauber aus dem LandingRecord. */}
           <div style={{ marginTop: "0.5rem" }}>
             <ForensicsBadge
-              forensicsVersion={2}
+              forensicsVersion={record.forensics_version}
               uxVersion={record.ux_version}
               confidence={record.landing_confidence}
               source={record.landing_source}

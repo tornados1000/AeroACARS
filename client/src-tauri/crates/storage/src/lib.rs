@@ -337,6 +337,13 @@ pub struct LandingRecord {
     #[serde(default)]
     pub ux_version: u8,
 
+    /// Touchdown-Forensik-Version (1 = legacy, 2 = touchdown_v2).
+    /// v0.7.1 P2.4-Fix: explizit im Record persistieren statt UI zu
+    /// zwingen den Wert zu raten. ForensicsBadge nutzt diesen Wert
+    /// + ux_version >= 1 als Bedingung.
+    #[serde(default)]
+    pub forensics_version: u8,
+
     // F4: Forensik-Sichtbarkeit
     #[serde(default)]
     pub landing_confidence: Option<String>,

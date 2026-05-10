@@ -6482,6 +6482,18 @@ fn open_landing_store(app: &AppHandle) -> Option<LandingStore> {
     LandingStore::open(dir).ok()
 }
 
+/// v0.7.1 Helper: actual_trip_burn = takeoff_fuel - landing_fuel
+/// (1:1 wie in build_landing_record line 6527-6530). Damit sub_scores
+/// + aggregate_master_score den gleichen Wert nutzen.
+fn actual_burn_for_record(stats: &FlightStats) -> Option<f32> {
+    match (stats.takeoff_fuel_kg, stats.landing_fuel_kg) {
+        (Some(toff), Some(land)) if toff > land && toff > 0.0 && land >= 0.0 => {
+            Some(toff - land)
+        }
+        _ => None,
+    }
+}
+
 /// v0.7.1 (Spec F4 + P2.2-D): atomic write of landing rate + confidence
 /// + source.
 ///
@@ -6520,7 +6532,35 @@ fn build_landing_record(
     let touchdown_at = stats.landing_at?;
     let landing_rate_fpm = stats.landing_rate_fpm?;
     let score = stats.landing_score?;
-    let grade = letter_grade(score.numeric());
+    // v0.7.1 P1.3-Fix: score_numeric kommt aus aggregate_master_score
+    // (gewichteter Mittelwert der Sub-Scores aus der landing-scoring
+    // Crate). Damit fliessen Fuel-/Loadsheet-/Stability-/Rollout-Werte
+    // genauso ein wie VS+G — Spar-Piloten und VFR-Piloten profitieren
+    // sichtbar im Hauptscore. Fallback auf score.numeric() (Touchdown-
+    // Klassifikation) wenn keine Sub-Scores berechnet werden konnten
+    // (= Schutz fuer pre-v0.7.1-Pfad in Tests/Edge-Cases).
+    // sub_scores werden weiter unten gebaut — wir muessen sie hier
+    // schon mal berechnen damit wir den Aggregate-Score haben.
+    let scoring_input = landing_scoring::LandingScoringInput {
+        vs_fpm: stats.landing_peak_vs_fpm.or(stats.landing_rate_fpm),
+        peak_g_load: stats.landing_peak_g_force,
+        bounce_count: Some(stats.bounce_count as u32),
+        approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
+        approach_bank_stddev_deg: stats.approach_bank_stddev_deg,
+        rollout_distance_m: stats.rollout_distance_m.map(|m| m as f32),
+        planned_burn_kg: stats.planned_burn_kg,
+        actual_trip_burn_kg: actual_burn_for_record(stats),
+        planned_zfw_kg: stats.planned_zfw_kg,
+        planned_tow_kg: stats.planned_tow_kg,
+        ..Default::default()
+    };
+    let computed_sub_scores = landing_scoring::compute_sub_scores(&scoring_input);
+    let aggregate_master =
+        landing_scoring::aggregate_master_score(&computed_sub_scores);
+    let score_numeric = aggregate_master
+        .map(|m| m as i32)
+        .unwrap_or_else(|| score.numeric());
+    let grade = letter_grade(score_numeric);
 
     // Compute fuel-efficiency once so the Landing tab doesn't have to
     // redo the formula. Same shape as build_pirep_fields.
@@ -6618,7 +6658,7 @@ fn build_landing_record(
         aircraft_title: aircraft_title.map(|s| s.to_string()).filter(|s| !s.is_empty()),
         sim_kind: sim_kind_label.map(|s| s.to_string()),
 
-        score_numeric: score.numeric(),
+        score_numeric,
         score_label: score.label().to_string(),
         grade_letter: grade.to_string(),
 
@@ -6685,6 +6725,7 @@ fn build_landing_record(
         // Phase 1 = backbone: Felder durchreichen, kein Pilot-sichtbares
         // Verhalten geaendert. Phase 2/3 konsumieren sie.
         ux_version: 1, // v0.7.1+ marker — UI nutzt sub_scores statt LegacyPirepNotice
+        forensics_version: touchdown_v2::FORENSICS_VERSION,
         landing_confidence: stats.landing_confidence.clone(),
         landing_source: stats.landing_source.clone(),
         // F7 (P2.1-A): bestehende Backend-Felder exponieren — keine
@@ -6697,27 +6738,10 @@ fn build_landing_record(
         // wrappen Some() unconditional.
         approach_excessive_sink: Some(stats.approach_excessive_sink),
         gate_window: None, // Phase 3: aus stab_v2-Compute befuellen
-        // P1.5 + Phase 2 F1/F2/F3: sub_scores aus der landing-scoring
-        // Crate. Inputs nutzen jetzt planned_burn + actual_trip_burn
-        // (statt fuel_efficiency_pct) damit das Hard-Gate aus F2 +
-        // Asymmetrie aus F3 greifen. planned_zfw + planned_tow
-        // aktivieren sub_loadsheet (F1: skipped wenn None).
-        sub_scores: {
-            let scoring_input = landing_scoring::LandingScoringInput {
-                vs_fpm: stats.landing_peak_vs_fpm.or(stats.landing_rate_fpm),
-                peak_g_load: stats.landing_peak_g_force,
-                bounce_count: Some(stats.bounce_count as u32),
-                approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
-                approach_bank_stddev_deg: stats.approach_bank_stddev_deg,
-                rollout_distance_m: stats.rollout_distance_m.map(|m| m as f32),
-                planned_burn_kg: stats.planned_burn_kg,
-                actual_trip_burn_kg: actual_burn,
-                planned_zfw_kg: stats.planned_zfw_kg,
-                planned_tow_kg: stats.planned_tow_kg,
-                ..Default::default()
-            };
-            landing_scoring::compute_sub_scores(&scoring_input)
-        },
+        // P1.5 + Phase 2 F1/F2/F3 + P1.3-Fix: sub_scores wurden oben
+        // schon berechnet damit aggregate_master_score → score_numeric
+        // gehen kann. Hier nur noch durchreichen, NICHT erneut rechnen.
+        sub_scores: computed_sub_scores,
     })
 }
 
@@ -7751,7 +7775,34 @@ async fn flight_end(
                     pilot_name,
                     distance_nm: body.distance,
                     flight_time_min: body.flight_time,
-                    score: stats_for_post.landing_score.map(|s| s.numeric()),
+                    // v0.7.1 P1.3-Fix: gewichteter Aggregate-Score
+                    // statt Touchdown-Klassifikation (zeigt jetzt auch
+                    // Fuel/Loadsheet im Discord-Embed).
+                    score: {
+                        let actual_burn = actual_burn_for_record(&stats_for_post);
+                        let scoring_input = landing_scoring::LandingScoringInput {
+                            vs_fpm: stats_for_post
+                                .landing_peak_vs_fpm
+                                .or(stats_for_post.landing_rate_fpm),
+                            peak_g_load: stats_for_post.landing_peak_g_force,
+                            bounce_count: Some(stats_for_post.bounce_count as u32),
+                            approach_vs_stddev_fpm: stats_for_post.approach_vs_stddev_fpm,
+                            approach_bank_stddev_deg: stats_for_post
+                                .approach_bank_stddev_deg,
+                            rollout_distance_m: stats_for_post
+                                .rollout_distance_m
+                                .map(|m| m as f32),
+                            planned_burn_kg: stats_for_post.planned_burn_kg,
+                            actual_trip_burn_kg: actual_burn,
+                            planned_zfw_kg: stats_for_post.planned_zfw_kg,
+                            planned_tow_kg: stats_for_post.planned_tow_kg,
+                            ..Default::default()
+                        };
+                        let subs = landing_scoring::compute_sub_scores(&scoring_input);
+                        landing_scoring::aggregate_master_score(&subs)
+                            .map(|m| m as i32)
+                            .or_else(|| stats_for_post.landing_score.map(|s| s.numeric()))
+                    },
                     ..Default::default()
                 };
                 drop(stats_for_post);
@@ -7769,6 +7820,34 @@ async fn flight_end(
                     let pirep_payload = {
                         let stats = flight.stats.lock().expect("flight stats");
                         let touchdown_count = stats.touchdown_events.len() as u32;
+                        // v0.7.1 P1.3-Fix: Sub-Scores einmal berechnen,
+                        // dann sowohl als sub_scores ins Payload als auch
+                        // als landing_score (gewichteter Aggregate) nutzen.
+                        let actual_burn = actual_burn_for_record(&stats);
+                        let scoring_input = landing_scoring::LandingScoringInput {
+                            vs_fpm: stats
+                                .landing_peak_vs_fpm
+                                .or(stats.landing_rate_fpm),
+                            peak_g_load: stats.landing_peak_g_force,
+                            bounce_count: Some(stats.bounce_count as u32),
+                            approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
+                            approach_bank_stddev_deg: stats.approach_bank_stddev_deg,
+                            rollout_distance_m: stats
+                                .rollout_distance_m
+                                .map(|m| m as f32),
+                            planned_burn_kg: stats.planned_burn_kg,
+                            actual_trip_burn_kg: actual_burn,
+                            planned_zfw_kg: stats.planned_zfw_kg,
+                            planned_tow_kg: stats.planned_tow_kg,
+                            ..Default::default()
+                        };
+                        let payload_sub_scores =
+                            landing_scoring::compute_sub_scores(&scoring_input);
+                        let aggregate_master =
+                            landing_scoring::aggregate_master_score(&payload_sub_scores);
+                        let payload_landing_score = aggregate_master
+                            .map(|m| m as i32)
+                            .or_else(|| stats.landing_score.map(|s| s.numeric()));
                         aeroacars_mqtt::PirepPayload {
                             ts: Utc::now().timestamp_millis(),
                             pirep_id: flight.pirep_id.clone(),
@@ -7792,7 +7871,10 @@ async fn flight_end(
                             planned_ldw_kg: stats.planned_ldw_kg,
                             peak_altitude_ft: stats.peak_altitude_ft.map(|v| v.round() as i32),
                             landing_vs_fpm: body.landing_rate.map(|r| r as i32),
-                            landing_score: stats.landing_score.map(|s| s.numeric()),
+                            // v0.7.1 P1.3-Fix: gewichteter Aggregate-Score
+                            // (Fuel/Loadsheet/Stability/Rollout fliessen ein),
+                            // mit Fallback auf Touchdown-Klassifikation.
+                            landing_score: payload_landing_score,
                             go_around_count: Some(stats.go_around_count),
                             touchdown_count: Some(touchdown_count),
                             dep_gate: stats.dep_gate.clone(),
@@ -7839,41 +7921,9 @@ async fn flight_end(
                             approach_stable_config: stats.approach_stable_config,
                             approach_excessive_sink: Some(stats.approach_excessive_sink),
                             gate_window: None, // Phase 3
-                            // P1.5 + Phase 2 (F1/F2/F3): Sub-Scores aus der
-                            // landing-scoring Crate mit den gleichen Inputs
-                            // wie build_landing_record (Konsistenz-Garantie).
-                            sub_scores: {
-                                let actual_burn = match (
-                                    stats.takeoff_fuel_kg,
-                                    stats.landing_fuel_kg,
-                                ) {
-                                    (Some(toff), Some(land))
-                                        if toff > land && toff > 0.0 && land >= 0.0 =>
-                                    {
-                                        Some(toff - land)
-                                    }
-                                    _ => None,
-                                };
-                                let scoring_input = landing_scoring::LandingScoringInput {
-                                    vs_fpm: stats
-                                        .landing_peak_vs_fpm
-                                        .or(stats.landing_rate_fpm),
-                                    peak_g_load: stats.landing_peak_g_force,
-                                    bounce_count: Some(stats.bounce_count as u32),
-                                    approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
-                                    approach_bank_stddev_deg: stats
-                                        .approach_bank_stddev_deg,
-                                    rollout_distance_m: stats
-                                        .rollout_distance_m
-                                        .map(|m| m as f32),
-                                    planned_burn_kg: stats.planned_burn_kg,
-                                    actual_trip_burn_kg: actual_burn,
-                                    planned_zfw_kg: stats.planned_zfw_kg,
-                                    planned_tow_kg: stats.planned_tow_kg,
-                                    ..Default::default()
-                                };
-                                landing_scoring::compute_sub_scores(&scoring_input)
-                            },
+                            // P1.5 + Phase 2 (F1/F2/F3) + P1.3-Fix:
+                            // bereits oben berechnet, hier nur durchreichen.
+                            sub_scores: payload_sub_scores,
                         }
                     };
                     // v0.5.34: PIREP-Forensik ins JSONL — Block/Flight-Time,
@@ -13451,17 +13501,24 @@ fn build_pirep_notes(flight: &ActiveFlight, stats: &FlightStats) -> String {
     };
     let crate_subs = landing_scoring::compute_sub_scores(&crate_input);
     if let Some(crate_master) = landing_scoring::aggregate_master_score(&crate_subs) {
-        let ts_master = stats.landing_score.map(|sc| sc.numeric());
+        // v0.7.1 P2.6-Fix: Drift-Vergleich gegen den ECHTEN
+        // Touchdown-Klassifikator-Score (LandingScore::numeric) ist
+        // unsinnig — das ist eine andere Score-Definition (vs/g/bounce-
+        // basierte Kategorie). Der Schatten-Wert ist jetzt selbst der
+        // gewichtete Aggregate-Score und wird im UI auch so verwendet
+        // (P1.3-Fix). Wir loggen nur, damit Audit-Trail im Log bleibt
+        // welcher Master-Score in welchem PIREP gelandet ist.
+        let touchdown_class = stats.landing_score.map(|sc| sc.label());
         tracing::info!(
             pirep_id = %flight.pirep_id,
-            crate_master = crate_master,
-            ts_master = ?ts_master,
+            master_score_v0_7_1 = crate_master,
+            touchdown_class = ?touchdown_class,
             crate_input_vs_fpm = ?crate_input.vs_fpm,
             crate_input_peak_g = ?crate_input.peak_g_load,
             crate_input_bounces = ?crate_input.bounce_count,
-            crate_input_fuel_pct = ?crate_input.fuel_efficiency_pct,
             crate_sub_count = crate_subs.len(),
-            "v0.7.1 Phase-0 Schatten-Score"
+            crate_skipped_count = crate_subs.iter().filter(|s| s.skipped).count(),
+            "v0.7.1 Master-Score-Aggregate (Crate-SSoT)"
         );
     }
 

@@ -202,6 +202,20 @@
       "source": "Quelle: {{source}}",
       "source_unknown": "Quelle: nicht verfügbar"
     },
+    "chart_zone": {
+      "vorlauf": "Vorlauf",
+      "gate": "Bewertet",
+      "flare": "Flare",
+      "tooltip": "Bewertet werden Anflug-Samples zwischen 0 und 1000 ft AGL. Die letzten 3 Sekunden vor Touchdown (Flare-Manöver) sind ausgeschlossen — der Flare wird im separaten Flare-Block bewertet."
+    },
+    "skipped_label": "nicht bewertet",
+    "skipped_reason": {
+      "no_planned_burn": "Kein OFP-Trip-Burn geplant — wird nicht bewertet (kein Penalty).",
+      "no_actual_burn": "Tatsächlicher Trip-Burn nicht messbar (Tank-Daten fehlen).",
+      "no_planned_zfw": "Kein ZFW eingetragen — VFR/Manual ohne Loadsheet-Wertung (kein Penalty).",
+      "no_planned_tow": "Kein TOW geplant — Loadsheet-Wertung übersprungen (kein Penalty).",
+      "fallback": "Nicht bewertet."
+    },
     "confidence": {
       "high": "Confidence: Hoch",
       "medium": "Confidence: Mittel",
@@ -918,7 +932,9 @@
       "alternate_help": "Ausweich-Flughafen.",
       "zfw": "ZFW (Zero Fuel Weight)",
       "zfw_placeholder": "z.B. 800",
-      "zfw_help": "Pflicht. Flugzeug + Pilot + Pax + Cargo (ohne Sprit). Nötig für Loadsheet-Score und ZFW-Vergleich gegen Sim."
+      "zfw_help": "Pflicht. Flugzeug + Pilot + Pax + Cargo (ohne Sprit). Nötig für Loadsheet-Score und ZFW-Vergleich gegen Sim.",
+      "zfw_help_optional": "Optional. Flugzeug + Pilot + Pax + Cargo (ohne Sprit). Leer lassen für VFR/Manual ohne Loadsheet-Wertung — Score wird dann ohne Loadsheet-/Mass-Anteil berechnet (kein 0-Penalty).",
+      "optional": "optional"
     }
   },
   "bid_card": {

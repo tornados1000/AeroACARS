@@ -202,6 +202,20 @@
       "source": "Source: {{source}}",
       "source_unknown": "Source: not available"
     },
+    "chart_zone": {
+      "vorlauf": "Pre-gate",
+      "gate": "Scored",
+      "flare": "Flare",
+      "tooltip": "Scored samples are between 0 and 1000 ft AGL. The last 3 seconds before touchdown (flare manoeuvre) are excluded — the flare is scored in its own block."
+    },
+    "skipped_label": "not scored",
+    "skipped_reason": {
+      "no_planned_burn": "No OFP trip burn planned — not scored (no penalty).",
+      "no_actual_burn": "Actual trip burn not measurable (fuel data missing).",
+      "no_planned_zfw": "No ZFW entered — VFR/manual without loadsheet scoring (no penalty).",
+      "no_planned_tow": "No TOW planned — loadsheet scoring skipped (no penalty).",
+      "fallback": "Not scored."
+    },
     "confidence": {
       "high": "Confidence: High",
       "medium": "Confidence: Medium",
@@ -918,7 +932,9 @@
       "alternate_help": "Backup airport.",
       "zfw": "ZFW (Zero Fuel Weight)",
       "zfw_placeholder": "e.g. 800",
-      "zfw_help": "Required. Aircraft + pilot + pax + cargo (no fuel). Needed for loadsheet score and ZFW vs sim comparison."
+      "zfw_help": "Required. Aircraft + pilot + pax + cargo (no fuel). Needed for loadsheet score and ZFW vs sim comparison.",
+      "zfw_help_optional": "Optional. Aircraft + pilot + pax + cargo (no fuel). Leave empty for VFR/manual flights without loadsheet scoring — the score is then computed without a loadsheet/mass component (no 0-penalty).",
+      "optional": "optional"
     }
   },
   "bid_card": {
