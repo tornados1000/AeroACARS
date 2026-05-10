@@ -6810,13 +6810,25 @@ fn spawn_phpvms_position_worker(
             let post_fut = client.post_positions(&flight.pirep_id, &batch);
             match tokio::time::timeout(BATCH_TIMEOUT, post_fut).await {
                 Ok(Ok(())) => {
-                    // Success: stats updaten, backoff reset, last_post_at gesetzt.
+                    // Success: queued_count = 0 (NICHT outbox.len()!).
+                    //
+                    // **WICHTIG zur Semantik:** zwischen drain und jetzt
+                    // kann der Streamer was in die Outbox gepusht haben.
+                    // outbox.len() waere dann > 0. Das wuerde aber heissen
+                    // dass der Indikator "queued (offline)" zeigt obwohl
+                    // gerade ein erfolgreicher POST gelaufen ist — exakt
+                    // der UX-Bug aus dem Pilot-Report 2026-05-10.
+                    //
+                    // v0.5.x-Semantik war: queued_count = "stuck items"
+                    // (failed POSTs in der file-queue). Im Cruise = 0,
+                    // Indikator zeigt "live". Genau das wollen wir.
+                    //
+                    // Items die der Streamer zwischen drain und jetzt
+                    // gepusht hat werden im NAECHSTEN POST mit raus.
                     {
                         let mut stats = flight.stats.lock().expect("flight stats");
                         stats.last_position_at = Some(Utc::now());
-                        let outbox_len = flight.position_outbox.lock()
-                            .expect("position_outbox lock").len();
-                        stats.queued_position_count = outbox_len as u32;
+                        stats.queued_position_count = 0;
                     }
                     consecutive_failures = 0;
                     last_post_at = Some(std::time::Instant::now());
@@ -6832,7 +6844,9 @@ fn spawn_phpvms_position_worker(
                     return;
                 }
                 Ok(Err(e)) => {
-                    // Andere Failure — KOMPLETTE batch zurueck in die outbox.
+                    // Andere Failure — KOMPLETTER batch zurueck in die outbox.
+                    // queued_count = outbox.len() (nach requeue) damit der
+                    // Indikator den ECHTEN backlog zeigt = stuck items.
                     tracing::warn!(
                         pirep_id = %flight.pirep_id,
                         error = %e,
@@ -6840,6 +6854,12 @@ fn spawn_phpvms_position_worker(
                         "phpvms-worker batch POST failed; queueing entire batch back"
                     );
                     requeue_batch(&flight, batch);
+                    let outbox_len = flight.position_outbox.lock()
+                        .expect("position_outbox lock").len();
+                    {
+                        let mut stats = flight.stats.lock().expect("flight stats");
+                        stats.queued_position_count = outbox_len as u32;
+                    }
                     consecutive_failures = consecutive_failures.saturating_add(1);
                 }
                 Err(_timeout) => {
@@ -6849,16 +6869,21 @@ fn spawn_phpvms_position_worker(
                         "phpvms-worker batch POST timed out (15s); queueing back"
                     );
                     requeue_batch(&flight, batch);
+                    let outbox_len = flight.position_outbox.lock()
+                        .expect("position_outbox lock").len();
+                    {
+                        let mut stats = flight.stats.lock().expect("flight stats");
+                        stats.queued_position_count = outbox_len as u32;
+                    }
                     consecutive_failures = consecutive_failures.saturating_add(1);
                 }
             }
-            // Outbox-Groesse + Persist-Check (ausserhalb der lock-Bloecke).
+            // Outbox-Groesse fuer Persist-Check (kein queued_count-Update mehr
+            // hier — das wurde im match-arm korrekt mit der richtigen Semantik
+            // gesetzt. Vorher war hier ein unconditional update das den
+            // success-arm-0-Wert mit dem Race-Condition-Wert ueberschrieb).
             let total_after = flight.position_outbox.lock()
                 .expect("position_outbox lock").len();
-            {
-                let mut stats = flight.stats.lock().expect("flight stats");
-                stats.queued_position_count = total_after as u32;
-            }
             // Persist-Trigger: alle PERSIST_INTERVAL (30s) wenn die Outbox
             // nicht leer ist. Das begrenzt den Crash-Verlust für phpVMS
             // Live-Map auf max ~30s an Positions (= 1-10 Items je nach

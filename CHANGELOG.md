@@ -4,6 +4,52 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.6.2] — 2026-05-10
+
+🩹 **Hotfix v0.6.1 → v0.6.2 — Indikator-Wackler „1 Position offline ↔ live" gefangen.**
+
+### Pilot-Report (Test-Flight CFG 785 EDDV→EDDB im Pushback)
+
+Indikator zeigte abwechselnd „OFFLINE 1 Position offline · Σ 251" und kurz „live", obwohl alles funktionierte (POSTs gingen raus, JSONL komplett, Live-Map auf VPS aktiv).
+
+### Root-Cause
+
+Der v0.6.1-Fix für Bug #7 hatte den UX-Indikator nicht KOMPLETT gefixt. Die Worker-Loop hatte nach dem `match` (Erfolg/Failure-Branches) noch einen **unconditional queued_position_count update** der den korrekt gesetzten 0-Wert aus dem success-Branch überschrieb mit dem race-condition-Wert:
+
+```rust
+match post_fut.await {
+    Ok(Ok(())) => { stats.queued_position_count = 0; }  // ← korrekt!
+    ...
+}
+// Außerhalb des match — race window:
+let total_after = outbox.lock().len();
+stats.queued_position_count = total_after as u32;  // ← ÜBERSCHREIBT mit 1!
+```
+
+**Sequenz:**
+1. t=0: Worker drained outbox (z.B. 1 Item) → POST success → field=0 ✓
+2. **Zwischen Zeile 6820 und 6856: Streamer pusht 1 fresh item** (Pushback-Phase, Streamer pusht alle ~3s)
+3. t=0 unconditional update: `field = outbox.len() = 1` ❌
+4. t=1, t=2, t=3: Worker tick `if !due continue` (Pushback interval=4s) → field bleibt 1 → UI zeigt „1 Position offline"
+5. t=4: Worker postet erneut → field=0 → kurz später Race → 1 → ...
+
+### Fix
+
+Unconditional update raus. queued_position_count wird jetzt **NUR im match-arm** gesetzt mit korrekter Semantik:
+
+- **success-arm:** `queued_position_count = 0` (egal was outbox.len() ist — der nächste POST nimmt es mit raus)
+- **failure-arm + timeout-arm:** `queued_position_count = outbox.len()` nach `requeue_batch` (= echter „stuck items" Backlog)
+- **404-arm:** Worker terminiert sauber (kein Update nötig)
+
+Damit matcht die Semantik jetzt v0.5.x: field = „stuck items wegen Network-Problem", 0 sonst. UI zeigt durchgehend „live" im normalen Betrieb, „queued" nur bei echten Connection-Issues.
+
+### Geänderte Dateien
+
+- `client/src-tauri/src/lib.rs` — Worker-Loop unconditional queued_count-Update entfernt, success/failure/timeout match-arms setzen field selbst mit korrekter Semantik
+- Versionen → 0.6.2
+
+---
+
 ## [v0.6.1] — 2026-05-10
 
 🩹 **Audit-Fixes vor v0.6.0-Rollout — der phpVMS-Worker batched jetzt wirklich.**
