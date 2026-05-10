@@ -1,6 +1,6 @@
 # Flight-Phase State-Machine — QS-Inventur fuer Bug-Untersuchung
 
-**Status:** v1.3 — **Draft for QS Review** (Round-3 Doku-Glaettung)
+**Status:** v1.4 — **Draft for QS Review** (Round-4 Doku-Glaettung)
 **Zweck:** Vollstaendige Inventur aller Phase-Wechsel + Trigger + Side-Effects + Anti-Flicker-Mechaniken. Damit kann VA-Owner / QS systematisch durchgehen und potenzielle Bug-Klassen finden bevor sie als Live-Bug auftauchen.
 **KEIN Implementierungs-Auftrag** — diese Spec dokumentiert NUR den Status-Quo + markiert Verdachtsstellen.
 
@@ -14,7 +14,20 @@ Die Phase-State-Machine in `step_flight()` (~600 Zeilen in `lib.rs`) ist ueber M
 
 Diese Spec ist die Antwort. Pro Transition: was triggert sie, welche Schwellen, welche Anti-Flicker-Mechaniken sind aktiv, welche Side-Effects passieren. Plus eine Verdachts-Liste (markiert mit **[VERDACHT]**) mit Stellen die im Code-Audit verdaechtig wirkten.
 
-### 0.1 Changelog v1.2 → v1.3 (Round-3 Doku-Glaettung)
+### 0.1 Changelog v1.3 → v1.4 (Round-4 Doku-Glaettung)
+
+2 P2 + 2 P3 aus Review-Round 4. Reine Doku-Konsistenz, keine neuen Themen.
+
+| # | Fix |
+|---|---|
+| **P2.1** | §3.1 Schreibstellen-Aufzaehlung praeziser: **2 direkte Writes im Final→Landing-Pfad (lib.rs:11679, 11734) + 2 guarded Rescue-Writes im Arrived-Fallback (lib.rs:12767, 12802 — beide im selben `if landing_at.is_none() && takeoff_at.is_some()` Block)**. v1.3 sagte "3 unconditional + 1 guarded" was 12767 falsch zaehlte |
+| **P2.2** | §13.1 Verdachts-Formulierung an Authority-Section angeglichen: Sampler schreibt `sampler_touchdown_at`, Streamer kopiert nach `landing_at`. Race ist NICHT "beide schreiben landing_at" sondern "Streamer setzt landing_at bevor Sampler sampler_touchdown_at validiert hat" |
+| **P3.1** | §10 Holding-Exit: kann zur vorherigen Phase zurueck (Cruise ODER Approach), nicht nur Approach |
+| **P3.2** | §10 Landing→TaxiIn Score-Klassifikation: Score wird im Landing-Window finalisiert (kann vor/um TaxiIn herum passieren), nicht hart an die Phase-Transition gebunden |
+
+---
+
+### 0.2 Changelog v1.2 → v1.3 (Round-3 Doku-Glaettung)
 
 2 P1 + 3 P2 + 1 P3 aus VA-Owner Review-Round 3. Reine Doku-Konsistenz-Korrekturen, kein neues Thema.
 
@@ -29,7 +42,7 @@ Diese Spec ist die Antwort. Pro Transition: was triggert sie, welche Schwellen, 
 
 ---
 
-### 0.2 Changelog v1.1 → v1.2 (Round-2 Korrekturen)
+### 0.3 Changelog v1.1 → v1.2 (Round-2 Korrekturen)
 
 3 P1 + 4 P2 sachliche Fehler aus Review-Round 2. v1.1 beschrieb teils ein "Idealmodell" das nicht zur Code-Realitaet passt — v1.2 zieht das gerade ohne neue Themen aufzumachen.
 
@@ -47,7 +60,7 @@ Plus 4 QS-Test-Verfeinerungen in §14.
 
 ---
 
-### 0.3 Changelog v1.0 → v1.1
+### 0.4 Changelog v1.0 → v1.1
 
 VA-Owner Review-Round 1 hat 3 P1 + 3 P2 sachliche Fehler aufgedeckt — alle korrigiert:
 
@@ -131,12 +144,16 @@ if let Some(sampler_at) = stats.sampler_touchdown_at {
 
 Das ist **bewusst nicht idempotent** — der Streamer-Tick will den genauen Sampler-Wert wenn vorhanden, sonst Snapshot-Buffer-Fallback, sonst `now`. Race-Risiko nur wenn der Sampler erst NACH Schritt 2 seinen Wert setzt — dann bleibt `landing_at` auf Snapshot-Buffer-Wert (~5s schlechter).
 
-**Andere `landing_at`-Schreibstellen:**
-- **lib.rs:11735** ueberschreibt mit `sampler_at` (Final→Landing-Pfad, Schritt 2)
-- **lib.rs:12767** schreibt im sampler-carry-over Pfad (Phase-Skip Edge-Case)
-- **lib.rs:12802** ist guarded: `if stats.landing_at.is_none() && stats.takeoff_at.is_some()` — letzte Verteidigungslinie
+**Komplette Aufzaehlung der `landing_at`-Schreibstellen (v1.4 praezisiert):**
 
-Insgesamt: **3 Sites unconditional + 1 guarded**, nicht "alle 4 idempotent" wie v1.2 sagte.
+| Pfad | Site | Verhalten |
+|---|---|---|
+| Final→Landing | lib.rs:11679 | **Direkt** — Snapshot-Buffer-Fallback (`actual_td_at` aus erstem on_ground-Sample im Buffer, sonst `now`) |
+| Final→Landing | lib.rs:11734 | **Direkt** — wenn `sampler_touchdown_at.is_some()` → ueberschreibt mit dem genaueren Sampler-Wert |
+| Arrived-Fallback | lib.rs:12767 | **Guarded** — innerhalb `if stats.landing_at.is_none() && stats.takeoff_at.is_some()` — wenn Sampler vorhanden, schreibt sampler_at als Rescue |
+| Arrived-Fallback | lib.rs:12802 | **Guarded** — gleicher Block, else-Branch: schreibt `now` als allerletzter Fallback |
+
+**Korrekt:** **2 direkte Writes im normalen Final→Landing-Pfad + 2 guarded Rescue-Writes im Arrived-Fallback** (beide im selben Guard-Block). Nicht "3 unconditional + 1 guarded" wie v1.3 sagte.
 
 ---
 
@@ -366,9 +383,10 @@ Distance wird Haversine pro Tick addiert. Im Holding zaehlt das die echt gefloge
 | Boarding → Pushback | `block_off_at = now`, MQTT `Block`-Event |
 | TakeoffRoll → Takeoff | `takeoff_at = now`, `takeoff_pitch_deg/bank_deg/fuel_kg/weight_kg` |
 | Cruise → Holding | (Anzeige-only, keine Side-Effects) |
-| Holding → Approach | (Anzeige-only) |
+| Approach → Holding | (Anzeige-only) |
+| Holding → Cruise / Approach | (Anzeige-only — Exit zur vorherigen Phase, oder direkt Approach falls echter Descent waehrend Hold erkannt) |
 | Final → Landing | Streamer setzt Phase + `landing_at` (zuerst aus Snapshot-Buffer, dann ueberschrieben mit `sampler_touchdown_at` falls vorhanden — siehe §3.1). `finalize_landing_rate()` setzt parallel `landing_rate_fpm/peak_vs/confidence/source` (NICHT `landing_at`). Touchdown-Window startet |
-| Landing → TaxiIn | Landing-Score wird klassifiziert + `landing_score_announced = false` |
+| Landing → TaxiIn | (kein direkter Score-Effekt). Landing-Score wird **im Landing-Window** finalisiert (kann vor/um TaxiIn herum passieren, nicht hart an die Phase-Transition gebunden — TOUCHDOWN_POST_WINDOW_MS gibt das Timing vor). Touchdown-Window-Dump triggert dann LandingFinalized + `landing_score_announced` |
 | TaxiIn → BlocksOn | `block_on_at = now`, Activity-Log "Block on" |
 | BlocksOn → Arrived | Auto-Submit-Hook (wenn aktiviert) |
 | Arrived → PirepSubmitted | phpVMS `/file` POST + MQTT `Pirep`-Publish + Discord-Embed + landing_history.json |
@@ -441,7 +459,7 @@ phpVMS hat weniger Phasen als AeroACARS — Cruise/Descent/Holding alle ENR. **U
 
 ### 13.1 Phase-Race-Conditions (§3.1)
 
-**Verdacht:** Sampler vs Streamer beide schreiben `landing_at`. Pruefen ob race moeglich ist.
+**Verdacht (v1.4 praezisiert):** Sampler schreibt `sampler_touchdown_at`, Streamer kopiert daraus nach `landing_at`. Race-Klasse: Streamer-Tick koennte den Final→Landing-Edge sehen BEVOR der Sampler seinen `sampler_touchdown_at`-Wert validiert hat — Streamer schreibt dann `landing_at` aus dem Snapshot-Buffer (lib.rs:11679), Sampler kommt einen Tick spaeter mit besserem Wert. Pruefen ob die `sampler_at`-Override-Stelle (lib.rs:11734) verlaesslich greift oder ob `landing_at` auf dem Snapshot-Buffer-Wert haengen bleibt.
 
 ### 13.2 Pause-Resume-Drift (§11.4)
 
@@ -526,4 +544,4 @@ S11 + S12 sind die **kritischsten neuen Risiken** und sollten zuerst Replay-Cove
 
 ---
 
-**Ende der Spec v1.3 — Round-3 Doku-Glaettung eingearbeitet. Spec ist jetzt nahe an "approved" — naechster Schritt: §13 (8 Verdachts-Klassen) + §14 (13 Szenarien) systematisch klassifizieren.**
+**Ende der Spec v1.4 — Round-4 Doku-Glaettung eingearbeitet. Naechster Schritt: §13 (8 Verdachts-Klassen) + §14 (13 Szenarien) systematisch klassifizieren.**
