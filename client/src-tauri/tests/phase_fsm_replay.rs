@@ -235,6 +235,110 @@ fn fixture_pto105_shows_short_holding_episode() {
     ));
 }
 
+// ─── PII-Schutz-Tests (verhindern PII-Leak in Repo) ─────────────────────
+
+/// Testet jede Fixture-Datei gegen eine Liste von Real-Pilot-Daten-Strings.
+/// Wenn ein anonymisierter Fixture-Build zukuenftig versehentlich originale
+/// Pirep-IDs / Airlines / Routen / Aircraft-Reg ins Repo holt, schlaegt
+/// dieser Test fehl bevor der Commit landet.
+#[test]
+fn fixtures_contain_no_real_pirep_ids() {
+    // Diese 16-Zeichen-Pirep-IDs der echten Real-Logs duerfen niemals
+    // im Repo auftauchen.
+    const REAL_PIREP_IDS: &[&str] = &[
+        "YKW9lKzvz31ljZOq", // URO913 original
+        "k5KmO0o6WYbXB20y", // PTO105_EDLV_EHEH original
+        "1ao7k8Rd0q0jDoDx", // DLH742 original
+    ];
+    for fname in &[
+        "phase_uro913_arrived_fallback_rolling.jsonl.gz",
+        "phase_pto105_holding_pending_leak.jsonl.gz",
+        "phase_dlh742_valid_holding.jsonl.gz",
+    ] {
+        let events = read_jsonl_gz(&fixture_path(fname));
+        let raw = serde_json::to_string(&events).unwrap();
+        for pid in REAL_PIREP_IDS {
+            assert!(
+                !raw.contains(pid),
+                "Fixture {} enthaelt echte PIREP-ID {} (PII-Leak!)",
+                fname,
+                pid
+            );
+        }
+    }
+}
+
+#[test]
+fn fixtures_contain_no_real_airlines_or_routes() {
+    // Echte Airline-ICAOs und Routen-ICAOs aus den Real-Logs.
+    // Anonymisierte Fixtures benutzen "TEST" + "XXXX/YYYY" — Real-Werte
+    // duerfen nicht durchsickern.
+    const REAL_AIRLINE_ROUTES: &[&str] = &[
+        "URO", "ZWWW", "EHBK", // URO913
+        "PTO", "EDLV", "EHEH", // PTO105 (PTO als Airline + Route-ICAOs)
+        "DLH", "EDDM", "RJBB", // DLH742
+    ];
+    for fname in &[
+        "phase_uro913_arrived_fallback_rolling.jsonl.gz",
+        "phase_pto105_holding_pending_leak.jsonl.gz",
+        "phase_dlh742_valid_holding.jsonl.gz",
+    ] {
+        let events = read_jsonl_gz(&fixture_path(fname));
+        // Pruefe nur die flight_started Events (haben airline/route Felder)
+        for ev in &events {
+            if ev["type"] != "flight_started" {
+                continue;
+            }
+            let airline = ev["airline_icao"].as_str().unwrap_or("");
+            let dpt = ev["dpt_airport"].as_str().unwrap_or("");
+            let arr = ev["arr_airport"].as_str().unwrap_or("");
+            for term in REAL_AIRLINE_ROUTES {
+                assert_ne!(
+                    airline, *term,
+                    "Fixture {} hat echte airline_icao={} (PII-Leak!)",
+                    fname, airline
+                );
+                assert_ne!(
+                    dpt, *term,
+                    "Fixture {} hat echte dpt_airport={} (PII-Leak!)",
+                    fname, dpt
+                );
+                assert_ne!(
+                    arr, *term,
+                    "Fixture {} hat echte arr_airport={} (PII-Leak!)",
+                    fname, arr
+                );
+            }
+            // Plus Airline muss explizit "TEST" sein (anonymisiertes Marker)
+            assert_eq!(
+                airline, "TEST",
+                "Fixture {} flight_started.airline_icao muss 'TEST' sein, ist '{}'",
+                fname, airline
+            );
+        }
+    }
+}
+
+#[test]
+fn fixtures_have_exactly_one_flight_started() {
+    // Bug-Schutz: vorherige v1-Anonymisierung hatte 2x flight_started
+    // (anonymisiert + Original). Hier sicherstellen dass es jetzt
+    // genau EINER ist pro Fixture.
+    for fname in &[
+        "phase_uro913_arrived_fallback_rolling.jsonl.gz",
+        "phase_pto105_holding_pending_leak.jsonl.gz",
+        "phase_dlh742_valid_holding.jsonl.gz",
+    ] {
+        let events = read_jsonl_gz(&fixture_path(fname));
+        let n = events.iter().filter(|e| e["type"] == "flight_started").count();
+        assert_eq!(
+            n, 1,
+            "Fixture {} muss genau 1 flight_started haben, hat {}",
+            fname, n
+        );
+    }
+}
+
 #[test]
 fn fixture_dlh742_valid_holding_episode() {
     // Positiv-Beleg: DLH742 hat ein ECHTES Holding (~109s) das gewuenscht
