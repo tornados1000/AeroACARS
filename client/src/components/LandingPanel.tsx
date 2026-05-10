@@ -1653,19 +1653,29 @@ function LandingDetail({
               />
             )}
             <dl className="landing-keyvals landing-keyvals--inline">
-              <div>
-                <dt>{t("landing.runway_id")}</dt>
-                <dd>
-                  {record.runway_match.airport_ident}/{record.runway_match.runway_ident}{" "}
-                  ({record.runway_match.surface})
-                </dd>
-              </div>
-              <div>
-                <dt>{t("landing.runway_length")}</dt>
-                <dd>
-                  {(record.runway_match.length_ft * 0.3048).toFixed(0)} m
-                </dd>
-              </div>
+              {/* v0.7.6 P1 (Refinement-Round-2): Auch runway_id und
+                  runway_length sind aus der Runway-DB und damit bei
+                  untrusted geometry irrefuehrend (GSG303-Klasse: zeigt
+                  sonst "K5S9/16 (asphalt) · 1152 m" obwohl der Pilot
+                  nach OR66 wollte). Bei untrusted komplett ausblenden —
+                  die Hint-Pill oben erklaert dem Piloten warum. */}
+              {geometryTrusted && (
+                <div>
+                  <dt>{t("landing.runway_id")}</dt>
+                  <dd>
+                    {record.runway_match.airport_ident}/{record.runway_match.runway_ident}{" "}
+                    ({record.runway_match.surface})
+                  </dd>
+                </div>
+              )}
+              {geometryTrusted && (
+                <div>
+                  <dt>{t("landing.runway_length")}</dt>
+                  <dd>
+                    {(record.runway_match.length_ft * 0.3048).toFixed(0)} m
+                  </dd>
+                </div>
+              )}
               {/* v0.7.6 P1-3: Centerline-Offset nur bei trusted geometry */}
               {geometryTrusted && (
                 <div>

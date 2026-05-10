@@ -6599,7 +6599,13 @@ pub fn runway_geometry_trust_check(
         _ => return (false, Some("no_runway_match")),
     };
     // 2) Match existiert aber != arr/divert → echtes Mismatch.
-    let icao_ok = matched == arr_airport || Some(matched) == divert_to;
+    //
+    // v0.7.6 P3 Refinement: case-insensitive Vergleich. ICAOs sind in
+    // unserer DB praktisch immer uppercase, aber externe phpVMS-Daten
+    // oder OFP-Imports koennten "edDM" oder "eddm" liefern und das
+    // sollte keine falsche icao_mismatch-Warnung triggern.
+    let icao_ok = matched.eq_ignore_ascii_case(arr_airport)
+        || divert_to.is_some_and(|d| matched.eq_ignore_ascii_case(d));
     if !icao_ok {
         return (false, Some("icao_mismatch"));
     }
@@ -17746,6 +17752,43 @@ mod v0_7_6_payload_consistency_tests {
         );
         assert!(!trusted);
         assert_eq!(reason, Some("no_runway_match"));
+    }
+
+    #[test]
+    fn runway_trust_icao_compare_is_case_insensitive() {
+        // v0.7.6 P3-Refinement: ICAOs koennten aus externen Quellen
+        // mit Mixed-Case kommen (phpVMS-Imports, OFP-Snapshots).
+        // Match "EDDM" gegen arr "eddm" muss trusted sein.
+        let (trusted, reason) = runway_geometry_trust_check(
+            Some("EDDM"),
+            "eddm",
+            None,
+            Some(50.0),
+            Some(400.0),
+        );
+        assert!(trusted, "EDDM/eddm muss case-insensitive matchen");
+        assert!(reason.is_none());
+
+        // Auch fuer divert
+        let (trusted, _) = runway_geometry_trust_check(
+            Some("eddm"),
+            "LFPG",
+            Some("EdDm"),
+            Some(15.0),
+            Some(400.0),
+        );
+        assert!(trusted, "divert ICAO muss case-insensitive matchen");
+
+        // Sanity: echte unterschiedliche Codes bleiben mismatch
+        let (trusted, reason) = runway_geometry_trust_check(
+            Some("EDDF"),
+            "EDDM",
+            None,
+            Some(50.0),
+            Some(400.0),
+        );
+        assert!(!trusted);
+        assert_eq!(reason, Some("icao_mismatch"));
     }
 
     #[test]
