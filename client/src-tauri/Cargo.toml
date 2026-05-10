@@ -160,5 +160,10 @@ sim-msfs.workspace = true
 [dependencies.sim-xplane]
 workspace = true
 
+[dev-dependencies]
+# v0.7.0 — Replay-Acceptance-Tests gegen historische JSONL-Fixtures
+# (Touchdown-Forensik v2). Fixtures sind .jsonl.gz, brauchen flate2.
+flate2 = "1"
+
 [lints]
 workspace = true

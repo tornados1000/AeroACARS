@@ -179,6 +179,19 @@ pub enum FlightLogEvent {
 /// Eine einzelne 50-Hz-Probe aus dem Touchdown-Window-Buffer. Felder
 /// matchen die wichtigsten `SimSnapshot`-Werte für Touchdown-Forensik.
 /// `Copy + Clone` damit der Sampler den Buffer billig dupliziert.
+///
+/// **v0.7.0 / forensics_version=2:** zwei neue Optional-Felder fuer
+/// Touchdown-Forensik v2:
+///   - `gear_normal_force_n`: bei X-Plane immer Some, bei MSFS None
+///     (Sim-Limit). Kritisch fuer A1 MUST-PASS Validation in der
+///     Forensik-v2-Selection-Chain. Spec docs/spec/touchdown-forensics-v2.md.
+///   - `total_weight_kg`: snapshot des Aircraft-Gewichts zum Zeitpunkt
+///     des Samples. Brauchen wir fuer die mass-aware Gear-Force-Threshold
+///     (3% des statischen Gewichts mit 1000N Floor) UND fuer
+///     deterministische Acceptance-Replays aus dem JSONL.
+///
+/// Backward-compat: alte JSONLs ohne diese Felder deserialisieren mit
+/// `None` via `serde(default)`. Forensik-v1-Logik ignoriert sie.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct TouchdownWindowSample {
     pub at: DateTime<Utc>,
@@ -193,6 +206,14 @@ pub struct TouchdownWindowSample {
     pub lon: f64,
     pub pitch_deg: f32,
     pub bank_deg: f32,
+    /// v0.7.0: gear_normal_force_n in Newton (X-Plane only — Sim-Limit MSFS).
+    /// MUST-PASS Validation Anchor in Forensik-v2 (siehe Spec Sektion 4.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gear_normal_force_n: Option<f32>,
+    /// v0.7.0: total weight in kg fuer mass-aware gear-force threshold
+    /// und deterministische Replay-Acceptance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_weight_kg: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

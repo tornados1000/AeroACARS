@@ -17,6 +17,11 @@ mod xplane_plugin_install;
 // direkt in lib.rs). Skeleton-Datei ist bewusst entfernt um keine
 // toten Pfade zu hinterlassen.
 
+// v0.7.0: Touchdown-Forensik v2 — Layer 1+2+3 (sim-agnostic) in
+// eigenem Modul fuer pure-Logic + Replay-Tests gegen JSONLs.
+// Spec: docs/spec/touchdown-forensics-v2.md (v2.3, approved).
+pub mod touchdown_v2;
+
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,6 +41,8 @@ use storage::{
     PositionQueue, QueuedPosition,
 };
 use sim_core::{FlightPhase, SimKind, SimSnapshot, Simulator};
+// v0.7.0 — re-export fuer Replay-Acceptance-Tests in tests/touchdown_v2_replay.rs
+pub use sim_core::SimKind as PublicSimKind;
 use tauri::{AppHandle, Manager};
 use tracing_subscriber::EnvFilter;
 
@@ -1133,6 +1140,12 @@ struct TelemetrySample {
     lon: f64,
     pitch_deg: f32,
     bank_deg: f32,
+    /// v0.7.0 — gear_normal_force_n (X-Plane only via DataRef, MSFS None).
+    /// MUST-PASS Anchor in Forensik-v2 X-Plane Validation (Spec Sektion 4.1).
+    gear_normal_force_n: Option<f32>,
+    /// v0.7.0 — total_weight_kg fuer mass-aware gear-force threshold
+    /// (3% × static weight mit 1000N Floor) und Replay-Determinismus.
+    total_weight_kg: Option<f32>,
 }
 
 /// Maximum age of any entry in the touchdown ring buffer. 5 s gives
@@ -1163,6 +1176,9 @@ impl From<TelemetrySample> for TouchdownWindowSample {
             lon: s.lon,
             pitch_deg: s.pitch_deg,
             bank_deg: s.bank_deg,
+            // v0.7.0 — Forensik-v2 fields propagated to JSONL
+            gear_normal_force_n: s.gear_normal_force_n,
+            total_weight_kg: s.total_weight_kg,
         }
     }
 }
@@ -8765,6 +8781,11 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
                 lon: snap.lon,
                 pitch_deg: snap.pitch_deg,
                 bank_deg: snap.bank_deg,
+                // v0.7.0 — Forensik-v2 fields direkt aus dem Sim-Snapshot.
+                // gear_normal_force_n ist X-Plane-only (None bei MSFS),
+                // total_weight_kg ist bei beiden Sims meist verfuegbar.
+                gear_normal_force_n: snap.gear_normal_force_n,
+                total_weight_kg: snap.total_weight_kg,
             });
 
             // v0.5.11: running peak-descent VS in the LOW-ALTITUDE zone
@@ -16072,6 +16093,9 @@ mod touchdown_vs_estimator_tests {
             lon: 0.0,
             pitch_deg: 0.0,
             bank_deg: 0.0,
+            // v0.7.0 — Forensik-v2 fields, default None fuer alte Tests
+            gear_normal_force_n: None,
+            total_weight_kg: None,
         }
     }
 

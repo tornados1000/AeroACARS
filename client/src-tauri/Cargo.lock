@@ -18,6 +18,7 @@ dependencies = [
  "chrono",
  "csv",
  "discord-rich-presence",
+ "flate2",
  "geo",
  "metar",
  "recorder",
