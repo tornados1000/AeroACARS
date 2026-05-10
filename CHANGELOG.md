@@ -4,6 +4,86 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.7.5] — 2026-05-10
+
+🛡️ **Phase-Safety Hotfix — zwei reale State-Machine-Bugs beseitigt, durch echte VPS-Pilot-Daten belegt + replay-getestet.**
+
+### Was
+
+VPS-Datenanalyse von 29 realen JSONL-Pilot-Logs hat zwei eigenstaendige Phase-FSM-Bugs aufgedeckt, die in Spec v1.0 als "theoretisch moeglich" markiert waren — aber in Real-Logs **belegt** sind:
+
+1. **URO913** — Universal Arrived-Fallback feuerte waehrend des Rolls (engines=0 + groundspeed > 1) und schaltete den Flieger faelschlich auf Arrived, obwohl der Pilot noch nicht stand.
+2. **PTO105** — `holding_pending_since` leakte phasenuebergreifend, sodass eine `Approach → Final → Approach`-Sequenz innerhalb von 5.2 s als "Holding" missdetektiert wurde, statt der spec-gemaessen 90 s Dwell.
+
+### Fix 1 — Arrived-Fallback verlangt echten Stillstand
+
+```rust
+// NEU: pub fn arrived_fallback_conditions_basic(...)
+on_ground && engines_running == 0 && groundspeed_kt < 1.0
+```
+
+Vorher fehlte die `groundspeed_kt < 1.0`-Bedingung — der Fallback feuerte bei `engines=0` selbst wenn der Flieger noch mit 42 kt rollte (URO913 Real-Log: 4 Snapshots mit gs > 1 + engines=0 + on_ground). Mit Fix bleibt der Fallback aus, bis der Flieger wirklich steht.
+
+### Fix 2 — `holding_pending_since` reset bei Phase-Wechsel ≠ Holding
+
+```rust
+// NEU: pub fn should_reset_holding_pending(prev, next) -> bool
+next != prev && next != FlightPhase::Holding
+```
+
+Im Phase-Wechsel-Block wird der Pending-Counter jetzt explizit zurueckgesetzt, wenn die naechste Phase **nicht** Holding ist. Vorher konnte ein leakender Counter dazu fuehren, dass eine kurze `Approach → Final → Approach`-Schwankung (5.2 s in PTO105) die 90 s Dwell-Pruefung umging.
+
+### Tests — 3-Layer Replay-Suite (13 neue Tests)
+
+**`tests/phase_fsm_replay.rs`** — 13/13 gruen:
+
+- **7 Helper-Tests** verifizieren beide Helper-Funktionen direkt (Wahrheitstabelle pro Bedingung).
+- **3 Fixture-Replay-Tests** laden anonymisierte Real-Daten und beweisen dass das Bug-Symptom in den Daten steckt + dass die Helper sie jetzt korrekt blockieren.
+- **3 PII-Schutz-Tests** verhindern dass anonymisierte Fixtures jemals echte PIREP-IDs / Airlines / Routen / Flugnummern ins Repo holen.
+
+### Anonymisierte Fixtures (PII-frei)
+
+```
+client/src-tauri/tests/fixtures/
+  phase_arrived_fallback_rolling.jsonl.gz  (TEST001 — URO913-Klasse)
+  phase_holding_pending_leak.jsonl.gz      (TEST002 — PTO105-Klasse)
+  phase_valid_holding.jsonl.gz             (TEST003 — DLH742 positiv-Beleg)
+```
+
+`pirep_id = TEST_FIXTURE`, `airline_icao = TEST`, `flight_number = TEST00X`, `dpt_airport = XXXX`, `arr_airport = YYYY`. Dateinamen tragen bewusst keine Real-Callsigns mehr.
+
+### Spec-Update
+
+`docs/spec/flight-phase-state-machine.md` v1.5:
+
+- §13.8 🔴 BELEGT (URO913)
+- §13.9 🔴 BELEGT (PTO105 — neu)
+- §15 VPS-Daten-Coverage (29 Logs analysiert)
+- §16 Reale Regression-Kandidaten
+
+### Backward-Compat
+
+- **Keine API-Aenderung** — beide Helper sind neu (`pub`) und werden intern aufgerufen.
+- **Pilot-Verhalten** wird strikter, aber korrekter:
+  - Rollende Flieger mit abgestellten Engines werden nicht mehr stillschweigend auf Arrived gesetzt (URO913-Klasse).
+  - Kurze Approach-Schwankungen unter 90 s werden nicht mehr als Holding missdetektiert (PTO105-Klasse).
+- Echte Holding-Episoden (>= 90 s Dwell, DLH742-Klasse) bleiben unveraendert erkannt — durch positiv-Beleg-Replay-Test abgesichert.
+
+### Tests gesamt
+
+- **116/116 gruen**
+- 57 lib unit
+- 30 sim_core unit
+- 8 goldenset (landing-scoring)
+- 8 touchdown_v2_replay
+- **13 phase_fsm_replay (NEU)**
+
+### Update-Empfehlung
+
+Auto-Updater zieht v0.7.5 automatisch fuer alle bestehenden v0.7.4-Pilot-Clients.
+
+---
+
 ## [v0.7.4] — 2026-05-10
 
 🧹 **Polish ueber v0.7.3 — Cargo-Aliase praeziser, A359-Edge geloest, Strict-Tests pro Familie.**
