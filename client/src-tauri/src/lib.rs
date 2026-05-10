@@ -13187,27 +13187,41 @@ fn build_pirep_notes(flight: &ActiveFlight, stats: &FlightStats) -> String {
 
     // v0.7.1 Phase 0 Schatten-Validation (Spec docs/spec/v0.7.1-landing-ux-fairness.md
     // §6 Phase 0 Step 4): die landing-scoring Crate berechnet parallel den
-    // Master-Score aus den gleichen Roh-Feldern. Der Wert wird hier als
-    // diagnostischer Vergleich angehaengt — KEIN Pilot-sichtbares
-    // Verhalten geaendert, nur transparenter Drift-Indikator. Phase-0-
-    // Acceptance: dieser Schatten-Wert MUSS dem TS-berechneten Master-
-    // Score entsprechen (Bit-Drift = Phase-0-Bug).
+    // Master-Score aus den gleichen Feldern wie das TS-LandingPanel +
+    // libComputeSubScores. Der Wert wird NICHT in den PIREP-Notes
+    // geschrieben (Pilot-sichtbar) sondern via tracing::info!() geloggt
+    // — Drift wird im Log-File sichtbar, Pilot sieht nichts.
+    //
+    // KRITISCH: Inputs muessen identisch sein zu LandingPanel.tsx:137-149
+    //   peakVs = landing_peak_vs_fpm ?? landing_rate_fpm
+    //   peak_g  = landing_peak_g_force (NICHT landing_g_force)
+    //   fuel_efficiency_pct: actual_burn = takeoff_fuel - landing_fuel
+    //                        (NICHT block_fuel - landing_fuel — siehe
+    //                         build_landing_record lib.rs:6467-6477)
+    //
+    // Phase-0-Acceptance: dieser Schatten-Wert MUSS dem TS-berechneten
+    // Master-Score entsprechen (Bit-Drift = Phase-0-Bug).
     let crate_input = landing_scoring::LandingScoringInput {
-        vs_fpm: stats.landing_rate_fpm,
-        peak_g_load: stats.landing_g_force,
+        // Spiegel von LandingPanel.tsx:140 `peakVs = landing_peak_vs_fpm ?? landing_rate_fpm`
+        vs_fpm: stats.landing_peak_vs_fpm.or(stats.landing_rate_fpm),
+        // Spiegel von LandingPanel.tsx:143 `peak_g_load: r.landing_peak_g_force`
+        peak_g_load: stats.landing_peak_g_force,
         bounce_count: Some(stats.bounce_count as u32),
         approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
         approach_bank_stddev_deg: stats.approach_bank_stddev_deg,
         rollout_distance_m: stats.rollout_distance_m.map(|m| m as f32),
-        // fuel_efficiency_pct wird hier 1:1 wie in der PIREP-payload gerechnet
-        // (vgl. lib.rs ~9907) damit der Schatten-Wert dem PIREP entspricht.
+        // Spiegel von build_landing_record lib.rs:6467-6477:
+        //   actual_burn = takeoff_fuel - landing_fuel  (NICHT block_fuel - landing_fuel)
+        //   pct = (actual - planned) / planned * 100
         fuel_efficiency_pct: match (
-            stats.block_fuel_kg,
+            stats.takeoff_fuel_kg,
             stats.landing_fuel_kg,
             stats.planned_burn_kg,
         ) {
-            (Some(block), Some(landing), Some(plan)) if plan > 0.0 => {
-                let actual = block - landing;
+            (Some(toff), Some(land), Some(plan))
+                if toff > land && toff > 0.0 && land >= 0.0 && plan > 0.0 =>
+            {
+                let actual = toff - land;
                 Some(((actual - plan) / plan) * 100.0)
             }
             _ => None,
@@ -13216,7 +13230,18 @@ fn build_pirep_notes(flight: &ActiveFlight, stats: &FlightStats) -> String {
     };
     let crate_subs = landing_scoring::compute_sub_scores(&crate_input);
     if let Some(crate_master) = landing_scoring::aggregate_master_score(&crate_subs) {
-        let _ = write!(s, " · Score-v0.7.1-Schatten {}", crate_master);
+        let ts_master = stats.landing_score.map(|sc| sc.numeric());
+        tracing::info!(
+            pirep_id = %flight.pirep_id,
+            crate_master = crate_master,
+            ts_master = ?ts_master,
+            crate_input_vs_fpm = ?crate_input.vs_fpm,
+            crate_input_peak_g = ?crate_input.peak_g_load,
+            crate_input_bounces = ?crate_input.bounce_count,
+            crate_input_fuel_pct = ?crate_input.fuel_efficiency_pct,
+            crate_sub_count = crate_subs.len(),
+            "v0.7.1 Phase-0 Schatten-Score"
+        );
     }
 
     s
