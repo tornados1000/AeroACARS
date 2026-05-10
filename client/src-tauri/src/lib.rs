@@ -9079,6 +9079,9 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
                 // Save direkt nach dem Setzen verhindert das.
                 save_active_flight(&app, &flight);
                 let count = samples.len();
+                // v0.7.0 — clone fuer touchdown_v2 weiter unten
+                // (samples wird gleich in record_event gemoved)
+                let samples_for_v2 = samples.clone();
                 record_event(
                     &app,
                     &flight.pirep_id,
@@ -9098,22 +9101,54 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
                     },
                 );
 
-                // v0.5.41: Score mit den high-res Werten neu berechnen.
-                // vs_at_edge (linear interpoliert auf den exakten on_ground-
-                // Edge zwischen zwei 20-30 ms Samples) ist physikalisch
-                // repraesentativer als der MSFS-SimVar-Latched-Wert. Beim
-                // DLH-1404-Test: SimVar -101 fpm, vs_at_edge -66 fpm =
-                // exakt der Volanta-Wert. Der Score wird dann durch die
-                // Standard-Klassifizierung neu bestimmt + announce_landing_
-                // score laesst den Streamer-Tick die touchdown_complete-
-                // Emission durchstellen.
-                let vs_edge = analysis.get("vs_at_edge_fpm").and_then(|v| v.as_f64()).map(|x| x as f32);
+                // v0.7.0 — Touchdown-Forensik v2 (Spec docs/spec/touchdown-forensics-v2.md).
+                // Ersetzt den fruheren vs_at_edge-unconditional-override (= war
+                // Bug #1 vom DAH 3181 Float-Streifschuss + 8 weitere Bugs).
+                //
+                // Neue Cascade:
+                //   1. touchdown_v2::compute_impact_frame liefert contact_frame +
+                //      impact_frame (= min vs in [contact-250ms, contact+100ms]) +
+                //      initial_load_peak.
+                //   2. touchdown_v2::compute_landing_rate macht VS-Cascade mit
+                //      HARD GUARDS:
+                //         vs_at_impact -> smoothed_500ms -> smoothed_1000ms ->
+                //         pre_flare_peak -> REJECT (kein Score).
+                //   3. Niemals positive Landerate (HARD GUARD strukturell).
+                //   4. forensics_version = 2 marker geht in PIREP-payload.
+                //
+                // Legacy: bei REJECT (z.B. positive vs_at_edge UND alle smoothed
+                // positiv = sollte nie passieren) bleibt das Feld unveraendert
+                // (= alter SimVar-Wert wenn vorhanden).
+                let v2_result = touchdown_v2::compute_impact_frame(&samples_for_v2, edge_at)
+                    .and_then(|impact_result| {
+                        touchdown_v2::compute_landing_rate(&samples_for_v2, &impact_result).ok()
+                    });
+
                 let pg_500 = analysis.get("peak_g_post_500ms").and_then(|v| v.as_f64()).map(|x| x as f32);
                 {
                     let mut s = flight.stats.lock().expect("flight stats");
-                    if let Some(v) = vs_edge {
-                        s.landing_peak_vs_fpm = Some(v);
-                        s.landing_rate_fpm = Some(v);
+                    if let Some(ref v2) = v2_result {
+                        // Forensik-v2 hat einen plausiblen VS gewählt
+                        // (HARD GUARD strukturell ausgeschlossen positiv)
+                        s.landing_peak_vs_fpm = Some(v2.vs_fpm);
+                        s.landing_rate_fpm = Some(v2.vs_fpm);
+                        tracing::info!(
+                            pirep_id = %flight.pirep_id,
+                            vs_fpm = v2.vs_fpm,
+                            source = %v2.source,
+                            confidence = ?v2.confidence,
+                            forensics_version = v2.forensics_version,
+                            "touchdown-forensics-v2 landing rate computed"
+                        );
+                    } else {
+                        // REJECT-Fall (Spec 5.3): alle Quellen positiv ODER NaN.
+                        // Lass den existierenden landing_rate_fpm unveraendert
+                        // (= primary chain Wert oder None). Kein automatischer
+                        // Score-Override mit unsicherem Wert.
+                        tracing::warn!(
+                            pirep_id = %flight.pirep_id,
+                            "touchdown-forensics-v2 rejected — keeping primary-chain value"
+                        );
                     }
                     if let Some(g) = pg_500 {
                         // Nur ueberschreiben wenn der Buffer-Peak hoeher ist als
@@ -9122,9 +9157,15 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
                         if g > cur { s.landing_peak_g_force = Some(g); }
                     }
                     // Re-Klassifizierung mit den neuen Werten
+                    // BUG #6 fix: bounce_count from analysis (50Hz Sampler-Wahrheit),
+                    // nicht vom Streamer-side s.bounce_count counter.
+                    let analysis_bounce: u8 = analysis.get("bounce_count")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n.min(u8::MAX as u64) as u8)
+                        .unwrap_or(s.bounce_count);
                     let peak_vs = s.landing_peak_vs_fpm.unwrap_or(0.0);
                     let peak_g = s.landing_peak_g_force.unwrap_or(0.0);
-                    let new_score = LandingScore::classify(peak_vs, peak_g, s.bounce_count);
+                    let new_score = LandingScore::classify(peak_vs, peak_g, analysis_bounce);
                     s.landing_score = Some(new_score);
                     s.landing_score_finalized = true;
                     // Reset announcement-flag damit announce_landing_score den
@@ -9143,10 +9184,49 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
                     window_ms = TOUCHDOWN_POST_WINDOW_MS,
                     flare_score = flare_score,
                     smooth_500ms_fpm = smooth_500,
-                    vs_at_edge_fpm = vs_edge,
+                    vs_v2_fpm = v2_result.as_ref().map(|v| v.vs_fpm),
+                    vs_v2_source = v2_result.as_ref().map(|v| v.source.as_str()),
                     peak_g_post_500ms = pg_500,
                     "touchdown window + analysis flushed; score recomputed from buffer"
                 );
+            }
+
+            // v0.7.0 — Phase H Step 2: Multi-TD via Climb-out-Reset.
+            //
+            // Spec Sektion 6 (LandingEpisode-Lifecycle): wenn aircraft nach
+            // einem TD wieder hochsteigt > 100ft AGL, ist der nächste TD eine
+            // neue Episode (Touch-and-Go / Go-Around / Re-Approach). Damit
+            // der Sampler die zweite Landung erfasst, muessen wir die single-
+            // shot Guards zuruecksetzen.
+            //
+            // Konsequenz fuer PIREP-Score: der LETZTE validierte TD ist der
+            // "final landing" TD. Ein dump pro Episode = ein touchdown_window
+            // event + landing_analysis event in der JSONL. Score wird beim
+            // PIREP-filing aus dem letzten gewonnen.
+            //
+            // PTO 705 Beispiel: Touch um 07:54:30 -> climbout auf 1560ft AGL ->
+            // Re-Approach -> echter Touch um 08:01:29 -> dieser bekommt jetzt
+            // eigenen capture-cycle + Score.
+            {
+                let mut s = flight.stats.lock().expect("flight stats");
+                let dumped = s.touchdown_window_dumped_at.is_some();
+                let agl_now = snap.altitude_agl_ft as f32;
+                if dumped && agl_now > 100.0 {
+                    // Climb-out detected nach Dump → bereit fuer naechste TD.
+                    // Reset alle TD-state-fields.
+                    s.sampler_touchdown_at = None;
+                    s.sampler_touchdown_vs_fpm = None;
+                    s.sampler_touchdown_g_force = None;
+                    s.touchdown_window_dumped_at = None;
+                    s.post_touchdown_buffer.clear();
+                    s.landing_score_finalized = false;
+                    // landing_critical_until bleibt write-only (legacy field)
+                    tracing::info!(
+                        pirep_id = %flight.pirep_id,
+                        agl_ft = agl_now,
+                        "v0.7.0 Multi-TD reset — climb-out > 100ft AGL detected after dump, ready for next TD"
+                    );
+                }
             }
         }
         tracing::info!(pirep_id = %flight.pirep_id, "touchdown sampler stopped");
@@ -12870,7 +12950,12 @@ fn build_pirep_notes(flight: &ActiveFlight, stats: &FlightStats) -> String {
     } else {
         s.push_str("\n\n");
     }
-    let _ = write!(s, "AeroACARS {}", env!("CARGO_PKG_VERSION"));
+    let _ = write!(
+        s,
+        "AeroACARS {} · Forensik v{}",
+        env!("CARGO_PKG_VERSION"),
+        touchdown_v2::FORENSICS_VERSION
+    );
 
     s
 }

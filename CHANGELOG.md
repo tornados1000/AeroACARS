@@ -4,6 +4,94 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.7.0] — 2026-05-10
+
+🏗 **Touchdown-Forensik v2 — strukturelles Redesign der Landerate-Berechnung.**
+
+### Warum
+
+Pilot-Bug-Report 2026-05-10: X-Plane DAH 3181 zeigte +104 fpm POSITIVE Landerate (physikalisch unmöglich). Tiefe Ursachen-Analyse + 3 Review-Runden mit dem VA-Owner ergaben **9 zusammenhängende Bugs** gleicher architektonischer Wurzel:
+
+- vs_at_edge unconditional-override ohne Plausibilitäts-Prüfung → positive Landerate möglich
+- Single-shot TD-Detection (`is_none()`-Guard) verhindert zweiten TD bei T&G/Go-Around
+- X-Plane on_ground edge ist trigger-happy → 44ms Float-Streifschuss wird als TD erkannt
+- bounce_count Inkonsistenz zwischen 50Hz Sampler und Streamer-Counter
+- Keine Confidence-Tagging
+- ...
+
+### Spec
+
+`docs/spec/touchdown-forensics-v2.md` (v2.3, approved nach 3 Review-Runden). 4-Layer-Architektur:
+
+1. **TD-Candidate Detection** (sim-spezifisch): X-Plane mit gear_force-edge ODER on_ground; MSFS nur on_ground
+2. **TD-Validation** (sim-spezifisch): X-Plane MUST-PASS gear_force (mass-aware Threshold) + 2 Plausibilitäts-Tests; MSFS 3-of-4 Voting; Fallback auf 4-of-4 für legacy-X-Plane ohne gear_force
+3. **VS-Calculation am IMPACT-Frame** (sim-agnostic): contact_frame ≠ impact_frame ≠ load_peak_frame. VS-Cascade: vs_at_impact → smoothed_500ms → smoothed_1000ms → pre_flare_peak → REJECT mit HARD GUARDS (niemals positiv, niemals < -3000 fpm)
+4. **LandingEpisode-Aggregation**: false_edges + contact + low_level_touches (Bounces) + settle. Multi-TD-Lifecycle für T&G/Go-Around. Härtester Impact in Episode = Bounce-Score-Regel.
+
+### Was sich ändert
+
+**Neue Module:**
+- `client/src-tauri/src/touchdown_v2.rs` (~700 Zeilen, 15 unit-tests)
+- `client/src-tauri/tests/touchdown_v2_replay.rs` (6 Replay-Tests gegen echte Pilot-JSONLs)
+
+**Schema-Erweiterung (backward-compatible):**
+- `TouchdownWindowSample` bekommt `gear_normal_force_n` + `total_weight_kg` als Optional fields
+- Sampler füllt sie aus dem Sim-Snapshot
+- Alte JSONLs deserialisieren weiter via serde-default
+
+**Sampler-Refactor (minimal-invasiv):**
+- vs_at_edge unconditional-override ersetzt durch `touchdown_v2::compute_landing_rate` cascade
+- Multi-TD via Climb-out-Reset: nach Dump + agl > 100ft AGL werden TD-state-fields zurückgesetzt → nächster TD wird erfasst
+- bounce_count aus 50Hz `analysis` (Wahrheit) statt Streamer-Counter (Inkonsistenz-Bug fix)
+- forensics_version = 2 als Footer in PIREP-notes
+
+**Verifiziert gegen 6 echte Test-Flüge (Replay-Acceptance-Tests):**
+
+| Flug | Sim | Vorher | Nachher | Status |
+|---|---|---|---|---|
+| PTO 105 GA | MSFS | -55/100 | -55/smooth | ✓ unverändert |
+| DLH 304 | MSFS | -357/80 | -357/acceptable | ✓ unverändert |
+| CFG 785 (EDDV-EDDB) | MSFS | -142/100 | -142/smooth | ✓ unverändert |
+| DLH 742 (EDDM-RJBB) | MSFS | -191/100 | -191/smooth | ✓ unverändert |
+| **DAH 3181 (ZGGG-DAAG)** | **X-Plane** | **+104/80 ❌** | **-414/firm + Float false_edge** | **✓ FIX** |
+| PTO 705 T&G | MSFS | -182 vom Streifschuss | erste Episode -182 + low_level_touches | ✓ |
+
+**Plus:** 4/4 MSFS-Flüge bit-identisch zu vorher (= Spec-Acceptance Sektion 10 erfüllt, keine Regression).
+
+### HARD GUARDS strukturell
+
+```rust
+fn finalize_vs(candidate_fpm: f32) -> Result<f32, RejectionReason> {
+    if !candidate_fpm.is_finite() { return Err(EmptyWindow); }
+    if candidate_fpm > 0.0       { return Err(PositiveVs); }
+    if candidate_fpm < -3000.0   { return Err(ImplausiblyHigh); }
+    Ok(candidate_fpm)
+}
+```
+
+**Niemals positive Landerate möglich.** Bei REJECT bleibt Score auf primary-chain Wert (kein automatischer Override mit unsicherem Wert).
+
+### Was BEWUSST NICHT in v0.7.0
+
+- Frontend-Confidence-Badge (kommt v0.7.1)
+- Episode-Anzeige im Cockpit (kommt v0.7.1)
+- Re-Score alter PIREPs (forward-only)
+- Per-gear contact / Throttle / N1 / Spoilers / Autobrake (addon-unzuverlässig)
+- Synthetic-TD Auto-Score (nur Review-Banner)
+
+### Geänderte Dateien
+
+- `client/src-tauri/Cargo.toml` — neue dev-dependency `flate2` für Replay-Tests
+- `client/src-tauri/crates/recorder/src/lib.rs` — TouchdownWindowSample Schema-Erweiterung
+- `client/src-tauri/src/lib.rs` — TelemetrySample-Felder, Sampler-Capture, Sampler-Loop (vs_at_edge → v2 cascade + Multi-TD-Reset + bounce_count fix), PIREP-notes-Footer
+- `client/src-tauri/src/touchdown_v2.rs` — neues Modul (~700 Zeilen)
+- `client/src-tauri/tests/touchdown_v2_replay.rs` — neue Replay-Acceptance-Tests
+- `client/src-tauri/tests/fixtures/*.jsonl.gz` — 6 echte Pilot-JSONLs für CI-Tests
+- `docs/spec/touchdown-forensics-v2.md` — vollständige Architektur-Spec (v2.3)
+- Versionen → 0.7.0
+
+---
+
 ## [v0.6.2] — 2026-05-10
 
 🩹 **Hotfix v0.6.1 → v0.6.2 — drei Bugs aus dem Pilot-Test-Flight CFG 785 EDDV→EDDB gefixt.**
