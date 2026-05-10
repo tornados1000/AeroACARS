@@ -1,10 +1,10 @@
 # Flight-Phase State-Machine — QS-Inventur fuer Bug-Untersuchung
 
-**Status:** v1.2 — **Draft for QS Review** (korrigiert nach VA-Owner Review-Round 2)
+**Status:** v1.3 — **Draft for QS Review** (Round-3 Doku-Glaettung)
 **Zweck:** Vollstaendige Inventur aller Phase-Wechsel + Trigger + Side-Effects + Anti-Flicker-Mechaniken. Damit kann VA-Owner / QS systematisch durchgehen und potenzielle Bug-Klassen finden bevor sie als Live-Bug auftauchen.
 **KEIN Implementierungs-Auftrag** — diese Spec dokumentiert NUR den Status-Quo + markiert Verdachtsstellen.
 
-> **Anker-Konvention (v1.1):** Diese Spec referenziert Code via **Funktions- und Konstanten-Namen**, nicht via Zeilennummern (driften zu schnell). Wo Zeilennummern stehen, sind sie als "Stand v0.7.4" markiert und nur als Suchhilfe.
+> **Anker-Konvention (seit v1.1):** Diese Spec referenziert Code via **Funktions- und Konstanten-Namen**, nicht via Zeilennummern (driften zu schnell). Wo Zeilennummern stehen, sind sie als "Stand v0.7.4" markiert und nur als Suchhilfe.
 
 ---
 
@@ -14,7 +14,22 @@ Die Phase-State-Machine in `step_flight()` (~600 Zeilen in `lib.rs`) ist ueber M
 
 Diese Spec ist die Antwort. Pro Transition: was triggert sie, welche Schwellen, welche Anti-Flicker-Mechaniken sind aktiv, welche Side-Effects passieren. Plus eine Verdachts-Liste (markiert mit **[VERDACHT]**) mit Stellen die im Code-Audit verdaechtig wirkten.
 
-### 0.1 Changelog v1.1 → v1.2 (Round-2 Korrekturen)
+### 0.1 Changelog v1.2 → v1.3 (Round-3 Doku-Glaettung)
+
+2 P1 + 3 P2 + 1 P3 aus VA-Owner Review-Round 3. Reine Doku-Konsistenz-Korrekturen, kein neues Thema.
+
+| # | Fix |
+|---|---|
+| **P1.1** | §3.1 sagte "alle 4 Sites idempotent" — falsch. Final→Landing-Pfad (lib.rs:11679) setzt `landing_at = Some(actual_td_at)` UNCONDITIONAL, danach (lib.rs:11734) wird `landing_at = Some(sampler_at)` ueberschrieben wenn `sampler_touchdown_at` vorhanden. Nur lib.rs:12802 ist guarded. v1.3: §3.1 ehrlich beschrieben |
+| **P1.2** | §10 Side-Effects-Tabelle hatte alten "via finalize_landing_rate" Text — widerspricht §3/§6 v1.2-Korrektur. Aktualisiert |
+| **P2.1** | §14-Header sagte "10 Szenarien" obwohl S11-S13 schon drin → "13 Szenarien" |
+| **P2.2** | §14.1 Replay-Test-Empfehlung erweitert um S11 + S12 (sind die kritischen neuen Risiken) |
+| **P2.3** | S12-Erwartung war zu optimistisch ("Resume erfordert User-Bestaetigung — Bug geloest"). Neu: "Vor Bestaetigung keine Transition; nach Bestaetigung muss Sanity-Tick verhindern dass erster Snapshot Phantom-Landing ausloest" |
+| **P3** | §0 Anker-Konvention sagte "v1.1" → "seit v1.1" |
+
+---
+
+### 0.2 Changelog v1.1 → v1.2 (Round-2 Korrekturen)
 
 3 P1 + 4 P2 sachliche Fehler aus Review-Round 2. v1.1 beschrieb teils ein "Idealmodell" das nicht zur Code-Realitaet passt — v1.2 zieht das gerade ohne neue Themen aufzumachen.
 
@@ -32,7 +47,7 @@ Plus 4 QS-Test-Verfeinerungen in §14.
 
 ---
 
-### 0.2 Changelog v1.0 → v1.1
+### 0.3 Changelog v1.0 → v1.1
 
 VA-Owner Review-Round 1 hat 3 P1 + 3 P2 sachliche Fehler aufgedeckt — alle korrigiert:
 
@@ -98,11 +113,30 @@ Wer darf was setzen? Klare Trennung wichtig damit nicht mehrere Quellen das glei
 
 Der Streamer-Tick (`step_flight` Final→Landing-Pfad) liest spaeter `sampler_touchdown_at` und kopiert es nach `stats.landing_at` (lib.rs:11679, 11735, 12767, 12802). 
 
-**Race-Risiko:**
-- Wenn der Sampler `sampler_touchdown_at = T1` setzt, danach der Streamer-Tick laeuft → liest `sampler_touchdown_at = Some(T1)` → schreibt `landing_at = Some(T1)`. ✓
-- Wenn der Streamer den Edge zuerst sieht (`!was_on_ground && on_ground`) und `sampler_touchdown_at` noch `None` ist → Streamer schreibt `landing_at = Some(now)` mit Snapshot-Timestamp. Sampler kommt spaeter mit besserem T1. **Aber landing_at wird nicht ueberschrieben** (lib.rs:12802 nutzt `or_insert`-aequivalent, nicht direkt). Ergebnis: `landing_at` ist Streamer-Snapshot-Zeit, Sampler-Genauigkeit fehlt.
+**Race-Verhalten (verifiziert v1.3):** Final→Landing-Pfad in `step_flight` schreibt `landing_at` in **zwei Schritten** (lib.rs:11679 + 11734):
 
-**Wo nachschauen:** sind alle 4 Stellen wo `stats.landing_at = Some(...)` geschrieben wird wirklich idempotent? Aktueller Verdacht: 11679 hat `actual_td_at` als Source-of-Truth, 11735 und 12767 nutzen `sampler_at`, 12802 nutzt `now` als Fallback. Pruefen ob alle drei `if landing_at.is_none()` davor haben.
+```rust
+// Schritt 1 (lib.rs:11679): UNCONDITIONAL erster Wert aus Snapshot-Buffer
+let actual_td_at = stats.snapshot_buffer.iter()
+    .find(|s| s.on_ground)
+    .map(|s| s.at)
+    .unwrap_or(now);
+stats.landing_at = Some(actual_td_at);
+
+// Schritt 2 (lib.rs:11734): wenn Sampler einen besseren Wert hat → ueberschreiben
+if let Some(sampler_at) = stats.sampler_touchdown_at {
+    stats.landing_at = Some(sampler_at);
+}
+```
+
+Das ist **bewusst nicht idempotent** — der Streamer-Tick will den genauen Sampler-Wert wenn vorhanden, sonst Snapshot-Buffer-Fallback, sonst `now`. Race-Risiko nur wenn der Sampler erst NACH Schritt 2 seinen Wert setzt — dann bleibt `landing_at` auf Snapshot-Buffer-Wert (~5s schlechter).
+
+**Andere `landing_at`-Schreibstellen:**
+- **lib.rs:11735** ueberschreibt mit `sampler_at` (Final→Landing-Pfad, Schritt 2)
+- **lib.rs:12767** schreibt im sampler-carry-over Pfad (Phase-Skip Edge-Case)
+- **lib.rs:12802** ist guarded: `if stats.landing_at.is_none() && stats.takeoff_at.is_some()` — letzte Verteidigungslinie
+
+Insgesamt: **3 Sites unconditional + 1 guarded**, nicht "alle 4 idempotent" wie v1.2 sagte.
 
 ---
 
@@ -333,7 +367,7 @@ Distance wird Haversine pro Tick addiert. Im Holding zaehlt das die echt gefloge
 | TakeoffRoll → Takeoff | `takeoff_at = now`, `takeoff_pitch_deg/bank_deg/fuel_kg/weight_kg` |
 | Cruise → Holding | (Anzeige-only, keine Side-Effects) |
 | Holding → Approach | (Anzeige-only) |
-| Final → Landing | `landing_at = actual_td_at` (vom 50Hz-Sampler via `finalize_landing_rate`), Touchdown-Window startet |
+| Final → Landing | Streamer setzt Phase + `landing_at` (zuerst aus Snapshot-Buffer, dann ueberschrieben mit `sampler_touchdown_at` falls vorhanden — siehe §3.1). `finalize_landing_rate()` setzt parallel `landing_rate_fpm/peak_vs/confidence/source` (NICHT `landing_at`). Touchdown-Window startet |
 | Landing → TaxiIn | Landing-Score wird klassifiziert + `landing_score_announced = false` |
 | TaxiIn → BlocksOn | `block_on_at = now`, Activity-Log "Block on" |
 | BlocksOn → Arrived | Auto-Submit-Hook (wenn aktiviert) |
@@ -439,9 +473,9 @@ Code hat Boarding-Direct-To-Takeoff-Pfade (laut Audit). Pruefen ob diese Flugart
 
 ---
 
-## 14. QS-Test-Matrix (10 Szenarien) (NEU v1.1)
+## 14. QS-Test-Matrix (13 Szenarien)
 
-Statt riesiger Test-Liste — diese 10 Szenarien decken die wichtigsten Faelle ab. Wenn ein Szenario fehlschlaegt → Hotfix-Spec analog `aircraft-type-match`-Maintenance-Workflow.
+Statt riesiger Test-Liste — diese 13 Szenarien decken die wichtigsten Faelle ab. Wenn ein Szenario fehlschlaegt → Hotfix-Spec analog `aircraft-type-match`-Maintenance-Workflow.
 
 | # | Szenario | Erwartung |
 |---|---|---|
@@ -456,12 +490,21 @@ Statt riesiger Test-Liste — diese 10 Szenarien decken die wichtigsten Faelle a
 | **S9** | Pause/Resume (Airliner in Cruise → Sim Pause 30 Min → Resume) | Phase bleibt Cruise, kein Phantom-Wechsel beim Resume-Tick |
 | **S10** | Slew/Teleport (Airliner 300 nm slewen) | Phase bleibt, **`last_lat/lon` und `distance_nm` werden NICHT von Slew vergiftet** (siehe §13.3 — Slew-Schaden entsteht genau hier) |
 | **S11** (NEU v1.2) | Engines off while rolling (Airliner Landing → engine-out shutdown bei gs=20 kt) | Universal-Arrived-Fallback feuert **NICHT** vor Stillstand (siehe §8.1 Code-Risiko) |
-| **S12** (NEU v1.2) | Final restored, Sim auf anderem Flughafen (App-Restart waehrend Final, Sim laed neuen Flug) | Resume erfordert User-Bestaetigung/Banner — Phase-Wechsel passiert NICHT automatisch beim ersten Tick. Wenn Bestaetigt: erster Snapshot triggert keinen Phantom-Touchdown |
+| **S12** (NEU v1.2) | Final restored, Sim auf anderem Flughafen (App-Restart waehrend Final, Sim laed neuen Flug) | **Vor User-Bestaetigung des Resume-Banners:** keine Transition (FSM-Tick darf nicht laufen). **Nach Bestaetigung:** ein "Sanity-Tick" muss verhindern dass der erste Snapshot Phantom-Landing triggert (z.B. neuer Sim-Standort auf Bahn → on_ground=true → Streamer wuerde `Final → Landing`-Edge sehen). Aktuell: **kein Sanity-Tick implementiert** (siehe §11.4 Verdacht), Bug-Risiko-Klasse |
 | **S13** (NEU v1.2) | Holding zwei Faelle: (a) echter 5-Min-Hold ueber VOR, (b) langer ATC-Vector / Orbit-Training | (a) Phase = Holding nach 90s. (b) Bewusst akzeptieren als "false positive" ODER Code-Threshold anpassen — entscheiden in QS-Review |
 
 ### 14.1 Test-Empfehlung
 
-S1, S6, S7, S8, S9, S10 sollten als **Replay-Tests** mit synthetischen Sim-Snapshot-Sequenzen umgesetzt werden (analog `touchdown_v2_replay.rs`). S2-S5 sind manuelle Acceptance-Tests vom VA-Owner.
+**Replay-/synthetische Tests** (analog `touchdown_v2_replay.rs`):
+- **S1** (Airliner Baseline)
+- **S6** (T&G), **S7** (GA), **S8** (Holding), **S9** (Pause/Resume), **S10** (Slew)
+- **S11** (NEU v1.3 Empfehlung: Engines off while rolling — Arrived-Fallback-Risiko §8.1)
+- **S12** (NEU v1.3 Empfehlung: Final-Restore Sanity-Tick — Phantom-Landing-Risiko §11.4)
+
+**Manuelle Acceptance-Tests** (vom VA-Owner mit echtem Sim):
+- S2 (VFR Manual ohne ZFW), S3 (Heli), S4 (Glider), S5 (Seaplane), S13 (Holding zwei Faelle)
+
+S11 + S12 sind die **kritischsten neuen Risiken** und sollten zuerst Replay-Coverage bekommen.
 
 ---
 
@@ -483,4 +526,4 @@ S1, S6, S7, S8, S9, S10 sollten als **Replay-Tests** mit synthetischen Sim-Snaps
 
 ---
 
-**Ende der Spec v1.2 — bitte QS-Review-Round 3. Korrekturen aus Round 2 alle eingearbeitet. Naechster Schritt: §13 + §14 (jetzt 13 Szenarien) systematisch durchgehen, jeden Punkt klassifizieren.**
+**Ende der Spec v1.3 — Round-3 Doku-Glaettung eingearbeitet. Spec ist jetzt nahe an "approved" — naechster Schritt: §13 (8 Verdachts-Klassen) + §14 (13 Szenarien) systematisch klassifizieren.**
