@@ -4,6 +4,58 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.7.3] — 2026-05-10
+
+🛬 **Aircraft-Type-Match: Cargo-Frachter HOHE-Prio Aliase + Spec-Pflege.**
+
+### Was
+
+Proaktive Erweiterung der `aircraft_aliases`-Tabelle um die wahrscheinlichsten Cargo-Frachter, basierend auf Spec §4 Arbeitsliste:
+
+- **`B748F`** — Boeing 747-8 Freighter (Lufthansa Cargo, Atlas Air, Cargolux, Polar Air Cargo)
+- **`B74F`** — Boeing 747-400 Freighter (Klassiker)
+- **`B752F`** — Boeing 757-200 Freighter (DHL/UPS/FedEx)
+- **`B763F`** — Boeing 767-300 Freighter (FedEx-Klassiker)
+- **`B762F`** — Boeing 767-200 Freighter
+- **`A332F`** — Airbus A330-200 Freighter (Qatar Cargo, Turkish Cargo, Etihad Cargo)
+
+Plus **6 neue Tests** in `aircraft_alias_tests` — pro Familie 1 Match + 1 offensichtlicher Mismatch (laut Spec Leitprinzip).
+
+### Cargo-Pragmatismus (Spec §7.3)
+
+- **Pax-Bid + Cargo-Sim** (z.B. `B752` Bid + `757-200F` Sim): wird akzeptiert via Long-Form-Substring. Begruendung: Cargo-Variante kann problemlos eine Pax-Strecke fliegen.
+- **Cargo-Bid + Cargo-Sim** (z.B. `B752F` Bid + `757-200F` Sim): matched ueber den neuen expliziten Alias.
+- **Cargo-Bid + Pax-Sim** (z.B. `B763F` Bid + `767-300` Pax-Sim): bleibt strict geblockt (Pax-Compartment hat keine Cargo-Lasten-Verteilung).
+
+### Spec aktualisiert
+
+`docs/spec/aircraft-type-match.md` v1.1 — neues **Leitprinzip** + **3 harte Regeln** (statt strenges Regelwerk):
+
+1. Keine extrem breiten Aliases wie `A3`, `747`, `MD`, `AIRBUS`
+2. Jeder neue Alias bekommt mindestens einen Match-Test
+3. Jeder neue Alias bekommt mindestens einen offensichtlichen Mismatch-Test
+
+Test-Matrix §5 von "Pflicht" auf "Empfehlung" umgestellt. §4 Arbeitsliste statt Lueckenanalyse.
+
+### Tests
+
+- **53/53 lib** (vorher 46 — 6 neu fuer Cargo + 1 Bug-Fix)
+- **17/17 aircraft_alias_tests** (vorher 10)
+- 30/30 landing-scoring + 8/8 goldenset
+- 8/8 touchdown_v2_replay
+- **Gesamt 99/99 Tests grün**
+
+### Nicht in v0.7.3
+
+Verbleibende Arbeitsliste fuer spaeter (proaktiv NICHT noetig — nur bei echtem Pilot-Bug):
+
+- ATR/CRJ/Q400 Familien (Regional)
+- MD-80/MD-90/Fokker Familien (selten)
+- Sukhoi SU95
+- A338F / A33F generisch
+
+---
+
 ## [v0.7.2] — 2026-05-10
 
 🔧 **Hotfix: MD-11 / MD-11F Aircraft-Type-Match.**

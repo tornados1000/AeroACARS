@@ -1,9 +1,27 @@
 # Aircraft-Type-Match — Architektur, Aliases, Maintenance
 
-**Status:** v1.0 — **Approved for implementation** (initial)
+**Status:** v1.1 — **Approved for implementation**
 **Cutoff:** Forward-only — gilt fuer alle Bids ab AeroACARS v0.7.2
 **Vorgaenger:** keine — initial Spec nach Live-Bug 2026-05-10 (MPH62 MD-11)
 **Goal:** Pilot wird NIE wieder von einer Cargo-/Variant-Bid blockiert obwohl er das richtige Flugzeug geladen hat. Gleichzeitig: echter Mismatch (z.B. A320 statt B738) wird zuverlaessig erkannt und blockiert.
+
+---
+
+## Leitprinzip
+
+Aircraft-Type-Matching soll Piloten nicht unnoetig blockieren, aber offensichtliche falsche Flugzeugtypen weiterhin erkennen.
+
+Wir bevorzugen **pragmatische, nachvollziehbare Aliases** gegenueber perfekter ICAO-Strenge. ICAO Doc 8643 ist die Referenz, aber phpVMS-, SimBrief- und VA-Daten koennen in der Praxis abweichen. Solche Abweichungen sind erlaubt, wenn sie dokumentiert und mit mindestens einem positiven und einem negativen Test abgesichert sind.
+
+Ziel ist **nicht**, jede moegliche Variante vorab perfekt zu modellieren. Ziel ist, neue False-Positive-Blocker schnell, kontrolliert und ohne breite Wildcards zu beheben.
+
+### Die drei harten Regeln
+
+1. **Keine extrem breiten Aliases** wie `A3`, `747`, `MD`, `AIRBUS` — Substring-Match ist sensitiv, breite Patterns kollidieren mit unverwandten Familien.
+2. **Jeder neue Alias bekommt mindestens einen Match-Test** (Bid-ICAO ↔ erwarteter Sim-Title).
+3. **Jeder neue Alias bekommt mindestens einen offensichtlichen Mismatch-Test** (gegen eine unverwandte Familie).
+
+Alles andere in dieser Spec ist Empfehlung und Arbeitsliste, nicht Pflicht.
 
 ---
 
@@ -179,9 +197,11 @@ Damit funktioniert sowohl:
 
 ---
 
-## 4. Lueckenanalyse
+## 4. Arbeitsliste — wahrscheinlich nuetzliche Aliases
 
-Diese ICAO-Codes haben **keinen Alias** in der Tabelle und wuerden bei einer GSG-Bid blockieren wenn der Sim-Title nicht den ICAO-Code als Substring enthaelt:
+Diese ICAO-Codes haben **keinen Alias** in der Tabelle. Wenn ein Pilot mit einem davon gegen einen Mismatch-Block laeuft, ist der Maintenance-Workflow aus §6 der direkte Pfad. Die Liste ist **Arbeitsliste, nicht Pflichtpaket** — proaktive Erweiterung nur wenn echte VA-Daten zeigen dass die Familie tatsaechlich genutzt wird.
+
+> **Hinweis:** Manche dieser ICAO-Codes (z.B. `B748F`, `B763F`) sind nicht streng ICAO Doc 8643. Sie werden aber in phpVMS-/SimBrief-/VA-Daten praktisch verwendet. Bei Umsetzung: kurzer Kommentar im Code "VA-/SimBrief-Alias" damit klar ist warum es kein offizieller Code ist.
 
 ### 4.1 Cargo-Varianten (HOHE Prio — Cargo-Operatoren wie Martinair, Lufthansa Cargo, FedEx etc.)
 
@@ -228,18 +248,22 @@ Diese ICAO-Codes haben **keinen Alias** in der Tabelle und wuerden bei einer GSG
 
 ---
 
-## 5. Test-Matrix (verbindlich)
+## 5. Test-Matrix (Empfehlung)
 
-Pro **Aircraft-Familie** muessen die folgenden Tests existieren:
+Pro **neuer Aircraft-Familie** sind die zwei harten Regeln aus dem Leitprinzip Pflicht:
+- mindestens 1 Match-Test (Long-Form oder Variant)
+- mindestens 1 offensichtlicher Mismatch-Test (gegen unverwandte Familie)
 
-| Test-Klasse | Was es testet | Pflicht? |
+Daruebergehend gibt es **Empfehlungen**, je nach Familie sinnvoll oder unnoetig:
+
+| Test-Klasse | Wann sinnvoll | Pflicht? |
 |---|---|---|
-| **Long-Form-Match** | `aircraft_types_match(ICAO, "Long Form")` ist `true` (z.B. `A359` ↔ `A350-900`) | Ja, pro Familie |
-| **Cargo-Variant-Match** | Pax-ICAO matched Frachter-Title (z.B. `MD11` ↔ `MD-11F`) | Ja, wenn Cargo-Variant existiert |
-| **Strict-Cargo-Match** | Reine Frachter-ICAO matched nur Frachter-Title (z.B. `MD11F` ↔ `MD-11F`) | Ja, wenn Cargo-Variant existiert |
-| **Unrelated-Mismatch** | Verwandte aber unterschiedliche Familien matchen NICHT (z.B. `MD11` ≠ `B748`) | Ja, pro Familie |
-| **Case-Insensitive** | Lowercase-Inputs funktionieren (`md11` ↔ `md-11f`) | Ja, mindestens ein Test pro Familie |
-| **Variant-Suffix-Variations** | NEO/MAX/ER mit/ohne Bindestrich/Leerzeichen (`A20N` ↔ `A320NEO`/`A320-NEO`/`A320 NEO`) | Wenn Familie Variant-Suffixe hat |
+| **Long-Form-Match** | Jede Familie wo Sim-Title eine Marketing-Form benutzt (`A350-900` statt `A359`) | nein, aber Standard |
+| **Cargo-Variant-Match** | Familien mit Frachter-Variante wo Pax-Bid auch Cargo-Sim akzeptieren soll | nein, abhaengig von VA-Praxis |
+| **Strict-Cargo-Match** | Wenn Pure-Frachter-ICAO existiert (B77F, MD11F, B748F) | nein |
+| **Unrelated-Mismatch** | Familien die optisch verwechselt werden koennten (MD-11 vs B747, A350 vs B777) | **ja, eine der zwei harten Regeln** |
+| **Case-Insensitive** | Lowercase-Inputs (rare in Praxis weil phpVMS uppercase) | nein |
+| **Variant-Suffix-Variations** | Familien mit NEO/MAX/ER/F-Suffix die im Title verschieden geschrieben werden | nein, aber empfohlen wenn drei oder mehr Schreibweisen existieren |
 
 ### 5.1 Verifikations-Befehl
 
@@ -247,22 +271,15 @@ Pro **Aircraft-Familie** muessen die folgenden Tests existieren:
 cargo test --lib aircraft_alias_tests
 ```
 
-Sollte **>= N Tests** liefern, wo N = (Anzahl Familien aus §3) × (Anzahl Pflicht-Klassen aus §5).
+Aktuell (v0.7.2): 10 Tests fuer 14 Familien — das reicht weil die zwei harten Regeln (Match + Mismatch) erfuellt sind. Mehr Tests sind willkommen, aber kein Release-Blocker.
 
-Aktuell (v0.7.2): 10 Tests fuer 14 Familien (nicht jede Familie hat alle Klassen — siehe §5.2).
+### 5.2 Empfohlene Coverage-Erweiterung (Backlog, nicht Pflicht)
 
-### 5.2 Test-Coverage-Soll (v0.7.3 Ziel)
+Wenn beim Pflegen mal Zeit ist, koennen die folgenden Long-Form-Tests nachgereicht werden — sie wuerden zukuenftige Blocker noch besser absichern:
 
-Mindestens ein Long-Form-Match-Test pro Familie + ein Unrelated-Mismatch-Test pro Familien-Paar das verwechselt werden koennte. Aktuell fehlen:
+- A330/A340/B747/B757/B767/E-Familien Long-Form-Match (alle haben Aliases, aber keinen expliziten Match-Test)
 
-- A330-Familie Long-Form-Match
-- A340 Long-Form-Match
-- 747-Familie Long-Form-Match
-- 757 Long-Form-Match
-- 767 Long-Form-Match
-- E170/E175/E190/E195 Long-Form-Match
-- Embraer-E2 Long-Form-Match
-- BCS1/BCS3 Long-Form-Match
+Das ist eine **Arbeitsliste**, kein Pflichtpaket. Wer einen davon mitnimmt wenn er sowieso die Datei aenderet, freuen wir uns.
 
 ---
 
@@ -280,10 +297,10 @@ Wenn ein Pilot mit `aircraft_mismatch` blockiert wird obwohl er das richtige Flu
    "<ICAO_BID>"    => &["<Long-Form-Substring>", "<ICAO_BID>"],
    "<ICAO_ACTUAL>" => &["<Long-Form-Substring>", "<ICAO_ACTUAL>"],  // bei Cargo separat
    ```
-5. **Tests hinzufuegen** in `aircraft_alias_tests`:
-   - Long-Form-Match (`<ICAO_BID>` ↔ `<Long-Form>`)
-   - Cargo-Variant-Match (falls applicable)
-   - Unrelated-Mismatch (gegen mindestens 2 unverwandte Familien)
+5. **Tests hinzufuegen** in `aircraft_alias_tests` — laut Leitprinzip nur 2 sind Pflicht:
+   - **mindestens 1 Match-Test** (Bid-ICAO ↔ erwarteter Sim-Title)
+   - **mindestens 1 Mismatch-Test** (gegen unverwandte Familie)
+   Mehr Tests sind willkommen aber kein Release-Blocker.
 6. **Spec updaten** — Inventur §3 erweitern, Lueckenanalyse §4 reduzieren
 7. **Hotfix-Release** (Patch-Version, z.B. v0.7.X+1)
 
@@ -339,13 +356,18 @@ Wenn ein Pilot mit `aircraft_mismatch` blockiert wird obwohl er das richtige Flu
 | `A359` | "Boeing 777-300ER" | ✗ unrelated widebodies |
 | `B788` | "Asobo 787-9" | ✗ verschiedene Variant (B788 ≠ B789) |
 
-### 7.3 Was unklar/edge-case ist
+### 7.3 Cargo-Pragmatismus
+
+**Pax-Bid + Cargo-Sim** (z.B. `MD11` Bid + `MD-11F` Sim-Title): wir akzeptieren das. Begruendung: Cargo-Variante hat groesseren Frachtraum, kann aber problemlos eine Pax-Strecke fliegen. Wenn eine VA das fuer ihre Dispatch-Disziplin nicht will, ist das eine **VA-Daten-Entscheidung** (in phpVMS strikt `MD11F` als Bid-ICAO setzen).
+
+**Cargo-Bid + Pax-Sim** (z.B. `MD11F` Bid + `MD-11` Sim-Title — JustFlight Pax-Variante): aktuell **strict** geblockt. Begruendung: Pax-Compartment hat keine Cargo-Lasten-Verteilung, der Pilot wuerde 78t Cargo in einem 290-Sitze-Sim fliegen. Falls in der Praxis das zu hart ist, koennen wir das auf "Warning + Trotzdem-Starten-Button" umstellen (analog `acknowledge_aircraft_mismatch` aus dem Manual-Pfad).
+
+### 7.4 Bekannte Edge-Cases (Stand v0.7.2)
 
 | Bid-ICAO | Sim-Title | Match? |
 |---|---|---|
-| `MD11F` | "Just Flight MD-11" (Pax-Title) | **✗** — strict gewollt: Cargo-Bid darf nicht in Pax-Sim fliegen (Cargo-Compartment fehlt) |
 | `MD11` | "DC-10-30" | ✗ — DC-10 ist Vorlauefer, nicht MD-11 |
-| `B748` | "Boeing 747-8 Freighter (PMDG)" | **fragwuerdig** — B748 ist normalerweise Pax-Variante, B748F waere Frachter. Akt. matched via Long-Form-Substring "747-8". TODO: separater B748F-Alias falls Cargo-Bids reinkommen |
+| `B748` | "Boeing 747-8 Freighter (PMDG)" | **derzeit ✓ via Long-Form "747-8" Substring** — Pax-Bid akzeptiert Frachter, gewuenscht (Cargo-Pragmatismus §7.3). Bei B748F-Bid wird gestrickt geblockt sobald wir B748F als eigenen Alias eintragen. |
 
 ---
 
@@ -385,4 +407,4 @@ Wenn ein Pilot mit `aircraft_mismatch` blockiert wird obwohl er das richtige Flu
 
 ---
 
-**Ende der Spec v1.0 — Maintenance-Prozess in §6 ist verbindlich. Naechster Update: §4 Lueckenanalyse abarbeiten, geplant fuer v0.7.3.**
+**Ende der Spec v1.1 — Leitplanke statt Regelwerk. Drei harte Regeln aus dem Leitprinzip sind Pflicht, alles andere Empfehlung. Naechster Update: §4 Cargo-Aliase nachziehen wenn Pilot-Daten zeigen dass die Familie genutzt wird (proaktiv v0.7.3 fuer die HOHE-Prio-Liste).**

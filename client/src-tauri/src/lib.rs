@@ -427,6 +427,9 @@ fn aircraft_aliases(code: &str) -> &'static [&'static str] {
         "A333" => &["A330-300"],
         "A338" => &["A330-800"],
         "A339" => &["A330-900"],
+        // A330-Frachter — VA-/SimBrief-Alias. Quatar Cargo / Turkish
+        // Cargo / Etihad Cargo flogen A330-200F.
+        "A332F" => &["A330-200F", "A332F"],
         // A340 family
         "A342" => &["A340-200"],
         "A343" => &["A340-300"],
@@ -456,13 +459,26 @@ fn aircraft_aliases(code: &str) -> &'static [&'static str] {
         "B742" => &["747-200"],
         "B744" => &["747-400"],
         "B748" => &["747-8"],
+        // 747-Frachter — VA-/SimBrief-Alias (nicht streng ICAO Doc 8643).
+        // Spec docs/spec/aircraft-type-match.md §4 + §7.3: Cargo-Bid
+        // strict gegen Frachter-Title; B744 (Pax-Bid) akzeptiert via
+        // Long-Form-Substring "747-400" auch -400F-Frachter (Cargo-
+        // Pragmatismus). Lufthansa Cargo / Atlas / Cargolux flogen
+        // historisch B744F + heute B748F.
+        "B74F"  => &["747-400F", "B74F"],
+        "B748F" => &["747-8F", "747-8 FREIGHTER", "B748F"],
         // 757
         "B752" => &["757-200"],
         "B753" => &["757-300"],
+        // 757-Frachter — VA-/SimBrief-Alias. DHL/UPS/FedEx-Klassiker.
+        "B752F" => &["757-200F", "B752F"],
         // 767
         "B762" => &["767-200"],
         "B763" => &["767-300"],
         "B764" => &["767-400"],
+        // 767-Frachter — VA-/SimBrief-Alias. FedEx/UPS-Klassiker.
+        "B762F" => &["767-200F", "B762F"],
+        "B763F" => &["767-300F", "B763F"],
         // 777
         "B772" => &["777-200"],
         "B77L" => &["777-200LR", "777-200 LR"],
@@ -17154,6 +17170,60 @@ mod aircraft_alias_tests {
         assert!(!aircraft_types_match("MD11", "B77W"));
         assert!(!aircraft_types_match("MD11", "A359"));
         assert!(!aircraft_types_match("MD11", "B748"));
+    }
+
+    // ─── v0.7.3 Cargo-Aliases (Spec §4 HOHE-Prio Arbeitsliste) ──────
+    // Pro Familie 1 Match-Test + 1 Mismatch-Test (Spec Leitprinzip).
+
+    #[test]
+    fn b748f_matches_747_8_freighter() {
+        assert!(aircraft_types_match("B748F", "747-8F"));
+        assert!(aircraft_types_match("B748F", "747-8 Freighter"));
+        // B748 (Pax-Bid) akzeptiert via Long-Form "747-8" Substring
+        // auch -8F-Frachter — Cargo-Pragmatismus §7.3.
+        assert!(aircraft_types_match("B748", "747-8 Freighter"));
+    }
+
+    #[test]
+    fn b748f_does_not_match_other_widebodies() {
+        assert!(!aircraft_types_match("B748F", "B77W"));
+        assert!(!aircraft_types_match("B748F", "A388"));
+    }
+
+    #[test]
+    fn b74f_matches_747_400_freighter() {
+        assert!(aircraft_types_match("B74F", "747-400F"));
+        assert!(!aircraft_types_match("B74F", "B763F"));
+    }
+
+    #[test]
+    fn b752f_matches_757_200f() {
+        assert!(aircraft_types_match("B752F", "757-200F"));
+        // B752 (Pax-Bid) akzeptiert auch -200F via "757-200" Substring
+        assert!(aircraft_types_match("B752", "757-200F"));
+        assert!(!aircraft_types_match("B752F", "B763"));
+    }
+
+    #[test]
+    fn b763f_matches_767_300f() {
+        assert!(aircraft_types_match("B763F", "767-300F"));
+        // B763 (Pax-Bid) akzeptiert auch -300F via "767-300" Substring
+        assert!(aircraft_types_match("B763", "767-300F"));
+        assert!(!aircraft_types_match("B763F", "A332F"));
+    }
+
+    #[test]
+    fn b762f_matches_767_200f() {
+        assert!(aircraft_types_match("B762F", "767-200F"));
+        assert!(!aircraft_types_match("B762F", "B763F"));
+    }
+
+    #[test]
+    fn a332f_matches_a330_200f() {
+        assert!(aircraft_types_match("A332F", "A330-200F"));
+        // A332 (Pax-Bid) akzeptiert auch -200F via "A330-200" Substring
+        assert!(aircraft_types_match("A332", "A330-200F"));
+        assert!(!aircraft_types_match("A332F", "B763F"));
     }
 }
 
