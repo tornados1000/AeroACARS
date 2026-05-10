@@ -1,6 +1,6 @@
 # Aircraft-Type-Match — Architektur, Aliases, Maintenance
 
-**Status:** v1.1 — **Approved for implementation**
+**Status:** v1.2 — **Approved for implementation** (Stand AeroACARS v0.7.3 + Pending v0.7.4 Polish)
 **Cutoff:** Forward-only — gilt fuer alle Bids ab AeroACARS v0.7.2
 **Vorgaenger:** keine — initial Spec nach Live-Bug 2026-05-10 (MPH62 MD-11)
 **Goal:** Pilot wird NIE wieder von einer Cargo-/Variant-Bid blockiert obwohl er das richtige Flugzeug geladen hat. Gleichzeitig: echter Mismatch (z.B. A320 statt B738) wird zuverlaessig erkannt und blockiert.
@@ -139,22 +139,23 @@ Damit funktioniert sowohl:
 
 ---
 
-## 3. Inventur (Stand v0.7.2)
+## 3. Inventur (Stand v0.7.3 + v0.7.4 Pending)
 
-49 ICAO-Codes mit expliziten Aliases. Pro Familie:
+**52 ICAO-Codes** mit expliziten Aliases. Pro Familie:
 
-### 3.1 Airbus (16)
+### 3.1 Airbus (17)
 
 | Familie | ICAO-Codes mit Alias |
 |---|---|
 | A220 | `BCS1`, `BCS3` |
 | A320 ceo+neo | `A318`, `A319`, `A320`, `A321`, `A20N`, `A21N` |
 | A330 | `A332`, `A333`, `A338`, `A339` |
+| **A330 Cargo** (NEU v0.7.3) | `A332F` |
 | A340 | `A342`, `A343`, `A345`, `A346` |
 | A350 | `A359`, `A35K` |
 | A380 | `A388` |
 
-### 3.2 Boeing (22)
+### 3.2 Boeing (27)
 
 | Familie | ICAO-Codes mit Alias |
 |---|---|
@@ -162,12 +163,15 @@ Damit funktioniert sowohl:
 | 737 NG | `B736`, `B737`, `B738`, `B739` |
 | 737 MAX | `B37M`, `B38M`, `B39M`, `B3XM` |
 | 747 | `B741`, `B742`, `B744`, `B748` |
+| **747 Cargo** (NEU v0.7.3) | `B74F`, `B748F` |
 | 757 | `B752`, `B753` |
+| **757 Cargo** (NEU v0.7.3) | `B752F` |
 | 767 | `B762`, `B763`, `B764` |
+| **767 Cargo** (NEU v0.7.3) | `B762F`, `B763F` |
 | 777 | `B772`, `B77L`, `B773`, `B77W`, `B77F` |
 | 787 | `B788`, `B789`, `B78X` |
 
-### 3.3 McDonnell Douglas (2 — NEU v0.7.2)
+### 3.3 McDonnell Douglas (2 — v0.7.2)
 
 | Familie | ICAO-Codes mit Alias |
 |---|---|
@@ -180,7 +184,7 @@ Damit funktioniert sowohl:
 | ERJ | `E170`, `E175`, `E190`, `E195` |
 | E2 | `E290`, `E295` |
 
-### 3.5 Test-Coverage (10 Tests in `aircraft_alias_tests`)
+### 3.5 Test-Coverage (21 Tests in `aircraft_alias_tests`, v0.7.4 Pending)
 
 | Test | Was es deckt |
 |---|---|
@@ -192,8 +196,19 @@ Damit funktioniert sowohl:
 | `unrelated_types_dont_match` | False-Positive-Schutz B738 ≠ A320 |
 | `case_insensitive` | Lowercase-Inputs |
 | `strict_equality_still_works_for_unaliased` | DH8D fallback |
-| **`md11_matches_md_11f_long_form`** | **Live-Bug 2026-05-10 (MD-11)** |
-| **`md11_does_not_match_unrelated_widebodies`** | MD11 ≠ B77W/A359/B748 |
+| `md11_matches_md_11f_long_form` | Live-Bug 2026-05-10 (MD-11) |
+| `md11_does_not_match_unrelated_widebodies` | MD11 ≠ B77W/A359/B748 |
+| `b748f_matches_747_8_freighter` | 747-8F + " Freighter" Long-Form (v0.7.3) |
+| `b748f_does_not_match_other_widebodies` | B748F ≠ B77W/A388 |
+| `b74f_matches_747_400_freighter` | 747-400F (v0.7.3) |
+| `b752f_matches_757_200f` | 757-200F + Pax-Bid B752 akzeptiert -200F (v0.7.3) |
+| `b763f_matches_767_300f` | 767-300F (v0.7.3) |
+| `b762f_matches_767_200f` | 767-200F (v0.7.3) |
+| `a332f_matches_a330_200f` | A330-200F (v0.7.3) |
+| **`cargo_aliases_match_freighter_long_form`** (v0.7.4) | **Alle 6 Cargo-Aliase matchen "X-XX Freighter" Long-Form** |
+| **`cargo_bid_strict_against_pax_sim`** (v0.7.4) | **Cargo-Bid + Pax-Sim BLOCKIERT pro Familie (Compartment-Unterschied)** |
+| **`pax_bid_accepts_cargo_sim_pragmatism`** (v0.7.4) | **Pax-Bid + Cargo-Sim akzeptiert (umgekehrte Richtung okay)** |
+| **`a359_does_not_match_a350_1000`** (v0.7.4) | **A359 ≠ A350-1000 (vorher matched faelschlich via "A350"-Substring)** |
 
 ---
 
@@ -203,20 +218,17 @@ Diese ICAO-Codes haben **keinen Alias** in der Tabelle. Wenn ein Pilot mit einem
 
 > **Hinweis:** Manche dieser ICAO-Codes (z.B. `B748F`, `B763F`) sind nicht streng ICAO Doc 8643. Sie werden aber in phpVMS-/SimBrief-/VA-Daten praktisch verwendet. Bei Umsetzung: kurzer Kommentar im Code "VA-/SimBrief-Alias" damit klar ist warum es kein offizieller Code ist.
 
-### 4.1 Cargo-Varianten (HOHE Prio — Cargo-Operatoren wie Martinair, Lufthansa Cargo, FedEx etc.)
+### 4.1 Cargo-Varianten
+
+**HOHE-Prio-Liste in v0.7.3 abgearbeitet** (B74F, B748F, B752F, B762F, B763F, A332F). Verbleibt:
 
 | ICAO-Code | Real-Name | Sim-Adapter (typisch) | Status |
 |---|---|---|---|
-| `B74F` | 747-Frachter (Klassiker) | div. | **fehlt** |
-| `B748F` | 747-8F | PMDG, Salty | **fehlt** |
-| `B74S` | 747SP / -200F | div. | **fehlt** |
-| `B752F` | 757-200F | DHL/UPS | **fehlt** |
-| `B763F` | 767-300F | FedEx, ABX | **fehlt** |
-| `B764F` | 767-400F (selten, kein realer Frachter) | — | n/a |
+| `B74S` | 747SP (Klassiker, sehr selten geflogen) | div. | **fehlt** — geringe Prio |
+| `B764F` | 767-400F (existiert real nicht) | — | n/a |
 | `B788F` | 787-Frachter (existiert nicht real) | — | n/a |
-| `A332F` | A330-200F | Quatar, Turkish | **fehlt** |
-| `A338F` | A330-800F | (selten) | **fehlt** |
-| `A33F` / `A330F` | Generischer A330F | div. | **fehlt** |
+| `A338F` | A330-800F (selten, Lufthansa-Cargo angekuendigt) | (selten) | **fehlt** — bei Bedarf |
+| `A33F` / `A330F` | Generischer A330F | div. | **fehlt** — geringe Prio (VAs sollten spezifisch A332F nutzen) |
 
 ### 4.2 Regional / Turboprop (MITTLERE Prio — kleinere VAs, Trainings-Bids)
 
@@ -407,4 +419,4 @@ Wenn ein Pilot mit `aircraft_mismatch` blockiert wird obwohl er das richtige Flu
 
 ---
 
-**Ende der Spec v1.1 — Leitplanke statt Regelwerk. Drei harte Regeln aus dem Leitprinzip sind Pflicht, alles andere Empfehlung. Naechster Update: §4 Cargo-Aliase nachziehen wenn Pilot-Daten zeigen dass die Familie genutzt wird (proaktiv v0.7.3 fuer die HOHE-Prio-Liste).**
+**Ende der Spec v1.2 — Leitplanke statt Regelwerk. Drei harte Regeln aus dem Leitprinzip sind Pflicht, alles andere Empfehlung. v0.7.3 hat die HOHE-Prio-Cargo-Familien (B74F/B748F/B752F/B762F/B763F/A332F) eingebaut. v0.7.4 Pending-Polish: " FREIGHTER" Long-Form fuer alle Cargo-Aliase + Cargo-Bid-vs-Pax-Sim Strict-Tests + A359-Alias narrowed (kein A350-1000-False-Positive mehr).**

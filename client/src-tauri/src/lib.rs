@@ -429,14 +429,20 @@ fn aircraft_aliases(code: &str) -> &'static [&'static str] {
         "A339" => &["A330-900"],
         // A330-Frachter — VA-/SimBrief-Alias. Quatar Cargo / Turkish
         // Cargo / Etihad Cargo flogen A330-200F.
-        "A332F" => &["A330-200F", "A332F"],
+        "A332F" => &["A330-200F", "A330-200 FREIGHTER", "A332F"],
         // A340 family
         "A342" => &["A340-200"],
         "A343" => &["A340-300"],
         "A345" => &["A340-500"],
         "A346" => &["A340-600"],
         // A350 family — the bug
-        "A359" => &["A350-900", "A350"],
+        // v0.7.4 (Round-1 Review): "A350"-Substring-Alias entfernt
+        // weil A359-Bid faelschlich auch A350-1000 matchte. Spec
+        // §3.3 "Anti-Patterns": Aliase muessen spezifisch genug sein
+        // dass nur die echte Familie matched. "A350-900" reicht weil
+        // alle bekannten Sim-Adapter (Asobo/iniBuilds/etc.) den
+        // Variant-Suffix immer mitliefern.
+        "A359" => &["A350-900"],
         "A35K" => &["A350-1000"],
         // A380
         "A388" => &["A380-800", "A380"],
@@ -465,20 +471,23 @@ fn aircraft_aliases(code: &str) -> &'static [&'static str] {
         // Long-Form-Substring "747-400" auch -400F-Frachter (Cargo-
         // Pragmatismus). Lufthansa Cargo / Atlas / Cargolux flogen
         // historisch B744F + heute B748F.
-        "B74F"  => &["747-400F", "B74F"],
+        // v0.7.4: " FREIGHTER" Long-Form ergaenzt (Round-1 Review)
+        // weil manche Sim-Addons den Title als "747-400 Freighter"
+        // ohne den F-Suffix-Kompakt schreiben.
+        "B74F"  => &["747-400F", "747-400 FREIGHTER", "B74F"],
         "B748F" => &["747-8F", "747-8 FREIGHTER", "B748F"],
         // 757
         "B752" => &["757-200"],
         "B753" => &["757-300"],
         // 757-Frachter — VA-/SimBrief-Alias. DHL/UPS/FedEx-Klassiker.
-        "B752F" => &["757-200F", "B752F"],
+        "B752F" => &["757-200F", "757-200 FREIGHTER", "B752F"],
         // 767
         "B762" => &["767-200"],
         "B763" => &["767-300"],
         "B764" => &["767-400"],
         // 767-Frachter — VA-/SimBrief-Alias. FedEx/UPS-Klassiker.
-        "B762F" => &["767-200F", "B762F"],
-        "B763F" => &["767-300F", "B763F"],
+        "B762F" => &["767-200F", "767-200 FREIGHTER", "B762F"],
+        "B763F" => &["767-300F", "767-300 FREIGHTER", "B763F"],
         // 777
         "B772" => &["777-200"],
         "B77L" => &["777-200LR", "777-200 LR"],
@@ -17224,6 +17233,60 @@ mod aircraft_alias_tests {
         // A332 (Pax-Bid) akzeptiert auch -200F via "A330-200" Substring
         assert!(aircraft_types_match("A332", "A330-200F"));
         assert!(!aircraft_types_match("A332F", "B763F"));
+    }
+
+    // ─── v0.7.4 Round-1 Review Polish ───────────────────────────────
+
+    /// P1: " FREIGHTER" Long-Form muss fuer alle Cargo-Aliase matchen
+    /// (manche Sim-Addons schreiben "757-200 Freighter" statt nur "F").
+    #[test]
+    fn cargo_aliases_match_freighter_long_form() {
+        assert!(aircraft_types_match("B74F",  "747-400 Freighter"));
+        assert!(aircraft_types_match("B748F", "747-8 Freighter"));
+        assert!(aircraft_types_match("B752F", "757-200 Freighter"));
+        assert!(aircraft_types_match("B763F", "767-300 Freighter"));
+        assert!(aircraft_types_match("B762F", "767-200 Freighter"));
+        assert!(aircraft_types_match("A332F", "A330-200 Freighter"));
+    }
+
+    /// P2: Strict-Cargo-Grenze (Spec §7.3): Cargo-Bid + Pax-Sim wird
+    /// blockiert (Pax-Compartment hat keine Cargo-Lasten-Verteilung).
+    /// Pax-Bid + Cargo-Sim ist hingegen erlaubt (Cargo-Pragmatismus).
+    /// Diese Tests dokumentieren die Asymmetrie pro Familie.
+    #[test]
+    fn cargo_bid_strict_against_pax_sim() {
+        // Cargo-Bid → Pax-Sim BLOCKIERT
+        assert!(!aircraft_types_match("B74F",  "747-400"));
+        assert!(!aircraft_types_match("B748F", "747-8"));
+        assert!(!aircraft_types_match("B752F", "757-200"));
+        assert!(!aircraft_types_match("B763F", "767-300"));
+        assert!(!aircraft_types_match("B762F", "767-200"));
+        assert!(!aircraft_types_match("A332F", "A330-200"));
+        assert!(!aircraft_types_match("MD11F", "MD-11"));
+    }
+
+    #[test]
+    fn pax_bid_accepts_cargo_sim_pragmatism() {
+        // Pax-Bid → Cargo-Sim akzeptiert (umgekehrte Richtung okay)
+        assert!(aircraft_types_match("B744", "747-400F"));
+        assert!(aircraft_types_match("B748", "747-8F"));
+        assert!(aircraft_types_match("B752", "757-200F"));
+        assert!(aircraft_types_match("B763", "767-300F"));
+        assert!(aircraft_types_match("B762", "767-200F"));
+        assert!(aircraft_types_match("A332", "A330-200F"));
+        assert!(aircraft_types_match("MD11", "MD-11F"));
+    }
+
+    /// P2: A359 darf NICHT A350-1000 matchen (war v0.7.3 Bug durch
+    /// "A350"-Substring-Alias). v0.7.4 hat den Alias entfernt.
+    #[test]
+    fn a359_does_not_match_a350_1000() {
+        assert!(!aircraft_types_match("A359", "A350-1000"));
+        // umgekehrt
+        assert!(!aircraft_types_match("A35K", "A350-900"));
+        // Sanity: was matchen soll, matched weiter
+        assert!(aircraft_types_match("A359", "A350-900"));
+        assert!(aircraft_types_match("A35K", "A350-1000"));
     }
 }
 
