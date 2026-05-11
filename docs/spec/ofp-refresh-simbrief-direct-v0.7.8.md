@@ -1,6 +1,6 @@
 # OFP-Refresh SimBrief-direct (v0.7.8 Datenpfad)
 
-**Status:** Draft v1.3 final-vor-Code (static_id raus, request_id rein, Error-Handling robust)
+**Status:** Draft v1.4 final-vor-Code (Polish-only nach 5 Redaktions-Nits)
 **Stand:** 2026-05-11
 **Trigger:** v0.7.7 (`608630e` auf main) loest nur die UX-Schicht. W5 (phpVMS-7 entfernt Bid nach Prefile) macht den pointer-basierten Daten-Pfad im Real-Boarding wirkungslos. Pilot kriegt eine ehrliche Notice — aber keine neuen Plan-Werte. Dieser Spec dokumentiert den **echten Daten-Pfad** der v0.7.7 abloest und beide Schichten **in einem Release** ausgeliefert werden.
 
@@ -32,7 +32,8 @@ SimBrief speichert latest OFP fuer User X
 [Pilot klickt "⟳ Aktualisieren" im AeroACARS-Bid-Tab]
        │
        ▼
-AeroACARS liest simbrief_username aus Settings   ← v0.7.8 NEU
+AeroACARS liest SimBrief-Identifier aus Settings ← v0.7.8 NEU
+       │ (Username ODER User-ID, mind. eines)
        │
        ▼
 GET https://www.simbrief.com/api/xml.fetcher.php?username={username}
@@ -110,7 +111,7 @@ Spec v1.2 (laut Live-Probe `?username=simbrief`): HTTP 200 + `<fetch><status>Err
 | Network/IO-Error vor Response | Internet weg | `Network` |
 | HTTP 200 + Status Success + valid OFP | Erfolg | weitermachen |
 
-Damit ist der Code robust gegen beide bekannten Failure-Pfade — und der `UserNotFound`-Code triggert die korrekte Notice ("SimBrief-Username/UserID nicht gefunden — pruefe Settings").
+Damit ist der Code robust gegen beide bekannten Failure-Pfade — und der `UserNotFound`-Code triggert die korrekte Notice ("SimBrief-Username/User-ID nicht gefunden — pruefe Settings").
 
 ### Identifier-Strategie v1.2
 
@@ -413,7 +414,7 @@ async fn flight_refresh_simbrief(...) -> Result<SimBriefRefreshResult, UiError> 
 
     // 3. SimBrief-Username lesen (Lock + Drop)
     let username = {
-        let guard = state.simbrief_username.lock()?;
+        let guard = state.simbrief_settings.lock()?;
         guard.clone()
     };
 
@@ -519,7 +520,7 @@ fn compose_failure(direct: SimBriefDirectError, pointer: UiError) -> UiError {
     match direct {
         SimBriefDirectError::UserNotFound => UiError::new(
             "simbrief_user_not_found",
-            "SimBrief-Username/UserID nicht gefunden. Pruefe Settings → SimBrief Integration.",
+            "SimBrief-Username/User-ID nicht gefunden. Pruefe Settings → SimBrief Integration.",
         ),
         SimBriefDirectError::Unavailable => UiError::new(
             "simbrief_unavailable_and_bid_gone",
@@ -643,21 +644,24 @@ Spec v1.0/v1.1 hatte ueberlegt: "OFP-`generated_at` > flight_started_at" als zus
 
 ---
 
-## 7. Aufwand-Schaetzung
+## 7. Aufwand-Schaetzung (v1.4 realistischer)
 
 | Komponente | LOC |
 |---|---|
-| Backend: `AppState.simbrief_username: Mutex<Option<String>>` + 2 Commands | ~30 |
-| Backend: `fetch_and_verify_simbrief_direct()` helper | ~50 |
-| Backend: `ofp_matches_active_flight()` pure function + Tests | ~40 |
-| Backend: `flight_refresh_simbrief` Pfad-Auswahl (refactor) | ~40 |
-| Frontend: Settings-Panel SimBrief-Section | ~50 |
-| Frontend: i18n DE/EN/IT (3 keys: title, label, hint) | ~15 |
-| Frontend: BidsList neue Notice-Variante `ofp_does_not_match_active_flight` | ~10 |
-| Frontend i18n fuer neue Notice | ~6 |
-| Tests Backend: 6 Match-Tests + 3 Pfad-Auswahl-Tests | ~80 |
+| Backend: `SimBriefSettings` struct + `AppState.simbrief_settings: Mutex<SimBriefSettings>` + 2 Tauri-Commands | ~40 |
+| Backend: `SimBriefOfp.request_id` Parser-Erweiterung + 2 Tests | ~20 |
+| Backend: `SimBriefDirectError`-Enum (4 Varianten) + Error-Mapping (HTTP-Code + `<fetch><status>`) | ~50 |
+| Backend: `fetch_and_verify_simbrief_direct()` helper | ~70 |
+| Backend: `normalize_callsign` + `split_callsign` + `ofp_matches_active_flight` pure functions | ~50 |
+| Backend: `flight_refresh_simbrief` Pfad-Auswahl + `compose_failure`-Logik | ~60 |
+| Backend: `verify_simbrief_identifier` Tauri-Command fuer "Pruefen"-Button | ~30 |
+| Frontend: Settings-Panel "SimBrief Integration"-Section (2 Inputs, "Pruefen"-Button, Status-Anzeige) | ~80 |
+| Frontend: App.tsx Login-Mount localStorage → Backend Sync | ~15 |
+| Frontend: BidsList Notice-Wording-Updates (Mismatch + bid_not_found) | ~10 |
+| Frontend: i18n DE/EN/IT (~8 neue Keys: title/intro/username_*/userid_*/verify/notice_mismatch) | ~50 |
+| Tests Backend: 11 Match-Tests + 5 Pfad-Tests + 5 Settings-Tests + 2 Parser-Tests | ~150 |
 
-**Geschaetzt: ~320 LOC Diff**. Spec-konform, additiv zu v0.7.7, keine Breaking Changes.
+**Geschaetzt: ~600 LOC Diff** (Polish-Korrektur gegenueber v1.3's ~320). Spec-konform, additiv zu v0.7.7-Foundation (`608630e`), keine Breaking Changes. Tests + i18n machen mehr aus als initial gedacht (Thomas-Hinweis QS v1.3: "eher 400-500 LOC" — v1.4-Detail-Tabelle landet bei 600).
 
 ---
 
@@ -668,7 +672,7 @@ Spec v1.0/v1.1 hatte ueberlegt: "OFP-`generated_at` > flight_started_at" als zus
 | SimBrief-direct: OFP matched + changed=true | (kein Notice) | — |
 | SimBrief-direct: OFP matched + changed=false | info | "OFP unveraendert. SimBrief liefert weiterhin OFP-ID {{id}}." |
 | **SimBrief-direct: Mismatch** (NEU v0.7.8) | warn | "Aktueller SimBrief-OFP gehoert zu Flug {{origin}} → {{destination}} ({{callsign}}). Bitte fuer den aktiven Flug auf simbrief.com neu generieren." |
-| SimBrief-direct: Username unbekannt → Fallback Pointer | warn | "SimBrief-Username '{{username}}' nicht gefunden. Pruefe Settings → SimBrief-Username." |
+| SimBrief-direct: Identifier unbekannt → Fallback Pointer | warn | "SimBrief-Username/User-ID nicht gefunden. Pruefe Settings → SimBrief Integration." |
 | Kein Username + Bid weg (W5) | warn | (existing v0.7.7) "Bid nicht mehr verfuegbar nach Prefile. Aktiviere SimBrief-direct in Settings fuer den Refresh-Pfad ohne Bid." (Hinweis-Text aktualisiert!) |
 
 **v0.7.8 aktualisiert den v0.7.7 `bid_not_found`-Notice-Text** damit Pilot weiss wie er sich selbst helfen kann.
@@ -696,11 +700,13 @@ Spec v1.0/v1.1 hatte ueberlegt: "OFP-`generated_at` > flight_started_at" als zus
 3. AeroACARS faellt auf Pointer-Pfad → `bid_not_found`
 4. **v0.7.8-aktualisierte Notice:** "Bid nicht mehr verfuegbar nach Prefile. Aktiviere SimBrief-direct in Settings fuer den Refresh-Pfad ohne Bid."
 
-### Workflow D: Pilot mit Username, SimBrief offline
-1. AeroACARS versucht SimBrief-direct → Network-Error
+### Workflow D: Pilot mit Identifier, SimBrief offline
+1. AeroACARS versucht SimBrief-direct → Network-Error (oder HTTP 5xx)
 2. SOFT-Fallback auf Pointer-Pfad
 3. Wenn Bid noch da → Pointer-Pfad-Ergebnis (selten)
-4. Wenn Bid weg → `bid_not_found`-Notice wie Workflow C
+4. Wenn Bid weg → **`compose_failure` priorisiert Direct-Error** (siehe §5.1):
+   - Notice: "SimBrief gerade nicht erreichbar; Pointer-Fallback auch nicht moeglich. Versuche es in ein paar Minuten erneut."
+   - Pilot weiss damit dass der **primaere** Fehler SimBrief-Verfuegbarkeit ist, nicht "Bid weg" — actionable Info zur richtigen Diagnose.
 
 ---
 
@@ -782,20 +788,6 @@ Frontend (manueller Smoke):
 ## 12. Versionierung dieser Spec
 
 - **v1.0 (2026-05-11):** Initial Draft basierend auf Thomas-Decision "SimBrief-direct, big release bundle".
-- **v1.3 (2026-05-11):** Final-vor-Code nach Thomas-QS auf Navigraph "Fetching a User's Latest OFP Data"-Doku:
-  - §3 SimBriefOfp-Parser: `static_id`-Feld komplett raus (war in v1.2 noch als Option enthalten). Begruendung Forum-Thread: `static_id` ist fuer Systeme die OFPs **erzeugen**, nicht fetchen. AeroACARS fetcht nur — wir brauchen keinen Slot-Pointer. Parser bekommt nur `request_id: String`.
-  - §3 `sequence_id` final ignoriert (kein DTO/Persistenz, optional tracing::debug nur fuer Diagnose).
-  - §3 Failure-Modes-Tabelle robust: **BEIDE Pfade** (HTTP 400 laut Navigraph-Doku UND `<fetch><status>Error</status>` laut Live-Probe) auf `UserNotFound` mappen. HTTP 5xx → `Unavailable`, andere non-2xx → `Network`, Parse-Fehler → `ParseFailed`.
-  - §3 Hinweis dass `request_id` und `bid.simbrief.id` aus phpVMS NICHT garantiert identisch sind — erster Pfad-Wechsel kann `changed=true` triggern auch bei inhaltsgleichem Plan, danach stabil.
-  - §11 alle v1.2-Punkte entschieden, **keine offenen Punkte mehr** — Spec ist code-ready.
-- **v1.2 (2026-05-11):** Nach direkter SimBrief-API-Probe (Thomas verlinkte Navigraph-Doku + Live-Demo):
-  - §3 komplett ueberarbeitet — XML-Response-Struktur direkt aus `?username=simbrief`-Probe gezogen statt aus indirekter Doku-Interpretation.
-  - **Vereinfachung gegenueber v1.0/v1.1:** Username-only Fetch funktioniert (Status "Success" bestaetigt). static_id ist NICHT zwingend — kann leer sein.
-  - §3 NEU: `<fetch><status>`-Tag als Error-Indikator. SimBrief liefert HTTP 200 + Status-Tag im XML, NICHT primaer HTTP 400 wie v1.1 (= Navigraph-Doku) sagte. Parser muss Status pruefen.
-  - §3 NEU: `sequence_id`-Feld entdeckt (Funktion unklar, derzeit ignoriert).
-  - §3 SimBriefOfp-Parser: zwei neue Felder `request_id: String` + `static_id: Option<String>`. Spec v1.1 hatte nur `ofp_id` — jetzt klar getrennt.
-  - §4.1 URL-Aufbau-Snippet mit Prioritaet user_id > username, beide URL-encoded.
-  - §11 v1.1-Punkte alle entschieden (mit Stand der API-Probe), 3 neue v1.2-Punkte fuer dein OK + Pilot-Probe-Test-Vorschlag (bid.simbrief.id vs request_id Identitaet pruefen).
 - **v1.1 (2026-05-11):** Nach 1. QS-Review von Thomas:
   - §3 P1: Parser-Erweiterung um `<params><request_id>` als `ofp.ofp_id` — Spec v1.0 sagte faelschlich "Parser muss NICHT erweitert werden". OHNE OFP-ID kein sauberer `changed`-Flag-Vergleich.
   - §3 P2: SimBrief-Failure-Mode-Liste korrigiert auf laut Navigraph-Doku: HTTP 400 + small XML error fuer invalid user / fetch error (nicht primaer 404/empty).
@@ -806,3 +798,23 @@ Frontend (manueller Smoke):
   - §6 P1: Callsign-Suffix-Match raus. Statt dessen normalisierter `airline_icao + flight_number`-Vergleich. `normalize_callsign` + `split_callsign` als Pure-Functions, getestet pro Edge-Case (insbesondere "DLH1100 vs 100"-False-Positive aus v1.0 verhindert).
   - §10 Tests aktualisiert: Suffix-Match-Tests raus, dafuer neue Edge-Cases (DLH1100, leerer Callsign, Hyphen-Variants). OFP-ID-Parsing-Tests neu. Settings-Tests um User-ID + URL-Encoding erweitert.
   - §11 Entscheidungs-Log: 5 v1.0-Punkte entschieden, 3 neue v1.1-Punkte fuer 2. QS.
+- **v1.2 (2026-05-11):** Nach direkter SimBrief-API-Probe (Thomas verlinkte Navigraph-Doku + Live-Demo):
+  - §3 komplett ueberarbeitet — XML-Response-Struktur direkt aus `?username=simbrief`-Probe gezogen statt aus indirekter Doku-Interpretation.
+  - **Vereinfachung gegenueber v1.0/v1.1:** Username-only Fetch funktioniert (Status "Success" bestaetigt). static_id ist NICHT zwingend — kann leer sein.
+  - §3 NEU: `<fetch><status>`-Tag als Error-Indikator. SimBrief liefert HTTP 200 + Status-Tag im XML, NICHT primaer HTTP 400 wie v1.1 (= Navigraph-Doku) sagte. Parser muss Status pruefen.
+  - §3 NEU: `sequence_id`-Feld entdeckt (Funktion unklar, derzeit ignoriert).
+  - §3 SimBriefOfp-Parser: zwei neue Felder `request_id: String` + `static_id: Option<String>`. Spec v1.1 hatte nur `ofp_id` — jetzt klar getrennt.
+  - §4.1 URL-Aufbau-Snippet mit Prioritaet user_id > username, beide URL-encoded.
+  - §11 v1.1-Punkte alle entschieden (mit Stand der API-Probe), 3 neue v1.2-Punkte fuer dein OK + Pilot-Probe-Test-Vorschlag (bid.simbrief.id vs request_id Identitaet pruefen).
+- **v1.3 (2026-05-11):** Final-vor-Code nach Thomas-QS auf Navigraph "Fetching a User's Latest OFP Data"-Doku:
+  - §3 SimBriefOfp-Parser: `static_id`-Feld komplett raus (war in v1.2 noch als Option enthalten). Begruendung Forum-Thread: `static_id` ist fuer Systeme die OFPs **erzeugen**, nicht fetchen. AeroACARS fetcht nur — wir brauchen keinen Slot-Pointer. Parser bekommt nur `request_id: String`.
+  - §3 `sequence_id` final ignoriert (kein DTO/Persistenz, optional tracing::debug nur fuer Diagnose).
+  - §3 Failure-Modes-Tabelle robust: **BEIDE Pfade** (HTTP 400 laut Navigraph-Doku UND `<fetch><status>Error</status>` laut Live-Probe) auf `UserNotFound` mappen. HTTP 5xx → `Unavailable`, andere non-2xx → `Network`, Parse-Fehler → `ParseFailed`.
+  - §3 Hinweis dass `request_id` und `bid.simbrief.id` aus phpVMS NICHT garantiert identisch sind — erster Pfad-Wechsel kann `changed=true` triggern auch bei inhaltsgleichem Plan, danach stabil.
+  - §11 alle v1.2-Punkte entschieden, **keine offenen Punkte mehr** — Spec ist code-ready.
+- **v1.4 (2026-05-11):** Polish nach Thomas-QS-Approval mit 5 Redaktions-Nits:
+  - §2 + §5 Begriffs-Konsistenz: `simbrief_username`-Bezuege in Pseudo-Code auf `simbrief_settings` korrigiert. localStorage-Key-Namen bleiben (sind technisch).
+  - §3 + §5 + §8 Notice-Wording: "SimBrief-Username/UserID" → "SimBrief-Username/User-ID" (Bindestrich). §8 Username-unbekannt-Notice auf Identifier-neutral umgeschrieben.
+  - §7 Aufwand realistischer: Detail-Tabelle ergibt ~600 LOC (statt v1.3-Schaetzung 320). Thomas-Hinweis: 400-500 LOC; v1.4-Detail-Tabelle landet bei 600 mit i18n + Tests.
+  - §9 Workflow D: bei `compose_failure` (SimBrief offline + Bid weg) wird Direct-Error priorisiert ("SimBrief gerade nicht erreichbar") statt schlichtem `bid_not_found`. Konsistent mit §5.1 Composite-Failure-Logik.
+  - §12 chronologische Reihenfolge fixiert (v1.0 → v1.1 → v1.2 → v1.3 → v1.4 latest-last) — vorher v1.3 vor v1.2/v1.1 was unleserlich war.
