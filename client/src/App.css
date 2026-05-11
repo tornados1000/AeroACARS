@@ -6468,13 +6468,14 @@ input:disabled {
 
 /* Coaching-Tipp — eine Zeile, leicht gehoben.
    v0.7.8 QS-Round-9: kein Purple mehr (war §4.5/V6-Verstoss).
+   v0.7.8 QS-Round-10: Border auf 1 px (V6 strict — keine Borders >1 px).
    Subtle Highlight via surface-2 + cyan-Akzent (passt zum
    existierenden Aufklaerungs-Block-Stil). */
 .sinkrate-forensik-coach {
   padding: 8px 12px;
   border-radius: var(--r-sm);
   background: var(--surface-2);
-  border-left: 2px solid #06b6d4;
+  border-left: 1px solid #06b6d4;
   font-size: 0.85rem;
   line-height: 1.45;
   color: var(--fg);
