@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { useConfirm } from "./ConfirmDialog";
 import { ForensicsBadge } from "./ForensicsBadge";
+import { SinkrateForensik } from "./SinkrateForensik";
 // v0.5.47 — Score-Modul ist jetzt zentral, identisch zu webapp/src/
 // components/landingScoring.ts. Dieselben Schwellen, Bands, Coach-Tipps
 // für Pilot-App und Live-Monitor.
@@ -1547,6 +1548,12 @@ function LandingDetail({
           </div>
         )}
       </section>
+
+      {/* v0.7.8: Sinkrate-Forensik — erklaert dem Piloten warum die
+          Landerate so ist wie sie ist. Spec docs/spec/v0.7.8-landing-rate-
+          explainability.md. Rendert nur wenn 50-Hz-Forensik-Felder
+          vorhanden sind (hasForensics()), sonst kompakter Legacy-Hinweis. */}
+      <SinkrateForensik record={record} />
 
       {/* v0.5.43: Flare-Quality — als eigene Section im gleichen Stil wie
           Approach-Stability. Nur sichtbar wenn die 50-Hz-Forensik-Felder

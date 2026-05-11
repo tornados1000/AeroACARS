@@ -253,7 +253,40 @@
     "flare_end_vs": "Sink rate just before TD",
     "flare_end_vs_hint": "Sink rate immediately before ground contact",
     "flare_detected": "Flare detected",
-    "flare_not_detected": "No flare detected"
+    "flare_not_detected": "No flare detected",
+    "sinkrate_forensik": {
+      "title": "🎯 Sink-Rate Forensics",
+      "intro_header": "Which sink-rate is the right one?",
+      "intro_body": "Depending on the averaging window you get different values for the same touchdown. Volanta and the cockpit VSI average over 0.5–1.5 s and filter out spikes, so a gust does not tag every touchdown as a hard landing. AeroACARS scores the cascade value at the actual ground-contact moment (engineering standard per FAR 25.473 — measures the loading on the landing-gear structure).",
+      "tool_section_title": "What your cockpit / Volanta shows",
+      "tool_section_subtitle": "Means over different time windows — spikes smoothed. Compare with the score block below.",
+      "score_section_title": "What AeroACARS scores",
+      "score_section_subtitle": "Engineering standard FAR 25.473 — load on the gear at the touchdown moment.",
+      "bucket_title": "How your sink rate developed in each phase",
+      "bucket_subtitle": "From the 4 cumulative means above we compute the real sink rate in each sub-window.",
+      "bucket_trend_drop": "Sink rate accelerated toward touchdown — flare not held / sagged through.",
+      "trace_title": "Last 3 seconds before touchdown",
+      "trace_no_data": "Position trace not available (too few buffer samples).",
+      "impact_title": "Impact loading",
+      "details_summary": "🔧 More details (position trace + impact G)",
+      "tile_1500ms": "1.5 s mean",
+      "tile_1000ms": "1.0 s mean",
+      "tile_500ms": "0.5 s mean",
+      "tile_250ms": "0.25 s mean",
+      "score_basis_label": "Sink-rate V/S (score basis)",
+      "score_basis_hint": "50 Hz sample at the touchdown moment — basis for the landing_rate sub-score.",
+      "score_basis_source_pill": "Source:",
+      "peak_pre_flare_label": "Peak sink-rate pre-flare:",
+      "peak_pre_flare_reduction": "Reduction by flare: {{reduction}} fpm",
+      "legacy_notice_text": "Forensic data was not yet recorded for this older flight.",
+      "tip": {
+        "flare_lost": "Flare ran out too early — hold the pitch attitude until the gear touches, throttle out AFTER touchdown.",
+        "hard_g": "Hard touchdown detected — start the pull-up earlier (~30 ft AGL), not at 10 ft.",
+        "no_flare": "No flare detected — raise the nose 2-3° at about 30 ft and hold it.",
+        "late_drop": "Noticeable drop in the final — sink rate was on average softer than at the touchdown moment. Check the bucket breakdown for where the sag began.",
+        "clean": "Clean touchdown — sink rate consistent, no drop in the final."
+      }
+    }
   },
   "about": {
     "tagline": "Modern ACARS for phpVMS 7 — MSFS 2020/2024 + X-Plane 11/12",

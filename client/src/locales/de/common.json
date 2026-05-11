@@ -253,7 +253,40 @@
     "flare_end_vs": "Sinkrate kurz vor TD",
     "flare_end_vs_hint": "Sinkrate unmittelbar vor dem Bodenkontakt",
     "flare_detected": "Flare erkannt",
-    "flare_not_detected": "Kein Flare erkannt"
+    "flare_not_detected": "Kein Flare erkannt",
+    "sinkrate_forensik": {
+      "title": "🎯 Sinkrate-Forensik",
+      "intro_header": "Welche Sinkrate ist die „richtige“?",
+      "intro_body": "Je nach Mittelungs-Fenster bekommst du unterschiedliche Werte für denselben Touchdown. Volanta und Cockpit-VSI mitteln über 0.5–1.5 s und filtern Spikes raus, damit eine Böe nicht jeden Touchdown als Hard-Landing taggt. AeroACARS scort hingegen den Cascade-Wert direkt am Aufsetz-Moment (Engineering-Standard nach FAR 25.473 — misst die Belastung der Fahrwerksstruktur).",
+      "tool_section_title": "Was dein Cockpit / Volanta anzeigt",
+      "tool_section_subtitle": "Mittel über verschiedene Zeitfenster — Spikes ausgeglättet. Vergleiche mit dem Score-Block unten.",
+      "score_section_title": "Was AeroACARS scort",
+      "score_section_subtitle": "Engineering-Standard FAR 25.473 — Belastung am Fahrwerk im Aufsetz-Moment.",
+      "bucket_title": "Wie sich deine Sinkrate in jeder Phase entwickelt hat",
+      "bucket_subtitle": "Aus den 4 Mittelwerten oben rechnen wir die echte Sinkrate in jedem Sub-Window aus.",
+      "bucket_trend_drop": "Sinkrate hat zum Touchdown hin stärker zugenommen — Flare nicht gehalten / durchgesackt.",
+      "trace_title": "Letzte 3 Sekunden vor Touchdown",
+      "trace_no_data": "Position-Trace nicht verfügbar (zu wenig Buffer-Samples).",
+      "impact_title": "Aufprall-Belastung",
+      "details_summary": "🔧 Mehr Details (Position-Trace + Aufprall-G)",
+      "tile_1500ms": "1.5 s Mittel",
+      "tile_1000ms": "1.0 s Mittel",
+      "tile_500ms": "0.5 s Mittel",
+      "tile_250ms": "0.25 s Mittel",
+      "score_basis_label": "Sinkrate-V/S (Score-Basis)",
+      "score_basis_hint": "50-Hz-Sample direkt am Aufsetz-Moment — Basis für den landing_rate-Sub-Score.",
+      "score_basis_source_pill": "Quelle:",
+      "peak_pre_flare_label": "Peak Sinkrate Pre-Flare:",
+      "peak_pre_flare_reduction": "Reduktion durch Flare: {{reduction}} fpm",
+      "legacy_notice_text": "Für diesen älteren Flug wurden die Forensik-Daten noch nicht gespeichert.",
+      "tip": {
+        "flare_lost": "Flare zu früh ausgelaufen — halte die Pitch-Attitude bis das Fahrwerk berührt, Throttle erst NACH Touchdown raus.",
+        "hard_g": "Hartes Aufsetzen erkannt — Pull-up früher beginnen (30 ft AGL), nicht erst im 10-ft-Bereich.",
+        "no_flare": "Kein Flare detektiert — bei ~30 ft die Nase 2-3° anheben und halten.",
+        "late_drop": "Deutlicher Drop im Final — Sinkrate war im Mittel weicher als am Aufsetz-Moment. Schau in die Bucket-Aufschlüsselung wo das Sacken begann.",
+        "clean": "Sauberer Touchdown — Sinkrate gleichmäßig, kein Drop im Final."
+      }
+    }
   },
   "about": {
     "tagline": "Modernes ACARS für phpVMS 7 — MSFS 2020/2024 + X-Plane 11/12",

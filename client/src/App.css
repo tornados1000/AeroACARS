@@ -6230,3 +6230,347 @@ input:disabled {
   padding: 16px 24px;
   border-top: 1px solid var(--border);
 }
+
+/* ─── v0.7.8 Sinkrate-Forensik (Spec §4.5) ──────────────────────────────
+   Folgt durchgehend dem bestehenden landing-section / landing-stability
+   Pattern (App.css:4841, 5172, 5180). Keine fremden Schatten, keine harten
+   Borders, keine neue Farb-Palette — nur cyan-Akzent fuer den Aufklaerungs-
+   Block (gleich wie VPS-Web 50-Hz-Card). */
+
+.landing-section--sinkrate-forensik {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+/* Aufklaerungs-Block — cyan-Akzent wie VPS-Web */
+.sinkrate-forensik-intro {
+  padding: 10px 14px;
+  border-left: 3px solid #06b6d4;
+  background: rgba(6, 182, 212, 0.06);
+  border-radius: var(--r-sm);
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+.sinkrate-forensik-intro__header {
+  font-weight: 600;
+  color: #67e8f9;
+  margin-bottom: 4px;
+}
+.sinkrate-forensik-intro__body {
+  color: var(--fg);
+  opacity: 0.92;
+  white-space: pre-line;
+}
+
+/* Sub-Section-Pattern */
+.sinkrate-forensik-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.sinkrate-forensik-section__title {
+  font-weight: 600;
+  font-size: 0.92rem;
+  color: var(--fg);
+}
+.sinkrate-forensik-section__subtitle {
+  font-size: 0.78rem;
+  color: var(--fg-dim);
+  line-height: 1.4;
+}
+
+/* 4-Tile-Reihe (Pattern wie landing-stability) */
+.sinkrate-forensik-tiles {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+.sinkrate-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}
+.sinkrate-tile__label {
+  font-size: 0.72rem;
+  color: var(--fg-dim);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.sinkrate-tile__hint {
+  text-transform: none;
+  letter-spacing: 0;
+  opacity: 0.7;
+}
+.sinkrate-tile__value {
+  font-family: var(--font-mono, monospace);
+  font-size: 1.15rem;
+  font-weight: 700;
+  color: var(--fg);
+}
+.sinkrate-tile__unit {
+  font-size: 0.7rem;
+  font-weight: 500;
+  color: var(--fg-dim);
+}
+.sinkrate-tile--good .sinkrate-tile__value { color: #34d399; }
+.sinkrate-tile--neutral .sinkrate-tile__value { color: #67e8f9; }
+.sinkrate-tile--warn .sinkrate-tile__value { color: #f59e0b; }
+.sinkrate-tile--err .sinkrate-tile__value { color: #ef4444; }
+.sinkrate-tile--err-severe .sinkrate-tile__value { color: #b91c1c; }
+.sinkrate-tile--na .sinkrate-tile__value { color: var(--fg-dim); }
+
+/* Score-Basis (gross + prominent) */
+.sinkrate-score-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px 16px;
+  border-radius: var(--r-sm);
+  background: linear-gradient(135deg, rgba(6, 182, 212, 0.10), rgba(6, 182, 212, 0.03));
+  border: 1px solid rgba(6, 182, 212, 0.30);
+}
+.sinkrate-score-tile__pill-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.sinkrate-score-tile__pill {
+  padding: 2px 8px;
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  border-radius: 999px;
+  background: #06b6d4;
+  color: #0f172a;
+}
+.sinkrate-score-tile__caption {
+  font-size: 0.78rem;
+  color: var(--fg-dim);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.sinkrate-score-tile__value {
+  font-family: var(--font-mono, monospace);
+  font-size: 2.3rem;
+  font-weight: 800;
+  line-height: 1.1;
+  color: var(--fg);
+}
+.sinkrate-score-tile--good .sinkrate-score-tile__value { color: #34d399; }
+.sinkrate-score-tile--neutral .sinkrate-score-tile__value { color: #67e8f9; }
+.sinkrate-score-tile--warn .sinkrate-score-tile__value { color: #f59e0b; }
+.sinkrate-score-tile--err .sinkrate-score-tile__value { color: #ef4444; }
+.sinkrate-score-tile--err-severe .sinkrate-score-tile__value { color: #b91c1c; }
+.sinkrate-score-tile__unit {
+  font-size: 0.95rem;
+  font-weight: 500;
+  color: var(--fg-dim);
+}
+.sinkrate-score-tile__source {
+  font-size: 0.74rem;
+  color: var(--fg-dim);
+}
+.sinkrate-score-tile__source-code {
+  font-family: var(--font-mono, monospace);
+  font-size: 0.72rem;
+  padding: 1px 4px;
+  margin-left: 4px;
+  background: var(--surface-2);
+  border-radius: 3px;
+}
+.sinkrate-score-tile__hint {
+  font-size: 0.72rem;
+  color: var(--fg-dim);
+  line-height: 1.4;
+}
+
+.sinkrate-forensik-pre-flare {
+  font-size: 0.82rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: baseline;
+  color: var(--fg);
+}
+.sinkrate-forensik-pre-flare__label {
+  color: var(--fg-dim);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  font-size: 0.7rem;
+}
+.sinkrate-forensik-pre-flare__value {
+  font-family: var(--font-mono, monospace);
+  font-weight: 700;
+}
+.sinkrate-forensik-pre-flare__reduction {
+  color: var(--fg-dim);
+}
+
+/* Bucket-Bars */
+.sinkrate-buckets {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.sinkrate-bucket-row {
+  display: grid;
+  grid-template-columns: 120px 1fr 80px;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.78rem;
+}
+.sinkrate-bucket-row__label {
+  font-family: var(--font-mono, monospace);
+  color: var(--fg-dim);
+}
+.sinkrate-bucket-row__bar {
+  height: 8px;
+  background: var(--surface-2);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.sinkrate-bucket-row__fill {
+  height: 100%;
+  border-radius: 4px;
+  transition: width 0.2s ease;
+  background: linear-gradient(90deg, #22c55e, #86efac);
+}
+.sinkrate-bucket-row__fill--good { background: linear-gradient(90deg, #22c55e, #34d399); }
+.sinkrate-bucket-row__fill--neutral { background: linear-gradient(90deg, #34d399, #67e8f9); }
+.sinkrate-bucket-row__fill--warn { background: linear-gradient(90deg, #fbbf24, #f59e0b); }
+.sinkrate-bucket-row__fill--err { background: linear-gradient(90deg, #f59e0b, #ef4444); }
+.sinkrate-bucket-row__fill--err-severe { background: linear-gradient(90deg, #ef4444, #b91c1c); }
+.sinkrate-bucket-row__value {
+  font-family: var(--font-mono, monospace);
+  font-weight: 600;
+  text-align: right;
+  color: var(--fg);
+}
+.sinkrate-bucket-row__unit {
+  font-size: 0.7rem;
+  color: var(--fg-dim);
+  font-weight: 500;
+}
+
+.sinkrate-forensik-trend-note {
+  margin-top: 6px;
+  padding: 6px 10px;
+  border-radius: var(--r-sm);
+  background: rgba(239, 68, 68, 0.08);
+  border-left: 2px solid #ef4444;
+  font-size: 0.78rem;
+  color: var(--fg);
+}
+
+/* Coaching-Tipp — eine Zeile, leicht gehoben */
+.sinkrate-forensik-coach {
+  padding: 8px 12px;
+  border-radius: var(--r-sm);
+  background: rgba(192, 132, 252, 0.06);
+  border-left: 2px solid #c084fc;
+  font-size: 0.85rem;
+  line-height: 1.45;
+  color: var(--fg);
+}
+
+/* <details> Collapsible */
+.sinkrate-forensik-details {
+  margin-top: 4px;
+}
+.sinkrate-forensik-details > summary {
+  cursor: pointer;
+  font-size: 0.78rem;
+  color: var(--fg-dim);
+  padding: 4px 0;
+  user-select: none;
+}
+.sinkrate-forensik-details > summary:hover {
+  color: var(--fg);
+}
+.sinkrate-forensik-details[open] > summary {
+  margin-bottom: 8px;
+}
+
+/* Position-Trace-Tabelle */
+.sinkrate-trace {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.sinkrate-trace__title {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--fg);
+}
+.sinkrate-trace__table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-mono, monospace);
+  font-size: 0.78rem;
+}
+.sinkrate-trace__table td {
+  padding: 3px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.sinkrate-trace__t { color: var(--fg-dim); width: 30%; }
+.sinkrate-trace__vs { color: var(--fg); width: 35%; }
+.sinkrate-trace__agl { color: var(--fg-dim); }
+
+/* Aufprall-Belastung */
+.sinkrate-impact {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.sinkrate-impact__title {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--fg);
+}
+.sinkrate-impact__tiles {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+}
+.sinkrate-impact__tile {
+  padding: 8px 10px;
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}
+.sinkrate-impact__label {
+  font-size: 0.7rem;
+  color: var(--fg-dim);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.sinkrate-impact__value {
+  font-family: var(--font-mono, monospace);
+  font-size: 1.15rem;
+  font-weight: 700;
+  color: var(--fg);
+}
+.sinkrate-impact__value span {
+  font-size: 0.72rem;
+  font-weight: 500;
+  color: var(--fg-dim);
+}
+.sinkrate-impact__tile--good .sinkrate-impact__value { color: #34d399; }
+.sinkrate-impact__tile--warn .sinkrate-impact__value { color: #f59e0b; }
+.sinkrate-impact__tile--err .sinkrate-impact__value { color: #ef4444; }
+
+/* Legacy-Notice (pre-Forensik-PIREPs) */
+.sinkrate-forensik-legacy {
+  padding: 10px 14px;
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--fg-dim);
+  font-size: 0.85rem;
+}

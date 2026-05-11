@@ -253,7 +253,40 @@
     "flare_end_vs": "Rateo discesa subito prima del TD",
     "flare_end_vs_hint": "Rateo di discesa immediatamente prima del contatto al suolo",
     "flare_detected": "Flare rilevato",
-    "flare_not_detected": "Nessun flare rilevato"
+    "flare_not_detected": "Nessun flare rilevato",
+    "sinkrate_forensik": {
+      "title": "🎯 Forense del rateo di discesa",
+      "intro_header": "Qual è il valore „giusto“?",
+      "intro_body": "A seconda della finestra di mediazione ottieni valori diversi per lo stesso touchdown. Volanta e il VSI di cabina mediano su 0.5–1.5 s e filtrano i picchi, in modo che una raffica non venga marcata come hard landing. AeroACARS valuta invece il valore della cascade esattamente nel momento del contatto al suolo (standard FAR 25.473 — misura il carico sul carrello).",
+      "tool_section_title": "Quello che mostra il cockpit / Volanta",
+      "tool_section_subtitle": "Medie su finestre temporali diverse — picchi smussati. Confronta con il blocco del punteggio sotto.",
+      "score_section_title": "Quello che AeroACARS valuta",
+      "score_section_subtitle": "Standard FAR 25.473 — carico sul carrello al momento del touchdown.",
+      "bucket_title": "Come si è sviluppato il tuo rateo di discesa in ogni fase",
+      "bucket_subtitle": "Dalle 4 medie cumulative sopra calcoliamo il rateo reale in ogni sotto-finestra.",
+      "bucket_trend_drop": "Il rateo di discesa è aumentato verso il touchdown — flare non mantenuto / cedimento.",
+      "trace_title": "Ultimi 3 secondi prima del touchdown",
+      "trace_no_data": "Tracciato posizione non disponibile (troppo pochi campioni di buffer).",
+      "impact_title": "Carico di impatto",
+      "details_summary": "🔧 Più dettagli (tracciato + G di impatto)",
+      "tile_1500ms": "Media 1.5 s",
+      "tile_1000ms": "Media 1.0 s",
+      "tile_500ms": "Media 0.5 s",
+      "tile_250ms": "Media 0.25 s",
+      "score_basis_label": "Rateo V/S (base del punteggio)",
+      "score_basis_hint": "Campione 50 Hz al momento del touchdown — base per il sub-score landing_rate.",
+      "score_basis_source_pill": "Sorgente:",
+      "peak_pre_flare_label": "Picco rateo pre-flare:",
+      "peak_pre_flare_reduction": "Riduzione tramite flare: {{reduction}} fpm",
+      "legacy_notice_text": "I dati forensi non sono ancora stati registrati per questo volo precedente.",
+      "tip": {
+        "flare_lost": "Flare terminato troppo presto — mantieni l'assetto di pitch finché il carrello tocca, gas via DOPO il touchdown.",
+        "hard_g": "Touchdown duro rilevato — inizia il pull-up prima (~30 ft AGL), non a 10 ft.",
+        "no_flare": "Nessun flare rilevato — alza il muso di 2-3° a circa 30 ft e mantienilo.",
+        "late_drop": "Drop evidente nel final — il rateo era in media più morbido rispetto al touchdown. Guarda la decomposizione a bucket per capire dove è iniziato il cedimento.",
+        "clean": "Touchdown pulito — rateo costante, nessun drop nel final."
+      }
+    }
   },
   "about": {
     "tagline": "ACARS moderno per phpVMS 7 — MSFS 2020/2024 + X-Plane 11/12",

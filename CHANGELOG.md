@@ -4,6 +4,67 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.7.8] — 2026-05-11
+
+🎯 **Sinkrate-Forensik im Landung-Tab — Pilot versteht warum seine Landerate so ist wie sie ist.**
+
+### Was
+
+Reine UI-Erweiterung, keine neue Datenerhebung. Adressiert wiederkehrende Pilot-Beschwerden vom Typ *"Volanta zeigt mir 232 fpm aber AeroACARS scort 357 — wer hat Recht?"* — beide Werte sind physikalisch korrekt, sie messen unterschiedliche Sachen. Die neue Sektion erklaert das transparent.
+
+Spec: `docs/spec/v0.7.8-landing-rate-explainability.md` v1.8 APPROVED (8 QS-Iterationen).
+
+### Was sich aendert (im Landung-Tab)
+
+Neue Sektion **🎯 Sinkrate-Forensik** zwischen Approach-Stability und Flare-Quality, mit 6 Bloecken:
+
+1. **Aufklaerungs-Block** (cyan-Akzent): "Welche Sinkrate ist die richtige?" — erklaert dass Volanta/Cockpit-VSI Mittel ueber 0.5-1.5 s zeigen, AeroACARS aber den Cascade-Wert direkt am Aufsetz-Moment scort (FAR 25.473 Engineering-Standard)
+2. **Tool-Mittel-Tiles** (4 Tiles): 1.5 s / 1.0 s / 0.5 s / 0.25 s aus `vs_smoothed_*_fpm` — was dein Cockpit/Volanta typischerweise anzeigt
+3. **Bucket-Aufschluesselung**: disjoint-Bucket-Differenz aus den 4 kumulativen Mittelwerten — zeigt wie sich die Sinkrate in jeder Phase entwickelt hat. Bei monotonem Anstieg ueber Betrag (|Delta| > 20 fpm in allen 3 Inter-Bucket-Schritten): Auto-Trend-Note "Flare nicht gehalten / durchgesackt"
+4. **Score-Basis-Tile** (gross + prominent): `landing_peak_vs_fpm ?? landing_rate_fpm` mit Tone-Farbe nach `T_VS_*`-Bands (200/400/600/1000 fpm) + `landing_source` als Quellen-Pill
+5. **Coaching-Tipp** (ein Satz nach Prioritaet): flare_lost / hard_g / no_flare / late_drop / clean
+6. **Mehr Details** (collapsible, default zu): Position-Trace letzte 3 s aus `touchdown_profile` (NICHT `approach_samples` — das hat nur vs_fpm/bank_deg) + Aufprall-Belastung (Peak-G post-TD 500ms/1s)
+
+### Backwards-Compat
+
+- Sektion rendert wenn `hasForensics(record) === true` — mindestens eines von `forensic_sample_count`, `vs_smoothed_*_fpm`, `vs_at_edge_fpm` gesetzt
+- Eintraege ohne 50-Hz-Forensik-Daten zeigen einen kompakten Legacy-Hinweis ("Fuer diesen aelteren Flug wurden die Forensik-Daten noch nicht gespeichert")
+- Tiles mit `null`-Wert zeigen `—` (Em-Dash), Grid bleibt 2x2 stabil
+- Score-Basis-Source-Pill nur wenn `landing_source != null && !== ""` (pre-v0.7.1: kein Pill, kein Error)
+
+### Design-Konsistenz mit AeroACARS-Look (§4.5)
+
+Spec verbietet "Stein im AeroACARS-Design". Implementiert mit:
+- `landing-section` / `landing-stability` / `landing-stability__row` Pattern (App.css:4841, 5172, 5180)
+- Lokale Sub-Komponenten (`SmoothedVsTile`, `ScoreBasisTile`, `VsBucketBreakdown`, `PositionTrace`, `ImpactTiles`) im selben File — kein Import nicht-existenter UI-Bibliothek
+- CSS-Variablen + Tone-Farb-Set, keine harten Borders, keine Box-Shadows, nur Volanta als externer Tool-Anker (kein DLHv/SmartCARS)
+
+### Out-of-Scope
+
+- Score-Engine bleibt unveraendert (Cascade-Chain `landing_peak_vs_fpm ?? landing_rate_fpm` in `LandingPanel.tsx:257, 1116` nicht angefasst)
+- Keine Backend-Aenderungen, keine VPS-Web-Aenderungen (dort schon in v0.7.7-Pipeline umgesetzt)
+- Sub-Score-Tabelle bleibt in `SubScoreGrid` weiter oben (kein Doppeln)
+
+### Tests
+
+- **31 Vitest-Tests** in `SinkrateForensik.test.tsx` (neu) — Bucket-Math, Trend-Detection, Coaching-Selector, Score-Basis-Cascade, Tone-Bands, Trace-Filter, GSG-218-End-to-End
+- Neue Test-Infrastruktur: `vitest`, `@testing-library/react`, `jsdom` (siehe `vitest.config.ts` + `src/test/setup.ts`)
+- `npm test` gruen, `npm run build` gruen
+- TypeScript exclude fuer Test-Files (App-Build umgeht Tests)
+
+### Files
+
+- `client/src/components/SinkrateForensik.tsx` (neu, ~370 Zeilen mit allen Sub-Komponenten)
+- `client/src/components/SinkrateForensik.test.tsx` (neu, 31 Tests)
+- `client/src/components/LandingPanel.tsx` (Import + Render-Stelle)
+- `client/src/locales/{de,en,it}/common.json` (je 29 neue Keys unter `landing.sinkrate_forensik.*`)
+- `client/src/App.css` (~320 Zeilen neue CSS-Klassen am Ende)
+- `client/vitest.config.ts` + `client/src/test/setup.ts` (Test-Setup)
+- `client/package.json` + `client/package-lock.json` (devDependencies)
+- `client/tsconfig.json` (exclude Test-Dateien aus App-Build)
+
+---
+
 ## [v0.7.7] — 2026-05-11
 
 🛫 **OFP-Refresh waehrend Boarding endlich nutzbar — SimBrief-direct macht den Bid-Pointer-Pfad obsolet. Real-Pilot-Frust beseitigt, Pilot-Callsign-Cases unterstuetzt.**
