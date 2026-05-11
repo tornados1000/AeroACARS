@@ -4649,13 +4649,25 @@ async fn flight_refresh_simbrief(
             }
             DirectOutcome::Mismatch { simbrief_origin, simbrief_dest, simbrief_callsign } => {
                 // v0.7.8 HARD-Block bei Mismatch (Spec v1.1 P1-2).
+                // v1.5.1: strukturierte Details als JSON im message-Feld
+                // damit Frontend einen reichen i18n-Notice rendern kann
+                // (aktiver Flug + SimBrief-Werte gegenuebergestellt).
+                let active_callsign_display = if active_airline_icao.is_empty() {
+                    active_flight_number.clone()
+                } else {
+                    format!("{}{}", active_airline_icao, active_flight_number)
+                };
+                let details = serde_json::json!({
+                    "active_callsign": active_callsign_display,
+                    "active_dpt": active_dpt,
+                    "active_arr": active_arr,
+                    "sb_callsign": simbrief_callsign,
+                    "sb_origin": simbrief_origin,
+                    "sb_dest": simbrief_dest,
+                });
                 return Err(UiError::new(
                     "ofp_does_not_match_active_flight",
-                    format!(
-                        "Latest SimBrief OFP belongs to {} → {} ({}). \
-                         Please regenerate the OFP for the current flight on simbrief.com.",
-                        simbrief_origin, simbrief_dest, simbrief_callsign,
-                    ),
+                    details.to_string(),
                 ));
             }
             DirectOutcome::Error(direct_err) => {

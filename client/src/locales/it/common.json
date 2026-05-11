@@ -843,7 +843,7 @@
     "ofp_bid_gone": "Prenotazione non più disponibile dopo prefile. Attiva SimBrief-diretto nelle Impostazioni (username o user-ID) per aggiornare l'OFP senza puntatore-bid.",
     "ofp_unchanged": "OFP invariato. SimBrief riporta ancora OFP-ID {{id}}.",
     "ofp_refreshed": "OFP aggiornato: nuovi valori del piano visibili nel cockpit e nel loadsheet.",
-    "ofp_does_not_match_active_flight": "L'ultimo OFP SimBrief appartiene a un altro volo. Per favore rigenera l'OFP per il volo attivo su simbrief.com.",
+    "ofp_does_not_match_active_flight": "Il tuo ultimo OFP SimBrief appartiene al volo {{sb_callsign}} ({{sb_origin}} → {{sb_dest}}). Il volo attivo è {{active_callsign}} ({{active_dpt}} → {{active_arr}}). Per favore genera un OFP per il volo attivo su simbrief.com.",
     "simbrief_user_not_found": "SimBrief username/user-ID non trovato. Controlla Impostazioni → Integrazione SimBrief.",
     "simbrief_unavailable_and_bid_gone": "SimBrief attualmente non disponibile; fallback puntatore anche non riuscito. Riprova tra qualche minuto.",
     "simbrief_direct_failed": "SimBrief-diretto fallito. Anche fallback puntatore non riuscito — vedi activity log.",

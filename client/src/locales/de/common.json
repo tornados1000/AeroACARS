@@ -842,7 +842,7 @@
     "ofp_bid_gone": "Bid nicht mehr verfügbar nach Prefile. Aktiviere SimBrief-direkt in Settings (Username oder User-ID), damit OFP-Refresh ohne Bid-Pointer funktioniert.",
     "ofp_unchanged": "OFP unverändert. SimBrief liefert weiterhin OFP-ID {{id}}.",
     "ofp_refreshed": "OFP aktualisiert: neue Plan-Werte in Cockpit und Loadsheet sichtbar.",
-    "ofp_does_not_match_active_flight": "Aktueller SimBrief-OFP gehört zu einem anderen Flug. Bitte für den aktiven Flug auf simbrief.com neu generieren.",
+    "ofp_does_not_match_active_flight": "Dein letzter SimBrief-OFP gehört zu Flug {{sb_callsign}} ({{sb_origin}} → {{sb_dest}}). Aktiver Flug ist aber {{active_callsign}} ({{active_dpt}} → {{active_arr}}). Bitte auf simbrief.com einen OFP für den aktiven Flug generieren.",
     "simbrief_user_not_found": "SimBrief-Username/User-ID nicht gefunden. Prüfe Settings → SimBrief Integration.",
     "simbrief_unavailable_and_bid_gone": "SimBrief gerade nicht erreichbar; Pointer-Fallback auch nicht möglich. Versuche es in ein paar Minuten erneut.",
     "simbrief_direct_failed": "SimBrief-direkt schlug fehl. Pointer-Fallback ebenfalls nicht erfolgreich — siehe Activity-Log.",

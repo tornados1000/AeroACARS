@@ -183,13 +183,41 @@ function airlineMonogram(flight: Flight): string {
 // v0.7.7: Pure helper damit der i18n-Key-Wahl gegen Tests + ohne React-
 // Renderer separat verifizierbar ist. Spec §8 Notice-Tabelle.
 // v0.7.8: erweitert um SimBrief-direct-Outcomes (Spec §8 Notice-Tabelle v1.4).
+// v1.5.1: Mismatch-Notice traegt jetzt strukturierte Params fuer reiche
+//   Pilot-Info (aktiver Flug gegen SimBrief-OFP).
 export function refreshNoticeKey(
   result: SimBriefRefreshResult | null,
-  error: { code?: string } | null,
-): { key: string; tone: "info" | "warn" } | null {
+  error: { code?: string; message?: string } | null,
+): { key: string; tone: "info" | "warn"; params?: Record<string, string> } | null {
   // v0.7.8 Outcomes — Direct-Pfad
   if (error?.code === "ofp_does_not_match_active_flight") {
-    return { key: "bids.ofp_does_not_match_active_flight", tone: "warn" };
+    // v1.5.1: Backend kodiert active_callsign/dpt/arr + sb_callsign/origin/dest
+    // als JSON im error.message. Parse fuer reichen Notice-Text.
+    let params: Record<string, string> = {
+      active_callsign: "—",
+      active_dpt: "—",
+      active_arr: "—",
+      sb_callsign: "—",
+      sb_origin: "—",
+      sb_dest: "—",
+    };
+    if (error.message) {
+      try {
+        const parsed = JSON.parse(error.message) as Record<string, unknown>;
+        for (const k of Object.keys(params)) {
+          const v = parsed[k];
+          if (typeof v === "string" && v.length > 0) params[k] = v;
+        }
+      } catch {
+        // JSON-Parse-Fehler → Defaults (—) bleiben. Pilot sieht
+        // unspezifischen Notice, kein Crash.
+      }
+    }
+    return {
+      key: "bids.ofp_does_not_match_active_flight",
+      tone: "warn",
+      params,
+    };
   }
   if (error?.code === "simbrief_user_not_found") {
     return { key: "bids.simbrief_user_not_found", tone: "warn" };
@@ -230,8 +258,14 @@ export function BidsList({
   // v0.7.7: kleiner Notice-Pill im Bid-Tab-Header nach Refresh.
   // 3 Outcomes (siehe Spec §8): bid_not_found (warn), ofp_unchanged
   // (info), changed (keine Notice — Erfolg ist still). Auto-clear nach 6s.
+  // v1.5.1: params fuer reiche Notices (Mismatch-Werte etc.).
   const [refreshNotice, setRefreshNotice] = useState<
-    { textKey: string; ofpId?: string; tone: "info" | "warn" } | null
+    {
+      textKey: string;
+      ofpId?: string;
+      tone: "info" | "warn";
+      params?: Record<string, string>;
+    } | null
   >(null);
   useEffect(() => {
     if (!refreshNotice) return;
@@ -353,12 +387,15 @@ export function BidsList({
     }
 
     // v0.7.7: Notice je nach Outcome (Spec §8 Notice-Tabelle).
+    // v1.5.1: notice.params traegt strukturierte Felder (z.B. Mismatch-
+    // Werte) die i18n-Templates befuellen.
     const notice = refreshNoticeKey(refreshOutcome.result, refreshOutcome.error);
     if (notice) {
       setRefreshNotice({
         textKey: notice.key,
         ofpId: refreshOutcome.result?.current_ofp_id,
         tone: notice.tone,
+        params: notice.params,
       });
     }
 
@@ -520,7 +557,12 @@ export function BidsList({
           }}
         >
           {refreshNotice.tone === "warn" ? "⚠ " : "ℹ︎ "}
-          {t(refreshNotice.textKey, { id: refreshNotice.ofpId ?? "" })}
+          {t(refreshNotice.textKey, {
+            id: refreshNotice.ofpId ?? "",
+            // v1.5.1: zusaetzliche Params fuer Mismatch-Notice (active_callsign,
+            // active_dpt, active_arr, sb_callsign, sb_origin, sb_dest).
+            ...(refreshNotice.params ?? {}),
+          })}
         </div>
       )}
 
