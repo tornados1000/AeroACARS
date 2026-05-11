@@ -273,26 +273,35 @@ export function BidsList({
   // parallel. Schreibt Ergebnisse in `bidPreviews` damit Display-Werte
   // die phpVMS-Snapshot-Werte ueberschreiben. Stille Fehler (nur Logging)
   // — Pre-Flight ist optional, phpVMS-Snapshot bleibt als Fallback.
-  const fetchPreviewsForBids = useCallback(async (bids: Bid[]) => {
-    if (bids.length === 0) {
-      setBidPreviews(new Map());
-      return;
-    }
-    const results = await Promise.allSettled(
-      bids.map((b) =>
-        invoke<BidSimBriefPreview>("bid_simbrief_preview", { bidId: b.id }),
-      ),
-    );
-    const next = new Map<number, BidSimBriefPreview>();
-    results.forEach((r, i) => {
-      if (r.status === "fulfilled") {
-        next.set(bids[i]!.id, r.value);
-      } else {
-        console.log("[bid_simbrief_preview]", bids[i]!.id, "failed:", r.reason);
+  // Returns success/error counts fuer Notice-Anzeige.
+  const fetchPreviewsForBids = useCallback(
+    async (bids: Bid[]): Promise<{ successCount: number; errorCount: number }> => {
+      if (bids.length === 0) {
+        setBidPreviews(new Map());
+        return { successCount: 0, errorCount: 0 };
       }
-    });
-    setBidPreviews(next);
-  }, []);
+      const results = await Promise.allSettled(
+        bids.map((b) =>
+          invoke<BidSimBriefPreview>("bid_simbrief_preview", { bidId: b.id }),
+        ),
+      );
+      const next = new Map<number, BidSimBriefPreview>();
+      let successCount = 0;
+      let errorCount = 0;
+      results.forEach((r, i) => {
+        if (r.status === "fulfilled") {
+          next.set(bids[i]!.id, r.value);
+          successCount++;
+        } else {
+          console.log("[bid_simbrief_preview]", bids[i]!.id, "failed:", r.reason);
+          errorCount++;
+        }
+      });
+      setBidPreviews(next);
+      return { successCount, errorCount };
+    },
+    [],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -370,20 +379,20 @@ export function BidsList({
     // `bid_not_found` antworten — refreshNoticeKey() macht daraus
     // einen ehrlichen Pilot-Hinweis (Spec §8).
     //
-    // v0.7.10: IMMER aufrufen, auch ohne aktiven Flug. Backend gibt
-    // dann `no_active_flight` zurueck — das mappen wir zu einem klaren
-    // Pilot-Hinweis statt frueher silent-success. v0.7.11 wird einen
-    // echten Pre-Flight-Refresh-Pfad bauen (eigener bid_preview_simbrief
-    // Backend-Command).
+    // v0.7.10: nur bei aktivem Flug aufrufen — Pre-Flight wird jetzt
+    // vom bid_simbrief_preview-Pfad gehandled (= grüner "Daten geladen"
+    // Notice statt no_active_flight-Fehler).
     const refreshP: Promise<{
       result: SimBriefRefreshResult | null;
       error: { code?: string } | null;
-    }> = invoke<SimBriefRefreshResult>("flight_refresh_simbrief")
-      .then((result) => ({ result, error: null }))
-      .catch((err: { code?: string; message?: string }) => ({
-        result: null,
-        error: err,
-      }));
+    }> = hasActiveFlight
+      ? invoke<SimBriefRefreshResult>("flight_refresh_simbrief")
+          .then((result) => ({ result, error: null }))
+          .catch((err: { code?: string; message?: string }) => ({
+            result: null,
+            error: err,
+          }))
+      : Promise.resolve({ result: null, error: null });
 
     const [freshBids, , freshProfile, refreshOutcome] = await Promise.all([
       bidsP,
@@ -397,8 +406,9 @@ export function BidsList({
     }
 
     // v0.7.10: pro Bid SimBrief-direct preview holen damit Display-Werte
-    // vom frischen OFP kommen statt vom phpVMS-Snapshot.
-    void fetchPreviewsForBids(freshBids);
+    // vom frischen OFP kommen statt vom phpVMS-Snapshot. Result zaehlt
+    // erfolgreiche Previews fuer den Pre-Flight-Notice unten.
+    const previewSummary = await fetchPreviewsForBids(freshBids);
 
     // v0.7.9 QS-Round-2: Notice-Logik defensiv — IMMER ein Banner zeigen,
     // egal was passiert. Vorher gab es Pfade die `null` zurueckgaben
@@ -469,12 +479,24 @@ export function BidsList({
         }
       }
     } else {
-      // Defensiver Fall: weder error noch result. Sollte nicht passieren
-      // aber Pilot soll trotzdem was sehen.
-      setRefreshNotice({
-        text: t("bids.refresh_no_result"),
-        tone: "warn",
-      });
+      // v0.7.10 Pre-Flight: kein aktiver Flug → flight_refresh_simbrief
+      // wurde gar nicht aufgerufen. Stattdessen rendert die Bid-Liste
+      // jetzt SimBrief-direct-Werte via bid_simbrief_preview. Notice
+      // zeigt wie viele Bids frische OFP-Daten geladen haben.
+      if (previewSummary.successCount > 0) {
+        setRefreshNotice({
+          text: t("bids.preview_loaded", {
+            count: previewSummary.successCount,
+          }),
+          tone: "ok",
+        });
+      } else if (previewSummary.errorCount > 0) {
+        setRefreshNotice({
+          text: t("bids.preview_failed_all"),
+          tone: "warn",
+        });
+      }
+      // Wenn beide 0: keine Bids in der Liste — kein Notice.
     }
 
     // v0.7.7 §6.5b: Bei `changed=true` Parent direkt benachrichtigen

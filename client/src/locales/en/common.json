@@ -928,7 +928,9 @@
     },
     "refresh_unknown_error": "Refresh failed ({{code}}) — please check the ACARS log",
     "refresh_no_result": "Refresh returned no result — please retry",
-    "no_active_flight_hint": "Pre-flight — the SimBrief OFP is loaded with the current plan when you click **IFR Start (SimBrief)**. The Refresh button in the bid tab cannot do a pre-flight OFP refresh (coming in v0.7.11)."
+    "no_active_flight_hint": "Pre-flight — the SimBrief OFP is loaded with the current plan when you click **IFR Start (SimBrief)**. The Refresh button in the bid tab cannot do a pre-flight OFP refresh (coming in v0.7.11).",
+    "preview_loaded": "✓ Fresh SimBrief values loaded ({{count}} bid · direct from simbrief.com)",
+    "preview_failed_all": "Could not load SimBrief values — showing phpVMS snapshot. Check Settings → SimBrief."
   },
   "flight": {
     "error": {
