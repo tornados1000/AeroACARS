@@ -1431,52 +1431,16 @@ function LandingDetail({
         <div className="landing-grid landing-grid--td">
           <VsCurveChart profile={record.touchdown_profile} />
           <dl className="landing-keyvals">
+            {/* v0.7.11: Touchdown-Card auf die wichtigen Werte reduziert.
+                Alle smoothed-VS-Werte (250/500/1000/1500 ms) + vs_at_edge
+                + landing_peak_vs_fpm + Peak-G post-TD wurden hier
+                entfernt — die gehoeren in die Sinkrate-Forensik-Sektion
+                weiter unten (v0.7.8). Pilot sieht hier nur EINE Sinkrate
+                (= Score-Basis nach v0.7.11 = vs_at_edge_fpm) + die
+                Aufprall-Werte. Kein Werte-Dschungel mehr. */}
             <div>
               <dt>{t("landing.landing_rate")}</dt>
               <dd>{fmtNumber(record.landing_rate_fpm, 0, "fpm")}</dd>
-            </div>
-            {/* v0.5.43: vs_at_edge — der "Volanta-equivalente" Wert direkt
-                neben Sinkrate, weil's der gleiche Begriff aus anderer
-                Mess-Methodik ist (interpoliert vs SimVar/Sampler-Best-Guess).
-                Plus 500-ms- und 1-s-Mean direkt darunter — Pilot sieht alle
-                drei VS-Mess-Methoden im gleichen Block. */}
-            {/* v0.5.47 — alle 50-Hz-Mittelwerte (Edge / 250 / 500 / 1000 /
-                1500 ms) auch im Client zeigen, identisch zur Webapp.
-                Pilot sieht im Client und im Live-Monitor exakt dieselbe
-                Reihenfolge mit denselben Werten. */}
-            {record.vs_at_edge_fpm != null && (
-              <div title={t("landing.vs_at_edge_hint") ?? undefined}>
-                <dt>{t("landing.vs_at_edge")}</dt>
-                <dd>{fmtNumber(record.vs_at_edge_fpm, 0, "fpm")}</dd>
-              </div>
-            )}
-            {record.vs_smoothed_250ms_fpm != null && (
-              <div title={t("landing.vs_smoothed_250ms_hint") ?? undefined}>
-                <dt>{t("landing.vs_smoothed_250ms")}</dt>
-                <dd>{fmtNumber(record.vs_smoothed_250ms_fpm, 0, "fpm")}</dd>
-              </div>
-            )}
-            {record.vs_smoothed_500ms_fpm != null && (
-              <div title={t("landing.vs_smoothed_500ms_hint") ?? undefined}>
-                <dt>{t("landing.vs_smoothed_500ms")}</dt>
-                <dd>{fmtNumber(record.vs_smoothed_500ms_fpm, 0, "fpm")}</dd>
-              </div>
-            )}
-            {record.vs_smoothed_1000ms_fpm != null && (
-              <div title={t("landing.vs_smoothed_1000ms_hint") ?? undefined}>
-                <dt>{t("landing.vs_smoothed_1000ms")}</dt>
-                <dd>{fmtNumber(record.vs_smoothed_1000ms_fpm, 0, "fpm")}</dd>
-              </div>
-            )}
-            {record.vs_smoothed_1500ms_fpm != null && (
-              <div title={t("landing.vs_smoothed_1500ms_hint") ?? undefined}>
-                <dt>{t("landing.vs_smoothed_1500ms")}</dt>
-                <dd>{fmtNumber(record.vs_smoothed_1500ms_fpm, 0, "fpm")}</dd>
-              </div>
-            )}
-            <div>
-              <dt>{t("landing.peak_vs")}</dt>
-              <dd>{fmtNumber(record.landing_peak_vs_fpm, 0, "fpm")}</dd>
             </div>
             <div>
               <dt>{t("landing.g_force")}</dt>
@@ -1486,21 +1450,6 @@ function LandingDetail({
               <dt>{t("landing.peak_g")}</dt>
               <dd>{fmtNumber(record.landing_peak_g_force, 2, "G")}</dd>
             </div>
-            {/* v0.5.43: Peak G nach TD = Gear-Compression-Spike, oft 100-300 ms
-                spaeter als der landing_peak_g (= Frame des Bodenkontakts).
-                Als zusaetzliche dl-Zeile damit Pilot beide Werte vergleichen kann. */}
-            {record.peak_g_post_500ms != null && (
-              <div title={t("landing.peak_g_post_500ms_hint") ?? undefined}>
-                <dt>{t("landing.peak_g_post_500ms")}</dt>
-                <dd>{fmtNumber(record.peak_g_post_500ms, 2, "G")}</dd>
-              </div>
-            )}
-            {record.peak_g_post_1000ms != null && (
-              <div title={t("landing.peak_g_post_1000ms_hint") ?? undefined}>
-                <dt>{t("landing.peak_g_post_1000ms")}</dt>
-                <dd>{fmtNumber(record.peak_g_post_1000ms, 2, "G")}</dd>
-              </div>
-            )}
             <div>
               <dt>{t("landing.pitch")}</dt>
               <dd>{fmtSigned(record.landing_pitch_deg, 1, "°")}</dd>

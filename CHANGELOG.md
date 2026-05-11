@@ -4,6 +4,59 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.7.11] — 2026-05-12
+
+🎯 **Eine Sinkrate, eine Wahrheit — Schluss mit dem Werte-Dschungel.**
+
+### Was
+
+Realer Pilot-Fall: DAL804 zeigte in phpVMS/AeroSore `-407 fpm` aber in der AeroACARS-UI `-364 fpm`. Beide Werte wurden vom Pilot-Client erzeugt — der eine aus dem MSFS-SimVar `PLANE TOUCHDOWN NORMAL VELOCITY` (latched), der andere aus dem 50-Hz-Buffer-Edge (interpoliert). Pilot war verständlicherweise irritiert ("der Pilot hat mich schon für doof erklärt").
+
+v0.7.11 macht den 50-Hz-Buffer-Edge-Wert (`vs_at_edge_fpm`) zur **einzigen kanonischen Score-Basis** und räumt die UI auf, sodass nirgendwo mehr verwirrende Parallel-Werte stehen.
+
+### Backend (Rust)
+
+- `lib.rs` Buffer-Dump-Hook: wenn die v2-Touchdown-Forensik-Kaskade (`vs_at_impact → smoothed_500ms → smoothed_1000ms → pre_flare_peak`) den primären VS-Wert REJECTet, wird jetzt **`vs_at_edge_fpm`** (50-Hz on-ground-Edge-Interpolation) statt MSFS-SimVar verwendet. SimVar-latched fällt damit raus aus dem Score, dem MQTT-Payload und dem phpVMS-PIREP.
+- `finalize_landing_rate(stats, vs_fpm, confidence, source)` Atomic-Write-Helper sorgt dafür dass `landing_rate_fpm`, `landing_rate_confidence` und `landing_rate_source` IMMER gemeinsam gesetzt werden.
+
+### Pilot-Client (Frontend)
+
+- `LandingPanel.tsx` Touchdown-Card aufgeräumt: alle smoothed-VS-Varianten (250/500/1000/1500 ms), `vs_at_edge_fpm`, `landing_peak_vs_fpm`, `peak_g_post_500ms/1000ms` aus der Touchdown-Card entfernt. Pilot sieht hier nur noch EINE Sinkrate (= Score-Basis), Touchdown-G, Peak-G, Pitch/Bank/Speed/Sideslip, Bounces, Heading. Die smoothed-Werte leben weiterhin in der **Sinkrate-Forensik-Sektion** (v0.7.8) — dort gehören sie hin.
+
+### VPS-Webapp
+
+- "Algorithmen-Forensik"-Sub-Section in der Diagnostik-Card entfernt. Die zeigte VS-Schätzer-Vergleiche (Lua-30 / Time-Tier-MSFS / SimVar-Final-VS) — gehört in interne Backend-Logs, nicht in die Pilot-UI. Der 50-Hz-TouchdownWindow-Card unten zeigt weiterhin alle relevanten Forensik-Werte für VA-Owner.
+
+### Vorher/Nachher
+
+- v0.7.10: DAL804 → phpVMS `-407 fpm` (SimVar) / AeroACARS-UI `-364 fpm` (50-Hz-Edge) → Pilot verwirrt
+- v0.7.11: DAL804 → phpVMS `-364 fpm` / AeroACARS-UI `-364 fpm` → konsistent
+
+---
+
+## [v0.7.10] — 2026-05-11
+
+✨ **Pre-Flight-SimBrief-direct: frische OFP-Werte schon in der Bid-Liste — vor dem IFR-Start.**
+
+### Was
+
+Bisher konnte der Pilot SimBrief-OFP-Daten erst nach dem IFR-Start via "Aktualisieren" laden — vorher zeigte die Bid-Liste nur die phpVMS-Pointer-Werte (oft veraltet). Pilot-Wunsch: *"warum kann ich die Daten nicht schon vor dem IFR-Start bekommen?"*
+
+v0.7.10 holt SimBrief-Daten direkt von simbrief.com (via `bid_simbrief_preview` Tauri-Command), sobald die Bid-Liste geladen wird.
+
+### Backend (Rust)
+
+- Neuer `#[tauri::command] bid_simbrief_preview(bid_id: i64)` — holt die SimBrief-OFP für eine Bid direkt von simbrief.com, ohne `phase_locked`/`active_flight`-Gate
+- Reuse von `try_simbrief_direct_with_match` Logik (gleicher Code-Path wie der Refresh-Button)
+
+### Frontend
+
+- `BidsList.tsx` `fetchPreviewsForBids()` ruft beim Bid-List-Load alle Previews parallel ab
+- Grünes "✓ Frische SimBrief-Werte geladen"-Banner bei Erfolg
+- Neuer Notice-Tone `"ok"` (zusätzlich zu `info/warn/err`) — grünes CSS
+
+---
+
 ## [v0.7.9] — 2026-05-11
 
 🔄 **SimBrief-OFP-Refresh: Callsign-Match auf SOFT-Warning umgestellt — DEP/ARR sind der echte Anker.**
