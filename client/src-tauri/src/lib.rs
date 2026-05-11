@@ -4605,6 +4605,216 @@ fn ofp_callsign_warning_dismiss(state: tauri::State<AppState>) {
     *state.ofp_callsign_warning.lock().expect("ofp_callsign_warning lock") = None;
 }
 
+/// v0.7.10: Pre-Flight-Preview eines SimBrief-OFP fuer einen bestimmten Bid.
+/// Holt OFP direkt von simbrief.com (= SimBrief-direct, gleicher Pfad wie
+/// `flight_refresh_simbrief` aber ohne `active_flight`-Anker — wir nutzen
+/// den Bid selbst fuer DEP/ARR/Callsign-Match.
+///
+/// Damit kann der Pilot VOR `IFR Start` schon die frischen OFP-Werte
+/// sehen statt nur den phpVMS-Snapshot. User-Wunsch:
+/// "Ich möchte die Daten auch schon vor dem Klick auf Start sehen".
+///
+/// Match-Verifikation wie v0.7.9: DEP+ARR hard, Callsign soft (nur Warning).
+#[tauri::command]
+async fn bid_simbrief_preview(
+    bid_id: i64,
+    state: tauri::State<'_, AppState>,
+) -> Result<BidSimBriefPreview, UiError> {
+    use api_client::SimBriefDirectError;
+
+    let client = current_client(&state)?;
+    let simbrief_settings = state
+        .simbrief_settings
+        .lock()
+        .expect("simbrief_settings lock")
+        .clone();
+
+    if !has_simbrief_identifier(&simbrief_settings) {
+        return Err(UiError::new(
+            "no_simbrief_settings",
+            "Bitte erst Settings → SimBrief mit Username oder User-ID konfigurieren.",
+        ));
+    }
+
+    // Hole Bid-Liste fuer DEP/ARR/Callsign-Match-Anker. Wir koennten den
+    // Bid auch aus dem Frontend uebergeben aber das ist zerbrechlicher
+    // (Frontend-State-Drift) — kanonisch ist phpVMS.
+    let bids = client.get_bids().await.map_err(|e| {
+        UiError::new(
+            "bids_fetch_failed",
+            format!("Bid-Liste konnte nicht geholt werden: {e}"),
+        )
+    })?;
+    let bid = bids.iter().find(|b| b.id == bid_id).ok_or_else(|| {
+        UiError::new(
+            "bid_not_found",
+            "Bid in der phpVMS-Liste nicht gefunden",
+        )
+    })?;
+
+    let active_airline_icao = bid
+        .flight
+        .airline
+        .as_ref()
+        .map(|a| a.icao.clone())
+        .unwrap_or_default();
+    let active_flight_number = bid.flight.flight_number.clone();
+    let active_bid_callsign = bid.flight.callsign.clone();
+    let pilot_callsign = state
+        .cached_pilot_callsign
+        .lock()
+        .expect("cached_pilot_callsign lock")
+        .clone();
+    let active_dpt = bid.flight.dpt_airport_id.clone();
+    let active_arr = bid.flight.arr_airport_id.clone();
+
+    // Direct-Fetch.
+    let ofp = match client
+        .fetch_simbrief_direct(
+            simbrief_settings.user_id.as_deref(),
+            simbrief_settings.username.as_deref(),
+        )
+        .await
+    {
+        Ok(ofp) => ofp,
+        Err(SimBriefDirectError::NoIdentifier) => {
+            return Err(UiError::new("no_simbrief_settings", "kein SimBrief-Identifier"));
+        }
+        Err(SimBriefDirectError::UserNotFound) => {
+            return Err(UiError::new(
+                "simbrief_user_not_found",
+                "SimBrief-User nicht gefunden",
+            ));
+        }
+        Err(SimBriefDirectError::Unavailable | SimBriefDirectError::Network) => {
+            return Err(UiError::new(
+                "simbrief_direct_failed",
+                "SimBrief.com nicht erreichbar",
+            ));
+        }
+        Err(SimBriefDirectError::ParseFailed) => {
+            return Err(UiError::new(
+                "simbrief_direct_failed",
+                "SimBrief-OFP konnte nicht geparst werden",
+            ));
+        }
+    };
+
+    // Match-Verify v0.7.9: DEP+ARR hard, Callsign soft.
+    let dpt_ok = ofp
+        .ofp_origin_icao
+        .trim()
+        .eq_ignore_ascii_case(active_dpt.trim());
+    let arr_ok = ofp
+        .ofp_destination_icao
+        .trim()
+        .eq_ignore_ascii_case(active_arr.trim());
+
+    if !dpt_ok || !arr_ok {
+        let candidates = build_candidate_callsigns(
+            &active_airline_icao,
+            &active_flight_number,
+            active_bid_callsign.as_deref(),
+            pilot_callsign.as_deref(),
+        );
+        let active_callsigns_display = if candidates.is_empty() {
+            format!("{}{}", active_airline_icao, active_flight_number)
+        } else {
+            candidates.join(" / ")
+        };
+        let details = serde_json::json!({
+            "active_callsigns": active_callsigns_display,
+            "active_dpt": active_dpt,
+            "active_arr": active_arr,
+            "sb_callsign": ofp.ofp_flight_number,
+            "sb_origin": ofp.ofp_origin_icao,
+            "sb_dest": ofp.ofp_destination_icao,
+        });
+        return Err(UiError::new(
+            "ofp_does_not_match_active_flight",
+            details.to_string(),
+        ));
+    }
+
+    let callsign_ok = ofp_matches_active_flight(
+        &ofp.ofp_origin_icao,
+        &ofp.ofp_destination_icao,
+        &ofp.ofp_flight_number,
+        &active_dpt,
+        &active_arr,
+        &active_airline_icao,
+        &active_flight_number,
+        active_bid_callsign.as_deref(),
+        pilot_callsign.as_deref(),
+    );
+
+    let callsign_warning = if callsign_ok {
+        None
+    } else {
+        let candidates = build_candidate_callsigns(
+            &active_airline_icao,
+            &active_flight_number,
+            active_bid_callsign.as_deref(),
+            pilot_callsign.as_deref(),
+        );
+        let active_callsigns_display = if candidates.is_empty() {
+            format!("{}{}", active_airline_icao, active_flight_number)
+        } else {
+            candidates.join(" / ")
+        };
+        Some(CallsignWarningDetails {
+            sb_callsign: ofp.ofp_flight_number.clone(),
+            active_callsigns: active_callsigns_display,
+        })
+    };
+
+    Ok(BidSimBriefPreview {
+        request_id: ofp.request_id.clone(),
+        planned_block_fuel_kg: ofp.planned_block_fuel_kg,
+        planned_burn_kg: ofp.planned_burn_kg,
+        planned_reserve_kg: ofp.planned_reserve_kg,
+        planned_zfw_kg: ofp.planned_zfw_kg,
+        planned_tow_kg: ofp.planned_tow_kg,
+        planned_ldw_kg: ofp.planned_ldw_kg,
+        alternate: ofp.alternate.clone(),
+        ofp_flight_number: ofp.ofp_flight_number.clone(),
+        ofp_origin_icao: ofp.ofp_origin_icao.clone(),
+        ofp_destination_icao: ofp.ofp_destination_icao.clone(),
+        callsign_warning,
+    })
+}
+
+/// v0.7.10: Pre-Flight-SimBrief-Preview-Response. Schlankes DTO statt
+/// `SimBriefRefreshResult` — wir haben keinen `previous_ofp_id` zum Vergleich
+/// (= Pre-Flight, kein State).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BidSimBriefPreview {
+    pub request_id: String,
+    pub planned_block_fuel_kg: f32,
+    pub planned_burn_kg: f32,
+    pub planned_reserve_kg: f32,
+    pub planned_zfw_kg: f32,
+    pub planned_tow_kg: f32,
+    pub planned_ldw_kg: f32,
+    pub alternate: Option<String>,
+    pub ofp_flight_number: String,
+    pub ofp_origin_icao: String,
+    pub ofp_destination_icao: String,
+    /// Wenn DEP+ARR matchen aber Callsign abweicht (v0.7.9 Soft-Warning).
+    pub callsign_warning: Option<CallsignWarningDetails>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallsignWarningDetails {
+    pub sb_callsign: String,
+    pub active_callsigns: String,
+}
+
+fn has_simbrief_identifier(s: &SimBriefSettings) -> bool {
+    s.user_id.as_deref().is_some_and(|v| !v.trim().is_empty())
+        || s.username.as_deref().is_some_and(|v| !v.trim().is_empty())
+}
+
 /// Fallback: wenn der Bid keinen SimBrief-Link mehr hat, error.
 #[tauri::command]
 async fn flight_refresh_simbrief(
@@ -17832,6 +18042,7 @@ pub fn run() {
             phpvms_get_bids,
             fetch_simbrief_preview,
             flight_refresh_simbrief,
+            bid_simbrief_preview,
             ofp_callsign_warning_get,
             ofp_callsign_warning_dismiss,
             flight_resume_after_disconnect,

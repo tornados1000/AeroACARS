@@ -225,6 +225,27 @@ export function BidsList({
     const id = setTimeout(() => setRefreshNotice(null), 6000);
     return () => clearTimeout(id);
   }, [refreshNotice]);
+
+  // v0.7.10: Pre-Flight SimBrief-Preview-Cache pro Bid. Wird durch
+  // `bid_simbrief_preview` befuellt — uberschreibt die phpVMS-Snapshot-
+  // Werte (Block, ZFW, TOW, LDW) in der Bid-Display-Anzeige.
+  interface BidSimBriefPreview {
+    request_id: string;
+    planned_block_fuel_kg: number;
+    planned_burn_kg: number;
+    planned_reserve_kg: number;
+    planned_zfw_kg: number;
+    planned_tow_kg: number;
+    planned_ldw_kg: number;
+    alternate: string | null;
+    ofp_flight_number: string;
+    ofp_origin_icao: string;
+    ofp_destination_icao: string;
+    callsign_warning: { sb_callsign: string; active_callsigns: string } | null;
+  }
+  const [bidPreviews, setBidPreviews] = useState<Map<number, BidSimBriefPreview>>(
+    new Map(),
+  );
   const [startingId, setStartingId] = useState<number | null>(null);
   const [startError, setStartError] = useState<{
     bidId: number;
@@ -241,9 +262,36 @@ export function BidsList({
     try {
       const bids = await invoke<Bid[]>("phpvms_get_bids");
       setState(bids.length === 0 ? { kind: "empty" } : { kind: "ready", bids });
+      return bids;
     } catch (err: unknown) {
       setState({ kind: "error", error: asUiError(err) });
+      return [];
     }
+  }, []);
+
+  // v0.7.10: holt SimBrief-direct-Preview fuer jeden Bid in der Liste
+  // parallel. Schreibt Ergebnisse in `bidPreviews` damit Display-Werte
+  // die phpVMS-Snapshot-Werte ueberschreiben. Stille Fehler (nur Logging)
+  // — Pre-Flight ist optional, phpVMS-Snapshot bleibt als Fallback.
+  const fetchPreviewsForBids = useCallback(async (bids: Bid[]) => {
+    if (bids.length === 0) {
+      setBidPreviews(new Map());
+      return;
+    }
+    const results = await Promise.allSettled(
+      bids.map((b) =>
+        invoke<BidSimBriefPreview>("bid_simbrief_preview", { bidId: b.id }),
+      ),
+    );
+    const next = new Map<number, BidSimBriefPreview>();
+    results.forEach((r, i) => {
+      if (r.status === "fulfilled") {
+        next.set(bids[i]!.id, r.value);
+      } else {
+        console.log("[bid_simbrief_preview]", bids[i]!.id, "failed:", r.reason);
+      }
+    });
+    setBidPreviews(next);
   }, []);
 
   useEffect(() => {
@@ -253,6 +301,9 @@ export function BidsList({
         const bids = await invoke<Bid[]>("phpvms_get_bids");
         if (cancelled) return;
         setState(bids.length === 0 ? { kind: "empty" } : { kind: "ready", bids });
+        // v0.7.10: nach Initial-Load gleich SimBrief-Previews holen
+        // damit der erste Render schon die frischen Werte zeigt.
+        void fetchPreviewsForBids(bids);
       } catch (err: unknown) {
         if (cancelled) return;
         setState({ kind: "error", error: asUiError(err) });
@@ -261,7 +312,7 @@ export function BidsList({
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [fetchPreviewsForBids]);
 
   // Background-poll bids so a freshly booked flight on phpVMS appears in
   // the list almost immediately — the pilot has the app open precisely
@@ -297,6 +348,8 @@ export function BidsList({
 
     // v0.7.7: Benannte Promises statt Promise<unknown>[]-Array damit
     // TypeScript die Result-Typen behaelt (QS-Hint aus Spec v1.1 §8).
+    // v0.7.10: fetchBids gibt jetzt die Bid-Liste zurueck damit wir
+    // danach SimBrief-direct fuer jeden Bid holen koennen.
     const bidsP = fetchBids();
     const simP = invoke("sim_force_resync").catch(() => {
       // Adapter command failures only happen if the mutex is poisoned
@@ -332,7 +385,7 @@ export function BidsList({
         error: err,
       }));
 
-    const [, , freshProfile, refreshOutcome] = await Promise.all([
+    const [freshBids, , freshProfile, refreshOutcome] = await Promise.all([
       bidsP,
       simP,
       profileP,
@@ -342,6 +395,10 @@ export function BidsList({
     if (freshProfile && onProfileRefreshed) {
       onProfileRefreshed(freshProfile);
     }
+
+    // v0.7.10: pro Bid SimBrief-direct preview holen damit Display-Werte
+    // vom frischen OFP kommen statt vom phpVMS-Snapshot.
+    void fetchPreviewsForBids(freshBids);
 
     // v0.7.9 QS-Round-2: Notice-Logik defensiv — IMMER ein Banner zeigen,
     // egal was passiert. Vorher gab es Pfade die `null` zurueckgaben
@@ -795,7 +852,7 @@ export function BidsList({
                       Buttons, damit der Pilot den Plan sieht bevor er auf
                       "Flug starten" klickt. Bei GSG kann der Pilot eh nur
                       einen Flug buchen, also immer sichtbar. */}
-                  <BidDetails flight={f} />
+                  <BidDetails flight={f} bidId={bid.id} preview={bidPreviews.get(bid.id) ?? null} />
                   {isSelected && null}
 
                   {/* Action-Zeile am Ende — Flug starten / OFP / Flugseite.
@@ -928,7 +985,30 @@ export function BidsList({
  *   Blocking — Pilot sieht erstmal die Route, der Plan-Block flutscht
  *   in 1-2s nach.
  */
-function BidDetails({ flight }: { flight: Flight }) {
+interface BidSimBriefPreviewProp {
+  request_id: string;
+  planned_block_fuel_kg: number;
+  planned_burn_kg: number;
+  planned_reserve_kg: number;
+  planned_zfw_kg: number;
+  planned_tow_kg: number;
+  planned_ldw_kg: number;
+  alternate: string | null;
+  ofp_flight_number: string;
+  ofp_origin_icao: string;
+  ofp_destination_icao: string;
+  callsign_warning: { sb_callsign: string; active_callsigns: string } | null;
+}
+
+function BidDetails({
+  flight,
+  bidId: _bidId,
+  preview,
+}: {
+  flight: Flight;
+  bidId: number;
+  preview: BidSimBriefPreviewProp | null;
+}) {
   const { t } = useTranslation();
   const [plan, setPlan] = useState<SimBriefOfp | null>(null);
   const [planError, setPlanError] = useState<string | null>(null);
@@ -940,7 +1020,41 @@ function BidDetails({ flight }: { flight: Flight }) {
   const [aircraft, setAircraft] = useState<AircraftInfo | null>(null);
 
   // OFP-Vorschau bei Bid-Selection holen. Nur einmal pro Render-Lifetime.
+  // v0.7.10: `preview` (SimBrief-direct via bid_simbrief_preview Parent-Call)
+  // hat Prioritaet — das sind die FRISCHEN Werte von simbrief.com. Der
+  // `fetch_simbrief_preview` Pfad (via phpVMS-Bid-Pointer) bleibt als
+  // Fallback wenn SimBrief-Settings fehlen oder direct-fetch failed.
   useEffect(() => {
+    // Wenn Preview-Werte aus SimBrief-direct da sind, baue daraus ein
+    // SimBriefOfp-kompatibles Objekt und nutze das. Kein phpVMS-Pointer-Call
+    // noetig.
+    if (preview) {
+      setPlan({
+        planned_block_fuel_kg: preview.planned_block_fuel_kg,
+        planned_burn_kg: preview.planned_burn_kg,
+        planned_reserve_kg: preview.planned_reserve_kg,
+        planned_zfw_kg: preview.planned_zfw_kg,
+        planned_tow_kg: preview.planned_tow_kg,
+        planned_ldw_kg: preview.planned_ldw_kg,
+        alternate: preview.alternate ?? undefined,
+        ofp_flight_number: preview.ofp_flight_number,
+        ofp_origin_icao: preview.ofp_origin_icao,
+        ofp_destination_icao: preview.ofp_destination_icao,
+        // Felder die SimBrief-direct nicht hat — auf Defaults
+        route: undefined,
+        waypoints: [],
+        max_zfw_kg: 0,
+        max_tow_kg: 0,
+        max_ldw_kg: 0,
+        request_id: preview.request_id,
+        // weitere OFP-Felder die nicht im Preview sind
+      } as unknown as SimBriefOfp);
+      setPlanLoading(false);
+      setPlanError(null);
+      return;
+    }
+
+    // Fallback v0.7.7-Pfad: phpVMS-Bid-Pointer
     const ofpId = flight.simbrief?.id;
     if (!ofpId) return;
     setPlanLoading(true);
@@ -956,7 +1070,7 @@ function BidDetails({ flight }: { flight: Flight }) {
         setPlanError(err.message ?? "Fehler");
       })
       .finally(() => setPlanLoading(false));
-  }, [flight.simbrief?.id, t]);
+  }, [flight.simbrief?.id, t, preview]);
 
   // Aircraft-Reg holen wenn verfügbar. Fail silent (Pilot sieht halt nur
   // Subfleet-Name ohne Reg, kein Spam).
