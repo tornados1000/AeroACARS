@@ -4650,15 +4650,32 @@ async fn flight_refresh_simbrief(
             DirectOutcome::Mismatch { simbrief_origin, simbrief_dest, simbrief_callsign } => {
                 // v0.7.8 HARD-Block bei Mismatch (Spec v1.1 P1-2).
                 // v1.5.1: strukturierte Details als JSON im message-Feld
-                // damit Frontend einen reichen i18n-Notice rendern kann
-                // (aktiver Flug + SimBrief-Werte gegenuebergestellt).
-                let active_callsign_display = if active_airline_icao.is_empty() {
-                    active_flight_number.clone()
+                // damit Frontend einen reichen i18n-Notice rendern kann.
+                // v1.5.2 (Thomas-QS P2): active_callsigns als komplette
+                // Kandidatenliste joined mit " / " — Pilot sieht ALLE
+                // valid-Formen (z.B. "CFG1504 / CFG4TK / 4TK") statt
+                // nur airline+flight_number. Wenn er ein Pilot-Callsign
+                // konfiguriert hat, weiss er sofort dass das auch
+                // akzeptiert worden waere.
+                let candidates = build_candidate_callsigns(
+                    &active_airline_icao,
+                    &active_flight_number,
+                    active_bid_callsign.as_deref(),
+                    active_pilot_callsign.as_deref(),
+                );
+                let active_callsigns_display = if candidates.is_empty() {
+                    // Sehr defensiver Fallback — sollte praktisch nicht
+                    // passieren weil airline+flight_number immer da sind.
+                    if active_airline_icao.is_empty() {
+                        active_flight_number.clone()
+                    } else {
+                        format!("{}{}", active_airline_icao, active_flight_number)
+                    }
                 } else {
-                    format!("{}{}", active_airline_icao, active_flight_number)
+                    candidates.join(" / ")
                 };
                 let details = serde_json::json!({
-                    "active_callsign": active_callsign_display,
+                    "active_callsigns": active_callsigns_display,
                     "active_dpt": active_dpt,
                     "active_arr": active_arr,
                     "sb_callsign": simbrief_callsign,

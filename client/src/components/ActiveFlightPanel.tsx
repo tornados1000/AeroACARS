@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useTranslation } from "react-i18next";
 import type { ActiveFlightInfo, SimSnapshot } from "../types";
+import { formatRefreshError } from "../lib/refreshErrorFormatter";
 import { useConfirm } from "./ConfirmDialog";
 import { InfoStrip } from "./InfoStrip";
 import { LiveTapes } from "./LiveTapes";
@@ -144,11 +145,14 @@ export function ActiveFlightPanel({ info, simSnapshot, onEnded }: Props) {
       await invoke("flight_refresh_simbrief");
       setRefreshMsg(t("active_flight.refresh_ofp_done"));
     } catch (err: unknown) {
-      const msg =
-        typeof err === "object" && err !== null && "message" in err
-          ? String((err as { message: string }).message)
-          : String(err);
-      setError(msg);
+      // v0.7.8 v1.5.2: shared Helper formattiert Mismatch-JSON +
+      // bekannte Error-Codes in lesbare Notices (Spec §8). Verhindert
+      // dass Pilot rohes JSON aus dem Mismatch-message-Feld sieht.
+      const formatted = formatRefreshError(
+        err as { code?: string; message?: string } | null,
+        t,
+      );
+      setError(formatted?.text ?? String(err));
     } finally {
       setBusy(null);
     }

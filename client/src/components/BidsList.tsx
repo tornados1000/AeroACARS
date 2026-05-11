@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useTranslation } from "react-i18next";
+import { formatRefreshError } from "../lib/refreshErrorFormatter";
 import type {
   ActiveFlightInfo,
   AircraftInfo,
@@ -180,64 +181,20 @@ function airlineMonogram(flight: Flight): string {
   );
 }
 
-// v0.7.7: Pure helper damit der i18n-Key-Wahl gegen Tests + ohne React-
-// Renderer separat verifizierbar ist. Spec §8 Notice-Tabelle.
-// v0.7.8: erweitert um SimBrief-direct-Outcomes (Spec §8 Notice-Tabelle v1.4).
-// v1.5.1: Mismatch-Notice traegt jetzt strukturierte Params fuer reiche
-//   Pilot-Info (aktiver Flug gegen SimBrief-OFP).
-export function refreshNoticeKey(
+// v0.7.7 → v1.5.2 refactor: Error-Notice-Mapping wurde in den shared
+// Helper `formatRefreshError` ausgelagert (lib/refreshErrorFormatter.ts).
+// Das hier bleibt fuer den Success-Pfad (changed=false → "OFP unchanged"-
+// Notice). Verhindert duplizierte JSON-Parse-Logik in 3 Komponenten.
+//
+// Spec docs/spec/ofp-refresh-simbrief-direct-v0.7.8.md §8 Notice-Tabelle.
+export function refreshSuccessNotice(
   result: SimBriefRefreshResult | null,
-  error: { code?: string; message?: string } | null,
-): { key: string; tone: "info" | "warn"; params?: Record<string, string> } | null {
-  // v0.7.8 Outcomes — Direct-Pfad
-  if (error?.code === "ofp_does_not_match_active_flight") {
-    // v1.5.1: Backend kodiert active_callsign/dpt/arr + sb_callsign/origin/dest
-    // als JSON im error.message. Parse fuer reichen Notice-Text.
-    let params: Record<string, string> = {
-      active_callsign: "—",
-      active_dpt: "—",
-      active_arr: "—",
-      sb_callsign: "—",
-      sb_origin: "—",
-      sb_dest: "—",
-    };
-    if (error.message) {
-      try {
-        const parsed = JSON.parse(error.message) as Record<string, unknown>;
-        for (const k of Object.keys(params)) {
-          const v = parsed[k];
-          if (typeof v === "string" && v.length > 0) params[k] = v;
-        }
-      } catch {
-        // JSON-Parse-Fehler → Defaults (—) bleiben. Pilot sieht
-        // unspezifischen Notice, kein Crash.
-      }
-    }
-    return {
-      key: "bids.ofp_does_not_match_active_flight",
-      tone: "warn",
-      params,
-    };
-  }
-  if (error?.code === "simbrief_user_not_found") {
-    return { key: "bids.simbrief_user_not_found", tone: "warn" };
-  }
-  if (error?.code === "simbrief_unavailable_and_bid_gone") {
-    return { key: "bids.simbrief_unavailable_and_bid_gone", tone: "warn" };
-  }
-  if (error?.code === "simbrief_direct_failed") {
-    return { key: "bids.simbrief_direct_failed", tone: "warn" };
-  }
-  // v0.7.7 Outcomes — Pointer-Pfad
-  if (error?.code === "bid_not_found") {
-    return { key: "bids.ofp_bid_gone", tone: "warn" };
-  }
+): { key: string; tone: "info" | "warn" } | null {
   if (result && !result.changed) {
     return { key: "bids.ofp_unchanged", tone: "info" };
   }
-  // changed=true und andere Errors (phase_locked, no_simbrief_link,
-  // ofp_fetch_failed, ofp_unusable) → kein Notice. Activity-Log
-  // im Backend zeigt die Erfolgs- bzw Detail-Story.
+  // changed=true → kein Notice (Erfolg ist still, Cockpit + Loadsheet
+  // zeigen die neuen Werte sofort).
   return null;
 }
 
@@ -255,17 +212,13 @@ export function BidsList({
   const [state, setState] = useState<State>({ kind: "loading" });
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [refreshing, setRefreshing] = useState(false);
-  // v0.7.7: kleiner Notice-Pill im Bid-Tab-Header nach Refresh.
-  // 3 Outcomes (siehe Spec §8): bid_not_found (warn), ofp_unchanged
-  // (info), changed (keine Notice — Erfolg ist still). Auto-clear nach 6s.
-  // v1.5.1: params fuer reiche Notices (Mismatch-Werte etc.).
+  // v0.7.7 → v1.5.2: Notice-Pill im Bid-Tab-Header nach Refresh.
+  // Vereinfacht auf {text, tone} weil der shared formatRefreshError-Helper
+  // bereits den fertig formatierten lokalisierten Text liefert. Success-
+  // Pfad (changed=false) bekommt seinen Text inline via t() in handleRefresh.
+  // Auto-clear nach 6s.
   const [refreshNotice, setRefreshNotice] = useState<
-    {
-      textKey: string;
-      ofpId?: string;
-      tone: "info" | "warn";
-      params?: Record<string, string>;
-    } | null
+    { text: string; tone: "info" | "warn" | "err" } | null
   >(null);
   useEffect(() => {
     if (!refreshNotice) return;
@@ -386,17 +339,25 @@ export function BidsList({
       onProfileRefreshed(freshProfile);
     }
 
-    // v0.7.7: Notice je nach Outcome (Spec §8 Notice-Tabelle).
-    // v1.5.1: notice.params traegt strukturierte Felder (z.B. Mismatch-
-    // Werte) die i18n-Templates befuellen.
-    const notice = refreshNoticeKey(refreshOutcome.result, refreshOutcome.error);
-    if (notice) {
-      setRefreshNotice({
-        textKey: notice.key,
-        ofpId: refreshOutcome.result?.current_ofp_id,
-        tone: notice.tone,
-        params: notice.params,
-      });
+    // v1.5.2: Notice-Logik vereinfacht — Error-Pfad geht durch den
+    // shared formatRefreshError-Helper (= identischer Output wie in
+    // Cockpit + Loadsheet). Success-Pfad mit changed=false rendert
+    // den ofp_unchanged-Notice inline.
+    if (refreshOutcome.error) {
+      const formatted = formatRefreshError(refreshOutcome.error, t);
+      if (formatted) {
+        setRefreshNotice({ text: formatted.text, tone: formatted.tone });
+      }
+    } else {
+      const success = refreshSuccessNotice(refreshOutcome.result);
+      if (success) {
+        setRefreshNotice({
+          text: t(success.key, {
+            id: refreshOutcome.result?.current_ofp_id ?? "",
+          }),
+          tone: success.tone,
+        });
+      }
     }
 
     // v0.7.7 §6.5b: Bei `changed=true` Parent direkt benachrichtigen
@@ -534,10 +495,10 @@ export function BidsList({
         </button>
       </header>
 
-      {/* v0.7.7: Notice nach Bid-Tab-Refresh wenn OFP-Refresh-Outcome
-          das verlangt (Spec §8 Notice-Tabelle). 3 Outcomes:
-          bid_not_found (warn), ofp_unchanged (info), changed (kein
-          Notice). Auto-clear nach 6s. */}
+      {/* v0.7.7 → v1.5.2: Notice nach Bid-Tab-Refresh. Text wird vom
+          formatRefreshError-Helper geliefert (Error-Pfad) ODER vom
+          inline-Render in handleRefresh (Success-Pfad mit changed=false).
+          Auto-clear nach 6s. */}
       {refreshNotice && (
         <div
           role="status"
@@ -547,22 +508,32 @@ export function BidsList({
             marginBottom: 10,
             borderRadius: 6,
             background:
-              refreshNotice.tone === "warn" ? "#3f2b0e" : "#1e3a5f",
+              refreshNotice.tone === "warn"
+                ? "#3f2b0e"
+                : refreshNotice.tone === "err"
+                  ? "#3f0e0e"
+                  : "#1e3a5f",
             border:
               refreshNotice.tone === "warn"
                 ? "1px solid #b8842a"
-                : "1px solid #3b82f6",
-            color: refreshNotice.tone === "warn" ? "#f5d68b" : "#cfe3ff",
+                : refreshNotice.tone === "err"
+                  ? "1px solid #c53030"
+                  : "1px solid #3b82f6",
+            color:
+              refreshNotice.tone === "warn"
+                ? "#f5d68b"
+                : refreshNotice.tone === "err"
+                  ? "#fca5a5"
+                  : "#cfe3ff",
             fontSize: "0.85rem",
           }}
         >
-          {refreshNotice.tone === "warn" ? "⚠ " : "ℹ︎ "}
-          {t(refreshNotice.textKey, {
-            id: refreshNotice.ofpId ?? "",
-            // v1.5.1: zusaetzliche Params fuer Mismatch-Notice (active_callsign,
-            // active_dpt, active_arr, sb_callsign, sb_origin, sb_dest).
-            ...(refreshNotice.params ?? {}),
-          })}
+          {refreshNotice.tone === "warn"
+            ? "⚠ "
+            : refreshNotice.tone === "err"
+              ? "✖ "
+              : "ℹ︎ "}
+          {refreshNotice.text}
         </div>
       )}
 

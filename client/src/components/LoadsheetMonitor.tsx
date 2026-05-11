@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import type { ActiveFlightInfo } from "../types";
+import { formatRefreshError } from "../lib/refreshErrorFormatter";
 
 interface Props {
   info: ActiveFlightInfo;
@@ -111,11 +112,14 @@ export function LoadsheetMonitor({ info }: Props) {
       // nicht für immer "frisch" suggeriert.
       setTimeout(() => setRefreshDone(false), 4000);
     } catch (err: unknown) {
-      const msg =
-        typeof err === "object" && err !== null && "message" in err
-          ? String((err as { message: string }).message)
-          : String(err);
-      setRefreshErr(msg);
+      // v0.7.8 v1.5.2: shared Helper formattiert Mismatch-JSON +
+      // bekannte Error-Codes in lesbare Notices. Verhindert rohes
+      // JSON im Inline-Refresh-Error-Display.
+      const formatted = formatRefreshError(
+        err as { code?: string; message?: string } | null,
+        t,
+      );
+      setRefreshErr(formatted?.text ?? String(err));
     } finally {
       setRefreshing(false);
     }
