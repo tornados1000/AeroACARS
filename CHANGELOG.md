@@ -4,6 +4,33 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.7.12] — 2026-05-12
+
+🐛 **Bid-Card: Pax + Cargo erscheinen wieder — auch ohne phpVMS-Bid-Pointer.**
+
+### Hintergrund
+
+Direkt nach v0.7.11-Release gemeldet: bei CFG2228 (Condor-Bid) war zwischen
+der Aircraft-Zeile und dem SimBrief-Plan-Block ein leerer Bereich — die
+Pax/Cargo-Chips fehlten komplett. Ursache: v0.7.10 Pre-Flight-SimBrief-direct
+holt OFP direkt von simbrief.com ohne die phpVMS-Bid-Pointer-Subfleet-Fares
+zu fuellen. Wenn die Bid noch keinen OFP via phpVMS gebunden hat (oder
+phpVMS bei diesem Subfleet keine fare-entries hat), waren `paxCount` und
+`cargoKg` 0 → Chips ausgeblendet.
+
+### Fix
+
+- `api-client/lib.rs` SimBrief-XML-Parser: extrahiert jetzt `<weights><pax_count>`
+  + `<weights><pax_count_actual>` (Fallback) + `<weights><cargo>` (kg).
+- `SimBriefOfp` struct: neue Felder `pax_count: i32` + `cargo_kg: f32`.
+- `BidSimBriefPreview` (Tauri-Response): gleichen Felder ergaenzt.
+- `bid_simbrief_preview` Command: populiert die Werte aus dem geparsten OFP.
+- `BidsList.tsx` BidDetails: `paxCount`/`cargoKg` bevorzugen jetzt
+  Preview-Werte (> 0) vor den Bid-Subfleet-Fares. Fallback bleibt damit
+  identisch zum v0.3.0-Verhalten fuer Pilots ohne SimBrief-Settings.
+
+---
+
 ## [v0.7.11] — 2026-05-12
 
 🎯 **Eine Sinkrate, eine Wahrheit — Schluss mit dem Werte-Dschungel.**

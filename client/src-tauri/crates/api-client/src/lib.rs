@@ -491,6 +491,17 @@ pub struct SimBriefOfp {
     /// Spec docs/spec/ofp-refresh-simbrief-direct-v0.7.8.md §3.
     #[serde(default)]
     pub request_id: String,
+    /// v0.7.12: `<weights><pax_count>` aus dem SimBrief-XML — Anzahl Pax
+    /// im OFP-Plan. Bei Pre-Flight-SimBrief-direct (v0.7.10) zeigt das
+    /// Frontend diesen Wert in der Bid-Card; ohne diesen Wert sah der
+    /// Pilot keine Pax-Info bevor er den OFP ueber phpVMS gebunden hat.
+    /// 0 wenn der Tag fehlt oder cargo-only.
+    #[serde(default)]
+    pub pax_count: i32,
+    /// v0.7.12: Cargo-Last in kg. SimBrief liefert das in `<weights><cargo>`
+    /// (default lbs, mit `units_set=kgs`-Toggle: kg). 0.0 wenn Tag fehlt.
+    #[serde(default)]
+    pub cargo_kg: f32,
 }
 
 /// Single navlog fix from a SimBrief OFP. `kind` carries the SimBrief
@@ -1649,6 +1660,26 @@ fn parse_simbrief_ofp(xml: &str) -> Option<SimBriefOfp> {
         .filter(|s| !s.is_empty());
     let waypoints = extract_navlog_fixes(xml);
 
+    // v0.7.12: Pax + Cargo aus <weights>. SimBrief liefert pax_count als
+    // Integer + cargo als float (in kg wenn die XML mit units_set=kgs
+    // angefordert wurde — was wir tun). Bei Cargo-Only-Flights ist
+    // pax_count = 0, bei Pax-Only-Flights cargo = 0. Bei Mixed-Loads
+    // beide > 0.
+    let pax_count: i32 = extract_tag(xml, "weights")
+        .and_then(|inner| extract_tag(inner, "pax_count"))
+        .and_then(|s| s.trim().parse().ok())
+        .or_else(|| {
+            extract_tag(xml, "weights")
+                .and_then(|inner| extract_tag(inner, "pax_count_actual"))
+                .and_then(|s| s.trim().parse().ok())
+        })
+        .unwrap_or(0);
+    let cargo_kg: f32 = extract_tag(xml, "weights")
+        .and_then(|inner| extract_tag(inner, "cargo"))
+        .and_then(|s| s.trim().parse().ok())
+        .map(to_kg)
+        .unwrap_or(0.0);
+
     Some(SimBriefOfp {
         planned_block_fuel_kg: plan_ramp,
         planned_burn_kg: est_burn,
@@ -1667,6 +1698,8 @@ fn parse_simbrief_ofp(xml: &str) -> Option<SimBriefOfp> {
         ofp_destination_icao,
         ofp_generated_at,
         request_id,
+        pax_count,
+        cargo_kg,
     })
 }
 

@@ -121,6 +121,10 @@ export interface SimBriefOfp {
   ofp_destination_icao: string;
   /** Wann der OFP erstellt wurde (Unix-Timestamp als String). */
   ofp_generated_at: string;
+  /** v0.7.12: Pax + Cargo aus dem SimBrief-XML — damit die Bid-Card auch
+   *  ohne phpVMS-Bid-Pointer-Subfleet-Fares die Pax/Cargo-Chips zeigt. */
+  pax_count?: number;
+  cargo_kg?: number;
 }
 
 export interface Flight {

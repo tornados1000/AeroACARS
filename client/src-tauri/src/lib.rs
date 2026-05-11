@@ -4780,6 +4780,8 @@ async fn bid_simbrief_preview(
         ofp_flight_number: ofp.ofp_flight_number.clone(),
         ofp_origin_icao: ofp.ofp_origin_icao.clone(),
         ofp_destination_icao: ofp.ofp_destination_icao.clone(),
+        pax_count: ofp.pax_count,
+        cargo_kg: ofp.cargo_kg,
         callsign_warning,
     })
 }
@@ -4800,6 +4802,11 @@ pub struct BidSimBriefPreview {
     pub ofp_flight_number: String,
     pub ofp_origin_icao: String,
     pub ofp_destination_icao: String,
+    /// v0.7.12: Pax + Cargo aus dem SimBrief-OFP. Damit die Bid-Card
+    /// auch ohne phpVMS-Bid-Pointer-Cache die Pax/Cargo-Chips anzeigt
+    /// (siehe BidsList.tsx `paxCount`/`cargoKg`).
+    pub pax_count: i32,
+    pub cargo_kg: f32,
     /// Wenn DEP+ARR matchen aber Callsign abweicht (v0.7.9 Soft-Warning).
     pub callsign_warning: Option<CallsignWarningDetails>,
 }

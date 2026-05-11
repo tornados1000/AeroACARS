@@ -241,6 +241,10 @@ export function BidsList({
     ofp_flight_number: string;
     ofp_origin_icao: string;
     ofp_destination_icao: string;
+    // v0.7.12: Pax/Cargo aus dem SimBrief-OFP-XML — die Bid-Card zeigt diese
+    // statt der phpVMS-Bid-Pointer-Subfleet-Fares wenn Preview da ist.
+    pax_count: number;
+    cargo_kg: number;
     callsign_warning: { sb_callsign: string; active_callsigns: string } | null;
   }
   const [bidPreviews, setBidPreviews] = useState<Map<number, BidSimBriefPreview>>(
@@ -1029,6 +1033,8 @@ interface BidSimBriefPreviewProp {
   ofp_flight_number: string;
   ofp_origin_icao: string;
   ofp_destination_icao: string;
+  pax_count: number;
+  cargo_kg: number;
   callsign_warning: { sb_callsign: string; active_callsigns: string } | null;
 }
 
@@ -1079,7 +1085,10 @@ function BidDetails({
         max_tow_kg: 0,
         max_ldw_kg: 0,
         request_id: preview.request_id,
-        // weitere OFP-Felder die nicht im Preview sind
+        // v0.7.12: Pax/Cargo aus dem OFP-XML — fuer die Bid-Card-Chips
+        // wenn die phpVMS-Bid-Pointer-Subfleet-Fares leer sind.
+        pax_count: preview.pax_count,
+        cargo_kg: preview.cargo_kg,
       } as unknown as SimBriefOfp);
       setPlanLoading(false);
       setPlanError(null);
@@ -1114,14 +1123,23 @@ function BidDetails({
       .catch(() => setAircraft(null));
   }, [flight.simbrief?.aircraft_id]);
 
-  // Pax + Cargo aus den Fares zusammenrechnen.
+  // Pax + Cargo zusammenrechnen.
+  // v0.7.12 (Bug-Fix): Bei aktivem Pre-Flight-Preview (v0.7.10) sind die
+  // phpVMS-Bid-Pointer-Subfleet-Fares oft leer (Pilot hat noch keinen
+  // OFP ueber phpVMS gebunden, sondern wir holen direkt von simbrief.com).
+  // Dann zog die Bid-Card vorher 0 Pax / 0 Cargo aus den Fares und blendete
+  // die Chips komplett aus — Pilot sah dann zwischen Aircraft-Zeile und
+  // SimBrief-Plan-Block einen leeren Bereich. Fix: Preview-Werte
+  // bevorzugen wenn da, sonst Fallback auf Bid-Subfleet-Fares.
   const fares = flight.simbrief?.subfleet?.fares ?? [];
-  const paxCount = fares
+  const faresPax = fares
     .filter((f) => (f.type ?? 0) === 0)
     .reduce((sum, f) => sum + (f.count ?? 0), 0);
-  const cargoKg = fares
+  const faresCargoKg = fares
     .filter((f) => (f.type ?? 0) === 1)
     .reduce((sum, f) => sum + (f.count ?? 0), 0);
+  const paxCount = preview && preview.pax_count > 0 ? preview.pax_count : faresPax;
+  const cargoKg = preview && preview.cargo_kg > 0 ? preview.cargo_kg : faresCargoKg;
 
   const aircraftType = flight.simbrief?.subfleet?.type_;
   const aircraftName = flight.simbrief?.subfleet?.name;
