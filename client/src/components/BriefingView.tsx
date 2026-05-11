@@ -21,6 +21,11 @@ interface Props {
   /** Called when BidsList' refresh handler returns a fresh profile so
    *  App.tsx can update the cached session + the PilotHeader rerenders. */
   onProfileRefreshed?: (profile: Profile) => void;
+  /** v0.7.7: Called when Bid-Tab-Refresh successfully refreshed the
+   *  active flight's OFP (`changed=true`). Parent triggert dann eine
+   *  `flight_status`-Re-Fetch damit Cockpit + Loadsheet sofort den
+   *  neuen Plan sehen. Spec docs/spec/ofp-refresh-during-boarding.md §6.5b. */
+  onActiveFlightUpdated?: () => void;
 }
 
 /**
@@ -38,6 +43,7 @@ export function BriefingView({
   simState,
   simSnapshot,
   onProfileRefreshed,
+  onActiveFlightUpdated,
 }: Props) {
   const { t } = useTranslation();
   const [, setSelectedBid] = useState<Bid | null>(null);
@@ -64,6 +70,7 @@ export function BriefingView({
         onSelect={setSelectedBid}
         onFlightStarted={setActiveFlight}
         onProfileRefreshed={onProfileRefreshed}
+        onActiveFlightUpdated={onActiveFlightUpdated}
       />
     </>
   );

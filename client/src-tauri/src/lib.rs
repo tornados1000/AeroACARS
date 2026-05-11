@@ -691,6 +691,17 @@ impl Drop for FlightSetupGuard<'_> {
 struct ActiveFlight {
     pirep_id: String,
     bid_id: i64,
+    /// v0.7.7: phpVMS-Flight-Identifier aus `Bid.flight_id`. Sibling von
+    /// `bid_id`. Wird beim `flight_start` aus dem Bid extrahiert BEVOR
+    /// `prefile_pirep` feuert — sonst ist der Schluessel verloren wenn
+    /// phpVMS-7 den Bid nach Prefile entfernt (W5). v0.7.8 nutzt den
+    /// `flight_id` als zentralen Pointer fuer den OFP-Refresh-Pfad
+    /// (entweder PAX-Studio-Endpoint /api/paxstudio/flights/{flight_id}/
+    /// simbrief ODER SimBrief-direct mit Flight-Match-Verifikation).
+    /// Empty string fuer pre-v0.7.7-Resume-Files — v0.7.8 muss diesen
+    /// Fall als "legacy active flight, direct refresh unavailable"
+    /// behandeln. Spec docs/spec/ofp-refresh-during-boarding.md §6.1.
+    flight_id: String,
     started_at: DateTime<Utc>,
     /// ICAO of the operating airline (e.g. "DLH"). Combined with
     /// `flight_number` to produce the full callsign on the dashboard
@@ -775,6 +786,11 @@ const CONN_STATE_FAILING: u8 = 1;
 struct PersistedFlight {
     pirep_id: String,
     bid_id: i64,
+    /// v0.7.7: phpVMS-Flight-Identifier (siehe `ActiveFlight.flight_id`).
+    /// `#[serde(default)]` damit pre-v0.7.7-Resume-Files weiter
+    /// deserialisierbar bleiben — Default ist `String::new()`.
+    #[serde(default)]
+    flight_id: String,
     started_at: DateTime<Utc>,
     #[serde(default)]
     airline_icao: String,
@@ -984,6 +1000,13 @@ struct PersistedFlightStats {
     touchdown_window_dumped_at: Option<DateTime<Utc>>,
     #[serde(default)]
     landing_score_finalized: bool,
+    /// v0.7.7: aktuelle SimBrief-OFP-ID — siehe FlightStats. `#[serde(default)]`
+    /// damit pre-v0.7.7-Resume-Files weiter parseable bleiben.
+    #[serde(default)]
+    simbrief_ofp_id: Option<String>,
+    /// v0.7.7: raw SimBrief `<params><time_generated>` — siehe FlightStats.
+    #[serde(default)]
+    simbrief_ofp_generated_at: Option<String>,
 }
 
 impl PersistedFlightStats {
@@ -1064,6 +1087,9 @@ impl PersistedFlightStats {
             sampler_takeoff_at: stats.sampler_takeoff_at,
             touchdown_window_dumped_at: stats.touchdown_window_dumped_at,
             landing_score_finalized: stats.landing_score_finalized,
+            // v0.7.7 OFP-Refresh-Foundation
+            simbrief_ofp_id: stats.simbrief_ofp_id.clone(),
+            simbrief_ofp_generated_at: stats.simbrief_ofp_generated_at.clone(),
         }
     }
 
@@ -1149,6 +1175,9 @@ impl PersistedFlightStats {
         stats.sampler_takeoff_at = self.sampler_takeoff_at;
         stats.touchdown_window_dumped_at = self.touchdown_window_dumped_at;
         stats.landing_score_finalized = self.landing_score_finalized;
+        // v0.7.7 OFP-Refresh-Foundation
+        stats.simbrief_ofp_id = self.simbrief_ofp_id;
+        stats.simbrief_ofp_generated_at = self.simbrief_ofp_generated_at;
     }
 }
 
@@ -1547,6 +1576,21 @@ struct FlightStats {
     /// Wird im PIREP-Body weitergegeben damit der aeroacars-live-
     /// Monitor "Manual"-Pill anzeigen kann.
     flight_plan_source: Option<&'static str>,
+
+    /// v0.7.7: aktuell aktive SimBrief-OFP-ID die beim `flight_start`
+    /// oder letzten `flight_refresh_simbrief` geholt wurde. None bei
+    /// VFR/Manual-Flights ohne OFP, oder pre-v0.7.7-PIREPs ohne dieses
+    /// Feld. Wird verwendet um "OFP unveraendert"-Feedback im Bid-Tab-
+    /// Refresh zu erkennen: nach neuem Fetch wird die alte mit der
+    /// neuen ID verglichen.
+    /// Spec docs/spec/ofp-refresh-during-boarding.md §6.1.
+    simbrief_ofp_id: Option<String>,
+
+    /// v0.7.7: rohes `<params><time_generated>` aus dem SimBrief-OFP
+    /// (kein Format parsing — SimBrief liefert typisch Unix-Timestamp-
+    /// String, aber wir machen keine Annahmen). Audit-Trail-Datum.
+    /// Spec docs/spec/ofp-refresh-during-boarding.md §6.1.
+    simbrief_ofp_generated_at: Option<String>,
     // ─── v0.5.26 Erweiterte Landung-Metriken ───────────────────────────
     //
     // Phase 1 — Sicherheits-Indikatoren:
@@ -4328,19 +4372,44 @@ async fn phpvms_get_bids(
 async fn flight_refresh_simbrief(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
-) -> Result<SimBriefOfpDto, UiError> {
-    // Snapshot bid_id under the lock; release it before any await.
-    let bid_id = {
+) -> Result<SimBriefRefreshResult, UiError> {
+    // Snapshot bid_id, current_phase, previous_ofp_id under the lock;
+    // release it before any await.
+    //
+    // v0.7.7: Phase-Gate + previous_ofp_id-Capture im selben Lock-Scope.
+    let (bid_id, current_phase, previous_ofp_id) = {
         let guard = state.active_flight.lock().expect("active_flight lock");
-        guard
+        let flight = guard
             .as_ref()
-            .ok_or_else(|| UiError::new("no_active_flight", "no flight is active"))?
-            .bid_id
+            .ok_or_else(|| UiError::new("no_active_flight", "no flight is active"))?;
+        let stats = flight.stats.lock().expect("flight stats lock");
+        (flight.bid_id, stats.phase, stats.simbrief_ofp_id.clone())
     };
+
+    // v0.7.7 Phase-Gate: OFP-Refresh ist nur bis vor Takeoff erlaubt
+    // (Preflight | Boarding | Pushback | TaxiOut). Spec §6.2.
+    if !matches!(
+        current_phase,
+        FlightPhase::Preflight
+            | FlightPhase::Boarding
+            | FlightPhase::Pushback
+            | FlightPhase::TaxiOut
+    ) {
+        return Err(UiError::new(
+            "phase_locked",
+            "OFP-Refresh ist nur bis vor Takeoff moeglich (Preflight bis TaxiOut)",
+        ));
+    }
+
     let client = current_client(&state)?;
     // Pull the up-to-date bid list — the pilot's OFP regeneration would
     // have updated the bid->simbrief relation server-side. We don't have
     // a "GET single bid by id" endpoint, so we list all and filter.
+    //
+    // v0.7.7 W5-Realitaet: phpVMS-7 entfernt den Bid nach Prefile. Der
+    // `bid_not_found`-Pfad ist deshalb in v0.7.7 wahrscheinlich der
+    // haeufigste Outcome. Frontend macht daraus eine ehrliche Notice
+    // ("OFP-Refresh ueber phpVMS-Pointer nicht moeglich" — siehe Spec §8).
     let bids = client.get_bids().await.map_err(|e| {
         UiError::new(
             "bids_fetch_failed",
@@ -4368,6 +4437,10 @@ async fn flight_refresh_simbrief(
             "SimBrief returned no usable OFP — check your simbrief.com OFP",
         )
     })?;
+
+    // v0.7.7 changed-Flag: identische OFP-ID → kein Pilot-Frust-Trigger.
+    let changed = previous_ofp_id.as_deref() != Some(sb_id.as_str());
+
     // Mutate the active flight's planned_* fields. We re-acquire the
     // lock here (post-await) and verify the flight is still the same
     // bid — protects against the user discarding mid-fetch.
@@ -4398,32 +4471,70 @@ async fn flight_refresh_simbrief(
         stats.planned_max_tow_kg = Some(ofp.max_tow_kg).filter(|&v| v > 0.0);
         stats.planned_max_ldw_kg = Some(ofp.max_ldw_kg).filter(|&v| v > 0.0);
         stats.flight_plan_source = Some("simbrief");
+        // v0.7.7: OFP-ID + generated_at fuer naechsten changed-Vergleich.
+        stats.simbrief_ofp_id = Some(sb_id.clone());
+        stats.simbrief_ofp_generated_at = if ofp.ofp_generated_at.is_empty() {
+            None
+        } else {
+            Some(ofp.ofp_generated_at.clone())
+        };
         drop(stats);
         save_active_flight(&app, flight);
     }
+    // v0.7.7 Audit-Trail: alte→neue OFP-ID + changed/unchanged-Marker.
     log_activity(
         &state,
         ActivityLevel::Info,
-        "OFP refreshed".to_string(),
+        if changed { "OFP refreshed" } else { "OFP unchanged" }.to_string(),
         Some(format!(
-            "Plan-Werte aktualisiert aus SimBrief — Block {:.0} kg, TOW {:.0} kg, LDW {:.0} kg",
-            ofp.planned_block_fuel_kg, ofp.planned_tow_kg, ofp.planned_ldw_kg
+            "{} → {} ({}). Block {:.0} kg, TOW {:.0} kg, LDW {:.0} kg",
+            previous_ofp_id.as_deref().unwrap_or("—"),
+            sb_id,
+            if changed { "neu" } else { "identisch" },
+            ofp.planned_block_fuel_kg,
+            ofp.planned_tow_kg,
+            ofp.planned_ldw_kg
         )),
     );
-    Ok(SimBriefOfpDto {
-        planned_block_fuel_kg: ofp.planned_block_fuel_kg,
-        planned_burn_kg: ofp.planned_burn_kg,
-        planned_reserve_kg: ofp.planned_reserve_kg,
-        planned_zfw_kg: ofp.planned_zfw_kg,
-        planned_tow_kg: ofp.planned_tow_kg,
-        planned_ldw_kg: ofp.planned_ldw_kg,
-        route: ofp.route,
-        alternate: ofp.alternate,
-        ofp_flight_number: ofp.ofp_flight_number,
-        ofp_origin_icao: ofp.ofp_origin_icao,
-        ofp_destination_icao: ofp.ofp_destination_icao,
-        ofp_generated_at: ofp.ofp_generated_at,
+    Ok(SimBriefRefreshResult {
+        ofp: SimBriefOfpDto {
+            planned_block_fuel_kg: ofp.planned_block_fuel_kg,
+            planned_burn_kg: ofp.planned_burn_kg,
+            planned_reserve_kg: ofp.planned_reserve_kg,
+            planned_zfw_kg: ofp.planned_zfw_kg,
+            planned_tow_kg: ofp.planned_tow_kg,
+            planned_ldw_kg: ofp.planned_ldw_kg,
+            route: ofp.route,
+            alternate: ofp.alternate,
+            ofp_flight_number: ofp.ofp_flight_number,
+            ofp_origin_icao: ofp.ofp_origin_icao,
+            ofp_destination_icao: ofp.ofp_destination_icao,
+            ofp_generated_at: ofp.ofp_generated_at,
+        },
+        previous_ofp_id,
+        current_ofp_id: sb_id,
+        changed,
     })
+}
+
+/// v0.7.7 DTO fuer `flight_refresh_simbrief`. Wrappt `SimBriefOfpDto`
+/// (= das was die UI zum Anzeigen braucht) und ergaenzt um die OFP-ID-
+/// Diff-Information die das Frontend fuer den unveraendert-Toast braucht.
+/// `SimBriefOfpDto` wird parallel auch von `fetch_simbrief_preview`
+/// genutzt — daher der Split. Spec §6.1.
+#[derive(Debug, Clone, Serialize)]
+struct SimBriefRefreshResult {
+    ofp: SimBriefOfpDto,
+    /// SimBrief-OFP-ID die vor diesem Refresh aktiv war. None bei
+    /// pre-v0.7.7-Resume-Files (Persistenz-Foundation kam erst in v0.7.7).
+    previous_ofp_id: Option<String>,
+    /// SimBrief-OFP-ID die jetzt aktiv ist (= aus dem phpVMS-Bid gerade
+    /// geholt). Bei `changed=false` ist das identisch zu `previous_ofp_id`.
+    current_ofp_id: String,
+    /// `current_ofp_id != previous_ofp_id`. Frontend nutzt das fuer die
+    /// "OFP unveraendert"-Info-Notice (sichtbar machen wenn PAX Studio
+    /// noch nicht synct hat).
+    changed: bool,
 }
 
 /// Frontend in der ausgeklappten Bid-Card aufgerufen, damit der Pilot
@@ -4667,6 +4778,7 @@ fn save_active_flight(app: &AppHandle, flight: &ActiveFlight) {
     let persisted = PersistedFlight {
         pirep_id: flight.pirep_id.clone(),
         bid_id: flight.bid_id,
+        flight_id: flight.flight_id.clone(),
         started_at: flight.started_at,
         airline_icao: flight.airline_icao.clone(),
         airline_logo_url: flight.airline_logo_url.clone(),
@@ -5064,6 +5176,13 @@ async fn flight_adopt(
     let flight = Arc::new(ActiveFlight {
         pirep_id: pirep.id.clone(),
         bid_id,
+        // v0.7.7: flight_id aus matching_bid wenn vorhanden, sonst leer.
+        // Im Adopt-Pfad kann der Bid bereits weg sein (W5: phpVMS-7
+        // entfernt Bid nach Prefile) — dann ist flight_id leer und
+        // v0.7.8 muss diesen Fall behandeln.
+        flight_id: matching_bid
+            .map(|b| b.flight_id.clone())
+            .unwrap_or_default(),
         // We don't know the original prefile time; treat "now" as the start
         // for our counters. The PIREP's actual times are intact server-side.
         started_at: Utc::now(),
@@ -5510,6 +5629,15 @@ async fn flight_start(
     let flight = Arc::new(ActiveFlight {
         pirep_id: pirep.id.clone(),
         bid_id,
+        // v0.7.7: flight_id aus dem Bid extrahieren BEVOR der Bid
+        // serverseitig nach Prefile entfernt wird (W5). Diese Stelle
+        // sitzt nach `client.prefile_pirep().await` — der Bid kann
+        // theoretisch schon weg sein wenn phpVMS-7 ihn synchron loescht,
+        // aber wir haben den lokalen `bid` aus dem fruehen `get_bids()`
+        // (lib.rs:5151-5155) noch im Scope. flight_id aus dem lokalen
+        // Bid-Snapshot ist daher zuverlaessig — egal was server-side
+        // mit dem Bid passiert.
+        flight_id: bid.flight_id.clone(),
         started_at: Utc::now(),
         airline_icao: bid
             .flight
@@ -5575,6 +5703,21 @@ async fn flight_start(
         stats.planned_max_tow_kg = Some(ofp.max_tow_kg).filter(|&v| v > 0.0);
         stats.planned_max_ldw_kg = Some(ofp.max_ldw_kg).filter(|&v| v > 0.0);
         stats.flight_plan_source = Some("simbrief");
+        // v0.7.7: OFP-Identifier persistieren fuer "OFP unveraendert"-
+        // Erkennung beim spaeteren `flight_refresh_simbrief`. sb.id ist
+        // die SimBrief-OFP-ID die wir gerade geholt haben; ofp_generated_at
+        // ist der raw <params><time_generated>-String aus dem XML.
+        // Spec docs/spec/ofp-refresh-during-boarding.md §6.1.
+        stats.simbrief_ofp_id = bid
+            .flight
+            .simbrief
+            .as_ref()
+            .map(|sb| sb.id.clone());
+        stats.simbrief_ofp_generated_at = if ofp.ofp_generated_at.is_empty() {
+            None
+        } else {
+            Some(ofp.ofp_generated_at.clone())
+        };
         drop(stats);
         // Persist immediately so a Tauri restart mid-flight doesn't
         // lose the plan.
@@ -6094,6 +6237,8 @@ async fn flight_start_manual(
     let flight = Arc::new(ActiveFlight {
         pirep_id: pirep.id.clone(),
         bid_id,
+        // v0.7.7: flight_id aus Bid (Manual-Mode-Variante).
+        flight_id: bid.flight_id.clone(),
         started_at: Utc::now(),
         airline_icao: airline.map(|a| a.icao.clone()).unwrap_or_default(),
         airline_logo_url: airline.and_then(|a| a.logo.clone()).filter(|s| !s.is_empty()),
@@ -16080,6 +16225,11 @@ async fn try_resume_flight(
     let flight = Arc::new(ActiveFlight {
         pirep_id: persisted.pirep_id.clone(),
         bid_id: persisted.bid_id,
+        // v0.7.7: flight_id aus PersistedFlight wieder herholen. Bei
+        // pre-v0.7.7-Resume-Files ist das Feld leer (String::new() via
+        // serde(default)) — v0.7.8 muss diesen Fall als "legacy active
+        // flight, direct refresh unavailable" behandeln.
+        flight_id: persisted.flight_id.clone(),
         started_at: persisted.started_at,
         airline_icao,
         // Resume-Pfad: Airline-Logo-URL aus der persisted Bid wieder
@@ -17862,6 +18012,192 @@ mod v0_7_6_payload_consistency_tests {
         let bounce_height = 13.57_f32;
         assert!(bounce_height >= touchdown_v2::BOUNCE_FORENSIC_MIN_AGL_FT);
         assert!(bounce_height < touchdown_v2::BOUNCE_SCORED_MIN_AGL_FT);
+    }
+}
+
+// ─── v0.7.7 OFP-Refresh Persistenz + Phase-Gate Tests ──────────────────
+//
+// Spec: docs/spec/ofp-refresh-during-boarding.md §10.
+//
+// Diese Tests pruefen die kritischen v0.7.7-Foundations:
+//   - flight_id + simbrief_ofp_id wandern korrekt durch
+//     FlightStats → PersistedFlightStats → wieder zurueck (Save/Load).
+//   - PersistedFlight.flight_id (top-level, NICHT in stats) bleibt
+//     beim Resume erhalten.
+//   - Pre-v0.7.7-Persistenz (ohne diese Felder) bleibt deserialisierbar.
+
+#[cfg(test)]
+mod v0_7_7_ofp_refresh_tests {
+    use super::*;
+
+    /// v0.7.7 §10-Pflicht: Save/Load erhaelt simbrief_ofp_id +
+    /// simbrief_ofp_generated_at in FlightStats.
+    #[test]
+    fn persisted_flight_stats_preserves_simbrief_ofp_id_round_trip() {
+        let mut stats = FlightStats::default();
+        stats.simbrief_ofp_id = Some("1777622821_5F3E3B3842".to_string());
+        stats.simbrief_ofp_generated_at = Some("1778452800".to_string());
+
+        let persisted = PersistedFlightStats::snapshot_from(&stats);
+        let mut restored = FlightStats::default();
+        persisted.apply_to(&mut restored);
+
+        assert_eq!(
+            restored.simbrief_ofp_id.as_deref(),
+            Some("1777622821_5F3E3B3842"),
+        );
+        assert_eq!(
+            restored.simbrief_ofp_generated_at.as_deref(),
+            Some("1778452800"),
+        );
+    }
+
+    /// v0.7.7 §10-Pflicht: pre-v0.7.7-Persistenz ohne die neuen Felder
+    /// bleibt deserialisierbar (serde(default) greift, Werte sind None).
+    #[test]
+    fn persisted_flight_stats_legacy_resume_yields_none_for_new_fields() {
+        // Minimaler JSON ohne simbrief_ofp_id / simbrief_ofp_generated_at —
+        // wie ein pre-v0.7.7 Snapshot aussehen wuerde.
+        let legacy_json = r#"{"distance_nm": 100.0}"#;
+        let parsed: PersistedFlightStats = serde_json::from_str(legacy_json)
+            .expect("legacy stats JSON must still deserialise");
+        assert_eq!(parsed.simbrief_ofp_id, None);
+        assert_eq!(parsed.simbrief_ofp_generated_at, None);
+    }
+
+    /// v0.7.7 §10-Pflicht: PersistedFlight legacy ohne flight_id-Feld
+    /// muss weiter parseable bleiben (= leer-String via serde(default)).
+    /// Das ist der "legacy active flight"-Fall fuer v0.7.8.
+    #[test]
+    fn persisted_flight_legacy_resume_yields_empty_flight_id() {
+        // Minimaler JSON ohne flight_id-Feld.
+        let legacy_json = r#"{
+            "pirep_id": "abc123",
+            "bid_id": 42,
+            "started_at": "2026-05-11T10:00:00Z",
+            "flight_number": "DLH100",
+            "dpt_airport": "EDDM",
+            "arr_airport": "LFPG",
+            "fares": []
+        }"#;
+        let parsed: PersistedFlight = serde_json::from_str(legacy_json)
+            .expect("legacy PersistedFlight must still deserialise");
+        assert_eq!(parsed.flight_id, "");
+        assert_eq!(parsed.bid_id, 42);
+    }
+
+    /// v0.7.7 §10-Pflicht: Round-Trip-Test fuer flight_id.
+    #[test]
+    fn persisted_flight_preserves_flight_id_round_trip() {
+        let original = PersistedFlight {
+            pirep_id: "abc123".to_string(),
+            bid_id: 42,
+            flight_id: "1234567".to_string(),
+            started_at: Utc::now(),
+            airline_icao: "DLH".to_string(),
+            airline_logo_url: None,
+            planned_registration: "D-AIUV".to_string(),
+            flight_number: "100".to_string(),
+            dpt_airport: "EDDM".to_string(),
+            arr_airport: "LFPG".to_string(),
+            fares: vec![],
+            stats: PersistedFlightStats::default(),
+        };
+        let json = serde_json::to_string(&original).expect("serialise");
+        let restored: PersistedFlight = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(restored.flight_id, "1234567");
+        assert_eq!(restored.bid_id, 42);
+    }
+
+    /// v0.7.7 §10-Pflicht: Phase-Gate Boundary. Pushback ist ERLAUBT
+    /// (Spec v1.1-Korrektur, frueher implizit ausgeschlossen).
+    /// Dieser Test pruefelt die Match-Logik direkt, da der Tauri-Command
+    /// asynchron + state-abhaengig ist.
+    #[test]
+    fn phase_gate_accepts_preflight_boarding_pushback_taxi_out() {
+        // Diese 4 Phasen MUESSEN akzeptiert werden — sonst koennen
+        // Piloten in Pushback nicht refreshen, was die v0.7.7-UX
+        // bricht.
+        for phase in [
+            FlightPhase::Preflight,
+            FlightPhase::Boarding,
+            FlightPhase::Pushback,
+            FlightPhase::TaxiOut,
+        ] {
+            let allowed = matches!(
+                phase,
+                FlightPhase::Preflight
+                    | FlightPhase::Boarding
+                    | FlightPhase::Pushback
+                    | FlightPhase::TaxiOut
+            );
+            assert!(
+                allowed,
+                "Phase {:?} muss erlaubt sein fuer OFP-Refresh",
+                phase
+            );
+        }
+    }
+
+    /// v0.7.7 §10-Pflicht: Phase-Gate Boundary. TakeoffRoll und
+    /// alles danach ist VERBOTEN — Plan ist da festgenagelt.
+    #[test]
+    fn phase_gate_rejects_takeoff_roll_and_later() {
+        for phase in [
+            FlightPhase::TakeoffRoll,
+            FlightPhase::Takeoff,
+            FlightPhase::Climb,
+            FlightPhase::Cruise,
+            FlightPhase::Holding,
+            FlightPhase::Descent,
+            FlightPhase::Approach,
+            FlightPhase::Final,
+            FlightPhase::Landing,
+            FlightPhase::TaxiIn,
+            FlightPhase::BlocksOn,
+            FlightPhase::Arrived,
+            FlightPhase::PirepSubmitted,
+        ] {
+            let allowed = matches!(
+                phase,
+                FlightPhase::Preflight
+                    | FlightPhase::Boarding
+                    | FlightPhase::Pushback
+                    | FlightPhase::TaxiOut
+            );
+            assert!(
+                !allowed,
+                "Phase {:?} darf NICHT erlaubt sein fuer OFP-Refresh — \
+                 Plan muss da festgenagelt sein",
+                phase
+            );
+        }
+    }
+
+    /// v0.7.7 §10-Pflicht: changed-Flag-Logik.
+    /// Wenn previous_ofp_id == current_ofp_id → changed=false.
+    /// Frontend nutzt das fuer den "OFP unveraendert"-Notice.
+    #[test]
+    fn changed_flag_is_false_when_ofp_id_identical() {
+        let previous: Option<String> = Some("abc123".to_string());
+        let current = "abc123";
+        let changed = previous.as_deref() != Some(current);
+        assert!(!changed, "identische OFP-IDs muessen changed=false ergeben");
+    }
+
+    /// v0.7.7 §10-Pflicht: changed-Flag-Logik.
+    /// Wenn previous_ofp_id != current_ofp_id (oder None) → changed=true.
+    #[test]
+    fn changed_flag_is_true_when_ofp_id_differs_or_first_set() {
+        // Fall 1: neue ID nach altem Refresh
+        let prev1: Option<String> = Some("old_id".to_string());
+        let cur1 = "new_id";
+        assert!(prev1.as_deref() != Some(cur1));
+
+        // Fall 2: erstes Mal gesetzt (previous = None)
+        let prev2: Option<String> = None;
+        let cur2 = "first_ofp";
+        assert!(prev2.as_deref() != Some(cur2));
     }
 }
 

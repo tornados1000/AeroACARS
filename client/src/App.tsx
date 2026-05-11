@@ -523,6 +523,16 @@ function App() {
           onLogout={handleLogout}
           simState={simState}
           simSnapshot={simSnapshot}
+          onActiveFlightUpdated={() => {
+            // v0.7.7: Bid-Tab-Refresh hat den OFP des aktiven Flugs
+            // erfolgreich erneuert (changed=true). Status sofort
+            // refetchen damit Cockpit + Loadsheet die neuen Plan-
+            // Werte sehen — ohne den 2s-flight_status-Poll abzuwarten.
+            // Spec docs/spec/ofp-refresh-during-boarding.md §6.5b.
+            void invoke<ActiveFlightInfo | null>("flight_status")
+              .then(setActiveFlight)
+              .catch(() => null);
+          }}
           onProfileRefreshed={(fresh) => {
             // Bubbled up from BidsList' Aktualisieren button.
             // Update the cached session so PilotHeader picks up

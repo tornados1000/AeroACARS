@@ -62,6 +62,27 @@ interface Props {
    *  session and the PilotHeader picks up new curr_airport/etc. without
    *  requiring a logout/login cycle. v0.1.30. */
   onProfileRefreshed?: (profile: Profile) => void;
+  /** v0.7.7: Bid-Tab-Refresh ruft `flight_refresh_simbrief` zusaetzlich
+   *  auf wenn ein aktiver Flug existiert. Bei einem successful Refresh
+   *  mit `changed=true` benachrichtigen wir den Parent, damit Cockpit +
+   *  Loadsheet sofort neuen Plan sehen (statt erst nach 2s flight_status-
+   *  Poll). Spec docs/spec/ofp-refresh-during-boarding.md §6.5b. */
+  onActiveFlightUpdated?: () => void;
+}
+
+/** v0.7.7: Tauri-Backend liefert das nach erfolgreichem
+ *  `flight_refresh_simbrief`. Spec §6.1 DTO-Split. */
+interface SimBriefRefreshResult {
+  ofp: {
+    planned_block_fuel_kg: number;
+    planned_burn_kg: number;
+    planned_tow_kg: number;
+    planned_ldw_kg: number;
+    // weitere Felder verfuegbar, aber Bid-Tab braucht nur die fuer den Notice
+  };
+  previous_ofp_id: string | null;
+  current_ofp_id: string;
+  changed: boolean;
 }
 
 const KNOWN_ERROR_CODES = new Set([
@@ -159,11 +180,30 @@ function airlineMonogram(flight: Flight): string {
   );
 }
 
+// v0.7.7: Pure helper damit der i18n-Key-Wahl gegen Tests + ohne React-
+// Renderer separat verifizierbar ist. Spec §8 Notice-Tabelle.
+export function refreshNoticeKey(
+  result: SimBriefRefreshResult | null,
+  error: { code?: string } | null,
+): { key: string; tone: "info" | "warn" } | null {
+  if (error?.code === "bid_not_found") {
+    return { key: "bids.ofp_bid_gone", tone: "warn" };
+  }
+  if (result && !result.changed) {
+    return { key: "bids.ofp_unchanged", tone: "info" };
+  }
+  // changed=true und andere Errors (phase_locked, no_simbrief_link,
+  // ofp_fetch_failed, ofp_unusable) → kein Notice. Activity-Log
+  // im Backend zeigt die Erfolgs- bzw Detail-Story.
+  return null;
+}
+
 export function BidsList({
   baseUrl,
   simState,
   simSnapshot,
   hasActiveFlight,
+  onActiveFlightUpdated,
   onSelect,
   onFlightStarted,
   onProfileRefreshed,
@@ -172,6 +212,17 @@ export function BidsList({
   const [state, setState] = useState<State>({ kind: "loading" });
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  // v0.7.7: kleiner Notice-Pill im Bid-Tab-Header nach Refresh.
+  // 3 Outcomes (siehe Spec §8): bid_not_found (warn), ofp_unchanged
+  // (info), changed (keine Notice — Erfolg ist still). Auto-clear nach 6s.
+  const [refreshNotice, setRefreshNotice] = useState<
+    { textKey: string; ofpId?: string; tone: "info" | "warn" } | null
+  >(null);
+  useEffect(() => {
+    if (!refreshNotice) return;
+    const id = setTimeout(() => setRefreshNotice(null), 6000);
+    return () => clearTimeout(id);
+  }, [refreshNotice]);
   const [startingId, setStartingId] = useState<number | null>(null);
   const [startError, setStartError] = useState<{
     bidId: number;
@@ -240,18 +291,69 @@ export function BidsList({
   async function handleRefresh() {
     if (refreshing) return;
     setRefreshing(true);
-    const [, , freshProfile] = await Promise.all([
-      fetchBids(),
-      invoke("sim_force_resync").catch(() => {
-        // Adapter command failures only happen if the mutex is
-        // poisoned (= app already broken). Don't fail the whole
-        // refresh because of it.
-      }),
-      invoke<Profile | null>("phpvms_refresh_profile").catch(() => null),
+    setRefreshNotice(null);
+
+    // v0.7.7: Benannte Promises statt Promise<unknown>[]-Array damit
+    // TypeScript die Result-Typen behaelt (QS-Hint aus Spec v1.1 §8).
+    const bidsP = fetchBids();
+    const simP = invoke("sim_force_resync").catch(() => {
+      // Adapter command failures only happen if the mutex is poisoned
+      // (= app already broken). Don't fail the whole refresh because of it.
+      return null;
+    });
+    const profileP = invoke<Profile | null>("phpvms_refresh_profile").catch(
+      () => null,
+    );
+
+    // v0.7.7: Wenn ein aktiver Flug existiert, OFP-Refresh mit ausloesen.
+    // Backend hat Phase-Gate (Preflight|Boarding|Pushback|TaxiOut) und
+    // returnt `phase_locked` in spaeteren Phasen — wir ignorieren das
+    // still, damit der Bid-Tab-Refresh in Cruise nicht spammt.
+    //
+    // W5-Realitaet: phpVMS-7 entfernt den Bid nach Prefile. In den
+    // meisten Real-Boarding-Faellen wird flight_refresh_simbrief mit
+    // `bid_not_found` antworten — refreshNoticeKey() macht daraus
+    // einen ehrlichen Pilot-Hinweis (Spec §8).
+    const refreshP: Promise<{
+      result: SimBriefRefreshResult | null;
+      error: { code?: string } | null;
+    }> = hasActiveFlight
+      ? invoke<SimBriefRefreshResult>("flight_refresh_simbrief")
+          .then((result) => ({ result, error: null }))
+          .catch((err: { code?: string; message?: string }) => ({
+            result: null,
+            error: err,
+          }))
+      : Promise.resolve({ result: null, error: null });
+
+    const [, , freshProfile, refreshOutcome] = await Promise.all([
+      bidsP,
+      simP,
+      profileP,
+      refreshP,
     ]);
+
     if (freshProfile && onProfileRefreshed) {
       onProfileRefreshed(freshProfile);
     }
+
+    // v0.7.7: Notice je nach Outcome (Spec §8 Notice-Tabelle).
+    const notice = refreshNoticeKey(refreshOutcome.result, refreshOutcome.error);
+    if (notice) {
+      setRefreshNotice({
+        textKey: notice.key,
+        ofpId: refreshOutcome.result?.current_ofp_id,
+        tone: notice.tone,
+      });
+    }
+
+    // v0.7.7 §6.5b: Bei `changed=true` Parent direkt benachrichtigen
+    // damit Cockpit + Loadsheet sofort den neuen Plan sehen statt erst
+    // nach 2s-flight_status-Poll.
+    if (refreshOutcome.result?.changed) {
+      onActiveFlightUpdated?.();
+    }
+
     // Tiny visible spinner tail so the pilot sees confirmation even
     // when both calls return instantly.
     setTimeout(() => setRefreshing(false), 400);
@@ -379,6 +481,33 @@ export function BidsList({
           {refreshing ? "…" : "⟳"} <span>{t("bids.refresh")}</span>
         </button>
       </header>
+
+      {/* v0.7.7: Notice nach Bid-Tab-Refresh wenn OFP-Refresh-Outcome
+          das verlangt (Spec §8 Notice-Tabelle). 3 Outcomes:
+          bid_not_found (warn), ofp_unchanged (info), changed (kein
+          Notice). Auto-clear nach 6s. */}
+      {refreshNotice && (
+        <div
+          role="status"
+          className={`bids-refresh-notice bids-refresh-notice--${refreshNotice.tone}`}
+          style={{
+            padding: "6px 10px",
+            marginBottom: 10,
+            borderRadius: 6,
+            background:
+              refreshNotice.tone === "warn" ? "#3f2b0e" : "#1e3a5f",
+            border:
+              refreshNotice.tone === "warn"
+                ? "1px solid #b8842a"
+                : "1px solid #3b82f6",
+            color: refreshNotice.tone === "warn" ? "#f5d68b" : "#cfe3ff",
+            fontSize: "0.85rem",
+          }}
+        >
+          {refreshNotice.tone === "warn" ? "⚠ " : "ℹ︎ "}
+          {t(refreshNotice.textKey, { id: refreshNotice.ofpId ?? "" })}
+        </div>
+      )}
 
       {showPositionWarning && (
         <div

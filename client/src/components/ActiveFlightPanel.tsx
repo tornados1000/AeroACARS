@@ -249,8 +249,12 @@ export function ActiveFlightPanel({ info, simSnapshot, onEnded }: Props) {
           {/* OFP refresh — pre-takeoff only. After takeoff the plan
               shouldn't change anyway, and we don't want pilots
               accidentally clobbering the loadsheet baseline mid-flight. */}
+          {/* v0.7.7: Phase-Gate inkl. Pushback (Spec §6.2) — Plan-Werte sind
+              dort noch nutzbar, Score noch nicht festgenagelt. Backend hat
+              denselben Gate. */}
           {(info.phase === "preflight" ||
             info.phase === "boarding" ||
+            info.phase === "pushback" ||
             info.phase === "taxi_out") && (
             <button
               type="button"
