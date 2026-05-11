@@ -229,7 +229,7 @@
     "vs_smoothed_250ms_hint": "Media dei rate di discesa negli ultimi 250 ms prima del TD",
     "vs_smoothed_500ms": "Rateo discesa media 500 ms (Volanta)",
     "vs_smoothed_500ms_hint": "Media dei rate di discesa negli ultimi 500 ms prima del TD",
-    "vs_smoothed_1000ms": "Rateo discesa media 1 s (DLHv)",
+    "vs_smoothed_1000ms": "Rateo discesa media 1 s",
     "vs_smoothed_1000ms_hint": "Media dei rate di discesa nell'ultimo secondo prima del TD",
     "vs_smoothed_1500ms": "Rateo discesa media 1,5 s",
     "vs_smoothed_1500ms_hint": "Media dei rate di discesa negli ultimi 1,5 s prima del TD",
@@ -257,7 +257,7 @@
     "sinkrate_forensik": {
       "title": "🎯 Forense del rateo di discesa",
       "intro_header": "Qual è il valore „giusto“?",
-      "intro_body": "A seconda della finestra di mediazione ottieni valori diversi per lo stesso touchdown. Volanta e il VSI di cabina mediano su 0.5–1.5 s e filtrano i picchi, in modo che una raffica non venga marcata come hard landing. AeroACARS valuta invece il valore della cascade esattamente nel momento del contatto al suolo (standard FAR 25.473 — misura il carico sul carrello).",
+      "intro_body": "A seconda della finestra di mediazione ottieni valori diversi per lo stesso touchdown. Volanta e il VSI di cabina mediano su 0.5–1.5 s e filtrano i picchi, in modo che una raffica non venga marcata come hard landing. AeroACARS valuta invece il valore del rateo di discesa esattamente al momento del contatto al suolo (standard FAR 25.473 — misura il carico sul carrello).",
       "tool_section_title": "Quello che mostra il cockpit / Volanta",
       "tool_section_subtitle": "Medie su finestre temporali diverse — picchi smussati. Confronta con il blocco del punteggio sotto.",
       "score_section_title": "Quello che AeroACARS valuta",
@@ -273,11 +273,11 @@
       "tile_1000ms": "Media 1.0 s",
       "tile_500ms": "Media 0.5 s",
       "tile_250ms": "Media 0.25 s",
-      "score_basis_label": "Rateo V/S (base del punteggio)",
+      "score_basis_label": "Rateo valutato",
       "score_basis_hint": "Campione 50 Hz al momento del touchdown — base per il sub-score landing_rate.",
       "score_basis_source_pill": "Sorgente:",
       "peak_pre_flare_label": "Picco rateo pre-flare:",
-      "peak_pre_flare_reduction": "Riduzione tramite flare: {{reduction}} fpm",
+      "peak_pre_flare_reduction": "Il flare ha ridotto il rateo di {{reduction}} fpm",
       "legacy_notice_text": "I dati forensi non sono ancora stati registrati per questo volo precedente.",
       "tip": {
         "flare_lost": "Flare terminato troppo presto — mantieni l'assetto di pitch finché il carrello tocca, gas via DOPO il touchdown.",
@@ -285,7 +285,14 @@
         "no_flare": "Nessun flare rilevato — alza il muso di 2-3° a circa 30 ft e mantienilo.",
         "late_drop": "Drop evidente nel final — il rateo era in media più morbido rispetto al touchdown. Guarda la decomposizione a bucket per capire dove è iniziato il cedimento.",
         "clean": "Touchdown pulito — rateo costante, nessun drop nel final."
-      }
+      },
+      "score_basis_sublabel": "Base del punteggio",
+      "peak_pre_flare_reduction_none": "Il flare non ha ridotto il rateo",
+      "tile_volanta_hint": "Smoothing di default Volanta",
+      "tile_na_tooltip": "Valore non registrato — buffer del sampler non pieno al touchdown",
+      "impact_g_500ms": "G di picco post-touchdown (500 ms)",
+      "impact_g_1000ms": "G di picco post-touchdown (1 s)",
+      "trace_caption": "Istantanee dal buffer del touchdown — non base del punteggio, solo per visualizzare l'andamento."
     }
   },
   "about": {

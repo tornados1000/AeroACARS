@@ -217,8 +217,11 @@ export function SinkrateForensik({ record }: { record: LandingRecord }) {
   });
   const trace = selectTraceSamples(record.touchdown_profile);
   const scoreVs = scoreBasisVs(record);
+  // Flare-Reduktion ueber Betraege (sonst falsches Vorzeichen bei negativen
+  // VS): peak = -235 fpm + edge = -142 fpm → |peak|-|edge| = 93 fpm POSITIV
+  // (= Sinkrate um 93 fpm reduziert). v0.7.8 QS-Round-9-Fix.
   const flareReduction = record.peak_vs_pre_flare_fpm != null && record.vs_at_edge_fpm != null
-    ? Math.round(record.peak_vs_pre_flare_fpm - record.vs_at_edge_fpm)
+    ? Math.round(Math.abs(record.peak_vs_pre_flare_fpm) - Math.abs(record.vs_at_edge_fpm))
     : null;
 
   return (
@@ -301,7 +304,9 @@ export function SinkrateForensik({ record }: { record: LandingRecord }) {
             </span>
             {flareReduction != null && (
               <span className="sinkrate-forensik-pre-flare__reduction">
-                · {t("landing.sinkrate_forensik.peak_pre_flare_reduction", { reduction: flareReduction })}
+                · {flareReduction > 0
+                  ? t("landing.sinkrate_forensik.peak_pre_flare_reduction", { reduction: flareReduction })
+                  : t("landing.sinkrate_forensik.peak_pre_flare_reduction_none")}
               </span>
             )}
           </div>
@@ -346,13 +351,23 @@ function SmoothedVsTile({
   value: number | null;
   volantaStyle?: boolean;
 }) {
+  const { t } = useTranslation();
   const tone = vsTone(value);
   const valueText = value != null ? `${Math.round(value)}` : "—";
+  const naTooltip = value == null ? t("landing.sinkrate_forensik.tile_na_tooltip") : undefined;
   return (
-    <div className={`sinkrate-tile ${tone ? `sinkrate-tile--${tone}` : "sinkrate-tile--na"}`}>
+    <div
+      className={`sinkrate-tile ${tone ? `sinkrate-tile--${tone}` : "sinkrate-tile--na"}`}
+      title={naTooltip}
+      aria-label={naTooltip ? `${label}: ${naTooltip}` : undefined}
+    >
       <div className="sinkrate-tile__label">
         {label}
-        {volantaStyle && <span className="sinkrate-tile__hint"> · Volanta-Style</span>}
+        {volantaStyle && (
+          <span className="sinkrate-tile__hint">
+            {" · "}{t("landing.sinkrate_forensik.tile_volanta_hint")}
+          </span>
+        )}
       </div>
       <div className="sinkrate-tile__value">
         {valueText}
@@ -367,11 +382,11 @@ function ScoreBasisTile({ vs, landingSource }: { vs: number; landingSource: stri
   const tone = vsTone(vs);
   return (
     <div className={`sinkrate-score-tile ${tone ? `sinkrate-score-tile--${tone}` : ""}`}>
-      <div className="sinkrate-score-tile__pill-row">
-        <span className="sinkrate-score-tile__pill">SCORE</span>
-        <span className="sinkrate-score-tile__caption">
-          {t("landing.sinkrate_forensik.score_basis_label")}
-        </span>
+      <div className="sinkrate-score-tile__heading">
+        {t("landing.sinkrate_forensik.score_basis_label")}
+      </div>
+      <div className="sinkrate-score-tile__sublabel">
+        {t("landing.sinkrate_forensik.score_basis_sublabel")}
       </div>
       <div className="sinkrate-score-tile__value">
         {Math.round(vs)}
@@ -423,6 +438,9 @@ function PositionTrace({ samples }: { samples: TraceSample[] }) {
       <div className="sinkrate-trace__title">
         📍 {t("landing.sinkrate_forensik.trace_title")}
       </div>
+      <div className="sinkrate-trace__caption">
+        {t("landing.sinkrate_forensik.trace_caption")}
+      </div>
       <table className="sinkrate-trace__table">
         <tbody>
           {samples.map((s, i) => (
@@ -459,12 +477,12 @@ function ImpactTiles({ g500ms, g1000ms }: { g500ms: number; g1000ms: number | nu
       </div>
       <div className="sinkrate-impact__tiles">
         <div className={`sinkrate-impact__tile sinkrate-impact__tile--${gToneFor(g500ms) ?? "na"}`}>
-          <div className="sinkrate-impact__label">Peak-G post-TD 500 ms</div>
+          <div className="sinkrate-impact__label">{t("landing.sinkrate_forensik.impact_g_500ms")}</div>
           <div className="sinkrate-impact__value">{g500ms.toFixed(2)} <span>G</span></div>
         </div>
         {g1000ms != null && (
           <div className={`sinkrate-impact__tile sinkrate-impact__tile--${gToneFor(g1000ms) ?? "na"}`}>
-            <div className="sinkrate-impact__label">Peak-G post-TD 1 s</div>
+            <div className="sinkrate-impact__label">{t("landing.sinkrate_forensik.impact_g_1000ms")}</div>
             <div className="sinkrate-impact__value">{g1000ms.toFixed(2)} <span>G</span></div>
           </div>
         )}

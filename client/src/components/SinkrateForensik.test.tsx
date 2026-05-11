@@ -5,7 +5,10 @@
 // Selektor, hasForensics, Score-Basis-Cascade). Render-Tests fuer
 // Missing-Data-Cases.
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeAll } from "vitest";
+import { render, screen } from "@testing-library/react";
+import i18next from "i18next";
+import { initReactI18next } from "react-i18next";
 import {
   hasForensics,
   computeBuckets,
@@ -14,8 +17,28 @@ import {
   scoreBasisVs,
   selectTraceSamples,
   vsTone,
+  SinkrateForensik,
 } from "./SinkrateForensik";
-import type { LandingProfilePoint } from "./LandingPanel";
+import type { LandingProfilePoint, LandingRecord } from "./LandingPanel";
+
+// v0.7.8 Phase 4 QS-Fix: i18n-Setup fuer Render-Tests damit
+// useTranslation() funktioniert. Echte DE-Keys werden geladen damit
+// Tests die Spec-Wortlaute pruefen koennen.
+import deCommon from "../locales/de/common.json";
+
+beforeAll(async () => {
+  if (!i18next.isInitialized) {
+    await i18next
+      .use(initReactI18next)
+      .init({
+        lng: "de",
+        fallbackLng: "de",
+        resources: { de: { common: deCommon } },
+        defaultNS: "common",
+        interpolation: { escapeValue: false },
+      });
+  }
+});
 
 // ───────────────────────────────────────────────────────────────────────────
 // GSG-218-Fixture (Live-DB-Werte, Spec §8.3)
@@ -309,3 +332,176 @@ describe("GSG-218 End-to-End — kompletter Fixture-Trockenlauf (Spec §8.3)", (
     })).toBe("flare_lost");
   });
 });
+
+// ───────────────────────────────────────────────────────────────────────────
+// Render-Tests mit @testing-library/react — DOM/UI-Verhalten absichern
+// (v0.7.8 QS-Round-9 P2-Fix)
+// ───────────────────────────────────────────────────────────────────────────
+
+function makeRecord(overrides: Partial<LandingRecord>): LandingRecord {
+  return {
+    pirep_id: "test",
+    touchdown_at: "2026-05-11T15:00:00Z",
+    recorded_at: "2026-05-11T15:00:00Z",
+    flight_number: "TST123",
+    airline_icao: "TST",
+    dpt_airport: "EDDF",
+    arr_airport: "EDDM",
+    aircraft_registration: null,
+    aircraft_icao: null,
+    aircraft_title: null,
+    sim_kind: null,
+    score_numeric: 80,
+    score_label: "smooth",
+    grade_letter: "B",
+    landing_rate_fpm: -200,
+    landing_peak_vs_fpm: null,
+    landing_g_force: null,
+    landing_peak_g_force: null,
+    landing_pitch_deg: null,
+    landing_bank_deg: null,
+    landing_speed_kt: null,
+    landing_heading_deg: null,
+    landing_weight_kg: null,
+    touchdown_sideslip_deg: null,
+    bounce_count: 0,
+    headwind_kt: null,
+    crosswind_kt: null,
+    approach_vs_stddev_fpm: null,
+    approach_bank_stddev_deg: null,
+    rollout_distance_m: null,
+    planned_block_fuel_kg: null,
+    planned_burn_kg: null,
+    planned_tow_kg: null,
+    planned_ldw_kg: null,
+    planned_zfw_kg: null,
+    actual_trip_burn_kg: null,
+    fuel_efficiency_kg_diff: null,
+    fuel_efficiency_pct: null,
+    takeoff_weight_kg: null,
+    takeoff_fuel_kg: null,
+    landing_fuel_kg: null,
+    block_fuel_kg: null,
+    runway_match: null,
+    touchdown_profile: [],
+    approach_samples: [],
+    forensic_sample_count: null,
+    vs_at_edge_fpm: null,
+    vs_smoothed_250ms_fpm: null,
+    vs_smoothed_500ms_fpm: null,
+    vs_smoothed_1000ms_fpm: null,
+    vs_smoothed_1500ms_fpm: null,
+    peak_g_post_500ms: null,
+    peak_g_post_1000ms: null,
+    peak_vs_pre_flare_fpm: null,
+    vs_at_flare_end_fpm: null,
+    flare_reduction_fpm: null,
+    flare_dvs_dt_fpm_per_sec: null,
+    flare_quality_score: null,
+    flare_detected: null,
+    landing_source: null,
+    ...overrides,
+  } as LandingRecord;
+}
+
+describe("SinkrateForensik render — Legacy + Missing-Data + Source-Pill", () => {
+  it("Legacy-Notice wenn keine Forensik-Felder gesetzt", () => {
+    render(<SinkrateForensik record={makeRecord({})} />);
+    expect(screen.getByText(/Forensik-Daten noch nicht gespeichert/i)).toBeInTheDocument();
+  });
+
+  it("Voll-Render wenn forensic_sample_count gesetzt", () => {
+    render(<SinkrateForensik record={makeRecord({
+      forensic_sample_count: 469,
+      landing_peak_vs_fpm: -343,
+    })} />);
+    expect(screen.getByText(/Sinkrate-Forensik/i)).toBeInTheDocument();
+    expect(screen.getByText(/Welche Sinkrate ist die/i)).toBeInTheDocument();
+  });
+
+  it("Missing-Data: 3 von 4 Smoothed-Tiles gesetzt → 4 Tiles im DOM, 1 mit Em-Dash + Tooltip", () => {
+    const { container } = render(<SinkrateForensik record={makeRecord({
+      forensic_sample_count: 469,
+      vs_smoothed_1500ms_fpm: -229,
+      vs_smoothed_1000ms_fpm: -266,
+      vs_smoothed_500ms_fpm: -314,
+      vs_smoothed_250ms_fpm: null, // ein Tile fehlt
+      vs_at_edge_fpm: -343,
+    })} />);
+    const tiles = container.querySelectorAll(".sinkrate-tile");
+    expect(tiles.length).toBe(4);
+    const naTile = container.querySelector(".sinkrate-tile--na");
+    expect(naTile).not.toBeNull();
+    expect(naTile?.textContent).toContain("—");
+    // Tooltip via title-Attribut
+    expect(naTile?.getAttribute("title")).toBeTruthy();
+    expect(naTile?.getAttribute("title")).toMatch(/Wert nicht erfasst/i);
+  });
+
+  it("Source-Pill nur wenn landing_source gesetzt", () => {
+    const { rerender } = render(<SinkrateForensik record={makeRecord({
+      forensic_sample_count: 469,
+      landing_peak_vs_fpm: -343,
+      landing_source: "vs_at_impact",
+    })} />);
+    expect(screen.getByText(/vs_at_impact/i)).toBeInTheDocument();
+
+    rerender(<SinkrateForensik record={makeRecord({
+      forensic_sample_count: 469,
+      landing_peak_vs_fpm: -343,
+      landing_source: null, // kein Pill erwartet
+    })} />);
+    expect(screen.queryByText(/vs_at_impact/)).toBeNull();
+  });
+
+  it("Bucket-Sektion ausgeblendet wenn nicht alle 5 Werte gesetzt", () => {
+    const { container } = render(<SinkrateForensik record={makeRecord({
+      forensic_sample_count: 469,
+      vs_smoothed_1500ms_fpm: -229,
+      // andere fehlen
+    })} />);
+    expect(container.querySelector(".sinkrate-buckets")).toBeNull();
+  });
+
+  it("Flare-Reduktion zeigt POSITIVE Zahl wenn Pilot reduziert hat (|peak|>|edge|)", () => {
+    // peak = -235, edge = -142 → |235|-|142| = 93 (Flare hat reduziert)
+    render(<SinkrateForensik record={makeRecord({
+      forensic_sample_count: 469,
+      landing_peak_vs_fpm: -142,
+      vs_at_edge_fpm: -142,
+      peak_vs_pre_flare_fpm: -235,
+    })} />);
+    // Wortlaut: "Flare hat Sinkrate um 93 fpm reduziert" — kein Minus
+    expect(screen.getByText(/93 fpm reduziert/i)).toBeInTheDocument();
+    // Kein "−93" / "-93" im Reduktions-Text
+    const reduction = screen.queryByText(/-93 fpm reduziert/);
+    expect(reduction).toBeNull();
+  });
+
+  it("Flare hat NICHT reduziert: alternativer Text statt negativer Zahl", () => {
+    // peak = -200, edge = -343 → |200|-|343| = -143 (negativ → "nicht reduziert")
+    render(<SinkrateForensik record={makeRecord({
+      forensic_sample_count: 469,
+      landing_peak_vs_fpm: -343,
+      vs_at_edge_fpm: -343,
+      peak_vs_pre_flare_fpm: -200,
+    })} />);
+    expect(screen.getByText(/Flare hat die Sinkrate nicht reduziert/i)).toBeInTheDocument();
+  });
+
+  it("Kein DLHv im Render-Output (V7-Acceptance)", () => {
+    const { container } = render(<SinkrateForensik record={makeRecord({
+      forensic_sample_count: 469,
+      vs_smoothed_1500ms_fpm: -229,
+      vs_smoothed_1000ms_fpm: -266,
+      vs_smoothed_500ms_fpm: -314,
+      vs_smoothed_250ms_fpm: -344,
+      vs_at_edge_fpm: -343,
+      landing_peak_vs_fpm: -343,
+    })} />);
+    expect(container.textContent).not.toMatch(/DLHv/i);
+    expect(container.textContent).not.toMatch(/SmartCARS/i);
+    expect(container.textContent).toMatch(/Volanta/);
+  });
+});
+

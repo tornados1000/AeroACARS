@@ -229,7 +229,7 @@
     "vs_smoothed_250ms_hint": "Mean of sink-rate samples in the last 250 ms before TD",
     "vs_smoothed_500ms": "Sink rate 500 ms mean (Volanta)",
     "vs_smoothed_500ms_hint": "Mean of sink-rate samples in the last 500 ms before TD",
-    "vs_smoothed_1000ms": "Sink rate 1 s mean (DLHv)",
+    "vs_smoothed_1000ms": "Sink rate 1 s mean",
     "vs_smoothed_1000ms_hint": "Mean of sink-rate samples in the last second before TD",
     "vs_smoothed_1500ms": "Sink rate 1.5 s mean",
     "vs_smoothed_1500ms_hint": "Mean of sink-rate samples in the last 1.5 s before TD",
@@ -257,7 +257,7 @@
     "sinkrate_forensik": {
       "title": "🎯 Sink-Rate Forensics",
       "intro_header": "Which sink-rate is the right one?",
-      "intro_body": "Depending on the averaging window you get different values for the same touchdown. Volanta and the cockpit VSI average over 0.5–1.5 s and filter out spikes, so a gust does not tag every touchdown as a hard landing. AeroACARS scores the cascade value at the actual ground-contact moment (engineering standard per FAR 25.473 — measures the loading on the landing-gear structure).",
+      "intro_body": "Depending on the averaging window you get different values for the same touchdown. Volanta and the cockpit VSI average over 0.5–1.5 s and filter out spikes, so a gust does not tag every touchdown as a hard landing. AeroACARS instead scores the sink-rate value at the actual ground-contact moment (engineering standard per FAR 25.473 — measures the loading on the landing-gear structure).",
       "tool_section_title": "What your cockpit / Volanta shows",
       "tool_section_subtitle": "Means over different time windows — spikes smoothed. Compare with the score block below.",
       "score_section_title": "What AeroACARS scores",
@@ -273,11 +273,11 @@
       "tile_1000ms": "1.0 s mean",
       "tile_500ms": "0.5 s mean",
       "tile_250ms": "0.25 s mean",
-      "score_basis_label": "Sink-rate V/S (score basis)",
+      "score_basis_label": "Scored sink-rate",
       "score_basis_hint": "50 Hz sample at the touchdown moment — basis for the landing_rate sub-score.",
       "score_basis_source_pill": "Source:",
       "peak_pre_flare_label": "Peak sink-rate pre-flare:",
-      "peak_pre_flare_reduction": "Reduction by flare: {{reduction}} fpm",
+      "peak_pre_flare_reduction": "Flare reduced sink rate by {{reduction}} fpm",
       "legacy_notice_text": "Forensic data was not yet recorded for this older flight.",
       "tip": {
         "flare_lost": "Flare ran out too early — hold the pitch attitude until the gear touches, throttle out AFTER touchdown.",
@@ -285,7 +285,14 @@
         "no_flare": "No flare detected — raise the nose 2-3° at about 30 ft and hold it.",
         "late_drop": "Noticeable drop in the final — sink rate was on average softer than at the touchdown moment. Check the bucket breakdown for where the sag began.",
         "clean": "Clean touchdown — sink rate consistent, no drop in the final."
-      }
+      },
+      "score_basis_sublabel": "Score basis",
+      "peak_pre_flare_reduction_none": "Flare did not reduce sink rate",
+      "tile_volanta_hint": "Volanta default smoothing",
+      "tile_na_tooltip": "Value not recorded — sampler buffer was not full at touchdown",
+      "impact_g_500ms": "Peak G post-touchdown (500 ms)",
+      "impact_g_1000ms": "Peak G post-touchdown (1 s)",
+      "trace_caption": "Snapshots from the touchdown buffer — not the score basis, only to visualize the trend."
     }
   },
   "about": {

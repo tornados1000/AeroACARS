@@ -6323,6 +6323,10 @@ input:disabled {
 .sinkrate-tile--err .sinkrate-tile__value { color: #ef4444; }
 .sinkrate-tile--err-severe .sinkrate-tile__value { color: #b91c1c; }
 .sinkrate-tile--na .sinkrate-tile__value { color: var(--fg-dim); }
+.sinkrate-tile--na {
+  cursor: help;
+  opacity: 0.85;
+}
 
 /* Score-Basis (gross + prominent) */
 .sinkrate-score-tile {
@@ -6334,25 +6338,20 @@ input:disabled {
   background: linear-gradient(135deg, rgba(6, 182, 212, 0.10), rgba(6, 182, 212, 0.03));
   border: 1px solid rgba(6, 182, 212, 0.30);
 }
-.sinkrate-score-tile__pill-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.sinkrate-score-tile__pill {
-  padding: 2px 8px;
-  font-size: 0.66rem;
+/* v0.7.8 QS-Round-9: "Bewertete Sinkrate" gross + "Score-Basis" klein
+   als Sublabel — pilot-freundlicher als die alte Pill-Optik. */
+.sinkrate-score-tile__heading {
+  font-size: 0.92rem;
   font-weight: 700;
-  letter-spacing: 0.06em;
-  border-radius: 999px;
-  background: #06b6d4;
-  color: #0f172a;
+  color: var(--fg);
+  letter-spacing: 0.02em;
 }
-.sinkrate-score-tile__caption {
-  font-size: 0.78rem;
+.sinkrate-score-tile__sublabel {
+  font-size: 0.7rem;
   color: var(--fg-dim);
-  letter-spacing: 0.04em;
+  letter-spacing: 0.06em;
   text-transform: uppercase;
+  margin-bottom: 2px;
 }
 .sinkrate-score-tile__value {
   font-family: var(--font-mono, monospace);
@@ -6467,12 +6466,15 @@ input:disabled {
   color: var(--fg);
 }
 
-/* Coaching-Tipp — eine Zeile, leicht gehoben */
+/* Coaching-Tipp — eine Zeile, leicht gehoben.
+   v0.7.8 QS-Round-9: kein Purple mehr (war §4.5/V6-Verstoss).
+   Subtle Highlight via surface-2 + cyan-Akzent (passt zum
+   existierenden Aufklaerungs-Block-Stil). */
 .sinkrate-forensik-coach {
   padding: 8px 12px;
   border-radius: var(--r-sm);
-  background: rgba(192, 132, 252, 0.06);
-  border-left: 2px solid #c084fc;
+  background: var(--surface-2);
+  border-left: 2px solid #06b6d4;
   font-size: 0.85rem;
   line-height: 1.45;
   color: var(--fg);
@@ -6506,6 +6508,12 @@ input:disabled {
   font-size: 0.8rem;
   font-weight: 600;
   color: var(--fg);
+}
+.sinkrate-trace__caption {
+  font-size: 0.72rem;
+  color: var(--fg-dim);
+  font-style: italic;
+  line-height: 1.4;
 }
 .sinkrate-trace__table {
   width: 100%;

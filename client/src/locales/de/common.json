@@ -229,7 +229,7 @@
     "vs_smoothed_250ms_hint": "Mittel der Sinkraten-Samples in den letzten 250 ms vor TD",
     "vs_smoothed_500ms": "Sinkrate 500 ms-Mean (Volanta)",
     "vs_smoothed_500ms_hint": "Mittel der Sinkraten-Samples in den letzten 500 ms vor TD",
-    "vs_smoothed_1000ms": "Sinkrate 1 s-Mean (DLHv)",
+    "vs_smoothed_1000ms": "Sinkrate 1 s-Mittel",
     "vs_smoothed_1000ms_hint": "Mittel der Sinkraten-Samples in der letzten Sekunde vor TD",
     "vs_smoothed_1500ms": "Sinkrate 1,5 s-Mean",
     "vs_smoothed_1500ms_hint": "Mittel der Sinkraten-Samples in den letzten 1,5 s vor TD",
@@ -257,7 +257,7 @@
     "sinkrate_forensik": {
       "title": "🎯 Sinkrate-Forensik",
       "intro_header": "Welche Sinkrate ist die „richtige“?",
-      "intro_body": "Je nach Mittelungs-Fenster bekommst du unterschiedliche Werte für denselben Touchdown. Volanta und Cockpit-VSI mitteln über 0.5–1.5 s und filtern Spikes raus, damit eine Böe nicht jeden Touchdown als Hard-Landing taggt. AeroACARS scort hingegen den Cascade-Wert direkt am Aufsetz-Moment (Engineering-Standard nach FAR 25.473 — misst die Belastung der Fahrwerksstruktur).",
+      "intro_body": "Je nach Mittelungsfenster bekommst du unterschiedliche Werte für denselben Touchdown. Volanta und Cockpit-VSI mitteln über 0.5–1.5 s und filtern Spikes raus, damit eine Böe nicht jeden Touchdown als Hard-Landing taggt. AeroACARS bewertet hingegen den Sinkraten-Wert direkt am Aufsetz-Moment (Engineering-Standard nach FAR 25.473 — misst die Belastung der Fahrwerksstruktur).",
       "tool_section_title": "Was dein Cockpit / Volanta anzeigt",
       "tool_section_subtitle": "Mittel über verschiedene Zeitfenster — Spikes ausgeglättet. Vergleiche mit dem Score-Block unten.",
       "score_section_title": "Was AeroACARS scort",
@@ -273,11 +273,11 @@
       "tile_1000ms": "1.0 s Mittel",
       "tile_500ms": "0.5 s Mittel",
       "tile_250ms": "0.25 s Mittel",
-      "score_basis_label": "Sinkrate-V/S (Score-Basis)",
+      "score_basis_label": "Bewertete Sinkrate",
       "score_basis_hint": "50-Hz-Sample direkt am Aufsetz-Moment — Basis für den landing_rate-Sub-Score.",
       "score_basis_source_pill": "Quelle:",
       "peak_pre_flare_label": "Peak Sinkrate Pre-Flare:",
-      "peak_pre_flare_reduction": "Reduktion durch Flare: {{reduction}} fpm",
+      "peak_pre_flare_reduction": "Flare hat Sinkrate um {{reduction}} fpm reduziert",
       "legacy_notice_text": "Für diesen älteren Flug wurden die Forensik-Daten noch nicht gespeichert.",
       "tip": {
         "flare_lost": "Flare zu früh ausgelaufen — halte die Pitch-Attitude bis das Fahrwerk berührt, Throttle erst NACH Touchdown raus.",
@@ -285,7 +285,14 @@
         "no_flare": "Kein Flare detektiert — bei ~30 ft die Nase 2-3° anheben und halten.",
         "late_drop": "Deutlicher Drop im Final — Sinkrate war im Mittel weicher als am Aufsetz-Moment. Schau in die Bucket-Aufschlüsselung wo das Sacken begann.",
         "clean": "Sauberer Touchdown — Sinkrate gleichmäßig, kein Drop im Final."
-      }
+      },
+      "score_basis_sublabel": "Score-Basis",
+      "peak_pre_flare_reduction_none": "Flare hat die Sinkrate nicht reduziert",
+      "tile_volanta_hint": "Volanta-Default-Glättung",
+      "tile_na_tooltip": "Wert nicht erfasst — Sampler-Buffer war beim Touchdown nicht voll",
+      "impact_g_500ms": "Peak-G nach Touchdown (500 ms)",
+      "impact_g_1000ms": "Peak-G nach Touchdown (1 s)",
+      "trace_caption": "Momentaufnahmen aus dem Touchdown-Buffer — nicht Score-Basis, nur zur Veranschaulichung des Verlaufs."
     }
   },
   "about": {
