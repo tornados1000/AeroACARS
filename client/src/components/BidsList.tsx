@@ -218,7 +218,7 @@ export function BidsList({
   // Pfad (changed=false) bekommt seinen Text inline via t() in handleRefresh.
   // Auto-clear nach 6s.
   const [refreshNotice, setRefreshNotice] = useState<
-    { text: string; tone: "info" | "warn" | "err" } | null
+    { text: string; tone: "info" | "warn" | "err" | "ok" } | null
   >(null);
   useEffect(() => {
     if (!refreshNotice) return;
@@ -339,28 +339,34 @@ export function BidsList({
       onProfileRefreshed(freshProfile);
     }
 
-    // v1.5.2: Notice-Logik vereinfacht — Error-Pfad geht durch den
-    // shared formatRefreshError-Helper (= identischer Output wie in
-    // Cockpit + Loadsheet). Success-Pfad mit changed=false rendert
-    // den ofp_unchanged-Notice inline.
+    // v0.7.9 QS-Round-2: Notice-Logik defensiv — IMMER ein Banner zeigen,
+    // egal was passiert. Vorher gab es Pfade die `null` zurueckgaben
+    // (success+changed=true, unknown-error-code) → Pilot sah gar nichts
+    // und wusste nicht ob der Refresh ueberhaupt durchlief.
+    // Plus: Diagnose-Log fuer Backend-Debugging.
+    console.log("[refresh] outcome:", refreshOutcome);
+
     if (refreshOutcome.error) {
       const formatted = formatRefreshError(refreshOutcome.error, t);
       if (formatted) {
         setRefreshNotice({ text: formatted.text, tone: formatted.tone });
-      }
-    } else {
-      const success = refreshSuccessNotice(refreshOutcome.result);
-      if (success) {
+      } else {
+        // Unbekannter Error-Code → roher Code als Fallback damit Pilot
+        // was sieht statt silent fail.
         setRefreshNotice({
-          text: t(success.key, {
-            id: refreshOutcome.result?.current_ofp_id ?? "",
+          text: t("bids.refresh_unknown_error", {
+            code: refreshOutcome.error.code ?? "unknown",
           }),
-          tone: success.tone,
+          tone: "warn",
         });
       }
-      // v0.7.9: Pruefe ob Backend ein Callsign-Warning gesetzt hat
-      // (OFP wurde geladen aber Callsign weicht ab). Wenn ja, zeige
-      // einen warn-Tone-Notice mit konkreten Werten.
+    } else if (refreshOutcome.result) {
+      // Success-Pfad: 2 Faelle (changed=true / changed=false), plus
+      // optional Callsign-Warning.
+      let noticeSet = false;
+
+      // v0.7.9: Callsign-Warning ueberschreibt alles andere wenn vorhanden
+      // — es ist die wichtigste Info ("OFP geladen aber Callsign weicht ab")
       try {
         const warn = await invoke<{
           sb_callsign: string;
@@ -375,10 +381,39 @@ export function BidsList({
             }),
             tone: "warn",
           });
+          noticeSet = true;
         }
       } catch {
         // noop — Warning ist Nice-to-have
       }
+
+      if (!noticeSet) {
+        if (refreshOutcome.result.changed) {
+          // OFP wurde wirklich aktualisiert — grüner Erfolg-Notice.
+          // Vorher silent (Spec sagte "Cockpit zeigt die neuen Werte"),
+          // aber Pilot brauchte sichtbare Bestaetigung dass der Klick
+          // was bewirkt hat.
+          setRefreshNotice({
+            text: t("bids.ofp_refreshed", {
+              id: refreshOutcome.result.current_ofp_id ?? "",
+            }),
+            tone: "ok",
+          });
+        } else {
+          // OFP-ID unveraendert → "kein Update" Notice (war vorher schon da)
+          setRefreshNotice({
+            text: t("bids.ofp_unchanged"),
+            tone: "info",
+          });
+        }
+      }
+    } else {
+      // Defensiver Fall: weder error noch result. Sollte nicht passieren
+      // aber Pilot soll trotzdem was sehen.
+      setRefreshNotice({
+        text: t("bids.refresh_no_result"),
+        tone: "warn",
+      });
     }
 
     // v0.7.7 §6.5b: Bei `changed=true` Parent direkt benachrichtigen

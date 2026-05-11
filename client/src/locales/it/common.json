@@ -882,7 +882,7 @@
     "simbrief_unavailable": "Impossibile caricare i valori del piano",
     "ofp_bid_gone": "Prenotazione non più disponibile dopo prefile. Attiva SimBrief-diretto nelle Impostazioni (username o user-ID) per aggiornare l'OFP senza puntatore-bid.",
     "ofp_unchanged": "OFP invariato. SimBrief riporta ancora OFP-ID {{id}}.",
-    "ofp_refreshed": "OFP aggiornato: nuovi valori del piano visibili nel cockpit e nel loadsheet.",
+    "ofp_refreshed": "OFP aggiornato — nuovi valori del piano caricati ({{id}})",
     "ofp_does_not_match_active_flight": "Il tuo ultimo OFP SimBrief appartiene al volo {{sb_callsign}} ({{sb_origin}} → {{sb_dest}}). Atteso sarebbe {{active_callsigns}} ({{active_dpt}} → {{active_arr}}). Per favore genera un OFP per il volo attivo su simbrief.com.",
     "simbrief_user_not_found": "SimBrief username/user-ID non trovato. Controlla Impostazioni → Integrazione SimBrief.",
     "simbrief_unavailable_and_bid_gone": "SimBrief attualmente non disponibile; fallback puntatore anche non riuscito. Riprova tra qualche minuto.",
@@ -926,7 +926,9 @@
       "bad_response": "Risposta non comprensibile.",
       "unknown": "Errore imprevisto durante il caricamento dei bid.",
       "details_summary": "Mostra dettagli tecnici"
-    }
+    },
+    "refresh_unknown_error": "Aggiornamento fallito ({{code}}) — controlla il log ACARS",
+    "refresh_no_result": "Aggiornamento senza risposta dal backend — riprova"
   },
   "flight": {
     "error": {

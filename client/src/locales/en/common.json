@@ -881,7 +881,7 @@
     "simbrief_unavailable": "Plan values could not be loaded",
     "ofp_bid_gone": "Bid no longer available after prefile. Enable SimBrief-direct in Settings (username or user-ID) so OFP refresh works without bid-pointer.",
     "ofp_unchanged": "OFP unchanged. SimBrief still reports OFP ID {{id}}.",
-    "ofp_refreshed": "OFP refreshed: new plan values now visible in cockpit and loadsheet.",
+    "ofp_refreshed": "OFP updated — new plan values loaded ({{id}})",
     "ofp_does_not_match_active_flight": "Your latest SimBrief OFP belongs to flight {{sb_callsign}} ({{sb_origin}} → {{sb_dest}}). Expected callsign would be {{active_callsigns}} ({{active_dpt}} → {{active_arr}}). Please generate an OFP for the active flight on simbrief.com.",
     "simbrief_user_not_found": "SimBrief username/user-ID not found. Check Settings → SimBrief Integration.",
     "simbrief_unavailable_and_bid_gone": "SimBrief currently unavailable; pointer-fallback also failed. Try again in a few minutes.",
@@ -925,7 +925,9 @@
       "bad_response": "The server response could not be understood.",
       "unknown": "Unexpected error while loading bids.",
       "details_summary": "Show technical details"
-    }
+    },
+    "refresh_unknown_error": "Refresh failed ({{code}}) — please check the ACARS log",
+    "refresh_no_result": "Refresh returned no result — please retry"
   },
   "flight": {
     "error": {
