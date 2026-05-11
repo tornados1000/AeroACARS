@@ -4,6 +4,92 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.7.7] — 2026-05-11
+
+🛫 **OFP-Refresh waehrend Boarding endlich nutzbar — SimBrief-direct macht den Bid-Pointer-Pfad obsolet. Real-Pilot-Frust beseitigt, Pilot-Callsign-Cases unterstuetzt.**
+
+### Was
+
+Real-Pilot-Frust nach v0.7.5/v0.7.6: Pilot regeneriert OFP auf simbrief.com, klickt "Aktualisieren" — und die Plan-Werte blieben alt. Wurzel-Analyse zeigte zwei verschachtelte Probleme:
+
+1. **W1 Discoverability** — Der prominente "Aktualisieren"-Button im Bid-Tab rief gar nicht den OFP-Refresh fuer den aktiven Flug auf. Pilot musste den versteckten Cockpit-Refresh-Button finden.
+2. **W5 Bid weg nach Prefile** — phpVMS-7 entfernt den Bid sofort wenn AeroACARS prefiled. Damit ist der gesamte phpVMS-Pointer-Pfad fuer OFP-Refresh **tot** sobald der Pilot in Boarding ist. Cockpit-Button auch.
+
+v0.7.7 loest beide gemeinsam — UX-Schicht + echter Daten-Pfad.
+
+Spec: `docs/spec/ofp-refresh-during-boarding.md` v1.4 + `docs/spec/ofp-refresh-simbrief-direct-v0.7.8.md` v1.5.
+
+### Schicht 1 — UX-Discoverability
+
+- **Bid-Tab-Refresh ruft jetzt auch `flight_refresh_simbrief`** — der prominente Button macht endlich was der Pilot erwartet
+- **Phase-Gate** `Preflight | Boarding | Pushback | TaxiOut` (inkl. Pushback — Plan-Werte sind dort noch nutzbar)
+- **`flight_id` persistiert** vor `prefile_pirep` aus dem Bid — sonst nach Prefile fuer immer weg (W5-Foundation)
+- **`simbrief_ofp_id` + `_generated_at`** in FlightStats fuer "OFP unveraendert"-Erkennung
+- **Notice-Infrastruktur** mit Auto-Clear + UI-Refresh-Trigger
+- Pilot-Client-Banner ist seit v0.7.1 schon master-score-derived — keine Aenderung noetig
+
+### Schicht 2 — Daten-Pfad SimBrief-direct
+
+- **`fetch_simbrief_direct()`** via `xml.fetcher.php?userid=X` oder `?username=X` — bypasst den phpVMS-Bid-Pointer komplett. Funktioniert auch wenn der Bid weg ist (W5-Loesung)
+- **Settings-Section "SimBrief Integration"** — eigene Tab-Sektion mit zwei Feldern (Username + User-ID), `Verbindung pruefen`-Button mit OFP-Vorschau bei Erfolg
+- **localStorage-Sync beim Login-Mount** — Settings sind nach App-Restart sofort verfuegbar, kein Pilot-Doppelklick noetig
+- **Robust-Error-Detection** — HTTP 400 (Navigraph-Doku) UND `<fetch><status>Error</status>` (Live-Probe) werden beide als `UserNotFound` gemapped
+- **`SimBriefDirectError`-Enum** (UserNotFound / Unavailable / Network / ParseFailed) mit spezifischen i18n-Notice-Texten
+
+### Match-Verifikation (Pilot-Callsign-Cases)
+
+Real-Beispiel: Pilot fliegt Bid `CFG1504` aber mit persoenlichem Callsign `4TK`. SimBrief-OFP traegt Callsign `CFG4TK`. Match-Logik akzeptiert eine **Kandidaten-Liste** valider Formen:
+
+1. `airline_icao + flight_number` (`CFG1504`)
+2. `flight_number` allein (`1504`)
+3. `Bid.flight.callsign` direkt (wenn phpVMS-VA das fuellt)
+4. `airline_icao + Profile.callsign` (`CFG4TK`)
+5. `Profile.callsign` allein (`4TK`)
+
+dpt/arr bleiben Pflicht-Anker. Kein blinder Suffix-Match (= `DLH1100` vs `100` MISMATCH, v1.1-Regression-Guard).
+
+### Mismatch-Handling
+
+Wenn der Pilot zwischen Bid-Start und Refresh einen OFP fuer einen **anderen Flug** generiert hat: **HARD-Block** mit reicher Notice. Pilot sieht:
+
+> ⚠ Dein letzter SimBrief-OFP gehoert zu Flug **CFG2000** (EDDF → GCTS). Erwartet waere **CFG1504 / 1504 / CFG4TK / 4TK** (EDDF → GCTS). Bitte auf simbrief.com einen OFP fuer den aktiven Flug generieren.
+
+Alle 3 Refresh-Buttons (Bid-Tab + Cockpit-Tab + Loadsheet-Inline) zeigen identische, lokalisierte Notice via shared `formatRefreshError`-Helper. Cockpit-Context zeigt zusaetzlich `phase_locked` + `no_simbrief_link` als lesbare Hinweise — keine `[object Object]`-Falle mehr.
+
+### Audit-Trail
+
+`flight_refresh_simbrief` loggt jetzt im Activity-Log:
+- `OFP refreshed` (alte ID → neue ID, neu)
+- `OFP unchanged` (gleiche ID, nichts ueberschrieben)
+
+Sichtbar im Pilot-Activity-Log + im JSONL-Flugprotokoll fuer Re-Analyse.
+
+### Composite-Failure-Priorisierung
+
+Wenn beide Pfade scheitern (SimBrief offline UND Bid weg), priorisiert die Notice den **Direct-Fehler** — Pilot weiss damit dass das Problem bei SimBrief-Konfiguration sitzt, nicht beim Bid. Falsche Diagnose ("Bid weg" als Sekundaer-Symptom) wird vermieden.
+
+### Backward-Compat
+
+- Pilot ohne SimBrief-Username/User-ID in Settings: faellt auf v0.7.6-Verhalten zurueck (Pointer-Pfad mit `bid_not_found`-Hinweis, jetzt mit Pointer auf Settings)
+- Alte v0.7.6-PIREPs werden nicht beruehrt
+- Alte landing_history.json + PersistedFlight-Snapshots bleiben lesbar (alle neuen Felder `Option<T>` + `#[serde(default)]`)
+
+### Tests
+
+- **179/179 gruen** (vorher 169)
+- 99 lib unit (+27: 8 Persistenz/Phase-Gate + 19 Match-Verifikation inkl. CFG4TK + Audit-Log)
+- 11 api-client (+2 SimBrief request_id-Parser)
+- 13 phase_fsm_replay (v0.7.5)
+- 8 touchdown_v2_replay
+- 30 sim_core unit + 9 sim_core lib
+- 8 goldenset (landing-scoring)
+
+### Update-Empfehlung
+
+Auto-Updater zieht v0.7.7 automatisch fuer alle bestehenden v0.7.6-Pilot-Clients. Pilot kann nach Update einmalig SimBrief-Username/User-ID in Settings eintragen (oder ohne SimBrief-direct weiter Pointer-Pfad nutzen). Ohne Settings-Eintrag funktioniert AeroACARS exakt wie v0.7.6.
+
+---
+
 ## [v0.7.6] — 2026-05-11
 
 🧮 **Landing Payload & UI Consistency — Score, Payload, Forensik und Web-Anzeige zeigen jetzt dieselbe Wahrheit. Drei reale Datenkonsistenz-Bugs beseitigt, durch zwei v0.7.5-Pilot-Logs belegt.**
