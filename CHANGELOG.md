@@ -4,6 +4,60 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.7.14] — 2026-05-12
+
+🎯 **Discord-Posts laufen jetzt zentral vom VPS — Pilot-Client postet nichts mehr.**
+
+### Warum
+
+v0.7.13 hatte Pilot-Local-Webhook-URL eingeführt — Pilot pasted die URL in Settings. Problem: bei N Piloten = N Stellen wo das Token leakt + jeder Pilot konnte eine andere URL setzen (= Discord-Spam-Risiko).
+
+Außerdem hat der Recorder auf live.kant.ovh **bereits seit Monaten** seine eigene Discord-Integration (Webapp-Admin → Settings → Discord-Webhook für Touchdown + PIREP-Posts). Pilot-Client postete zusätzlich → doppelte Posts für Landing + PIREP, plus zwei einzelne Events (Takeoff, Divert) die nur der Pilot-Client gepostet hat.
+
+v0.7.14 räumt das auf: **Pilot-Client-Discord-Code komplett raus, Recorder ist die einzige Quelle**.
+
+### Pilot-Client (~250 LOC raus)
+
+- `client/src-tauri/src/discord.rs` komplett gelöscht
+- `mod discord;` aus `lib.rs` raus
+- 4 `discord::post_event(...)`-Aufrufe in `lib.rs` raus (Takeoff, Landing, PirepFiled, Divert)
+- `discord_webhook_get` + `discord_webhook_set` Tauri-Commands raus
+- Settings-Sektion „Discord-Integration" + i18n-Keys (DE/EN/IT) raus
+- Migration: alte `<app_data_dir>/discord-webhook.txt` aus v0.7.13 wird beim ersten Start unter v0.7.14 automatisch gelöscht
+- Cargo `discord-rich-presence` Dep blieb schon raus (v0.7.13)
+
+### Recorder (~80 LOC neu)
+
+- `postTakeoff(db, ev)` — neuer Discord-Poster für Takeoff-Events. Triggered vom MQTT-`takeoff`-Channel den der Recorder schon empfängt.
+- `postPirep` erweitert um Divert-Detection: bei `payload.divert === true` zeigt das Embed `🔀 DIVERT filed` (orange) mit klarer Vorher→Nachher-Route (`EDDF → ~~MDPC~~ ➜ MDST`)
+- `mqttSubscriber` neuer `onTakeoff`-Hook
+- `index.ts` wired `void postTakeoff(db, row)` an den Subscriber
+- Neue Setting `enable_takeoffs` (Default: true) — gleicher Pattern wie `enable_touchdowns`/`enable_pireps`
+
+### Webapp (Admin)
+
+- Settings → Discord-Webhook: zusätzlicher Toggle „Takeoffs posten" zwischen Webhook-URL und „Touchdowns posten"
+- PIREPs-Label ergänzt: „PIREPs posten (inkl. Divert-Embed bei Umleitungen)"
+
+### Was VA-Owner macht (einmalig)
+
+1. Browser: https://live.kant.ovh/admin/ → Settings → Discord-Webhook
+2. **Webhook-URL** einfügen (aus dem Discord-Server, falls noch nicht da)
+3. **Toggles** prüfen (Takeoffs/Touchdowns/PIREPs alle ✓ ist Default)
+4. **Test**-Button → grünes „✓ Webhook OK"
+5. **Speichern**
+
+Fertig. **Kein Pilot muss irgendwas machen.** Beim nächsten Flug postet der Recorder Takeoff + Touchdown + PIREP (+ ggf. Divert) automatisch.
+
+### Sicherheits-Properties
+
+- URL liegt **nur** in SQLite-DB des Recorders (`/var/lib/aeroacars-recorder/`)
+- URL geht **nie** an einen Pilot-Client
+- Pilot kann URL nicht sehen, ändern, oder missbrauchen
+- Rotation: VA-Owner ändert die URL in 30 Sek im Webapp-Admin, fertig
+
+---
+
 ## [v0.7.13] — 2026-05-12
 
 🧹 **Codebase-Audit + Security-Cleanup — kein hardcoded Token mehr, ~700 LOC tot raus.**

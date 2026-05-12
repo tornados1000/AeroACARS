@@ -431,12 +431,6 @@
       "verify_err_parse_failed": "Impossibile leggere la risposta di SimBrief.",
       "verify_err_unknown": "Errore sconosciuto durante la verifica."
     },
-    "discord": {
-      "title": "Integrazione Discord",
-      "intro": "Opzionale. AeroACARS può postare eventi Takeoff / Landing / PIREP / Divert in un canale Discord — tramite un webhook configurato dalla tua VA. Lascia vuoto per nessun post. Chiedi al tuo VA owner l'URL del webhook.",
-      "webhook_label": "URL Webhook",
-      "webhook_hint": "Formato: https://discord.com/api/webhooks/.../... — il token è praticamente una password, NON condividere in chat."
-    },
     "simulator_section": "Simulatore",
     "simulator_label": "Simulatore attivo",
     "simulator_hint": "Scegli il tuo simulatore. AeroACARS si connette automaticamente non appena il simulatore viene avviato.",

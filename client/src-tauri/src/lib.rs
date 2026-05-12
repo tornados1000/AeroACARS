@@ -5,7 +5,9 @@
 //! per-user config dir. The API key itself is stored via `secrets` (OS keyring),
 //! never on disk in plaintext.
 
-mod discord;
+// v0.7.14: `mod discord` entfernt — Pilot-Client postet keine Discord-Events
+// mehr. Recorder auf live.kant.ovh macht das jetzt zentral (eine Quelle,
+// VA-Owner-kontrolliert via Webapp-Admin-Settings). Audit Q4-2026-05 (C1).
 mod runway;
 mod xplane_plugin_install;
 // v0.6.0 — neuer zentraler State-Owner. Aktiviert wenn die Env-Var
@@ -4247,56 +4249,28 @@ fn set_minimize_to_tray(
     Ok(())
 }
 
-/// v0.7.13: Discord-Webhook-URL aus dem File-Storage lesen
-/// (`<app_data_dir>/discord-webhook.txt`). Returnt `None` wenn die Datei
-/// fehlt oder leer ist. Spec: Audit-A1.
-#[tauri::command]
-fn discord_webhook_get(app: AppHandle) -> Option<String> {
-    let base = app.path().app_data_dir().ok()?;
-    let path = base.join("discord-webhook.txt");
-    let content = std::fs::read_to_string(path).ok()?;
-    let trimmed = content.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
+// v0.7.13 Discord-Webhook-File-Commands entfernt + v0.7.14 Migration:
+// die alte Pilot-Local-Datei `<app_data_dir>/discord-webhook.txt` wird beim
+// App-Start geloescht (siehe `migrate_remove_discord_webhook_file` weiter
+// unten + Call im Setup-Hook). Discord-Posts macht ab v0.7.14 ausschliesslich
+// der Recorder auf live.kant.ovh, konfigurierbar via Webapp-Admin-Settings.
 
-/// v0.7.13: Discord-Webhook-URL setzen. Leerer / None-Wert loescht die
-/// Datei (= keine Discord-Posts mehr). Sonst File-Write mit chmod 0600
-/// auf Unix (Webhook-Token ist quasi ein Passwort). Spec: Audit-A1.
-#[tauri::command]
-fn discord_webhook_set(app: AppHandle, url: Option<String>) -> Result<(), UiError> {
-    let base = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| UiError::new("path_err", format!("app_data_dir: {e}")))?;
-    std::fs::create_dir_all(&base)
-        .map_err(|e| UiError::new("io_err", format!("mkdir: {e}")))?;
+/// v0.7.14: Migration — alte Pilot-Local-Webhook-Datei (`<app_data_dir>/
+/// discord-webhook.txt`) aus v0.7.13 loeschen. Der Pilot-Client postet ab
+/// v0.7.14 nichts mehr in Discord — der Recorder macht das zentral.
+fn migrate_remove_discord_webhook_file(app: &AppHandle) {
+    let Ok(base) = app.path().app_data_dir() else {
+        return;
+    };
     let path = base.join("discord-webhook.txt");
-    let trimmed = url
-        .as_deref()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    match trimmed {
-        Some(u) => {
-            std::fs::write(&path, &u)
-                .map_err(|e| UiError::new("io_err", format!("write: {e}")))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-            }
-            tracing::info!("discord webhook URL gesetzt (Laenge: {})", u.len());
-        }
-        None => {
-            // Datei loeschen — Discord-Posts deaktiviert.
-            let _ = std::fs::remove_file(&path);
-            tracing::info!("discord webhook URL geloescht");
+    if path.exists() {
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::info!(
+                "v0.7.14 migration: discord-webhook.txt geloescht (Discord-Posts macht jetzt der VPS-Recorder)"
+            ),
+            Err(e) => tracing::warn!(error = %e, "v0.7.14 migration: discord-webhook.txt loeschen failed"),
         }
     }
-    Ok(())
 }
 
 // v0.7.13: `get_simbrief_settings` Tauri-Command entfernt — Frontend
@@ -9069,48 +9043,11 @@ async fn flight_end(
                 outcome: FlightOutcome::Filed,
             },
         );
-        // v0.4.0: Discord-Webhook für Divert. Fire-and-forget — wir
-        // wollen Discord NIE im File-Pfad warten lassen.
-        {
-            let actual_arr = divert_to
-                .as_deref()
-                .unwrap_or(&flight.arr_airport)
-                .to_string();
-            let cached_pilot = state
-                .cached_pilot
-                .lock()
-                .expect("cached_pilot lock")
-                .clone();
-            let (pilot_ident, pilot_name) = match cached_pilot {
-                Some((id, name)) => (Some(id), Some(name)),
-                None => (None, None),
-            };
-            let stats_for_post = flight.stats.lock().expect("flight stats");
-            let ctx = discord::EventContext {
-                callsign: format_callsign(&flight.airline_icao, &flight.flight_number),
-                airline_logo_url: flight.airline_logo_url.clone(),
-                dpt_icao: flight.dpt_airport.clone(),
-                arr_icao: actual_arr,
-                planned_arr_icao: Some(flight.arr_airport.clone()),
-                aircraft_type: Some(flight.aircraft_icao.clone()).filter(|s| !s.is_empty()),
-                aircraft_reg: Some(flight.planned_registration.clone()).filter(|s| !s.is_empty()),
-                pilot_ident,
-                pilot_name,
-                distance_nm: body.distance,
-                flight_time_min: body.flight_time,
-                // v0.7.1 Round-3 P2-Fix: Divert-Discord-Embed nutzt jetzt
-                // den GLEICHEN Aggregate-Master-Score wie der normale
-                // PIREP-Discord-Embed (siehe lib.rs ~7945). Vorher zeigte
-                // ein Divert-Embed den alten Touchdown-Klassifikator —
-                // inkonsistent zum "Discord-Embed score = Aggregate"-Vertrag.
-                score: compute_aggregate_master_score(&stats_for_post)
-                    .map(|m| m as i32)
-                    .or_else(|| stats_for_post.landing_score.map(|s| s.numeric())),
-                ..Default::default()
-            };
-            drop(stats_for_post);
-            tokio::spawn(discord::post_event(app.clone(), discord::EventKind::Divert, ctx));
-        }
+        // v0.7.14: Pilot-Client-Discord-Post fuer Divert entfernt — Recorder
+        // postet das jetzt zentral (= eine Quelle, kein Doppel-Post). Die
+        // Divert-Info ist im PirepPayload (divert + diverted_to) und kommt
+        // automatisch beim Recorder an wenn der MQTT-PIREP-Event publisht.
+        // Audit Q4-2026-05 (C1).
         consume_bid_best_effort(&client, flight.bid_id).await;
         // Drop the in-memory active flight: divert is finalized.
         let _ = state.active_flight.lock().expect("active_flight lock").take();
@@ -9173,65 +9110,9 @@ async fn flight_end(
                     outcome: FlightOutcome::Filed,
                 },
             );
-            // v0.4.0: Discord-Webhook für regulären File-Erfolg.
-            // Fire-and-forget. Divert hat einen eigenen Hook oben
-            // (anderes Embed mit DIVERT-Banner).
-            {
-                let cached_pilot = state
-                    .cached_pilot
-                    .lock()
-                    .expect("cached_pilot lock")
-                    .clone();
-                let (pilot_ident, pilot_name) = match cached_pilot {
-                    Some((id, name)) => (Some(id), Some(name)),
-                    None => (None, None),
-                };
-                let stats_for_post = flight.stats.lock().expect("flight stats");
-                let ctx = discord::EventContext {
-                    callsign: format_callsign(&flight.airline_icao, &flight.flight_number),
-                        airline_logo_url: flight.airline_logo_url.clone(),
-                    dpt_icao: flight.dpt_airport.clone(),
-                    arr_icao: flight.arr_airport.clone(),
-                    aircraft_type: Some(flight.aircraft_icao.clone()).filter(|s| !s.is_empty()),
-                    aircraft_reg: Some(flight.planned_registration.clone()).filter(|s| !s.is_empty()),
-                    pilot_ident,
-                    pilot_name,
-                    distance_nm: body.distance,
-                    flight_time_min: body.flight_time,
-                    // v0.7.1 P1.3-Fix: gewichteter Aggregate-Score
-                    // statt Touchdown-Klassifikation (zeigt jetzt auch
-                    // Fuel/Loadsheet im Discord-Embed).
-                    score: {
-                        let actual_burn = actual_burn_for_record(&stats_for_post);
-                        let scoring_input = landing_scoring::LandingScoringInput {
-                            vs_fpm: stats_for_post
-                                .landing_peak_vs_fpm
-                                .or(stats_for_post.landing_rate_fpm),
-                            peak_g_load: stats_for_post.landing_peak_g_force,
-                            // v0.7.6 P2-B: zentraler Helper statt direkten Read.
-                            bounce_count: Some(scored_bounce_count_for_score(&stats_for_post)),
-                            approach_vs_stddev_fpm: stats_for_post.approach_vs_stddev_fpm,
-                            approach_bank_stddev_deg: stats_for_post
-                                .approach_bank_stddev_deg,
-                            rollout_distance_m: stats_for_post
-                                .rollout_distance_m
-                                .map(|m| m as f32),
-                            planned_burn_kg: stats_for_post.planned_burn_kg,
-                            actual_trip_burn_kg: actual_burn,
-                            planned_zfw_kg: stats_for_post.planned_zfw_kg,
-                            planned_tow_kg: stats_for_post.planned_tow_kg,
-                            ..Default::default()
-                        };
-                        let subs = landing_scoring::compute_sub_scores(&scoring_input);
-                        landing_scoring::aggregate_master_score(&subs)
-                            .map(|m| m as i32)
-                            .or_else(|| stats_for_post.landing_score.map(|s| s.numeric()))
-                    },
-                    ..Default::default()
-                };
-                drop(stats_for_post);
-                tokio::spawn(discord::post_event(app.clone(), discord::EventKind::PirepFiled, ctx));
-            }
+            // v0.7.14: Pilot-Client-Discord-Post fuer PirepFiled entfernt —
+            // Recorder postet das jetzt zentral via `postPirep` aus dem
+            // MQTT-PIREP-Event. Audit Q4-2026-05 (C1).
             // v0.5.11: MQTT live-tracking PIREP publish. Best-effort,
             // fire-and-forget. Monitor uses this to mark a flight
             // as completed in the live history.
@@ -11406,17 +11287,14 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
 
             // Snapshot the current phase BEFORE stepping so we can pass
             // the from→to pair to the recorder when it changes.
-            // Plus snapshot Takeoff/Landing-at flags so we can fire
-            // Discord-Webhook-Posts beim None→Some-Übergang nach
-            // step_flight (v0.4.0).
-            let (prev_phase, prev_block_off_at, prev_takeoff_at, prev_landing_at) = {
+            // Plus snapshot Takeoff/Block-flags fuer MQTT-Snapshot-Publish
+            // beim None→Some-Übergang nach step_flight.
+            // v0.7.14: prev_landing_at war frueher fuer Discord-Webhook-Post
+            // — Discord macht jetzt der Recorder zentral. Wir tracken nur noch
+            // Takeoff + Block fuer die MQTT-Snapshot-Publishes (weiter unten).
+            let (prev_phase, prev_block_off_at, prev_takeoff_at) = {
                 let stats = flight.stats.lock().expect("flight stats");
-                (
-                    stats.phase,
-                    stats.block_off_at,
-                    stats.takeoff_at,
-                    stats.landing_at,
-                )
+                (stats.phase, stats.block_off_at, stats.takeoff_at)
             };
             // Update running stats AND step the flight-phase FSM.
             // v0.5.25: arr_airport_elevation_ft fuer HAT-basiertes
@@ -11443,60 +11321,10 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                 }
             }
             let phase_change = step_flight(&flight, &snap);
-            // v0.4.0: Discord-Webhook-Posts für Takeoff + Landing.
-            // Wir feuern fire-and-forget (tokio::spawn) damit der
-            // Streamer-Tick nie auf Discord wartet — ein langsamer
-            // Webhook würde sonst die Position-Post-Frequenz killen.
-            // Filter: Übergang None→Some am Stats-Feld, nicht Phase
-            // — verhindert Doppel-Posts wenn der FSM zwischen Phasen
-            // hin- und herflattert.
-            {
-                let cached_pilot = app
-                    .state::<AppState>()
-                    .cached_pilot
-                    .lock()
-                    .expect("cached_pilot lock")
-                    .clone();
-                let (pilot_ident, pilot_name) = match cached_pilot {
-                    Some((id, name)) => (Some(id), Some(name)),
-                    None => (None, None),
-                };
-                let stats = flight.stats.lock().expect("flight stats");
-                if prev_takeoff_at.is_none() && stats.takeoff_at.is_some() {
-                    let ctx = discord::EventContext {
-                        callsign: format_callsign(&flight.airline_icao, &flight.flight_number),
-                                airline_logo_url: flight.airline_logo_url.clone(),
-                        dpt_icao: flight.dpt_airport.clone(),
-                        arr_icao: flight.arr_airport.clone(),
-                        aircraft_type: Some(flight.aircraft_icao.clone()).filter(|s| !s.is_empty()),
-                        aircraft_reg: Some(flight.planned_registration.clone()).filter(|s| !s.is_empty()),
-                        pilot_ident: pilot_ident.clone(),
-                        pilot_name: pilot_name.clone(),
-                        block_fuel_kg: stats.block_fuel_kg,
-                        planned_block_fuel_kg: stats.planned_block_fuel_kg,
-                        tow_kg: stats.takeoff_weight_kg.map(|w| w as f32),
-                        ..Default::default()
-                    };
-                    tokio::spawn(discord::post_event(app.clone(), discord::EventKind::Takeoff, ctx));
-                }
-                if prev_landing_at.is_none() && stats.landing_at.is_some() {
-                    let ctx = discord::EventContext {
-                        callsign: format_callsign(&flight.airline_icao, &flight.flight_number),
-                                airline_logo_url: flight.airline_logo_url.clone(),
-                        dpt_icao: flight.dpt_airport.clone(),
-                        arr_icao: flight.arr_airport.clone(),
-                        aircraft_type: Some(flight.aircraft_icao.clone()).filter(|s| !s.is_empty()),
-                        aircraft_reg: Some(flight.planned_registration.clone()).filter(|s| !s.is_empty()),
-                        pilot_ident: pilot_ident.clone(),
-                        pilot_name: pilot_name.clone(),
-                        landing_rate_fpm: stats.landing_rate_fpm,
-                        score: stats.landing_score.map(|s| s.numeric()),
-                        distance_nm: Some(stats.distance_nm),
-                        ..Default::default()
-                    };
-                    tokio::spawn(discord::post_event(app.clone(), discord::EventKind::Landing, ctx));
-                }
-            }
+            // v0.7.14: Pilot-Client-Discord-Posts fuer Takeoff + Landing
+            // entfernt — Recorder postet das jetzt zentral via MQTT-Trigger
+            // (`takeoff` + `touchdown` Events publishen sowieso, Recorder
+            // abonniert sie). Audit Q4-2026-05 (C1).
             // v0.5.14: MQTT block + takeoff snapshots. Fire on the same
             // None→Some transitions used by the Discord webhook block
             // above. Block fires when block_off_at is stamped (=
@@ -17914,6 +17742,13 @@ pub fn run() {
                     tracing::error!(error = %e, "could not resolve app_data_dir for secrets");
                 }
             }
+
+            // v0.7.14: alte Pilot-Local-Webhook-Datei `discord-webhook.txt`
+            // aus v0.7.13 loeschen. Discord-Posts macht ab v0.7.14 der
+            // Recorder auf live.kant.ovh zentral (Webapp-Admin-Settings).
+            // Audit Q4-2026-05 (C1).
+            migrate_remove_discord_webhook_file(&app.handle());
+
             // Resolve the activity-log persistence path now that we
             // have an AppHandle. After this, save_activity_log() can
             // run without a handle (uses the OnceLock cache).
@@ -17997,9 +17832,8 @@ pub fn run() {
             divert_nearest_airports,
             fetch_release_notes,
             set_minimize_to_tray,
-            // v0.7.13 Discord-Webhook-URL Setting (Audit A1 — kein Hardcode mehr)
-            discord_webhook_get,
-            discord_webhook_set,
+            // v0.7.14: Discord-Posts macht der Recorder zentral — keine
+            // Pilot-Client-Commands mehr fuer Webhook-URL. Audit C1.
             // v0.7.8 SimBrief Integration (Spec §4)
             set_simbrief_settings,
             verify_simbrief_identifier,
