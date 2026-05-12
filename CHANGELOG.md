@@ -4,6 +4,75 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.7.16] — 2026-05-12 · Fenix A32x Cockpit-State (Opt-in Beta)
+
+🧪 **Stable-Release mit neuem Opt-in Beta-Feature für Fenix A32x. Standardmäßig deaktiviert. Read-only, kein FSUIPC, keine MSFS Community-Folder-Änderungen. Wer ihn nicht einschaltet, fliegt bit-identisch zu v0.7.15.**
+
+### Was die Version liefert
+
+#### Fenix A319 / A320 / A321 Variant-Erkennung
+- `AircraftProfile` erweitert um `FenixA319` und `FenixA321` (vorher liefen beide als `FenixA320`)
+- Detection per Title-Substring + ICAO-Fallback (für Repaints ohne Variant-Suffix)
+- Helper `AircraftProfile::is_fenix()` für alle drei Varianten
+- Label-Differenzierung: „Fenix A319" / „Fenix A320" / „Fenix A321"
+
+#### Additive Fenix-LVAR-Mappings (Opt-in)
+Neu unter dem `fenix_beta_enabled`-Flag (Default off):
+- `L:S_OH_EXT_LT_LANDING_L` + `_R` (3-Pos-Selektor: retracted/off/on) → `light_landing`
+- `L:S_OH_EXT_LT_NOSE` (3-Pos: off/taxi/T.O.) → `light_taxi`
+- `L:S_OH_EXT_LT_WING` (Wing-Inspection) → neu: `light_wing` für Fenix-Beta-User
+- `L:S_OH_EXT_LT_RWY_TURNOFF` (Runway-Turnoff, read-only QS)
+- `L:S_OH_EXT_LT_LANDING_BOTH` (Composite, Verifikation gegen L/R)
+- `L:S_FC_FLAPS` (Flaps-Lever-Detent, read-only QS)
+
+LVAR-Namen verifiziert gegen den **echten Fenix-Install** auf der Dev-Maschine — Quelle:
+`SimObjects\Airplanes\FNX_32X\model\FNX32X_Interior.xml` in
+`fnx-aircraft-320` / `fnx-aircraft-319-321`.
+
+#### Feature-Flag-Infrastruktur
+- `fenix_beta_enabled: AtomicBool` auf `MsfsAdapter::Shared`
+- Tauri-Commands `set_fenix_beta_enabled` / `get_fenix_beta_enabled`
+- Frontend-Toggle in Settings → Beta (DE / EN / IT lokalisiert)
+- localStorage-Persistenz + Backend-Sync beim App-Mount
+- Default off → bit-identisches Verhalten zu v0.7.15 Stable für alle Nicht-Beta-User
+
+### Spec-Garantien
+
+- ❌ Keine Writes, keine Steuerung, kein FMC-Zugriff
+- ❌ Keine FSUIPC-Abhängigkeit
+- ❌ Keine MSFS Community-Folder-Additionen (kein WASM-Modul, keine DLL)
+- ✅ Read-only via plain SimConnect mit `L:`-Prefix
+- ✅ Pilot muss nur AeroACARS-Update installieren + Schalter umlegen
+- ✅ Bei fehlender LVAR: leise auf Standard-MSFS-SimVar zurückfallen, kein Crash
+
+### Tests
+
+- 12 neue Rust-Unit-Tests (7 in sim-core für A319/A320/A321-Detection + is_fenix-Helper; 5 in sim-msfs für Beta-On/Off-Mapping + Layout-Smoke-Test)
+- `cargo test --workspace --lib`: 224/224 passed
+
+### Verifikation
+
+| Check | Status |
+|---|---|
+| `cargo check` (client/src-tauri) | ✅ |
+| `cargo test --workspace --lib` | ✅ 224/224 |
+| Spec-Pfad-Aktualisierung (`Cockpit_Behavior.xml` → `FNX32X_Interior.xml`) | ✅ |
+| LVAR-Namen vs. echter Fenix-Install | ✅ |
+| Stable-Verhalten (Beta aus) bit-identisch zu v0.7.15 | ✅ |
+
+### Release-Regeln
+
+Diese Version geht **als normales Stable-Release** über den Auto-Updater an alle Piloten. Das Fenix-Profil ist Opt-in und Default off, deshalb kein Risiko für die breite Nutzerbasis.
+
+Stable-Übernahme der Fenix-LVAR-Mappings in den **Default-Path** (= ohne Opt-in) folgt frühestens, wenn das Beta-Feedback grün ist.
+
+### Dokumente
+
+- Spec: [docs/spec/fenix-a32x-cockpit-state-beta.md](docs/spec/fenix-a32x-cockpit-state-beta.md)
+- QS-Guide: [docs/spec/fenix-a32x-beta-qs-guide.md](docs/spec/fenix-a32x-beta-qs-guide.md)
+
+---
+
 ## [v0.7.15] — 2026-05-12 · Sim-Recovery Release
 
 🎯 **Laufende Flüge überleben Simulator-Crash, Pause, Neustart oder kurze Rechner-Unterbrechungen sauber — ohne Datenloch, ohne Session-Split, mit korrekter Flight-Time.**
