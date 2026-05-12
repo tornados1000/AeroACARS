@@ -108,11 +108,11 @@ pub enum FieldId {
     TakeoffConfigWarning,
     /// Spec v0.7.15 F6: `sim/time/paused` — 1 wenn der User die
     /// Pause-Taste in X-Plane gedrueckt hat, sonst 0. Plus Replay
-    /// (`sim/time/sim_in_replay`) wird zur selben Pause-Logik
+    /// (`sim/time/is_in_replay`) wird zur selben Pause-Logik
     /// aggregiert: aus AeroACARS-Sicht ist Replay "Flug-Telemetrie
     /// ist nicht echt, also als Pause behandeln".
     SimPaused,
-    /// Spec v0.7.15 F6: `sim/time/sim_in_replay` — 1 wenn der User in
+    /// Spec v0.7.15 F6: `sim/time/is_in_replay` — 1 wenn der User in
     /// X-Planes Replay-Modus ist (eigene Pause-aehnliche Quelle).
     SimInReplay,
 }
@@ -575,7 +575,7 @@ pub struct XPlaneState {
     /// Pause-Taste in X-Plane gedrueckt hat. SimSnapshot.paused wird
     /// daraus gespeist.
     pub sim_paused: bool,
-    /// Spec v0.7.15 F6: `sim/time/sim_in_replay`-Wert. AeroACARS
+    /// Spec v0.7.15 F6: `sim/time/is_in_replay`-Wert. AeroACARS
     /// behandelt Replay als Pause-aequivalent (kein echter Flug).
     pub sim_in_replay: bool,
     /// True once we've received at least one RREF packet — drives
@@ -747,7 +747,7 @@ impl XPlaneState {
             parking_brake: self.parking_brake_ratio > 0.5,
             stall_warning: self.stall_warning,
             overspeed_warning: false, // X-Plane has no direct overspeed annunciator
-            // Spec v0.7.15 F6: aus sim/time/paused + sim/time/sim_in_replay
+            // Spec v0.7.15 F6: aus sim/time/paused + sim/time/is_in_replay
             // ableiten. Beide werden als Pause-aequivalent behandelt — Replay
             // ist keine echte Flugaufzeichnung, der Streamer-Loop pausiert
             // also fuer beide Faelle und der Pause-Akkumulator zaehlt.
