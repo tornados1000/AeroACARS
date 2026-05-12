@@ -4,6 +4,98 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.7.15] — 2026-05-12 · Sim-Recovery Release
+
+🎯 **Laufende Flüge überleben Simulator-Crash, Pause, Neustart oder kurze Rechner-Unterbrechungen sauber — ohne Datenloch, ohne Session-Split, mit korrekter Flight-Time.**
+
+### Trigger
+
+Real-Pilot-Incident **AUA 323 LOWW→ESGG am 2026-05-11** (PIREP `J2VoaZmoD6LQGpMg`): MSFS friert im Descent ein, ACARS pausiert nach 30 s, Pilot bemerkt es erst nach manueller Landung am Boden in ESGG. Resultat: zwei Sessions im History-Tab, Block-Time-Drift, AeroACARS-Recorder hat eine 23-min Lücke nicht überbrückt.
+
+Diese Version ist ein **kombiniertes Sim-Recovery-Release** das diese Wurzel an drei Stellen anpackt: Pause-Handling, Session-Identität, Sim-Awareness.
+
+### Was die Version liefert
+
+#### Phase 1 (Client) — Auto-Resume + Pause-Akkumulator + `pirep_id`-Payload
+- Streamer-Loop resumed automatisch sobald wieder Sim-Daten kommen — kein manueller „Flug fortsetzen"-Klick mehr nötig
+- Manueller Resume-Button bleibt als Fallback
+- Pause-Dauern werden in `pause_total_duration_secs` akkumuliert + an `pause_segments` angehängt (Audit-Log)
+- Block-/Flight-Time im PIREP zieht akkumulierte Pause-Zeit ab (Heartbeat + File + Manual-Edit)
+- Reposition-Distanz beim Resume wird NICHT in `distance_nm` addiert (`last_lat`/`last_lon` reset)
+- `pirep_id` wird in jedem Position-MQTT-Payload mitgesendet
+- **Heartbeat-Fix**: bei Sim-Disconnect ohne Snapshot wird trotzdem alle 30 s ein Heartbeat mit `last_good_snap` an phpVMS gesendet → PIREP bleibt unbegrenzt am Leben
+
+#### Phase 2 (Server) — `pirep_id`-Join im `ensureSession`
+- Recorder priorisiert `pirep_id` aus dem Payload VOR der Standard-Heuristik (callsign/dep/arr + Zeitfenster) → 23-min-Positions-Lücken erzeugen keine neue Session mehr
+- 6h-Cutoff: ENDED-Sessions können nur innerhalb von 6h nach `last_seen` reopened werden
+- Terminal-Schutz: ARRIVED/PIREP_SUBMITTED-Sessions werden NIE wiedereröffnet
+- Backfill: ACTIVE-Sessions ohne `pirep_id` bekommen sie nachträglich angeheftet
+- Frisch erstellte Sessions bekommen `pirep_id` direkt mit gesetzt
+
+#### F5 — MSFS-Pause via SimConnect `Pause_EX1`
+- SimConnect-System-Event `Pause_EX1` mit `dwData`-Flag-Set wird abonniert
+- Aktive MSFS-Esc-Pause / Active-Pause / Sim-Pause werden sofort erkannt — kein 30 s-Warten auf Disconnect-Threshold
+- Initial-State zuverlässig: wenn AeroACARS connectet während MSFS schon pausiert ist, kommt sofort ein initialer Pause_EX1-Event
+- `SimSnapshot.paused` wird durchgereicht, der Streamer pausiert + akkumuliert
+- Auto-Resume bei Pause_EX1-Event mit `dwData=0` ohne Pilot-Klick
+
+#### F6 — X-Plane Pause + Replay-Modus
+- Neue RREF-Subscriptions auf `sim/time/paused` + `sim/time/is_in_replay`
+- `SimSnapshot.paused` wird aus beiden gespeist (Replay-Modus zählt als Pause-äquivalent)
+- Funktioniert ohne X-Plane-Plugin-Update — RREF ist nativ, kein Protokoll-Bump nötig
+
+#### F7 — Aircraft-Change-Warnung nach Recovery (MSFS + X-Plane ≥12.1)
+- Beim Resume Vergleich `snap.aircraft_icao` vs. `flight.aircraft_icao` (Bid-Wert)
+- Bei Mismatch: Activity-Log-Warn mit konkretem Hinweis („Sim meldet A320, Bid erwartet B738")
+- Resume wird NICHT blockiert (Spec-Prinzip P2: informieren statt blockieren) — Pilot kann via PIREP-Cancel-UI korrigieren
+- **Sim-Coverage:** MSFS via SimConnect (ATC MODEL); X-Plane via Web-API ab v12.1 (`sim/aircraft/view/acf_ICAO`). X-Plane <12.1 oder mit deaktivierter Web-API überspringt F7 still (keine falsch-positiven Warnungen)
+
+### Datenmodell
+
+`FlightStats` + `PersistedFlightStats` erweitert um (alle `#[serde(default)]`, forward-only):
+- `pause_total_duration_secs: i64` — Summe aller Pause-Sekunden
+- `pause_segments: Vec<PauseSegment>` — Audit-Daten pro Pause-Block (Start, Ende, Reason, Drift)
+- `current_pause_reason: Option<PauseReason>` — aktive Reason für Resume-Helper
+- `PauseReason` enum: `SimDisconnect` | `SimPause` | `ManualResume`
+
+Pre-v0.7.15 `active_flight.json` lädt weiter — fehlende Felder defaulten auf `0` / leeren Vec / `None`.
+
+### Tests
+
+- 16 neue Rust-Unit-Tests (Block-Time-Saturating-Arithmetik, Drift-Schwellen-Monotonie, PauseSegment serde-Roundtrip, PausedFlightStats Backward-Compat, SimPause-Reason persistence)
+- 5 Node-Test-Driver-Tests im Recorder (25-min-Gap, Terminal-Schutz, 6h-Cutoff, Legacy-Backfill, brand-new Session)
+- `cargo test --lib`: 115/115 passed
+- `npm test` im Recorder: 5/5 passed
+
+### Verifikation
+
+| Check | Status |
+|---|---|
+| `cargo check` (client/src-tauri) | ✅ |
+| `cargo test --lib` | ✅ 115/115 |
+| `npx tsc --noEmit` (recorder) | ✅ |
+| `npm test` (recorder) | ✅ 5/5 |
+| forward-only: pre-v0.7.15 `active_flight.json` lädt | ✅ via `serde(default)` |
+
+### Companion Server-Deploy
+
+Server-Patches sind in `aeroacars-live` (commits `92b22c6` + `0ffceca`) gepusht. Auf `live.kant.ovh` deployen via `deploy-recorder.sh`.
+
+### Aus Scope BEWUSST raus (kommt später)
+
+- F8 Bid-Change-Detection (nur Light-Check geplant gewesen, nicht fertig)
+- Neue Toast-/Banner-UI-Architektur
+- Drift-Linie auf Karte
+- Vollständige 29-Szenarien-Pilot-QS-Matrix
+
+### Spec-Referenz
+
+Komplette Anforderungen + Akzeptanzkriterien: [`docs/spec/sim-disconnect-auto-resume.md`](docs/spec/sim-disconnect-auto-resume.md)
+
+Trigger-Incident-Daten (PIREP `J2VoaZmoD6LQGpMg`) für späteren Forensik-Review.
+
+---
+
 ## [v0.7.14] — 2026-05-12
 
 🎯 **Discord-Posts laufen jetzt zentral vom VPS — Pilot-Client postet nichts mehr.**

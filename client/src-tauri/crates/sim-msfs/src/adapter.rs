@@ -53,6 +53,24 @@ const PMDG_X777_DEFINITION_ID: sys::SIMCONNECT_DATA_DEFINITION_ID = 101;
 const PMDG_X777_REQUEST_ID: sys::SIMCONNECT_DATA_REQUEST_ID = 101;
 const AIRCRAFT_LOADED_REQUEST_ID: sys::SIMCONNECT_DATA_REQUEST_ID = 200;
 const SIM_START_EVENT_ID: u32 = 300;
+/// Spec v0.7.15 F5 (QS-Round-2): SimConnect `Pause_EX1`-Event statt der
+/// zwei separaten `Paused`/`Unpaused`-Events. `Pause_EX1` schickt
+/// sofort den aktuellen Pause-State + bei jedem Wechsel ein Update
+/// mit `dwData`-Flag-Set:
+///   bit 0 (0x01) = SIMCONNECT_PAUSE_FLAG_PAUSE         (Full Pause)
+///   bit 1 (0x02) = SIMCONNECT_PAUSE_FLAG_PAUSE_WITH_SOUND
+///   bit 2 (0x04) = SIMCONNECT_PAUSE_FLAG_ACTIVE_PAUSE
+///   bit 3 (0x08) = SIMCONNECT_PAUSE_FLAG_SIM_PAUSE
+/// = 0 → kein Pause. != 0 → irgendeine Pause-Variante.
+///
+/// Vorteil ggue. `Paused`+`Unpaused`: wenn AeroACARS connectet
+/// waehrend MSFS schon pausiert ist, kommt sofort ein initialer
+/// Pause_EX1-Event mit dem aktuellen State. Bei den zwei separaten
+/// Events haette `sim_paused` bis zum naechsten Toggle weiter `false`
+/// gezeigt.
+///
+/// SDK-Doku: https://docs.flightsimulator.com/html/Programming_Tools/SimConnect/API_Reference/Events_And_Data/SimConnect_SubscribeToSystemEvent.htm
+const PAUSE_EX1_EVENT_ID: u32 = 301;
 const STALE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Public connection state mirrored to the frontend.
@@ -76,6 +94,13 @@ struct Shared {
     state: Mutex<ConnectionState>,
     snapshot: Mutex<Option<SimSnapshot>>,
     last_error: Mutex<Option<String>>,
+    /// Spec v0.7.15 F5: SimConnect-`Paused`/`Unpaused`-System-Events
+    /// setzen dieses Atomic. Wird beim Bauen jedes `SimSnapshot` in
+    /// `telemetry::parse` zurueck nach `snap.paused` kopiert, damit
+    /// der Streamer-Loop in `lib.rs` ueber den bestehenden Snapshot-
+    /// Pfad lesen kann (= keine zweite IPC-Schiene noetig). Default
+    /// false bis der Sim das erste Mal pausiert.
+    sim_paused: AtomicBool,
     /// Last touchdown sample as seen on data definition #2. Updated
     /// asynchronously by SimConnect — we merge it into each emitted
     /// `SimSnapshot` so downstream consumers see a unified view.
@@ -469,6 +494,7 @@ impl MsfsAdapter {
                 state: Mutex::new(ConnectionState::Disconnected),
                 snapshot: Mutex::new(None),
                 last_error: Mutex::new(None),
+                sim_paused: AtomicBool::new(false),
                 touchdown: Mutex::new(None),
                 inspector: Mutex::new(InspectorState::default()),
                 pmdg: Mutex::new(PmdgSharedState::default()),
@@ -848,6 +874,12 @@ fn run_dispatch(
                     match request_id {
                         REQUEST_ID => {
                             let mut snap = telemetry::parse(&bytes, simulator);
+                            // Spec v0.7.15 F5: Pause-State aus dem Atomic
+                            // in den Snapshot kopieren — wird vom Streamer-
+                            // Loop in lib.rs ausgewertet damit der Pause-
+                            // Akkumulator auch waehrend MSFS-Esc-Pause
+                            // (= eingefrorene Snapshots) korrekt zaehlt.
+                            snap.paused = shared.sim_paused.load(Ordering::Relaxed);
                             // Merge in the most recent touchdown sample
                             // so consumers see a unified snapshot.
                             if let Some(td) = *shared.touchdown.lock().unwrap() {
@@ -1023,7 +1055,7 @@ fn run_dispatch(
                         }
                     }
                 }
-                Ok(Some(DispatchMsg::SystemEvent { event_id })) => {
+                Ok(Some(DispatchMsg::SystemEvent { event_id, data })) => {
                     if event_id == SIM_START_EVENT_ID {
                         // SimStart fires when the user loads a new
                         // flight. Re-request AircraftLoaded so we
@@ -1031,6 +1063,20 @@ fn run_dispatch(
                         if let Err(e) = conn.subscribe_aircraft_loaded() {
                             tracing::warn!(error = %e, "re-request AircraftLoaded failed");
                         }
+                    } else if event_id == PAUSE_EX1_EVENT_ID {
+                        // Spec v0.7.15 F5 (QS-Round-2): Pause_EX1 sendet
+                        // bei jedem Pause-Wechsel ein Event mit Flag-Set
+                        // im dwData. Wir behandeln jedes != 0 als
+                        // "Pause aktiv" — Full/Active/Sim-Pause-
+                        // Unterscheidung kommt erst mit einer
+                        // spaeteren Iteration falls relevant.
+                        let paused = data != 0;
+                        shared.sim_paused.store(paused, Ordering::Relaxed);
+                        tracing::info!(
+                            data = format!("0x{:x}", data),
+                            paused,
+                            "MSFS SimConnect Pause_EX1-Event empfangen"
+                        );
                     }
                 }
                 Err(e) => {
@@ -1503,6 +1549,26 @@ impl Connection {
                 "SubscribeToSystemEvent(SimStart) returned 0x{hr:08X}"
             ));
         }
+
+        // Spec v0.7.15 F5 (QS-Round-2): `Pause_EX1`-Event statt der
+        // zwei separaten `Paused`/`Unpaused`-Events. Pause_EX1 sendet
+        // sofort beim Subscribe den aktuellen Pause-State + bei jedem
+        // Wechsel ein Update mit `dwData`-Flag-Set. Damit ist die
+        // Pause-Detection korrekt auch wenn AeroACARS connectet
+        // waehrend MSFS schon pausiert ist.
+        let cevent = std::ffi::CString::new("Pause_EX1").expect("ASCII");
+        let hr = unsafe {
+            sys::SimConnect_SubscribeToSystemEvent(
+                self.handle,
+                PAUSE_EX1_EVENT_ID,
+                cevent.as_ptr(),
+            )
+        };
+        if hr != 0 {
+            return Err(format!(
+                "SubscribeToSystemEvent(Pause_EX1) returned 0x{hr:08X}"
+            ));
+        }
         Ok(())
     }
 
@@ -1606,7 +1672,7 @@ impl Connection {
             }
             id if id == SIMCONNECT_RECV_ID_EVENT => {
                 let evt = unsafe { &*(p_data as *const sys::SIMCONNECT_RECV_EVENT) };
-                Some(DispatchMsg::SystemEvent { event_id: evt.uEventID })
+                Some(DispatchMsg::SystemEvent { event_id: evt.uEventID, data: evt.dwData })
             }
             _ => None,
         };
@@ -1668,7 +1734,12 @@ enum DispatchMsg {
     /// Subscribed system event fired (e.g. `SimStart` when the user
     /// loads a new flight or changes aircraft). On a SimStart we
     /// re-request AircraftLoaded to pick up any variant change.
-    SystemEvent { event_id: u32 },
+    /// SimConnect-System-Event (= subscribed via
+    /// `SimConnect_SubscribeToSystemEvent`). `data` ist der `dwData`-Wert
+    /// aus `SIMCONNECT_RECV_EVENT` — Bedeutung event-spezifisch.
+    /// Fuer `Pause_EX1` ist es das Flag-Set (siehe PAUSE_EX1_EVENT_ID-
+    /// Konstanten-Doku), fuer `SimStart` u.a. 0.
+    SystemEvent { event_id: u32, data: u32 },
 }
 
 // Marker so the file always references kind/Utc when stub'd out.

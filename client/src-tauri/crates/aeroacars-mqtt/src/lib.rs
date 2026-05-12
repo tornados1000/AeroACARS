@@ -91,6 +91,14 @@ pub struct FlightMeta {
     /// placeholder like "FFSTS"). Empty when the bid had no
     /// registration on file — falls back to the snap's value then.
     pub planned_registration: String,
+    /// Spec sim-disconnect-auto-resume F4: phpVMS-PIREP-ID des
+    /// aktiven Flugs. Wird in jeden Position-Payload mit eingebaut,
+    /// damit `aeroacars-live` Server-Sessions ueber die `pirep_id`
+    /// joinen kann statt nur ueber (callsign, dep, arr) + Zeitfenster.
+    /// Loest den AUA-323-Fall: 23-Minuten-Positions-Luecke erzeugt
+    /// keinen Session-Split mehr, solange der Client dieselbe
+    /// `pirep_id` weiterschickt.
+    pub pirep_id: String,
 }
 
 /// v0.5.14: rich position telemetry. Goal is "PIREP-grade analysis from
@@ -183,6 +191,14 @@ struct PositionPayload {
     dep: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     arr: Option<String>,
+    /// Spec sim-disconnect-auto-resume F4: phpVMS-PIREP-ID — wird in
+    /// jedem Position-Tick mitgesendet damit der Server-Splitter
+    /// (`recorder/mqttSubscriber.ts:ensureSession`) Sessions ueber
+    /// `pirep_id` joinen kann. Pre-MVP-Sessions ohne `pirep_id` im
+    /// Payload fallen weiter in den Standard-Pfad (callsign/dep/arr
+    /// + Zeitfenster) — forward-only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pirep_id: Option<String>,
     /// v0.5.24: Client-Version damit der aeroacars-live-Monitor sieht
     /// welcher Pilot mit welcher Build-Version sendet. Ermöglicht
     /// Version-Compliance-Tracking (= "Pilot X läuft noch v0.5.16-Pre-
@@ -753,6 +769,7 @@ impl Handle {
             simulator: simulator_label(snap.simulator),
             dep: non_empty(&meta.dep_icao),
             arr: non_empty(&meta.arr_icao),
+            pirep_id: non_empty(&meta.pirep_id),
             client_version: env!("CARGO_PKG_VERSION"),
         };
         match self.tx.try_send(Cmd::Position(Box::new(payload))) {

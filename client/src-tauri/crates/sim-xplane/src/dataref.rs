@@ -106,6 +106,15 @@ pub enum FieldId {
     LightWheelWell,
     /// `laminar/B738/annunciator/takeoff_config` — 1=warning, 0=clear.
     TakeoffConfigWarning,
+    /// Spec v0.7.15 F6: `sim/time/paused` — 1 wenn der User die
+    /// Pause-Taste in X-Plane gedrueckt hat, sonst 0. Plus Replay
+    /// (`sim/time/is_in_replay`) wird zur selben Pause-Logik
+    /// aggregiert: aus AeroACARS-Sicht ist Replay "Flug-Telemetrie
+    /// ist nicht echt, also als Pause behandeln".
+    SimPaused,
+    /// Spec v0.7.15 F6: `sim/time/is_in_replay` — 1 wenn der User in
+    /// X-Planes Replay-Modus ist (eigene Pause-aehnliche Quelle).
+    SimInReplay,
 }
 
 /// One row in the catalog: a DataRef name + which snapshot field it
@@ -465,6 +474,21 @@ pub const CATALOG: &[DatarefEntry] = &[
         name: "laminar/B738/toggle_switch/wheel_well_light_pos",
         field: FieldId::LightWheelWell,
     },
+    // Spec v0.7.15 F6: X-Plane-Pause + Replay sind als Pause-aequivalent
+    // an AeroACARS gemeldet (siehe FieldId::SimPaused / SimInReplay).
+    // Die existierende `paused: false`-Konstante in to_snapshot() weiter
+    // unten wird damit ersetzt durch den dynamischen Wert.
+    DatarefEntry {
+        name: "sim/time/paused",
+        field: FieldId::SimPaused,
+    },
+    DatarefEntry {
+        // QS-Finding (2026-05-12): Dataref-Name war fruehe Iteration mit
+        // `sim_in_replay`-Tippfehler. X-Plane SDK + eigenes Plugin
+        // (`xplane-plugin/src/plugin.cpp:649`) nutzen `is_in_replay`.
+        name: "sim/time/is_in_replay",
+        field: FieldId::SimInReplay,
+    },
     DatarefEntry {
         name: "laminar/B738/annunciator/takeoff_config",
         field: FieldId::TakeoffConfigWarning,
@@ -547,6 +571,13 @@ pub struct XPlaneState {
     pub light_wing: bool,
     pub light_wheel_well: bool,
     pub takeoff_config_warning: bool,
+    /// Spec v0.7.15 F6: `sim/time/paused`-Wert. true wenn der User die
+    /// Pause-Taste in X-Plane gedrueckt hat. SimSnapshot.paused wird
+    /// daraus gespeist.
+    pub sim_paused: bool,
+    /// Spec v0.7.15 F6: `sim/time/is_in_replay`-Wert. AeroACARS
+    /// behandelt Replay als Pause-aequivalent (kein echter Flug).
+    pub sim_in_replay: bool,
     /// True once we've received at least one RREF packet — drives
     /// the connection state machine's transition into `Connected`.
     pub got_first_packet: bool,
@@ -655,6 +686,9 @@ impl XPlaneState {
             FieldId::LightWing => self.light_wing = value > 0.5,
             FieldId::LightWheelWell => self.light_wheel_well = value > 0.5,
             FieldId::TakeoffConfigWarning => self.takeoff_config_warning = value > 0.5,
+            // Spec v0.7.15 F6
+            FieldId::SimPaused => self.sim_paused = value > 0.5,
+            FieldId::SimInReplay => self.sim_in_replay = value > 0.5,
         }
     }
 
@@ -713,7 +747,11 @@ impl XPlaneState {
             parking_brake: self.parking_brake_ratio > 0.5,
             stall_warning: self.stall_warning,
             overspeed_warning: false, // X-Plane has no direct overspeed annunciator
-            paused: false,
+            // Spec v0.7.15 F6: aus sim/time/paused + sim/time/is_in_replay
+            // ableiten. Beide werden als Pause-aequivalent behandelt — Replay
+            // ist keine echte Flugaufzeichnung, der Streamer-Loop pausiert
+            // also fuer beide Faelle und der Pause-Akkumulator zaehlt.
+            paused: self.sim_paused || self.sim_in_replay,
             slew_mode: false,
             simulation_rate: 1.0,
             gear_position: self.gear_deploy,
