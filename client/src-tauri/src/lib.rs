@@ -10099,6 +10099,16 @@ fn apply_pause_resume(
     // die "Wahrheit" was geflogen werden soll. Wenn das Pre-Pause-
     // Aircraft schon falsch war, hat das Activity-Log das beim
     // Flug-Start schon protokolliert.
+    //
+    // Sim-Coverage:
+    //   - MSFS: aircraft_icao kommt aus SimConnect (ATC MODEL/ATC ID-
+    //     Pfad in crates/sim-msfs/src/adapter/telemetry.rs)
+    //   - X-Plane: aircraft_icao kommt aus der X-Plane Web-API ab
+    //     v12.1 (sim/aircraft/view/acf_ICAO, siehe
+    //     crates/sim-xplane/src/web_api.rs + adapter.rs:264). Wenn
+    //     der Pilot die Web-API NICHT in X-Plane → Settings → Network
+    //     aktiviert hat, ist `aircraft_icao=None` und F7 ueberspringt
+    //     die Pruefung still (= keine falsch-positiven Warnungen).
     if let Some(cur) = current_snap {
         if let Some(snap_icao) = cur.aircraft_icao.as_deref().and_then(extract_icao_code) {
             let bid_icao = flight.aircraft_icao.trim().to_uppercase();

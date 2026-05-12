@@ -483,7 +483,10 @@ pub const CATALOG: &[DatarefEntry] = &[
         field: FieldId::SimPaused,
     },
     DatarefEntry {
-        name: "sim/time/sim_in_replay",
+        // QS-Finding (2026-05-12): Dataref-Name war fruehe Iteration mit
+        // `sim_in_replay`-Tippfehler. X-Plane SDK + eigenes Plugin
+        // (`xplane-plugin/src/plugin.cpp:649`) nutzen `is_in_replay`.
+        name: "sim/time/is_in_replay",
         field: FieldId::SimInReplay,
     },
     DatarefEntry {

@@ -32,21 +32,23 @@ Diese Version ist ein **kombiniertes Sim-Recovery-Release** das diese Wurzel an 
 - Backfill: ACTIVE-Sessions ohne `pirep_id` bekommen sie nachträglich angeheftet
 - Frisch erstellte Sessions bekommen `pirep_id` direkt mit gesetzt
 
-#### F5 — MSFS-Pause/Unpause via SimConnect-Events
-- SimConnect-System-Events `Paused` + `Unpaused` werden abonniert
-- Aktive MSFS-Esc-Pause wird sofort erkannt — kein 30 s-Warten auf Disconnect-Threshold
+#### F5 — MSFS-Pause via SimConnect `Pause_EX1`
+- SimConnect-System-Event `Pause_EX1` mit `dwData`-Flag-Set wird abonniert
+- Aktive MSFS-Esc-Pause / Active-Pause / Sim-Pause werden sofort erkannt — kein 30 s-Warten auf Disconnect-Threshold
+- Initial-State zuverlässig: wenn AeroACARS connectet während MSFS schon pausiert ist, kommt sofort ein initialer Pause_EX1-Event
 - `SimSnapshot.paused` wird durchgereicht, der Streamer pausiert + akkumuliert
-- Auto-Resume bei Unpause-Event ohne Pilot-Klick
+- Auto-Resume bei Pause_EX1-Event mit `dwData=0` ohne Pilot-Klick
 
 #### F6 — X-Plane Pause + Replay-Modus
-- Neue RREF-Subscriptions auf `sim/time/paused` + `sim/time/sim_in_replay`
+- Neue RREF-Subscriptions auf `sim/time/paused` + `sim/time/is_in_replay`
 - `SimSnapshot.paused` wird aus beiden gespeist (Replay-Modus zählt als Pause-äquivalent)
 - Funktioniert ohne X-Plane-Plugin-Update — RREF ist nativ, kein Protokoll-Bump nötig
 
-#### F7 — Aircraft-Change-Warnung nach Recovery
+#### F7 — Aircraft-Change-Warnung nach Recovery (MSFS + X-Plane ≥12.1)
 - Beim Resume Vergleich `snap.aircraft_icao` vs. `flight.aircraft_icao` (Bid-Wert)
 - Bei Mismatch: Activity-Log-Warn mit konkretem Hinweis („Sim meldet A320, Bid erwartet B738")
 - Resume wird NICHT blockiert (Spec-Prinzip P2: informieren statt blockieren) — Pilot kann via PIREP-Cancel-UI korrigieren
+- **Sim-Coverage:** MSFS via SimConnect (ATC MODEL); X-Plane via Web-API ab v12.1 (`sim/aircraft/view/acf_ICAO`). X-Plane <12.1 oder mit deaktivierter Web-API überspringt F7 still (keine falsch-positiven Warnungen)
 
 ### Datenmodell
 
