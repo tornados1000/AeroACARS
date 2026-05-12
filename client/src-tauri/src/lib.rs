@@ -1955,6 +1955,13 @@ struct FlightStats {
     /// client.
     pending_acars_logs: Vec<String>,
 
+    /// v0.7.17 (B-004): One-shot flag damit die „Aircraft fliegt nach
+    /// ARRIVED"-Warnung pro Flug nur einmal gefeuert wird (kein Spam,
+    /// kein redundantes flight.stop-Setzen). FlightStats ist nicht
+    /// persisted (PersistedFlightStats ist die Persistenz-Schicht);
+    /// `Default::default()` setzt es auf false.
+    arrived_stale_warning_logged: bool,
+
     // ---- Landing Analyzer (Stage 2): SimBrief OFP plan ----
     /// Planned block (= ramp) fuel from the SimBrief OFP, in kg.
     /// None when the bid had no SimBrief OFP attached or the fetch
@@ -3865,6 +3872,28 @@ fn activity_log_clear(state: tauri::State<'_, AppState>) {
     // Also persist the cleared state — otherwise a restart would
     // restore the pre-clear contents from disk.
     save_activity_log(&log);
+}
+
+/// v0.7.17 (B-006): Append an Activity-Log-Entry from the frontend.
+///
+/// Bisher waren Activity-Log-Eintraege nur backend-seitig moeglich
+/// (`log_activity(...)`). Manche Frontend-State-Wechsel (z.B. Auto-File-
+/// Failure) brauchen einen sichtbaren Eintrag im Log — sonst sieht der
+/// Pilot nicht was schief lief. `level` ist "info" | "warn" | "error".
+#[tauri::command]
+fn activity_log_add(
+    state: tauri::State<'_, AppState>,
+    level: String,
+    message: String,
+    detail: Option<String>,
+) {
+    let parsed_level = match level.as_str() {
+        "info" => ActivityLevel::Info,
+        "warn" => ActivityLevel::Warn,
+        "error" => ActivityLevel::Error,
+        _ => ActivityLevel::Info,
+    };
+    log_activity(&state, parsed_level, message, detail);
 }
 
 // ---- Landing-history commands (Landing tab) ----
@@ -8263,6 +8292,12 @@ fn build_landing_record(
         vs_smoothed_1500ms_fpm: ana_f32(&stats.landing_analysis, "vs_smoothed_1500ms_fpm"),
         peak_g_post_500ms: ana_f32(&stats.landing_analysis, "peak_g_post_500ms"),
         peak_g_post_1000ms: ana_f32(&stats.landing_analysis, "peak_g_post_1000ms"),
+        // v0.7.17 (B-009): G-Force-Forensik
+        g_at_edge: ana_f32(&stats.landing_analysis, "g_at_edge"),
+        g_smoothed_250ms_post: ana_f32(&stats.landing_analysis, "g_smoothed_250ms_post"),
+        g_median_post_500ms: ana_f32(&stats.landing_analysis, "g_median_post_500ms"),
+        g_p95_post_500ms: ana_f32(&stats.landing_analysis, "g_p95_post_500ms"),
+        max_gear_force_n: ana_f32(&stats.landing_analysis, "max_gear_force_n"),
         peak_vs_pre_flare_fpm: ana_f32(&stats.landing_analysis, "peak_vs_pre_flare_fpm"),
         vs_at_flare_end_fpm: ana_f32(&stats.landing_analysis, "vs_at_flare_end_fpm"),
         flare_reduction_fpm: ana_f32(&stats.landing_analysis, "flare_reduction_fpm"),
@@ -10552,6 +10587,84 @@ fn compute_landing_analysis(
     let pg_500 = peak_g_window(500);
     let pg_1000 = peak_g_window(1000);
 
+    // v0.7.17 (B-009): G-Force-Forensik — analog Sinkrate-Forensik.
+    //
+    // Sample-basierte robuste Statistiken statt naivem max(), damit
+    // Sim-Strut-Compression-Spikes (X-Plane + MSFS) nicht den Score
+    // zerschiessen.
+
+    // G im interpolierten Edge-Frame (analog vs_at_edge).
+    let g_at_edge: Option<f32> = match (last_air, first_ground) {
+        (Some(a), Some(g)) => {
+            let t_a = a.at.timestamp_millis() as f64;
+            let t_g = g.at.timestamp_millis() as f64;
+            let t_edge = edge_ms as f64;
+            if (t_g - t_a).abs() < 1e-6 {
+                Some(a.g_force)
+            } else {
+                let alpha = ((t_edge - t_a) / (t_g - t_a)).clamp(0.0, 1.0);
+                Some((a.g_force as f64 + (g.g_force as f64 - a.g_force as f64) * alpha) as f32)
+            }
+        }
+        _ => None,
+    };
+
+    // Hilfsfunktion: G-Samples im Post-Edge-Fenster sammeln.
+    let collect_g_post = |window_ms: i64| -> Vec<f32> {
+        let hi = edge_ms + window_ms;
+        samples
+            .iter()
+            .filter_map(|s| {
+                let ts = s.at.timestamp_millis();
+                if ts >= edge_ms && ts <= hi {
+                    Some(s.g_force)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+
+    // Mean / Median / 95p — robuste Statistiken.
+    fn mean_of(xs: &[f32]) -> Option<f32> {
+        if xs.is_empty() { return None; }
+        let sum: f64 = xs.iter().map(|x| *x as f64).sum();
+        Some((sum / xs.len() as f64) as f32)
+    }
+    fn percentile_of(xs: &[f32], p: f32) -> Option<f32> {
+        if xs.is_empty() { return None; }
+        let mut sorted: Vec<f32> = xs.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let idx = ((sorted.len() as f32 - 1.0) * p).round() as usize;
+        Some(sorted[idx.min(sorted.len() - 1)])
+    }
+
+    let g_250_samples = collect_g_post(250);
+    let g_500_samples = collect_g_post(500);
+    let g_smoothed_250ms_post = mean_of(&g_250_samples);
+    let g_median_post_500ms = percentile_of(&g_500_samples, 0.5);
+    let g_p95_post_500ms = percentile_of(&g_500_samples, 0.95);
+
+    // Max Gear-Normal-Force im Post-Edge-Fenster (Strut-Compression-Mass).
+    // gear_normal_force_n ist Option<f32> (X-Plane liefert es, MSFS None).
+    let max_gear_force_n: Option<f32> = {
+        let hi = edge_ms + 1000; // 1 s nach Edge
+        let mut peak = 0.0_f32;
+        let mut found = false;
+        for s in samples {
+            let ts = s.at.timestamp_millis();
+            if ts >= edge_ms && ts <= hi {
+                if let Some(f) = s.gear_normal_force_n {
+                    if f > peak {
+                        peak = f;
+                        found = true;
+                    }
+                }
+            }
+        }
+        if found { Some(peak) } else { None }
+    };
+
     // --- Flare-Analyse ---
     // Window: [-2000 ms, -100 ms] vor Edge. Suche steepste Sinkrate +
     // VS-Wert kurz vor Edge.
@@ -10697,6 +10810,12 @@ fn compute_landing_analysis(
         "vs_smoothed_1500ms_fpm": vs_1500,
         "peak_g_post_500ms": pg_500,
         "peak_g_post_1000ms": pg_1000,
+        // v0.7.17 (B-009): G-Force-Forensik
+        "g_at_edge": g_at_edge,
+        "g_smoothed_250ms_post": g_smoothed_250ms_post,
+        "g_median_post_500ms": g_median_post_500ms,
+        "g_p95_post_500ms": g_p95_post_500ms,
+        "max_gear_force_n": max_gear_force_n,
         "peak_vs_pre_flare_fpm": peak_vs_pre,
         "vs_at_flare_end_fpm": vs_at_flare_end,
         "flare_reduction_fpm": flare_reduction,
@@ -12106,6 +12225,12 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                             vs_smoothed_1500ms_fpm: ana_f32(&stats.landing_analysis, "vs_smoothed_1500ms_fpm"),
                             peak_g_post_500ms: ana_f32(&stats.landing_analysis, "peak_g_post_500ms"),
                             peak_g_post_1000ms: ana_f32(&stats.landing_analysis, "peak_g_post_1000ms"),
+                            // v0.7.17 (B-009): G-Force-Forensik
+                            g_at_edge: ana_f32(&stats.landing_analysis, "g_at_edge"),
+                            g_smoothed_250ms_post: ana_f32(&stats.landing_analysis, "g_smoothed_250ms_post"),
+                            g_median_post_500ms: ana_f32(&stats.landing_analysis, "g_median_post_500ms"),
+                            g_p95_post_500ms: ana_f32(&stats.landing_analysis, "g_p95_post_500ms"),
+                            max_gear_force_n: ana_f32(&stats.landing_analysis, "max_gear_force_n"),
                             peak_vs_pre_flare_fpm: ana_f32(&stats.landing_analysis, "peak_vs_pre_flare_fpm"),
                             vs_at_flare_end_fpm: ana_f32(&stats.landing_analysis, "vs_at_flare_end_fpm"),
                             flare_reduction_fpm: ana_f32(&stats.landing_analysis, "flare_reduction_fpm"),
@@ -14219,10 +14344,30 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
 
                 if !in_bounce_window && stats.landing_score.is_none() {
                     // All windows have closed — finalise the score once.
-                    let peak_vs = stats.landing_peak_vs_fpm.unwrap_or(0.0);
-                    let peak_g = stats.landing_peak_g_force.unwrap_or(0.0);
-                    let score = LandingScore::classify(peak_vs, peak_g, stats.bounce_count);
-                    stats.landing_score = Some(score);
+                    //
+                    // v0.7.17 (B-005): Wenn `landing_peak_vs_fpm` None ist
+                    // (= Sampler hat den Touchdown-VS gar nicht erfasst,
+                    // typisch bei Phantom-Touchdowns durch on_ground-
+                    // Flicker oder Sim-Bug), waere `unwrap_or(0.0)` =
+                    // 0.0 fpm gefallen → Smooth-Score 100 trotz nie
+                    // wirklich gemessenen Werts. Pilot sieht „Butter
+                    // Landing 100/100" obwohl gar kein Touchdown war.
+                    //
+                    // Fix: nur klassifizieren wenn `landing_peak_vs_fpm`
+                    // tatsaechlich Some ist (also der Sampler einen Wert
+                    // hatte). Sonst landing_score bleibt None, das
+                    // Touchdown-Event wird im PIREP als „score not
+                    // captured" markiert.
+                    if let Some(peak_vs) = stats.landing_peak_vs_fpm {
+                        let peak_g = stats.landing_peak_g_force.unwrap_or(0.0);
+                        let score = LandingScore::classify(peak_vs, peak_g, stats.bounce_count);
+                        stats.landing_score = Some(score);
+                    } else {
+                        tracing::warn!(
+                            pirep_id = %flight.pirep_id,
+                            "landing_peak_vs_fpm = None at score-finalise — keeping landing_score=None (B-005). Sampler likely missed the touchdown edge."
+                        );
+                    }
                 }
 
                 // Touch-and-Go classifier — runs in parallel with the
@@ -14388,9 +14533,42 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                 }
             }
         }
-        FlightPhase::Arrived
-        | FlightPhase::PirepSubmitted
-        | FlightPhase::Preflight => {}
+        FlightPhase::Arrived | FlightPhase::PirepSubmitted => {
+            // v0.7.17 (B-004): Sanity-Check fuer „Aircraft fliegt wieder
+            // obwohl Phase ARRIVED ist". Klassisches Pattern: Pilot
+            // landet, vergisst Flug zu beenden (oder Auto-File scheitert
+            // silent, siehe B-006), startet im Sim einen neuen Flug.
+            // Position-Stream lief vorher endlos mit der alten PIREP-ID
+            // weiter und packte die neuen Positionen in den alten
+            // PIREP-Recorder-Stream (= „Aircraft springt nach Landung
+            // ploetzlich 750 km weg" wie bei CFG 1641 EDDM→EDDL).
+            //
+            // Hier ist die FSM die einzige Stelle die das mitbekommen
+            // kann — der Position-Worker selbst hat keinen Zugriff auf
+            // die Phase, posted blind. Wir setzen flight.stop damit der
+            // Worker beim naechsten Tick sauber abdreht. PIREP bleibt
+            // existing (wird nicht gefilt, bleibt prefiled — falls Pilot
+            // doch zurueckkommt und manuell beenden moechte).
+            let aircraft_clearly_flying =
+                !snap.on_ground && snap.groundspeed_kt > 100.0 && snap.engines_running > 0;
+            if aircraft_clearly_flying && !stats.arrived_stale_warning_logged {
+                tracing::warn!(
+                    pirep_id = %flight.pirep_id,
+                    phase = ?stats.phase,
+                    gs_kt = snap.groundspeed_kt,
+                    agl_ft = snap.altitude_agl_ft,
+                    "FSM phase=Arrived/PirepSubmitted but aircraft is flying again — stopping position stream"
+                );
+                stats.arrived_stale_warning_logged = true;
+                stats.pending_acars_logs.push(
+                    "Position-Stream gestoppt — Flugzeug fliegt wieder, aber PIREP war als 'angekommen' markiert. \
+                     Bitte den alten Flug manuell beenden (PIREP-Detail) oder via 'Flug verwerfen' verwerfen, \
+                     dann neuen Flug starten.".to_string(),
+                );
+                flight.stop.store(true, Ordering::Relaxed);
+            }
+        }
+        FlightPhase::Preflight => {}
     }
 
     // Universal "we're done" fallback. The normal FSM chain assumes a
@@ -18544,6 +18722,7 @@ pub fn run() {
             flight_cancel,
             activity_log_get,
             activity_log_clear,
+            activity_log_add,
             landing_list,
             landing_get_current,
             landing_delete,

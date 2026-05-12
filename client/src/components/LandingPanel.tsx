@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useConfirm } from "./ConfirmDialog";
 import { ForensicsBadge } from "./ForensicsBadge";
 import { SinkrateForensik } from "./SinkrateForensik";
+import { GForceForensik } from "./GForceForensik";
 // v0.5.47 — Score-Modul ist jetzt zentral, identisch zu webapp/src/
 // components/landingScoring.ts. Dieselben Schwellen, Bands, Coach-Tipps
 // für Pilot-App und Live-Monitor.
@@ -100,6 +101,12 @@ export interface LandingRecord {
   vs_smoothed_1500ms_fpm?: number | null;
   peak_g_post_500ms?: number | null;
   peak_g_post_1000ms?: number | null;
+  // v0.7.17 (B-009): G-Force-Forensik (analog vs_smoothed_*)
+  g_at_edge?: number | null;
+  g_smoothed_250ms_post?: number | null;
+  g_median_post_500ms?: number | null;
+  g_p95_post_500ms?: number | null;
+  max_gear_force_n?: number | null;
   peak_vs_pre_flare_fpm?: number | null;
   vs_at_flare_end_fpm?: number | null;
   flare_reduction_fpm?: number | null;
@@ -1503,6 +1510,12 @@ function LandingDetail({
           explainability.md. Rendert nur wenn 50-Hz-Forensik-Felder
           vorhanden sind (hasForensics()), sonst kompakter Legacy-Hinweis. */}
       <SinkrateForensik record={record} />
+
+      {/* v0.7.17 (B-009): G-Force-Forensik — analog zur Sinkrate-Forensik.
+          Erklaert warum AeroACARS bei butterweichen Landungen manchmal hohe
+          G-Werte misst (Sim-Strut-Compression statt echtem Pilot-Impact)
+          und der Master-Score trotzdem als „Smooth" klassifiziert wird. */}
+      <GForceForensik record={record} />
 
       {/* v0.5.43: Flare-Quality — als eigene Section im gleichen Stil wie
           Approach-Stability. Nur sichtbar wenn die 50-Hz-Forensik-Felder

@@ -289,6 +289,38 @@
       "impact_g_500ms": "Peak G post-touchdown (500 ms)",
       "impact_g_1000ms": "Peak G post-touchdown (1 s)",
       "trace_caption": "Snapshots from the touchdown buffer — not the score basis, only to visualize the trend."
+    },
+    "gforce_forensik": {
+      "title": "💪 G-Force Forensics",
+      "intro_header": "Which G-force is the right one?",
+      "intro_body": "AeroACARS samples the G-load at touchdown at 50 Hz. Volanta and cockpit G-meters show a smoothed mean over ~250 ms — what the pilot feels. High G-spikes from landing-gear strut compression are physically simulated, but on small GA aircraft the sim often models struts harder than reality. If your vertical descent rate was buttery, it leads the master score — the G-peak is then a sim-strut artifact, not a pilot error.",
+      "tool_section_title": "G trace around touchdown",
+      "tool_section_subtitle": "Edge = the touchdown frame, then strut compression. Compare with the robust statistics below.",
+      "robust_section_title": "Robust statistics (spike-resistant)",
+      "robust_section_subtitle": "Median and 95th percentile filter out single sim-frame spikes. If they are noticeably lower than the peak, the peak was a spike — not a real impact.",
+      "score_section_title": "What AeroACARS scores",
+      "score_section_subtitle": "Master score favors sink rate over G — V/S is what maintenance rules actually define.",
+      "tile_edge": "Edge (touchdown frame)",
+      "tile_250ms": "250 ms mean",
+      "tile_500ms": "500 ms (peak)",
+      "tile_1000ms": "1 s (peak)",
+      "tile_median": "Median 500 ms",
+      "tile_p95": "95th percentile",
+      "tile_volanta_hint": "Volanta default smoothing",
+      "tile_peak_hint": "max value",
+      "tile_na_tooltip": "Value not recorded — sampler buffer was not full at touchdown",
+      "spike_detected": "Peak ({{peak}} G) is well above 95th percentile ({{p95}} G) — looks like a single sim-frame spike, not a real strut compression.",
+      "score_basis_label": "Scored G-peak",
+      "score_basis_sublabel": "Peak G (500 ms post-edge)",
+      "score_strut_force": "Gear normal force: {{force}} N",
+      "score_vs_leads": "Sink rate was smooth (< 200 fpm) — master score is not dragged down by G. Pilot error unlikely.",
+      "tip": {
+        "sim_strut": "High G from sim landing-gear compression. Your sink rate was smooth — not a pilot error. This is common on small GA aircraft where the sim's strut spring model is harder than real life.",
+        "real_impact": "Real hard impact: V/S and G both agree on a high value. Flare earlier, reduce throttle sooner.",
+        "clean": "Clean G trace — no anomalies at touchdown.",
+        "airborne_spike": "G peak without a corresponding gear-force spike — looks like sim-frame stutter or sample noise, not a real impact.",
+        "outlier_filtered": "Single G spike detected — median and 95th percentile show calm values. The peak was likely caused by a sim-frame spike (strut rebound or numerical anomaly)."
+      }
     }
   },
   "about": {

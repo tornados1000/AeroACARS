@@ -95,12 +95,27 @@ export function CockpitView({
         // path had a race window where a stale poll could overwrite
         // a "no flight" reading and bring it back briefly.
         setActiveFlight(null);
-      } catch {
-        // Validation failure (e.g. distance to airport > MAX, fuel
-        // missing) — leave activeFlight alone so the manual "End"
-        // button still works and surfaces the file-or-cancel dialog.
-        // Don't reset the ref: we don't want a retry loop, the pilot
-        // can hit the button manually.
+      } catch (err: unknown) {
+        // v0.7.17 (B-006): Auto-File-Failure war vorher KOMPLETT
+        // stumm — catch{} schluckte alles, Pilot dachte „auto-filed"
+        // aber tatsaechlich war der PIREP noch lokal nicht gefilt
+        // (z.B. „not_at_arrival" weil Pilot inzwischen vom Gate weg,
+        // oder „fuel" weil Block-Fuel fehlt). Pilot lief in den
+        // Stale-Stream-Zustand (B-004).
+        //
+        // Jetzt: Activity-Log-Warning + UI-Toast damit der Pilot weiss
+        // dass Auto-File scheiterte und er manuell „Flug beenden"
+        // klicken muss. activeFlight bleibt erhalten damit der
+        // manuelle Button weiter funktioniert. autoFiledRef bleibt
+        // gesetzt → kein Retry-Loop.
+        const errObj = err as { code?: string; message?: string } | undefined;
+        const errCode = errObj?.code ?? "unknown";
+        const errMsg = errObj?.message ?? String(err);
+        void invoke("activity_log_add", {
+          level: "warn",
+          message: 'Auto-File fehlgeschlagen — bitte manuell „Flug beenden" klicken',
+          detail: `${errCode}: ${errMsg}`,
+        }).catch(() => null);
       }
     })();
   }, [activeFlight, autoFile]);

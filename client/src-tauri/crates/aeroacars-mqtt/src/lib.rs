@@ -468,6 +468,17 @@ pub struct TouchdownPayload {
     /// Peak G ueber 1000 ms post-Edge.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_g_post_1000ms: Option<f32>,
+    /// v0.7.17 (B-009): G-Force-Forensik (analog vs_smoothed_*).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub g_at_edge: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub g_smoothed_250ms_post: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub g_median_post_500ms: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub g_p95_post_500ms: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_gear_force_n: Option<f32>,
     /// Steepste Sinkrate in [-2000, -100] ms vor Edge — Pre-Flare.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_vs_pre_flare_fpm: Option<f32>,

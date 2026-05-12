@@ -350,7 +350,40 @@ pub fn classify_landing(
 ) -> LandingCategory {
     let by_vs = classify_by_vs(peak_vs_fpm);
     let by_g = peak_g.map(classify_by_g).unwrap_or(LandingCategory::Smooth);
-    let mut cat = LandingCategory::worse_of(by_vs, by_g);
+    // v0.7.17 (B-009): V/S-led classification.
+    //
+    // Vorher: `worse_of(by_vs, by_g)` — fuehrte zu falschen „Severe"-
+    // Klassifikationen bei butterweichen Touchdowns, sobald die Sim-
+    // Strut-Compression einen einzelnen G-Spike >2.10 produzierte.
+    // Echtes Pilot-Performance-Signal ist die vertikale Sinkrate (V/S)
+    // — das was der Pilot beim Aufsetzen fuehlt und was Wartungs-
+    // bestimmungen tatsaechlich definieren (-600 fpm = "Hard").
+    //
+    // Neue Logik: V/S fuehrt. G darf die Klassifikation maximal um
+    // EINE Stufe verschlechtern (= Indikator fuer ungewohnt harte
+    // Strut-Compression), aber nie alleine zu Severe fuehren bei
+    // smoother V/S. Bei echten Hard-Impacts (V/S >= -600 fpm)
+    // dominiert das schlechtere Signal wie bisher.
+    let mut cat = match (by_vs, by_g) {
+        // V/S = Smooth: G kann maximal um eine Stufe runter
+        (LandingCategory::Smooth, LandingCategory::Hard)
+        | (LandingCategory::Smooth, LandingCategory::Severe) => LandingCategory::Acceptable,
+        (LandingCategory::Smooth, _) => LandingCategory::Smooth,
+
+        // V/S = Acceptable: G kann maximal um eine Stufe runter
+        (LandingCategory::Acceptable, LandingCategory::Hard)
+        | (LandingCategory::Acceptable, LandingCategory::Severe) => LandingCategory::Firm,
+        (LandingCategory::Acceptable, _) => LandingCategory::Acceptable,
+
+        // V/S = Firm: G kann maximal um eine Stufe runter
+        (LandingCategory::Firm, LandingCategory::Severe) => LandingCategory::Hard,
+        (LandingCategory::Firm, _) => LandingCategory::Firm,
+
+        // V/S = Hard/Severe: echter Impact, worse_of greift wie vorher
+        (LandingCategory::Hard, _) | (LandingCategory::Severe, _) => {
+            LandingCategory::worse_of(by_vs, by_g)
+        }
+    };
     if bounces > 0 && cat != LandingCategory::Severe {
         cat = cat.bump_up();
     }
@@ -446,9 +479,61 @@ mod tests {
     }
 
     #[test]
-    fn classify_landing_takes_worst_of_vs_and_g() {
-        // Smooth VS aber severe G
+    fn classify_landing_vs_led_smooth_vs_severe_g() {
+        // v0.7.17 (B-009): V/S-led classification.
+        // Vorher worse_of(Smooth, Severe) = Severe.
+        // Jetzt V/S Smooth fuehrt, G darf maximal 1 Stufe runter → Acceptable.
         let cat = classify_landing(-50.0, Some(2.20), 0);
+        assert_eq!(cat, LandingCategory::Acceptable);
+    }
+
+    // v0.7.17 (B-009) — V/S-led classification tests
+    #[test]
+    fn b009_butter_landing_with_sim_strut_spike_stays_smooth() {
+        // Real-Tester-Case GSG 105: VS -116 fpm (Smooth) + G 2.30 (Severe)
+        // wegen Sim-Strut-Compression. Vorher: worse_of -> Severe.
+        // Jetzt: Smooth gefuehrt von V/S, G nur 1-Stufen-Downgrade -> Acceptable.
+        let cat = classify_landing(-116.0, Some(2.30), 0);
+        assert_eq!(cat, LandingCategory::Acceptable);
+    }
+
+    #[test]
+    fn b009_smooth_vs_with_hard_g_only_one_step_down() {
+        let cat = classify_landing(-150.0, Some(1.80), 0);
+        assert_eq!(cat, LandingCategory::Acceptable);
+    }
+
+    #[test]
+    fn b009_smooth_vs_with_smooth_g_stays_smooth() {
+        let cat = classify_landing(-100.0, Some(1.10), 0);
+        assert_eq!(cat, LandingCategory::Smooth);
+    }
+
+    #[test]
+    fn b009_real_hard_impact_still_classified_correctly() {
+        // V/S Hard (-700 fpm), G Severe (2.50): worse_of greift, bleibt Severe
+        let cat = classify_landing(-700.0, Some(2.50), 0);
         assert_eq!(cat, LandingCategory::Severe);
+    }
+
+    #[test]
+    fn b009_acceptable_vs_with_severe_g_one_step_down() {
+        // V/S Acceptable (-300 fpm), G Severe (2.30) -> Firm
+        let cat = classify_landing(-300.0, Some(2.30), 0);
+        assert_eq!(cat, LandingCategory::Firm);
+    }
+
+    #[test]
+    fn b009_firm_vs_with_severe_g_one_step_down() {
+        // V/S Firm (-500 fpm), G Severe (2.30) -> Hard
+        let cat = classify_landing(-500.0, Some(2.30), 0);
+        assert_eq!(cat, LandingCategory::Hard);
+    }
+
+    #[test]
+    fn b009_bounces_still_bump_up_one_stufe() {
+        // Smooth + bounce -> Acceptable (bump_up greift weiterhin)
+        let cat = classify_landing(-100.0, Some(1.10), 1);
+        assert_eq!(cat, LandingCategory::Acceptable);
     }
 }

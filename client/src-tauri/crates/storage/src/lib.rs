@@ -304,6 +304,24 @@ pub struct LandingRecord {
     /// Peak G im 1000 ms post-Edge.
     #[serde(default)]
     pub peak_g_post_1000ms: Option<f32>,
+    /// v0.7.17 (B-009): G-Force-Forensik (analog vs_smoothed_*).
+    /// G im Edge-Frame (interpoliert) — was der Pilot beim Aufsetzen
+    /// gefuehlt hat, bevor die Strut komprimiert.
+    #[serde(default)]
+    pub g_at_edge: Option<f32>,
+    /// Mean G ueber 0..250 ms post-Edge — was Volanta/Cockpit zeigt.
+    #[serde(default)]
+    pub g_smoothed_250ms_post: Option<f32>,
+    /// Median G ueber 0..500 ms post-Edge — robust gg Sim-Strut-Spikes.
+    #[serde(default)]
+    pub g_median_post_500ms: Option<f32>,
+    /// 95th-Percentile G ueber 0..500 ms — verschluckt 5 % Spikes.
+    #[serde(default)]
+    pub g_p95_post_500ms: Option<f32>,
+    /// Max Fahrwerks-Normalkraft in N — Strut-Compression-Mass fuer
+    /// die Aufklaerung in der G-Forensik-UI (Erklaer-Tile).
+    #[serde(default)]
+    pub max_gear_force_n: Option<f32>,
     /// Steepste Sinkrate in [-2000, -100] ms vor Edge.
     #[serde(default)]
     pub peak_vs_pre_flare_fpm: Option<f32>,

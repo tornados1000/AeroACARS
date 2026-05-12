@@ -29,6 +29,17 @@ pub struct SimSnapshot {
     pub lon: f64,
     pub altitude_msl_ft: f64,
     pub altitude_agl_ft: f64,
+    /// v0.7.17 (B-003): MSFS `INDICATED ALTITUDE` SimVar — what the
+    /// cockpit PFD reads with the current baro setting. Diverges from
+    /// `altitude_msl_ft` (geometric MSL) by 1–2k ft in arctic cold or
+    /// strong ISA deviations. `None` for sims that don't wire it.
+    #[serde(default)]
+    pub altitude_indicated_ft: Option<f64>,
+    /// v0.7.17 (B-003): MSFS `PRESSURE ALTITUDE` SimVar — always STD
+    /// (29.92 inHg / 1013 hPa). What Mode-C transponders and VATSIM
+    /// transmit. `None` for sims that don't wire it.
+    #[serde(default)]
+    pub altitude_pressure_ft: Option<f64>,
 
     // Attitude / motion
     pub heading_deg_true: f32,
@@ -420,6 +431,8 @@ impl Default for SimSnapshot {
             lon: 0.0,
             altitude_msl_ft: 0.0,
             altitude_agl_ft: 0.0,
+            altitude_indicated_ft: None,
+            altitude_pressure_ft: None,
             heading_deg_true: 0.0,
             heading_deg_magnetic: 0.0,
             pitch_deg: 0.0,

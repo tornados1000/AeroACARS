@@ -289,6 +289,38 @@
       "impact_g_500ms": "Peak-G nach Touchdown (500 ms)",
       "impact_g_1000ms": "Peak-G nach Touchdown (1 s)",
       "trace_caption": "Momentaufnahmen aus dem Touchdown-Buffer — nicht Score-Basis, nur zur Veranschaulichung des Verlaufs."
+    },
+    "gforce_forensik": {
+      "title": "💪 G-Kraft-Forensik",
+      "intro_header": "Welche G-Kraft ist die richtige?",
+      "intro_body": "AeroACARS misst die G-Belastung beim Touchdown im 50-Hz-Sampling. Volanta und Cockpit-G-Meter zeigen einen geglätteten Mittelwert über ~250 ms — das was der Pilot fühlt. Hohe G-Spikes durch Fahrwerks-Federkompression (= Strut-Compression) sind im Sim physikalisch korrekt simuliert, aber bei kleinen GA-Aircraft im Sim oft härter als in der Realität. Wenn deine vertikale Sinkrate butterweich war, dominiert sie den Master-Score — der G-Peak ist dann ein Sim-Strut-Artefakt, kein Pilotenfehler.",
+      "tool_section_title": "G-Verlauf um den Touchdown",
+      "tool_section_subtitle": "Edge = Frame des Aufsetzens, danach Strut-Compression. Vergleiche mit den robusten Statistiken unten.",
+      "robust_section_title": "Robuste Statistiken (Spike-resistent)",
+      "robust_section_subtitle": "Median und 95-Percentile filtern einzelne Sim-Frame-Spikes raus. Wenn diese deutlich kleiner sind als der Peak, war der Peak ein Spike — kein echter Impact.",
+      "score_section_title": "Was AeroACARS scort",
+      "score_section_subtitle": "Master-Score bevorzugt Sinkrate über G — V/S ist das was Wartungs-Bestimmungen definieren.",
+      "tile_edge": "Edge (Aufsetz-Frame)",
+      "tile_250ms": "250 ms Mittel",
+      "tile_500ms": "500 ms (Peak)",
+      "tile_1000ms": "1 s (Peak)",
+      "tile_median": "Median 500 ms",
+      "tile_p95": "95-Percentile",
+      "tile_volanta_hint": "Volanta-Default-Glättung",
+      "tile_peak_hint": "Max-Wert",
+      "tile_na_tooltip": "Wert nicht erfasst — Sampler-Buffer war beim Touchdown nicht voll",
+      "spike_detected": "Peak ({{peak}} G) liegt deutlich über 95-Percentile ({{p95}} G) — sieht aus wie ein einzelner Sim-Frame-Spike, nicht wie eine echte Strut-Compression.",
+      "score_basis_label": "Bewertete G-Peak",
+      "score_basis_sublabel": "Peak G (500 ms post-Edge)",
+      "score_strut_force": "Fahrwerks-Normalkraft: {{force}} N",
+      "score_vs_leads": "Sinkrate war smooth (< 200 fpm) — Master-Score wird nicht durch G heruntergezogen. Pilotenfehler unwahrscheinlich.",
+      "tip": {
+        "sim_strut": "Hohe G durch Sim-Fahrwerks-Compression. Deine Sinkrate war smooth — kein Pilotenfehler. Das passiert besonders bei kleinen GA-Aircraft, deren Fahrwerks-Federn der Sim oft härter modelliert als die Realität.",
+        "real_impact": "Echter harter Impact: V/S und G stimmen beide hoch überein. Mehr Flare vor Aufsetzen, früher Throttle reduzieren.",
+        "clean": "Sauberer G-Verlauf — keine Auffälligkeiten beim Aufsetzen.",
+        "airborne_spike": "G-Peak ohne signifikanten Fahrwerks-Force-Anstieg — sieht nach Sim-Frame-Stutter oder Sample-Noise aus, kein echter Impact.",
+        "outlier_filtered": "Einzelner G-Spike erkannt — Median und 95-Percentile zeigen unauffällige Werte. Der Peak wurde wahrscheinlich von einem Sim-Frame-Spike verursacht (Strut-Rebound oder numerische Anomalie)."
+      }
     }
   },
   "about": {

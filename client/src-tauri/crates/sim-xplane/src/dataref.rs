@@ -723,6 +723,12 @@ impl XPlaneState {
             lon: self.lon,
             altitude_msl_ft: self.altitude_msl_m / M_PER_FT,
             altitude_agl_ft: self.altitude_agl_m / M_PER_FT,
+            // v0.7.17 (B-003): X-Plane stellt diese MSFS-spezifischen
+            // Pendants nicht direkt zur Verfuegung (X-Plane berechnet
+            // pressure altitude implizit aus baro+QNH); wir lassen sie
+            // hier None und debuggen ausschliesslich den MSFS-Pfad.
+            altitude_indicated_ft: None,
+            altitude_pressure_ft: None,
             heading_deg_true: self.heading_true_deg,
             heading_deg_magnetic: self.heading_magnetic_deg,
             pitch_deg: self.pitch_deg,

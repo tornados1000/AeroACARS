@@ -55,6 +55,17 @@ pub const TELEMETRY_FIELDS: &[TelemetryField] = &[
     F::f64("PLANE LONGITUDE", "degrees"),
     F::f64("PLANE ALTITUDE", "feet"),
     F::f64("PLANE ALT ABOVE GROUND", "feet"),
+    // v0.7.17 (B-003): zusaetzliche Altitude-SimVars um den bekannten
+    // MSFS-Altimetrie-Bug zu diagnostizieren — `PLANE ALTITUDE` ist
+    // geometric MSL und divergiert in arktischer Kaelte oder bei
+    // hohen ISA-Abweichungen 1-2k ft vom Cockpit-PFD-Reading. Mode-C-
+    // Transponder + VATSIM nutzen pressure altitude.
+    //   * INDICATED ALTITUDE: was das Cockpit-PFD zeigt (mit aktuellem
+    //     Baro-Setting; in cruise mit STD = pressure altitude)
+    //   * PRESSURE ALTITUDE: was Mode-C/VATSIM transmittet (immer STD)
+    // Refs: swift-project/pilotclient #169, MSFS DevSupport-Threads.
+    F::f64("INDICATED ALTITUDE", "feet"),
+    F::f64("PRESSURE ALTITUDE", "feet"),
     // ---- Attitude / motion ----
     F::f64("PLANE HEADING DEGREES TRUE", "degrees"),
     F::f64("PLANE HEADING DEGREES MAGNETIC", "degrees"),
@@ -330,6 +341,11 @@ pub struct Telemetry {
     pub lon: f64,
     pub altitude_msl_ft: f64,
     pub altitude_agl_ft: f64,
+    /// v0.7.17 (B-003) — INDICATED ALTITUDE (cockpit PFD reading,
+    /// baro-corrected). 0.0 when the SimVar is absent.
+    pub altitude_indicated_ft: f64,
+    /// v0.7.17 (B-003) — PRESSURE ALTITUDE (always STD). 0.0 when absent.
+    pub altitude_pressure_ft: f64,
 
     pub heading_true_deg: f64,
     pub heading_magnetic_deg: f64,
@@ -690,6 +706,8 @@ impl Telemetry {
         pull_f64!(t.lon);
         pull_f64!(t.altitude_msl_ft);
         pull_f64!(t.altitude_agl_ft);
+        pull_f64!(t.altitude_indicated_ft);
+        pull_f64!(t.altitude_pressure_ft);
 
         pull_f64!(t.heading_true_deg);
         pull_f64!(t.heading_magnetic_deg);
@@ -1182,6 +1200,21 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
         lon: t.lon,
         altitude_msl_ft: t.altitude_msl_ft,
         altitude_agl_ft: t.altitude_agl_ft,
+        // v0.7.17 (B-003): Indicated + Pressure altitude side-by-side
+        // mit `altitude_msl_ft` (geometric MSL). Wenn ein SimVar
+        // nicht gesetzt wurde (0.0), liefern wir `None` damit
+        // Downstream zwischen "nicht gemessen" und "0 ft" unterscheiden
+        // kann.
+        altitude_indicated_ft: if t.altitude_indicated_ft.abs() > f64::EPSILON {
+            Some(t.altitude_indicated_ft)
+        } else {
+            None
+        },
+        altitude_pressure_ft: if t.altitude_pressure_ft.abs() > f64::EPSILON {
+            Some(t.altitude_pressure_ft)
+        } else {
+            None
+        },
         heading_deg_true: t.heading_true_deg as f32,
         heading_deg_magnetic: t.heading_magnetic_deg as f32,
         // v0.5.24: MSFS-SimConnect convention is INVERTED — `PLANE PITCH
