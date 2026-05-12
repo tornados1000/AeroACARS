@@ -490,6 +490,205 @@ Mindesttests fuer die Umsetzung:
 - neue/angepasste Tests fuer Pause-Akkumulator und Session-Join vorhanden
 - QS mit mindestens einem simulierten Disconnect und einer Server-Luecke dokumentiert
 
+## Entwicklungsauftrag v0.7.15 - Sim-Recovery Release
+
+### Release-Ziel
+
+`v0.7.15` soll nicht nur ein kleiner Hotfix sein, sondern ein geschlossenes **Sim-Recovery-Release**.
+
+Ziel ist: Ein laufender Flug soll nach Sim-Crash, Sim-Pause, Sim-Neustart, X-Plane-Pause, Aircraft-Wechsel nach Recovery und Rechner-Reboot so robust wie moeglich weitergefuehrt werden, ohne dass phpVMS oder der Recorder daraus falsche Zeiten, falsche Distanzen oder mehrere Sessions erzeugen.
+
+### Bereits enthaltene Basis
+
+Diese Punkte gelten als Basis und bleiben Bestandteil von `v0.7.15`:
+
+1. Phase 1 Client Auto-Resume.
+2. Pause-Akkumulator.
+3. Pausezeit-Abzug von Flight-/Block-Time.
+4. Reposition-Distanz wird nicht gezaehlt.
+5. Heartbeat waehrend Sim-Disconnect-Pause mit `last_good_snap`.
+6. `pirep_id` im Position-/MQTT-Payload.
+7. Phase 2 Server-Join per `pirep_id`.
+8. 6h-Cutoff fuer ended/recent Session-Reuse.
+9. Terminalschutz gegen Wiedereroeffnen gefileter/angekommener Sessions.
+
+### Zusaetzlicher Scope fuer v0.7.15
+
+In `v0.7.15` sollen zusaetzlich umgesetzt werden:
+
+| ID | Thema | Ziel |
+|---|---|---|
+| F5 | SimConnect Pause/Unpause Events | MSFS-Pause/Frozen-Snapshot sauber erkennen und Pausezeit akkumulieren |
+| F6 | X-Plane Paused-Heartbeat | X-Plane-Pause aktiv melden, auch wenn weiterhin alte/stehende Daten kommen |
+| F7 | Aircraft-Change-Banner | Nach Recovery warnen, wenn Sim-Flugzeug/Registration nicht mehr zum aktiven Flug passt |
+
+`F8 Bid-Change-Detection` bleibt fuer `v0.7.15` nur optional als Light-Check. Wenn es den Release verzoegert, wird F8 verschoben.
+
+### Nicht mehr in v0.7.15 aufnehmen
+
+Damit der Release nicht ausufert:
+
+- keine Drift-Linie auf Karte
+- keine neue Toast-/Banner-Architektur
+- keine Replay-Erkennung
+- keine komplette Webapp-Pause-Segment-Ansicht
+- keine 29-Szenarien-Voll-QS vor dem ersten Release
+- keine grossen Refactors ausserhalb Recovery/Pause/Resume
+
+### Implementierungsreihenfolge
+
+#### Schritt 1 - F5 MSFS SimConnect Pause/Unpause
+
+Ziel: Der Client soll echte MSFS-Pause erkennen, auch wenn SimConnect weiter eingefrorene Snapshots liefert.
+
+Umsetzung:
+
+1. Im MSFS/SimConnect-Adapter pruefen, ob Pause-State aus SimConnect verfuegbar ist.
+2. Pause-State in den gemeinsamen `SimSnapshot` oder einen begleitenden Status einbauen.
+3. Streamer-Loop so erweitern:
+   - wenn Sim-Pause aktiv wird: `paused_since` setzen, `paused_last_known` speichern
+   - waehrend Sim-Pause: Heartbeat weiter senden
+   - wenn Sim-Pause endet: denselben Resume-Helper wie Auto-Resume nutzen
+4. Keine harte Blockade bei Drift.
+5. Pausezeit muss in `pause_total_duration_secs` einlaufen.
+
+Akzeptanz:
+
+- MSFS Esc-Pause 2 Minuten -> Pause-Segment ca. 120 Sekunden.
+- phpVMS-Heartbeat laeuft waehrend Pause weiter.
+- Nach Unpause resumed der Flug ohne Button.
+- Flight-Time im PIREP ist um Pausezeit reduziert.
+
+#### Schritt 2 - F7 Aircraft-Change-Banner
+
+Ziel: Nach Resume/Recovery soll der Pilot sehen, wenn das aktuell geladene Flugzeug nicht zum aktiven Flug passt.
+
+Umsetzung:
+
+1. Beim Pause-Start vorhandene Aircraft-Daten speichern:
+   - `aircraft_icao`
+   - Registration, falls verfuegbar
+   - ggf. Titel/Model-String, falls schon vorhanden
+2. Beim Resume aktuellen Snapshot/Sim-Aircraft gegen den aktiven Flug vergleichen.
+3. Bei Abweichung:
+   - Warnung im bestehenden Active-Flight-Bereich anzeigen
+   - Activity-Log schreiben
+   - Resume nicht blockieren
+4. Kein neues UI-System bauen. Bestehende Warn-/Banner-Flaeche verwenden.
+
+Akzeptanz:
+
+- Gleiches Flugzeug -> keine Warnung.
+- Gleiche Familie/ICAO -> keine harte Warnung, maximal Info falls Registration anders.
+- Anderes ICAO -> sichtbare Warnung.
+- Warnung blockiert Resume nicht.
+
+#### Schritt 3 - F6 X-Plane Paused-Heartbeat
+
+Ziel: X-Plane soll einen aktiven Pause-Zustand an AeroACARS melden koennen, damit die Pausezeit auch dort sauber gezaehlt wird.
+
+Umsetzung:
+
+1. X-Plane-Plugin/Adapter pruefen, ob `sim/time/paused` oder aequivalenter Pause-State gelesen werden kann.
+2. Pause-State in den Client transportieren.
+3. Gemeinsame Pause-Logik wiederverwenden:
+   - Pause aktiv -> `paused_since`
+   - Heartbeat mit letzter Position
+   - Pause Ende -> Resume-Helper
+4. Falls Plugin-Protokoll erweitert werden muss:
+   - backward-compatible Feld einfuehren
+   - alte Plugin-Versionen laufen weiter ohne F6
+   - UI zeigt keinen Fehler, sondern arbeitet wie bisher mit Disconnect-Erkennung
+
+Akzeptanz:
+
+- X-Plane Pause 2 Minuten -> Pause-Segment ca. 120 Sekunden.
+- X-Plane alter Plugin-Stand ohne Pause-Feld -> kein Crash, Fallback wie bisher.
+- Heartbeat laeuft waehrend Pause weiter.
+- Flight-Time wird um Pausezeit reduziert.
+
+### F8 Bid-Change-Detection Light Optional
+
+Nur umsetzen, wenn nach F5-F7 noch sauber Zeit ist.
+
+Light-Scope:
+
+- Beim Resume pruefen, ob aktiver phpVMS-PIREP noch dieselbe `pirep_id` hat.
+- Wenn ein anderer Bid/PIREP aktiv ist: Warnung und kein stiller Wechsel.
+- Kein grosses Bid-Wechsel-UI bauen.
+
+### QS-Matrix v0.7.15
+
+| # | Bereich | Test |
+|---|---|---|
+| Q1 | Sim-Disconnect | Sim liefert >30s keine Snapshots -> Pause-State |
+| Q2 | Sim-Disconnect | Ohne Snapshot sendet Client alle 30s Heartbeat mit `last_good_snap` |
+| Q3 | Auto-Resume | Snapshot kommt zurueck -> Resume ohne Button |
+| Q4 | Pausezeit | 10 Minuten Pause reduzieren PIREP-Zeit um 10 Minuten |
+| Q5 | Distanz | 80 NM Reposition wird nicht zu `distance_nm` addiert |
+| Q6 | Server | 25 Minuten Positionsluecke mit gleicher `pirep_id` bleibt eine Session |
+| Q7 | Server | ARRIVED/PIREP_SUBMITTED Session wird nicht wieder geoeffnet |
+| Q8 | Reboot | Rechner/App-Neustart unter 6h adoptiert offenen PIREP |
+| Q9 | Reboot | Neustart nach >6h/PIREP weg zeigt Recovery-Hinweis |
+| Q10 | MSFS Pause | MSFS Esc-Pause erzeugt Pause-Segment und Heartbeat laeuft weiter |
+| Q11 | MSFS Pause | MSFS Unpause resumed automatisch |
+| Q12 | X-Plane Pause | X-Plane Pause erzeugt Pause-Segment, wenn Plugin Pause-State liefert |
+| Q13 | X-Plane Compat | Altes X-Plane-Plugin ohne Pause-State bleibt kompatibel |
+| Q14 | Aircraft Change | Gleiches Aircraft nach Resume -> keine Warnung |
+| Q15 | Aircraft Change | Anderes Aircraft nach Resume -> sichtbare Warnung, kein Block |
+
+### Release-Gates v0.7.15
+
+Vor Build/Release muessen gruen sein:
+
+- Client: `npm run build`
+- Client: `cargo check`
+- Client: `cargo test`
+- Client: vorhandene Frontend-Tests
+- Recorder: `npm run build`
+- Recorder: `npm test`
+- Webapp: `npm run build`
+- ein realer oder synthetischer MSFS Pause/Unpause-QS
+- ein X-Plane-Kompatibilitaets-QS, mindestens mit altem Plugin-Fallback
+
+### Release-Notes Entwurf
+
+Titel:
+
+```text
+v0.7.15 - Sim Recovery Release
+```
+
+Deutsch:
+
+```text
+Diese Version verbessert die Wiederaufnahme laufender Fluege nach Simulator-Crash, Pause, Neustart oder kurzer Rechner-Unterbrechung.
+
+- AeroACARS pausiert den Flug automatisch, wenn der Simulator keine Daten mehr liefert.
+- Der phpVMS-PIREP wird waehrend einer Sim-Unterbrechung weiter per Heartbeat wachgehalten.
+- Sobald der Simulator wieder Daten liefert, wird der Flug automatisch fortgesetzt.
+- Pausezeit wird von Flight-/Block-Time abgezogen.
+- Reposition-Distanz nach Recovery wird nicht als geflogene Distanz gezaehlt.
+- Der Recorder haelt Sessions anhand der `pirep_id` zusammen, damit ein Flug nicht durch Datenluecken in mehrere Sessions zerfaellt.
+- MSFS-Pause/Unpause und X-Plane-Pause werden, soweit vom Simulator/Plugin gemeldet, als echte Pause behandelt.
+- AeroACARS warnt, wenn nach Recovery ein anderes Flugzeug geladen ist.
+```
+
+Englisch:
+
+```text
+This release improves recovery for active flights after simulator crashes, pauses, restarts, or short computer interruptions.
+
+- AeroACARS automatically pauses the flight when the simulator stops sending data.
+- The phpVMS PIREP is kept alive with heartbeat updates during simulator interruptions.
+- The flight automatically resumes once simulator data returns.
+- Paused time is subtracted from flight/block time.
+- Reposition distance after recovery is not counted as flown distance.
+- The recorder keeps sessions together by `pirep_id`, preventing one flight from being split by telemetry gaps.
+- MSFS pause/unpause and X-Plane pause, where reported by the simulator/plugin, are treated as real pause time.
+- AeroACARS warns if a different aircraft is loaded after recovery.
+```
+
 ## Code-Check 2026-05-12
 
 Diese Punkte wurden gegen den aktuellen Stand geprueft:
