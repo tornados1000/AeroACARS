@@ -4036,7 +4036,23 @@ fn landing_get_current(
         SimKind::Msfs2020 | SimKind::Msfs2024 => Some("MSFS"),
         SimKind::XPlane11 | SimKind::XPlane12 => Some("X-PLANE"),
     };
-    let aircraft_icao = snapshot.as_ref().and_then(|s| s.aircraft_icao.as_deref());
+    // v0.7.17 (B-015b QS-Fix): Aircraft-ICAO mit Bid-Fallback — identische
+    // Logik wie der Final-Filing-Pfad in `record_landing_for_filed_flight`
+    // (siehe lib.rs:~8510). Vorher: Live-Vorschau nutzte nur Snapshot-
+    // Aircraft → bei Sim-Disconnect oder X-Plane Web API aus war
+    // `aircraft_icao=None` → sub_rollout fiel auf Light-GA-Schwellen
+    // zurueck → Pilot sah inkonsistente Cockpit-Vorschau-Scores gegenueber
+    // dem spaeter persistierten LandingRecord. QS-Round-1 Befund.
+    let bid_icao = flight.aircraft_icao.trim();
+    let bid_icao_opt: Option<&str> = if bid_icao.is_empty() {
+        None
+    } else {
+        Some(bid_icao)
+    };
+    let aircraft_icao = snapshot
+        .as_ref()
+        .and_then(|s| s.aircraft_icao.as_deref())
+        .or(bid_icao_opt);
     let aircraft_title = snapshot.as_ref().and_then(|s| s.aircraft_title.as_deref());
     build_landing_record(&flight, &stats, sim_label, aircraft_icao, aircraft_title)
 }
@@ -8032,6 +8048,36 @@ pub fn ofp_matches_active_flight(
     candidates.contains(&simbrief_norm)
 }
 
+/// v0.7.17 (B-015a QS-Fix): Single-Source-of-Truth fuer den Score-V/S.
+///
+/// QS-Round-1 Befund: Frontend `scoreBasisVs()` priorisierte bereits
+/// `vs_at_edge_fpm`, aber die im Record GESPEICHERTEN sub_scores wurden
+/// im Backend mit `landing_peak_vs_fpm.or(landing_rate_fpm)` gebaut —
+/// ohne den Edge-Wert. Bei `ux_version >= 1` zeigt der Frontend die
+/// gespeicherten Werte direkt (nicht den scoreBasisVs-Pfad), also war
+/// die Korrektur dort wirkungslos.
+///
+/// Cascade-Reihenfolge (matched `scoreBasisVs()` im TS-Frontend):
+///   1. `vs_at_edge_fpm` aus `stats.landing_analysis` (50-Hz-Buffer-
+///      Edge, FAR 25.473 Engineering-Standard) — wenn `< 0`
+///   2. `stats.landing_peak_vs_fpm` (Touchdown-Window-Peak, Streamer-
+///      Tick-Cadence)
+///   3. `stats.landing_rate_fpm` (Streamer-Tick-Snapshot am TD-Frame)
+fn score_basis_vs_fpm(stats: &FlightStats) -> Option<f32> {
+    if let Some(edge) = stats
+        .landing_analysis
+        .as_ref()
+        .and_then(|v| v.get("vs_at_edge_fpm"))
+        .and_then(|v| v.as_f64())
+    {
+        let edge_f32 = edge as f32;
+        if edge_f32 < 0.0 {
+            return Some(edge_f32);
+        }
+    }
+    stats.landing_peak_vs_fpm.or(stats.landing_rate_fpm)
+}
+
 /// v0.7.1 Helper: actual_trip_burn = takeoff_fuel - landing_fuel
 /// (1:1 wie in build_landing_record line 6527-6530). Damit sub_scores
 /// + aggregate_master_score den gleichen Wert nutzen.
@@ -8058,7 +8104,9 @@ fn compute_aggregate_master_score(
 ) -> Option<u8> {
     let actual_burn = actual_burn_for_record(stats);
     let scoring_input = landing_scoring::LandingScoringInput {
-        vs_fpm: stats.landing_peak_vs_fpm.or(stats.landing_rate_fpm),
+        // v0.7.17 (B-015a QS-Fix): Edge-Wert hat Vorrang — siehe
+        // `score_basis_vs_fpm()` Doc.
+        vs_fpm: score_basis_vs_fpm(stats),
         peak_g_load: stats.landing_peak_g_force,
         // v0.7.6 P2-B: zentraler Helper statt direkten Read.
         bounce_count: Some(scored_bounce_count_for_score(stats)),
@@ -8229,7 +8277,9 @@ fn build_landing_record(
     // Fallback auf Touchdown-Klassifikation wenn keine Sub-Scores
     // berechnet werden konnten (Edge-Case Schutz).
     let scoring_input = landing_scoring::LandingScoringInput {
-        vs_fpm: stats.landing_peak_vs_fpm.or(stats.landing_rate_fpm),
+        // v0.7.17 (B-015a QS-Fix): Edge-Wert hat Vorrang — siehe
+        // `score_basis_vs_fpm()` Doc.
+        vs_fpm: score_basis_vs_fpm(stats),
         peak_g_load: stats.landing_peak_g_force,
         // v0.7.6 P2-B: zentraler Helper statt direkten Read.
         bounce_count: Some(scored_bounce_count_for_score(stats)),
@@ -9553,9 +9603,8 @@ async fn flight_end(
                         // als landing_score (gewichteter Aggregate) nutzen.
                         let actual_burn = actual_burn_for_record(&stats);
                         let scoring_input = landing_scoring::LandingScoringInput {
-                            vs_fpm: stats
-                                .landing_peak_vs_fpm
-                                .or(stats.landing_rate_fpm),
+                            // v0.7.17 (B-015a QS-Fix): Edge-Wert hat Vorrang.
+                            vs_fpm: score_basis_vs_fpm(&stats),
                             peak_g_load: stats.landing_peak_g_force,
                             // v0.7.6 P2-B: zentraler Helper statt direkten Read.
                             bounce_count: Some(scored_bounce_count_for_score(&stats)),
@@ -15846,7 +15895,9 @@ fn build_pirep_notes(flight: &ActiveFlight, stats: &FlightStats) -> String {
         _ => None,
     };
     let crate_input = landing_scoring::LandingScoringInput {
-        vs_fpm: stats.landing_peak_vs_fpm.or(stats.landing_rate_fpm),
+        // v0.7.17 (B-015a QS-Fix): Edge-Wert hat Vorrang — siehe
+        // `score_basis_vs_fpm()` Doc.
+        vs_fpm: score_basis_vs_fpm(stats),
         peak_g_load: stats.landing_peak_g_force,
         // v0.7.6 P2-B: zentraler Helper statt direkten Read.
         bounce_count: Some(scored_bounce_count_for_score(stats)),
@@ -19248,6 +19299,59 @@ mod touch_and_go_go_around_tests {
             600.0,
         );
         assert_eq!(out, Some(FlightPhase::Descent));
+    }
+
+    // ---- v0.7.17 (B-015a QS-Fix): score_basis_vs_fpm ----
+
+    #[test]
+    fn score_basis_uses_edge_when_negative() {
+        // EIN799-Regression: vs_at_edge_fpm = -265 muss gewinnen gegen
+        // landing_peak_vs_fpm = -311.
+        let mut stats = FlightStats::default();
+        stats.landing_peak_vs_fpm = Some(-311.0);
+        stats.landing_rate_fpm = Some(-311.0);
+        stats.landing_analysis = Some(serde_json::json!({
+            "vs_at_edge_fpm": -265.0,
+        }));
+        assert_eq!(score_basis_vs_fpm(&stats), Some(-265.0));
+    }
+
+    #[test]
+    fn score_basis_falls_back_when_edge_missing() {
+        let mut stats = FlightStats::default();
+        stats.landing_peak_vs_fpm = Some(-311.0);
+        stats.landing_rate_fpm = Some(-358.0);
+        // No landing_analysis at all.
+        assert_eq!(score_basis_vs_fpm(&stats), Some(-311.0));
+        // landing_analysis ohne vs_at_edge_fpm-Key.
+        stats.landing_analysis = Some(serde_json::json!({
+            "other_field": 42,
+        }));
+        assert_eq!(score_basis_vs_fpm(&stats), Some(-311.0));
+    }
+
+    #[test]
+    fn score_basis_ignores_positive_edge() {
+        // Bumping/Ballooning kurz vor TD kann positive Werte produzieren —
+        // das ist kein echter Aufsetz-Moment, fallback auf peak.
+        let mut stats = FlightStats::default();
+        stats.landing_peak_vs_fpm = Some(-311.0);
+        stats.landing_analysis = Some(serde_json::json!({
+            "vs_at_edge_fpm": 12.0,
+        }));
+        assert_eq!(score_basis_vs_fpm(&stats), Some(-311.0));
+    }
+
+    #[test]
+    fn score_basis_full_fallback_chain() {
+        // peak None → rate.
+        let mut stats = FlightStats::default();
+        stats.landing_peak_vs_fpm = None;
+        stats.landing_rate_fpm = Some(-358.0);
+        assert_eq!(score_basis_vs_fpm(&stats), Some(-358.0));
+        // alle None → None.
+        let stats2 = FlightStats::default();
+        assert_eq!(score_basis_vs_fpm(&stats2), None);
     }
 }
 
