@@ -17107,6 +17107,52 @@ fn inspector_list(_state: tauri::State<'_, AppState>) -> Vec<serde_json::Value> 
     }
 }
 
+// ---- Fenix A32x Beta toggle (v0.7.16) ----
+//
+// Opt-in flag that gates the additive Fenix-A32x LVAR overrides in the
+// MSFS adapter's telemetry mapping (landing/nose/wing lights + flaps
+// lever cross-check). Default is `false` — current Fenix users on
+// v0.7.15 stable see no behavioral change unless they flip this on
+// from the Settings → Beta panel.
+//
+// Frontend persists the choice in localStorage and re-syncs it on
+// app start / login. Backend lives on the `MsfsAdapter` (atomic bool).
+
+#[tauri::command]
+fn set_fenix_beta_enabled(
+    _state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), UiError> {
+    #[cfg(target_os = "windows")]
+    {
+        let adapter = _state.msfs.lock().expect("msfs lock");
+        adapter.set_fenix_beta_enabled(enabled);
+        tracing::info!(enabled, "fenix_beta_enabled set");
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = enabled;
+        Err(UiError::new(
+            "unsupported",
+            "Fenix Beta is only available on the Windows MSFS adapter",
+        ))
+    }
+}
+
+#[tauri::command]
+fn get_fenix_beta_enabled(_state: tauri::State<'_, AppState>) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        let adapter = _state.msfs.lock().expect("msfs lock");
+        adapter.fenix_beta_enabled()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
 /// X-Plane DataRef inspector: returns the static catalog with the
 /// most recent received value per entry. Unlike the MSFS Inspector
 /// (where the user adds names manually) the X-Plane catalog is
@@ -18311,6 +18357,8 @@ pub fn run() {
             inspector_add,
             inspector_remove,
             inspector_list,
+            set_fenix_beta_enabled,
+            get_fenix_beta_enabled,
             xplane_inspector_list,
             xplane_premium_status,
             xplane_detect_install_path,

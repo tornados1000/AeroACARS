@@ -84,6 +84,26 @@ export function SettingsPanel({
   const [simbriefUserId, setSimbriefUserId] = useState<string>(
     () => localStorage.getItem("simbrief_user_id") ?? "",
   );
+
+  // v0.7.16: Fenix A32x Beta opt-in. Backend default is `false`;
+  // we mirror that here so a brand-new install never accidentally
+  // enables the beta path. localStorage persists the choice between
+  // app starts. Backend sync happens on mount below + on every toggle.
+  // Spec docs/spec/fenix-a32x-cockpit-state-beta.md.
+  const [fenixBetaEnabled, setFenixBetaEnabled] = useState<boolean>(
+    () => localStorage.getItem("fenix_beta_enabled") === "1",
+  );
+
+  // v0.7.16: Push the persisted Fenix Beta opt-in to the backend
+  // on every mount (covers app restart and Settings re-open after
+  // login). Without this, the backend would always start with the
+  // default `false` even if the user toggled it last session.
+  useEffect(() => {
+    void invoke("set_fenix_beta_enabled", {
+      enabled: fenixBetaEnabled,
+    }).catch(() => null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [verifying, setVerifying] = useState(false);
   const [verifyStatus, setVerifyStatus] = useState<{
     tone: "ok" | "err";
@@ -390,6 +410,36 @@ export function SettingsPanel({
                 __html: t("behaviour.minimize_to_tray_hint"),
               }}
             />
+          </span>
+        </label>
+      </div>
+
+      {/* v0.7.16: Fenix A32x Beta opt-in panel.
+         * Spec docs/spec/fenix-a32x-cockpit-state-beta.md.
+         * Default off; Fenix pilots enable it explicitly. Read-only,
+         * no FSUIPC, no MSFS Community-folder additions. */}
+      <div className="settings__section">
+        <h3>{t("settings.beta_section")}</h3>
+        <p className="settings__row-hint">{t("settings.fenix_beta_intro")}</p>
+        <label className="settings__checkbox">
+          <input
+            type="checkbox"
+            checked={fenixBetaEnabled}
+            onChange={(e) => {
+              const next = e.target.checked;
+              setFenixBetaEnabled(next);
+              if (next) localStorage.setItem("fenix_beta_enabled", "1");
+              else localStorage.removeItem("fenix_beta_enabled");
+              void invoke("set_fenix_beta_enabled", { enabled: next }).catch(
+                () => null,
+              );
+            }}
+          />
+          <span>
+            <strong>{t("settings.fenix_beta_label")}</strong>
+            <span className="settings__row-hint">
+              {t("settings.fenix_beta_hint")}
+            </span>
           </span>
         </label>
       </div>

@@ -549,9 +549,15 @@ pub enum AircraftProfile {
     /// LVar reference: github.com/flybywiresim/aircraft/blob/master/
     /// fbw-a32nx/docs/a320-simvars.md
     FbwA32nx,
-    /// Fenix Simulations A320 v2. LVars in `Cockpit_Behavior.xml` plus
+    /// Fenix Simulations A319 v2 (shares the `FNX_32X` SimObject with
+    /// the A320 — LVar names are variant-identical, only the airframe
+    /// dimensions differ).
+    FenixA319,
+    /// Fenix Simulations A320 v2. LVars in `FNX32X_Interior.xml` plus
     /// the Fenix knowledge base.
     FenixA320,
+    /// Fenix Simulations A321 v2 (same `FNX_32X` SimObject as A320).
+    FenixA321,
     /// PMDG 737 (700/800/900). LVars are in PMDG's SDK header.
     Pmdg737,
     /// PMDG 777 (200/300). Same SDK family as the 737.
@@ -576,8 +582,20 @@ impl AircraftProfile {
         if t.contains("flybywire") || t.contains("fbw a32nx") || t.contains("a32nx") {
             return Self::FbwA32nx;
         }
-        // Fenix — title typically begins with "FenixA320" / "FenixA319".
+        // Fenix — title typically begins with "FenixA319" / "FenixA320" /
+        // "FenixA321". All three variants share the same `FNX_32X`
+        // SimObject and LVar namespace, so the mapping is identical;
+        // we differentiate purely so the activity log and PIREP show
+        // the correct sub-type. ICAO callout is the secondary signal
+        // for repaints whose title doesn't carry the variant suffix
+        // (some community liveries flatten everything to "FenixA320").
         if t.contains("fenix") {
+            if t.contains("a319") || i.contains("a319") {
+                return Self::FenixA319;
+            }
+            if t.contains("a321") || i.contains("a321") {
+                return Self::FenixA321;
+            }
             return Self::FenixA320;
         }
         // PMDG 737 — covers 736/737/738/739 NG and MAX variants.
@@ -606,12 +624,21 @@ impl AircraftProfile {
         Self::Default
     }
 
+    /// `true` if this profile is any Fenix A32x variant. All three
+    /// share the same `FNX_32X` SimObject + LVar namespace, so most
+    /// adapter mapping branches treat them identically.
+    pub fn is_fenix(self) -> bool {
+        matches!(self, Self::FenixA319 | Self::FenixA320 | Self::FenixA321)
+    }
+
     /// Short human-readable label for the activity log.
     pub fn label(self) -> &'static str {
         match self {
             Self::Default => "Default (standard SimVars)",
             Self::FbwA32nx => "FlyByWire A32NX",
+            Self::FenixA319 => "Fenix A319",
             Self::FenixA320 => "Fenix A320",
+            Self::FenixA321 => "Fenix A321",
             Self::Pmdg737 => "PMDG 737",
             Self::Pmdg777 => "PMDG 777",
             Self::IniA340 => "INIBuilds A340",
@@ -738,3 +765,64 @@ pub enum SimError {
 //   * Implement the SimAdapter trait in `sim-msfs`.
 //   * Add a Phase FSM driven by SimSnapshot streams.
 //   * Add a snapshot ring buffer for downstream consumers.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_fenix_a319_from_title() {
+        let p = AircraftProfile::detect("FenixA319 IAE", "A319");
+        assert_eq!(p, AircraftProfile::FenixA319);
+        assert!(p.is_fenix());
+        assert_eq!(p.label(), "Fenix A319");
+    }
+
+    #[test]
+    fn detect_fenix_a320_default_when_no_variant() {
+        // Plain "Fenix" matches A320 as the canonical fallback. This
+        // is the v0.7.15 stable behavior — preserve it so community
+        // liveries that flatten the title still get a Fenix profile.
+        let p = AircraftProfile::detect("Fenix Simulations Airbus", "A320");
+        assert_eq!(p, AircraftProfile::FenixA320);
+    }
+
+    #[test]
+    fn detect_fenix_a320_explicit() {
+        let p = AircraftProfile::detect("FenixA320 CFM SL", "A320");
+        assert_eq!(p, AircraftProfile::FenixA320);
+        assert!(p.is_fenix());
+    }
+
+    #[test]
+    fn detect_fenix_a321_from_title() {
+        let p = AircraftProfile::detect("FenixA321 NEO LR", "A321");
+        assert_eq!(p, AircraftProfile::FenixA321);
+        assert!(p.is_fenix());
+        assert_eq!(p.label(), "Fenix A321");
+    }
+
+    #[test]
+    fn detect_fenix_a319_via_icao_only() {
+        // Repaint scenario: title omits the variant marker, ICAO still
+        // identifies it. Match on either signal is by design.
+        let p = AircraftProfile::detect("Fenix Repaint", "A319");
+        assert_eq!(p, AircraftProfile::FenixA319);
+    }
+
+    #[test]
+    fn detect_non_fenix_stays_default() {
+        let p = AircraftProfile::detect("Asobo A320 Neo", "A20N");
+        assert_eq!(p, AircraftProfile::Default);
+        assert!(!p.is_fenix());
+    }
+
+    #[test]
+    fn is_fenix_covers_all_three_variants() {
+        assert!(AircraftProfile::FenixA319.is_fenix());
+        assert!(AircraftProfile::FenixA320.is_fenix());
+        assert!(AircraftProfile::FenixA321.is_fenix());
+        assert!(!AircraftProfile::FbwA32nx.is_fenix());
+        assert!(!AircraftProfile::Default.is_fenix());
+    }
+}

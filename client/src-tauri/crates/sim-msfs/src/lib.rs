@@ -113,6 +113,10 @@ mod stub {
         pub fn last_error(&self) -> Option<String> {
             Some("MSFS adapter is Windows-only".into())
         }
+        pub fn set_fenix_beta_enabled(&self, _enabled: bool) {}
+        pub fn fenix_beta_enabled(&self) -> bool {
+            false
+        }
     }
 }
 

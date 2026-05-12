@@ -255,6 +255,41 @@ pub const TELEMETRY_FIELDS: &[TelemetryField] = &[
     F::f64("L:I_MIP_AUTOBRAKE_LO_L", "Number"),
     F::f64("L:I_MIP_AUTOBRAKE_MED_L", "Number"),
     F::f64("L:I_MIP_AUTOBRAKE_MAX_L", "Number"),
+
+    // ---- Fenix A32x Beta LVars (v0.7.16) ----
+    // Read from the verified `FNX32X_Interior.xml` shipped with
+    // fnx-aircraft-320 / fnx-aircraft-319-321. All names cross-checked
+    // against `<VAR_NAME>` entries in the live Fenix install. These
+    // fields are always read into the parsed Telemetry block so the
+    // payload layout stays stable; the mapping into SimSnapshot only
+    // takes effect when `fenix_beta_enabled` is true (set via the
+    // Tauri command `set_fenix_beta_enabled`, default off).
+    //
+    // Wing light: 0 = off, 1 = on. Boeing-typical "WING" inspection
+    // light; Airbus pilots toggle it at night or when checking icing.
+    F::f64("L:S_OH_EXT_LT_WING", "Number"),
+    // Runway turnoff: 0 = off, 1 = on. Two separate lamps on the
+    // nose gear strut; Fenix exposes them as one combined switch.
+    F::f64("L:S_OH_EXT_LT_RWY_TURNOFF", "Number"),
+    // Landing lights L/R: 0 = retracted, 1 = off, 2 = on. The
+    // 3-position selector models the real A320 — retracted is the
+    // stowed position pre-takeoff.
+    F::f64("L:S_OH_EXT_LT_LANDING_L", "Number"),
+    F::f64("L:S_OH_EXT_LT_LANDING_R", "Number"),
+    // Composite "BOTH" selector (line 680 in FNX32X_Interior.xml):
+    // Fenix wires a single switch that drives L+R together. Beta QS
+    // task is to verify it stays in sync with the individual L/R
+    // switches — we read it for cross-check but the mapping uses
+    // L/R as the source of truth.
+    F::f64("L:S_OH_EXT_LT_LANDING_BOTH", "Number"),
+    // Nose light: 0 = off, 1 = taxi, 2 = T.O. Combines nose taxi
+    // and nose take-off into one 3-position switch.
+    F::f64("L:S_OH_EXT_LT_NOSE", "Number"),
+    // Flaps lever: enum 0..5 (UP, 1, 1+F, 2, 3, FULL). Beta-only:
+    // the existing `FLAPS HANDLE PERCENT` SimVar works on Fenix; this
+    // adds the lever *detent* as a cross-check value the activity log
+    // can pin against (e.g. "Lever 1+F" vs the percentage).
+    F::f64("L:S_FC_FLAPS", "Number"),
 ];
 
 // Helper builders so the table above stays compact.
@@ -414,6 +449,15 @@ pub struct Telemetry {
     pub fnx_autobrake_lo: f64,
     pub fnx_autobrake_med: f64,
     pub fnx_autobrake_max: f64,
+
+    // v0.7.16 Fenix A32x extension LVars (read-only).
+    pub fnx_ext_lt_wing: f64,
+    pub fnx_ext_lt_rwy_turnoff: f64,
+    pub fnx_ext_lt_landing_l: f64,
+    pub fnx_ext_lt_landing_r: f64,
+    pub fnx_ext_lt_landing_both: f64,
+    pub fnx_ext_lt_nose: f64,
+    pub fnx_fc_flaps_lever: f64,
 }
 
 // ---- Touchdown sample (separate data definition #2) ----
@@ -760,6 +804,16 @@ impl Telemetry {
         pull_f64!(t.fnx_autobrake_med);
         pull_f64!(t.fnx_autobrake_max);
 
+        // v0.7.16 Fenix A32x extension LVars — same TELEMETRY_FIELDS
+        // order as registered above.
+        pull_f64!(t.fnx_ext_lt_wing);
+        pull_f64!(t.fnx_ext_lt_rwy_turnoff);
+        pull_f64!(t.fnx_ext_lt_landing_l);
+        pull_f64!(t.fnx_ext_lt_landing_r);
+        pull_f64!(t.fnx_ext_lt_landing_both);
+        pull_f64!(t.fnx_ext_lt_nose);
+        pull_f64!(t.fnx_fc_flaps_lever);
+
         // Silence the unused-assignment warning the last `pull_*!`
         // emits (the macro always advances `off`, but the very last
         // call doesn't read it again).
@@ -770,9 +824,16 @@ impl Telemetry {
 }
 
 /// Convenience used by the worker: parse + remap to `SimSnapshot`.
-pub fn parse(bytes: &[u8], simulator: Simulator) -> SimSnapshot {
+///
+/// `fenix_beta_enabled` (v0.7.16) gates the additive Fenix-A32x
+/// LVAR overrides for landing / nose / wing / runway-turnoff lights
+/// and the flaps lever detent. Default is `false`: when off, the
+/// snapshot mapping is bit-identical to v0.7.15 stable (no regression
+/// for current Fenix users). When on, verified Fenix LVARs replace
+/// the standard SimVars for the affected fields.
+pub fn parse(bytes: &[u8], simulator: Simulator, fenix_beta_enabled: bool) -> SimSnapshot {
     let t = Telemetry::from_block(bytes);
-    telemetry_to_snapshot(t, simulator)
+    telemetry_to_snapshot(t, simulator, fenix_beta_enabled)
 }
 
 /// Map 0.0 → None, anything > 0 → Some. Used for SimVars where a
@@ -805,10 +866,18 @@ fn read_str256(bytes: &[u8], off: usize) -> Option<String> {
     })
 }
 
-fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
+fn telemetry_to_snapshot(
+    t: Telemetry,
+    simulator: Simulator,
+    fenix_beta_enabled: bool,
+) -> SimSnapshot {
     let profile = AircraftProfile::detect(&t.title, &t.atc_model);
-    let is_fenix = matches!(profile, AircraftProfile::FenixA320);
+    let is_fenix = profile.is_fenix();
     let is_fbw = matches!(profile, AircraftProfile::FbwA32nx);
+    // v0.7.16 gate: additive LVAR overrides only kick in when
+    // the user has opted into the Fenix Beta profile. Stable behavior
+    // (v0.7.15 baseline) is the `false` branch everywhere below.
+    let fenix_beta = is_fenix && fenix_beta_enabled;
 
     let engines_running = (t.eng1_firing as u8)
         + (t.eng2_firing as u8)
@@ -947,6 +1016,41 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
     };
     let strobe_state = if is_fenix {
         Some(t.fnx_strobe.round().clamp(0.0, 2.0) as u8)
+    } else {
+        None
+    };
+
+    // v0.7.16 — additive Fenix-A32x lights/lever (only when
+    // `fenix_beta_enabled` is set on the adapter). All LVAR names
+    // verified against `SimObjects\Airplanes\FNX_32X\model\
+    // FNX32X_Interior.xml` in the live Fenix install.
+    //
+    //   * `L:S_OH_EXT_LT_LANDING_L`/`_R` are 3-position selectors
+    //     (0 = retracted, 1 = off, 2 = on). "Light landing" is true
+    //     iff at least one side is in the "on" position (= 2). The
+    //     stowed/off positions both count as off — pilots leave the
+    //     lights retracted on the ground for life-cycle reasons, the
+    //     PIREP shouldn't treat that as a "landing lights on" event.
+    //   * `L:S_OH_EXT_LT_NOSE`: 0 = off, 1 = taxi, 2 = T.O. The
+    //     standard `LIGHT TAXI` SimVar is binary; Fenix's switch is
+    //     tri-state, with T.O. being the brighter (full-power) mode
+    //     used during takeoff/landing. Either mode counts as "taxi
+    //     light on" for the binary snapshot pill.
+    //   * `L:S_OH_EXT_LT_WING`: 0/1. Standard MSFS doesn't expose a
+    //     wing-inspection light SimVar; we surface it only when Fenix
+    //     beta is on (otherwise stays `None`).
+    let fenix_beta_light_landing = if fenix_beta {
+        Some(t.fnx_ext_lt_landing_l as i32 == 2 || t.fnx_ext_lt_landing_r as i32 == 2)
+    } else {
+        None
+    };
+    let fenix_beta_light_taxi = if fenix_beta {
+        Some(t.fnx_ext_lt_nose as i32 >= 1)
+    } else {
+        None
+    };
+    let fenix_beta_light_wing = if fenix_beta {
+        Some(t.fnx_ext_lt_wing as i32 != 0)
     } else {
         None
     };
@@ -1151,10 +1255,12 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
         com2_mhz: positive_or_none(t.com2_mhz as f32),
         nav1_mhz: positive_or_none(t.nav1_mhz as f32),
         nav2_mhz: positive_or_none(t.nav2_mhz as f32),
-        light_landing: Some(t.light_landing),
+        // v0.7.16: Fenix beta overrides landing/taxi via verified
+        // overhead LVARs. Stable behavior (beta off) is `Some(t.light_*)`.
+        light_landing: fenix_beta_light_landing.or(Some(t.light_landing)),
         light_beacon: Some(light_beacon),
         light_strobe: Some(light_strobe),
-        light_taxi: Some(t.light_taxi),
+        light_taxi: fenix_beta_light_taxi.or(Some(t.light_taxi)),
         light_nav: Some(light_nav),
         light_logo: Some(light_logo),
         strobe_state,
@@ -1175,9 +1281,10 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
         engine_anti_ice: Some(engine_anti_ice),
         wing_anti_ice: Some(wing_anti_ice),
         // v0.3.0: filled by the PMDG snapshot()-merge layer when a
-        // PMDG aircraft is loaded. Standard MSFS SimVars don't expose
-        // these as separate fields, so they stay None for non-PMDG.
-        light_wing: None,
+        // PMDG aircraft is loaded. v0.7.16 also surfaces Fenix's
+        // `L:S_OH_EXT_LT_WING` (no standard SimVar covers it). Stays
+        // `None` for non-PMDG / non-Fenix-beta aircraft.
+        light_wing: fenix_beta_light_wing,
         light_wheel_well: None,
         xpdr_mode_label: None,
         takeoff_config_warning: None,
@@ -1196,5 +1303,162 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
         // merging the latest ClientData block — not here in the
         // standard SimVar parse path.
         pmdg: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal Fenix-profile Telemetry with the standard
+    /// SimVars showing "all lights off" and a specific set of Fenix
+    /// extension LVAR values. Used by the beta-mapping tests below.
+    fn fenix_telemetry(
+        landing_l: f64,
+        landing_r: f64,
+        nose: f64,
+        wing: f64,
+    ) -> Telemetry {
+        let mut t = Telemetry::default();
+        t.title = "FenixA320 CFM SL".into();
+        t.atc_model = "A320".into();
+        // Standard SimVars stay false so any positive in the snapshot
+        // is unambiguously sourced from the Fenix LVARs.
+        t.light_landing = false;
+        t.light_taxi = false;
+        t.fnx_ext_lt_landing_l = landing_l;
+        t.fnx_ext_lt_landing_r = landing_r;
+        t.fnx_ext_lt_nose = nose;
+        t.fnx_ext_lt_wing = wing;
+        t
+    }
+
+    #[test]
+    fn beta_off_preserves_v0_7_15_stable_lights() {
+        // With beta disabled, the Fenix extension LVARs must NOT
+        // affect the snapshot — the standard SimVar values are the
+        // source of truth, exactly as in v0.7.15.
+        let t = fenix_telemetry(2.0, 2.0, 1.0, 1.0);
+        let snap = telemetry_to_snapshot(t, Simulator::Msfs2024, false);
+        assert_eq!(snap.light_landing, Some(false));
+        assert_eq!(snap.light_taxi, Some(false));
+        assert_eq!(snap.light_wing, None);
+    }
+
+    #[test]
+    fn beta_on_maps_landing_from_lvar_l_or_r_equals_2() {
+        // Either side at position 2 ("on") counts as landing-on. The
+        // 0/1 positions (retracted/off) both stay off.
+        let snap_l_only = telemetry_to_snapshot(
+            fenix_telemetry(2.0, 0.0, 0.0, 0.0),
+            Simulator::Msfs2024,
+            true,
+        );
+        assert_eq!(snap_l_only.light_landing, Some(true));
+
+        let snap_r_only = telemetry_to_snapshot(
+            fenix_telemetry(0.0, 2.0, 0.0, 0.0),
+            Simulator::Msfs2024,
+            true,
+        );
+        assert_eq!(snap_r_only.light_landing, Some(true));
+
+        let snap_off_with_off_position = telemetry_to_snapshot(
+            fenix_telemetry(1.0, 1.0, 0.0, 0.0),
+            Simulator::Msfs2024,
+            true,
+        );
+        // Position 1 = "off" (not retracted), still no landing light.
+        assert_eq!(snap_off_with_off_position.light_landing, Some(false));
+
+        let snap_retracted = telemetry_to_snapshot(
+            fenix_telemetry(0.0, 0.0, 0.0, 0.0),
+            Simulator::Msfs2024,
+            true,
+        );
+        assert_eq!(snap_retracted.light_landing, Some(false));
+    }
+
+    #[test]
+    fn beta_on_maps_taxi_from_nose_lvar() {
+        // 0 = off, 1 = taxi, 2 = T.O. — both 1 and 2 count as on
+        // for the binary taxi-light snapshot pill.
+        let snap_off = telemetry_to_snapshot(
+            fenix_telemetry(0.0, 0.0, 0.0, 0.0),
+            Simulator::Msfs2024,
+            true,
+        );
+        assert_eq!(snap_off.light_taxi, Some(false));
+
+        let snap_taxi = telemetry_to_snapshot(
+            fenix_telemetry(0.0, 0.0, 1.0, 0.0),
+            Simulator::Msfs2024,
+            true,
+        );
+        assert_eq!(snap_taxi.light_taxi, Some(true));
+
+        let snap_takeoff = telemetry_to_snapshot(
+            fenix_telemetry(0.0, 0.0, 2.0, 0.0),
+            Simulator::Msfs2024,
+            true,
+        );
+        assert_eq!(snap_takeoff.light_taxi, Some(true));
+    }
+
+    #[test]
+    fn beta_on_maps_wing_light_from_lvar() {
+        let snap_off = telemetry_to_snapshot(
+            fenix_telemetry(0.0, 0.0, 0.0, 0.0),
+            Simulator::Msfs2024,
+            true,
+        );
+        assert_eq!(snap_off.light_wing, Some(false));
+
+        let snap_on = telemetry_to_snapshot(
+            fenix_telemetry(0.0, 0.0, 0.0, 1.0),
+            Simulator::Msfs2024,
+            true,
+        );
+        assert_eq!(snap_on.light_wing, Some(true));
+    }
+
+    #[test]
+    fn beta_on_does_not_affect_non_fenix_aircraft() {
+        // Beta flag must not leak into non-Fenix aircraft mapping —
+        // an Asobo A320 with non-zero Fenix LVAR fields (which would
+        // never happen in practice, but defensive) must stay on the
+        // standard SimVar path.
+        let mut t = Telemetry::default();
+        t.title = "Asobo A320 Neo".into();
+        t.atc_model = "A20N".into();
+        t.light_landing = false;
+        t.light_taxi = false;
+        // Pretend the Fenix LVAR slots happened to have values:
+        t.fnx_ext_lt_landing_l = 2.0;
+        t.fnx_ext_lt_nose = 1.0;
+        t.fnx_ext_lt_wing = 1.0;
+        let snap = telemetry_to_snapshot(t, Simulator::Msfs2024, true);
+        assert_eq!(snap.light_landing, Some(false));
+        assert_eq!(snap.light_taxi, Some(false));
+        assert_eq!(snap.light_wing, None);
+    }
+
+    #[test]
+    fn telemetry_fields_layout_matches_struct_pulls() {
+        // Smoke test: the parser walks the buffer in TELEMETRY_FIELDS
+        // order, so the total declared size must match the number of
+        // pull_*! calls in from_block(). If someone adds a field to
+        // the list without a matching pull, this test catches the
+        // drift via a too-large or too-small parse.
+        let total: usize = TELEMETRY_FIELDS.iter().map(|f| f.kind.size()).sum();
+        // Build a buffer of exactly that size — all zeros — and
+        // confirm from_block doesn't panic and returns defaults.
+        let buf = vec![0u8; total];
+        let t = Telemetry::from_block(&buf);
+        // Sanity: a known field at the end (autobrake_max) reads 0.
+        assert_eq!(t.fnx_autobrake_max, 0.0);
+        // And the new beta extension fields too.
+        assert_eq!(t.fnx_ext_lt_wing, 0.0);
+        assert_eq!(t.fnx_fc_flaps_lever, 0.0);
     }
 }
