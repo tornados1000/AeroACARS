@@ -1041,10 +1041,11 @@ function FlugzeugBar({ props }: { props: RunwayDiagramV2Props }) {
         display: "flex",
         flexDirection: "column",
         gap: 2,
-        // flex 999 0 auto: greedy growth (frisst restliche Zeile),
-        // kein flex-shrink. minWidth genug damit alle Stats inline
-        // passen ohne dass die Bar in zwei Zeilen umbricht.
-        flex: "999 0 auto",
+        // flex 999 1 0: basis=0 zwingt Bar dazu, exakt den Restplatz
+        // bündig bis zur rechten Container-Kante auszufüllen (statt
+        // bei flex-basis auto am Content-Ende zu stoppen). Damit
+        // alignment mit den Pills der Zeile darüber.
+        flex: "999 1 0",
         minWidth: 320,
       }}
     >
