@@ -56,6 +56,21 @@ export interface RunwayDiagramV2Props {
   tch_class?: TchClass | null;
   pre_displaced_threshold?: boolean | null;
   rollout_m?: number | null;
+
+  // Optional Aircraft-Daten für die Landeeinschätzung. Wenn nichts
+  // gesetzt → FLUGZEUG-Pill wird nicht gerendert.
+  aircraft_icao?: string | null;
+  aircraft_title?: string | null;
+  aircraft_registration?: string | null;
+  landing_weight_kg?: number | null;
+  planned_ldw_kg?: number | null;
+  landing_speed_kt?: number | null;
+  landing_pitch_deg?: number | null;
+  landing_bank_deg?: number | null;
+  landing_peak_g_force?: number | null;
+  headwind_kt?: number | null;
+  crosswind_kt?: number | null;
+
   locale?: "de" | "en" | "it";
 }
 
@@ -622,71 +637,60 @@ export function RunwayDiagramV2(props: RunwayDiagramV2Props) {
               Reines Overlap-Hygiene-Detail, kein User-sichtbares
               Verhalten ändert sich beim normalen Fall. */}
           {exitX != null && (() => {
+            // 3-Modi-Anti-Overlap:
+            // 1. "right": Wenn Rollout sehr kurz (< 80 px) → Labels rechts
+            //    vom Bremspunkt-Dot, nicht drüber (sonst crashen sie in
+            //    den TD-Dot-Bereich).
+            // 2. "below": Wenn der TD-Dot durch großen XTD-Offset weit
+            //    oben sitzt (tdY < rwyTop + 60), würden Labels über dem
+            //    Dot in die AUFSETZZONE-Beschriftung crashen → Labels
+            //    UNTER den Bremspunkt-Dot.
+            // 3. "above": Standard-Fall, Labels über dem Dot.
             const exitGap = exitX - tdX;
-            const labelsRight = exitGap < 80;
+            const mode: "right" | "below" | "above" =
+              exitGap < 80
+                ? "right"
+                : tdY < rwyTop + 60
+                ? "below"
+                : "above";
+            const textProps = {
+              fill: TOKENS.exitDot,
+              fontWeight: "800" as const,
+              fontFamily: "monospace",
+              stroke: "#0c1628",
+              strokeWidth: "3",
+              paintOrder: "stroke" as const,
+            };
             return (
               <g>
                 <circle cx={exitX} cy={tdY} r="11" fill={TOKENS.exitDot} opacity="0.25" />
                 <circle cx={exitX} cy={tdY} r="6" fill={TOKENS.exitDot} stroke="#0c1628" strokeWidth="1.5" />
-                {labelsRight ? (
+                {mode === "right" && (
                   <>
-                    <text
-                      x={exitX + 18}
-                      y={tdY - 4}
-                      textAnchor="start"
-                      fontSize="14"
-                      fill={TOKENS.exitDot}
-                      fontWeight="800"
-                      fontFamily="monospace"
-                      stroke="#0c1628"
-                      strokeWidth="3"
-                      paintOrder="stroke"
-                    >
+                    <text x={exitX + 18} y={tdY - 4} textAnchor="start" fontSize="14" {...textProps}>
                       Bremspunkt
                     </text>
-                    <text
-                      x={exitX + 18}
-                      y={tdY + 12}
-                      textAnchor="start"
-                      fontSize="13"
-                      fill={TOKENS.exitDot}
-                      fontWeight="800"
-                      fontFamily="monospace"
-                      stroke="#0c1628"
-                      strokeWidth="3"
-                      paintOrder="stroke"
-                    >
+                    <text x={exitX + 18} y={tdY + 12} textAnchor="start" fontSize="13" {...textProps}>
                       40 kt
                     </text>
                   </>
-                ) : (
+                )}
+                {mode === "below" && (
                   <>
-                    <text
-                      x={exitX}
-                      y={tdY - 36}
-                      textAnchor="middle"
-                      fontSize="14"
-                      fill={TOKENS.exitDot}
-                      fontWeight="800"
-                      fontFamily="monospace"
-                      stroke="#0c1628"
-                      strokeWidth="3"
-                      paintOrder="stroke"
-                    >
+                    <text x={exitX} y={tdY + 22} textAnchor="middle" fontSize="14" {...textProps}>
                       Bremspunkt
                     </text>
-                    <text
-                      x={exitX}
-                      y={tdY - 20}
-                      textAnchor="middle"
-                      fontSize="13"
-                      fill={TOKENS.exitDot}
-                      fontWeight="800"
-                      fontFamily="monospace"
-                      stroke="#0c1628"
-                      strokeWidth="3"
-                      paintOrder="stroke"
-                    >
+                    <text x={exitX} y={tdY + 38} textAnchor="middle" fontSize="13" {...textProps}>
+                      40 kt
+                    </text>
+                  </>
+                )}
+                {mode === "above" && (
+                  <>
+                    <text x={exitX} y={tdY - 36} textAnchor="middle" fontSize="14" {...textProps}>
+                      Bremspunkt
+                    </text>
+                    <text x={exitX} y={tdY - 20} textAnchor="middle" fontSize="13" {...textProps}>
                       40 kt
                     </text>
                   </>
@@ -925,6 +929,7 @@ export function RunwayDiagramV2(props: RunwayDiagramV2Props) {
               : "neutral"
           }
         />
+        <AircraftPill props={props} />
       </div>
 
       {glossaryOpen && (
@@ -938,6 +943,155 @@ export function RunwayDiagramV2(props: RunwayDiagramV2Props) {
 
 // Atomare Stat-Pille — 1 Label + 1 Value, optionale Tone-Farbe am Wert.
 // Ersetzt das alte 3-Box-DetailCard-Layout (v2.2).
+// Flugzeug-Box — wide Pill mit allen für die Landeeinschätzung
+// relevanten Aircraft-Daten. Nur sichtbar wenn aircraft_icao oder
+// aircraft_title oder eine der numerischen Telemetrie-Werte vorhanden
+// ist. Wenn nichts vorhanden → komplett unsichtbar.
+function AircraftPill({ props }: { props: RunwayDiagramV2Props }) {
+  const has =
+    props.aircraft_icao ||
+    props.aircraft_title ||
+    props.landing_weight_kg != null ||
+    props.landing_speed_kt != null ||
+    props.landing_peak_g_force != null;
+  if (!has) return null;
+
+  // Wind-Format: "HW 8 kt · XW 2 kt LINKS"
+  const windStr = (() => {
+    const hw = props.headwind_kt;
+    const xw = props.crosswind_kt;
+    if (hw == null && xw == null) return null;
+    const parts: string[] = [];
+    if (hw != null) {
+      parts.push(hw >= 0 ? `HW ${Math.abs(hw).toFixed(0)} kt` : `TW ${Math.abs(hw).toFixed(0)} kt`);
+    }
+    if (xw != null) {
+      const side = xw > 0 ? "RECHTS" : xw < 0 ? "LINKS" : "";
+      parts.push(`XW ${Math.abs(xw).toFixed(0)} kt${side ? " " + side : ""}`);
+    }
+    return parts.join(" · ");
+  })();
+
+  // Landegewicht mit Δ zu Plan
+  const weightStr = (() => {
+    if (props.landing_weight_kg == null) return null;
+    const realT = (props.landing_weight_kg / 1000).toFixed(1);
+    if (props.planned_ldw_kg == null) return `${realT} t`;
+    const planT = (props.planned_ldw_kg / 1000).toFixed(1);
+    const deltaT = (props.landing_weight_kg - props.planned_ldw_kg) / 1000;
+    const sign = deltaT >= 0 ? "+" : "";
+    return `${realT} t  (Plan ${planT} t · Δ ${sign}${deltaT.toFixed(1)} t)`;
+  })();
+
+  // Pitch / Bank kombiniert
+  const pitchBankStr = (() => {
+    if (props.landing_pitch_deg == null && props.landing_bank_deg == null) return null;
+    const p = props.landing_pitch_deg?.toFixed(1) ?? "—";
+    const b = props.landing_bank_deg?.toFixed(1) ?? "—";
+    return `${p}° / ${b}°`;
+  })();
+
+  // Header-Zeile: Title + Type/Registration
+  const headerTitle =
+    props.aircraft_title || props.aircraft_icao || "Flugzeug";
+  const headerSub = (() => {
+    const parts: string[] = [];
+    if (props.aircraft_icao && props.aircraft_title) parts.push(props.aircraft_icao);
+    if (props.aircraft_registration) parts.push(`Reg: ${props.aircraft_registration}`);
+    return parts.join(" · ");
+  })();
+
+  return (
+    <div
+      style={{
+        padding: "8px 12px",
+        background: "rgba(255,255,255,0.04)",
+        border: "1px solid rgba(255,255,255,0.10)",
+        borderRadius: 8,
+        display: "flex",
+        flexDirection: "column",
+        gap: 4,
+        minWidth: 280,
+        maxWidth: 440,
+        flex: "1 1 auto",
+      }}
+    >
+      <div
+        style={{
+          fontSize: "0.68rem",
+          fontWeight: 700,
+          letterSpacing: 1.1,
+          textTransform: "uppercase",
+          opacity: 0.65,
+        }}
+      >
+        Flugzeug
+      </div>
+      <div style={{ fontSize: "0.95rem", fontWeight: 700, color: "#e2e8f0" }}>
+        {headerTitle}
+      </div>
+      {headerSub && (
+        <div style={{ fontSize: "0.78rem", opacity: 0.7 }}>{headerSub}</div>
+      )}
+      <div
+        style={{
+          marginTop: 4,
+          borderTop: "1px solid rgba(255,255,255,0.08)",
+          paddingTop: 6,
+          display: "grid",
+          gridTemplateColumns: "auto 1fr",
+          rowGap: 3,
+          columnGap: 10,
+          fontSize: "0.82rem",
+        }}
+      >
+        {weightStr != null && (
+          <>
+            <span style={{ opacity: 0.65 }}>Landegewicht</span>
+            <span style={{ fontWeight: 600 }}>{weightStr}</span>
+          </>
+        )}
+        {props.landing_speed_kt != null && (
+          <>
+            <span style={{ opacity: 0.65 }}>Touchdown-IAS</span>
+            <span style={{ fontWeight: 600 }}>{props.landing_speed_kt.toFixed(0)} kt</span>
+          </>
+        )}
+        {pitchBankStr && (
+          <>
+            <span style={{ opacity: 0.65 }}>Pitch / Bank</span>
+            <span style={{ fontWeight: 600 }}>{pitchBankStr}</span>
+          </>
+        )}
+        {props.landing_peak_g_force != null && (
+          <>
+            <span style={{ opacity: 0.65 }}>Peak-G</span>
+            <span
+              style={{
+                fontWeight: 600,
+                color:
+                  props.landing_peak_g_force >= 1.7
+                    ? "#ef4444"
+                    : props.landing_peak_g_force >= 1.5
+                    ? "#fbbf24"
+                    : "#22c55e",
+              }}
+            >
+              {props.landing_peak_g_force.toFixed(2)} g
+            </span>
+          </>
+        )}
+        {windStr && (
+          <>
+            <span style={{ opacity: 0.65 }}>Wind</span>
+            <span style={{ fontWeight: 600 }}>{windStr}</span>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function Pill({
   label,
   value,

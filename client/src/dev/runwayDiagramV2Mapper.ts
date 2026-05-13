@@ -52,6 +52,18 @@ export function mapLandingRecordToV2Props(
     tch_class: (record.tch_class ?? null) as TchClass | null,
     pre_displaced_threshold: record.pre_displaced_threshold ?? null,
     rollout_m: record.rollout_distance_m ?? null,
+    // Aircraft-Daten für die Landeeinschätzung
+    aircraft_icao: record.aircraft_icao ?? null,
+    aircraft_title: record.aircraft_title ?? null,
+    aircraft_registration: record.aircraft_registration ?? null,
+    landing_weight_kg: record.landing_weight_kg ?? null,
+    planned_ldw_kg: record.planned_ldw_kg ?? null,
+    landing_speed_kt: record.landing_speed_kt ?? null,
+    landing_pitch_deg: record.landing_pitch_deg ?? null,
+    landing_bank_deg: record.landing_bank_deg ?? null,
+    landing_peak_g_force: record.landing_peak_g_force ?? null,
+    headwind_kt: record.headwind_kt ?? null,
+    crosswind_kt: record.crosswind_kt ?? null,
     locale: "de",
   };
 }
