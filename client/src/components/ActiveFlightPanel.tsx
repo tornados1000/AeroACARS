@@ -187,8 +187,12 @@ export function ActiveFlightPanel({ info, simSnapshot, onEnded }: Props) {
         cancelLabel: t("active_flight.confirm_cancel_finalizable_other"),
       });
       if (tryFile) {
-        // File-First: force=false (oder undefined). Backend versucht
-        // erst zu filen, fällt nur bei HardFailed in cancel.
+        // File-First: force=false. Backend versucht erst zu filen.
+        // Outcomes:
+        //   - Ok(filed_instead | queued | cancelled) → kein weiterer Dialog.
+        //   - Err(blocked)            → Account-Sperre, Fehlertext.
+        //   - Err(file_first_failed)  → invokeCancelOrForce zeigt
+        //     zweiten Confirm-Dialog (R2-1). Kein Auto-Cancel mehr.
         await invokeCancelOrForce(false);
         return;
       }
