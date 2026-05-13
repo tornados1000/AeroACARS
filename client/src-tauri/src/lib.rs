@@ -397,6 +397,28 @@ fn clean_atc_model(raw: &str) -> Option<String> {
     if upper.starts_with("TT:") || upper.contains("ATCCOM.") || upper.ends_with(".TEXT") {
         return None;
     }
+    // v0.8.1: Vendor-Tag-Prefix-Strip. Einige MSFS-Addons (Flysimware
+    // Citation X, manche Carenado-Pakete) schicken den ICAO mit einem
+    // "$$:"-Prefix als ATC-MODEL — Sim liefert z.B. "$$:C750" statt
+    // "C750". Aircraft-Mismatch-Check verglich dann "C750" (Bid) gegen
+    // "$$:C750" (Sim) und schlug fehl. Live-Bug GSG/Sven M 2026-05-13.
+    // Wir strippen den Prefix wenn er aus 1-4 Zeichen + ":" besteht
+    // und kein Buchstabe enthält (= Sonderzeichen wie "$$:" / "##:"),
+    // damit echte ICAO-Codes wie "TT:..." (= text-token, oben schon
+    // gefiltert) nicht falsch behandelt werden.
+    if let Some(colon_pos) = upper.find(':') {
+        if colon_pos <= 4 {
+            let prefix = &upper[..colon_pos];
+            let is_vendor_tag = !prefix.is_empty()
+                && !prefix.chars().any(|c| c.is_ascii_alphanumeric());
+            if is_vendor_tag {
+                let stripped = upper[colon_pos + 1..].trim().to_string();
+                if !stripped.is_empty() {
+                    return Some(stripped);
+                }
+            }
+        }
+    }
     Some(upper)
 }
 
@@ -22221,6 +22243,70 @@ mod aircraft_alias_tests {
         assert!(!aircraft_types_match("HDJT", "C25A"));   // CitationJet
         assert!(!aircraft_types_match("HDJT", "E50P"));   // Phenom 100
         assert!(!aircraft_types_match("HDJT", "TBM9"));   // TBM 930
+    }
+
+    /// v0.8.1: Vendor-Tag-Prefix-Strip im clean_atc_model. Live-Bug
+    /// GSG/Sven M 2026-05-13: Cessna Citation X — MSFS-Addon (Flysimware
+    /// vermutet) schickt "$$:C750" als ATC-MODEL statt nur "C750".
+    /// Ohne den Strip war exp=C750 act=$$:C750 ein Mismatch.
+    #[test]
+    fn vendor_prefix_dollar_dollar_colon_gets_stripped() {
+        use super::clean_atc_model;
+        assert_eq!(clean_atc_model("$$:C750"), Some("C750".to_string()));
+        assert_eq!(clean_atc_model("$$:b738"), Some("B738".to_string()));
+        // case-insensitive (uppercase happens early in the function)
+        assert_eq!(clean_atc_model("##:A320"), Some("A320".to_string()));
+    }
+
+    #[test]
+    fn normal_atc_model_passes_through_unchanged() {
+        use super::clean_atc_model;
+        // Regular ICAO codes without vendor prefix bleiben unverändert.
+        assert_eq!(clean_atc_model("C750"), Some("C750".to_string()));
+        assert_eq!(clean_atc_model("B738"), Some("B738".to_string()));
+        assert_eq!(clean_atc_model("HDJT"), Some("HDJT".to_string()));
+    }
+
+    #[test]
+    fn tt_text_token_still_rejected() {
+        use super::clean_atc_model;
+        // TT:-Prefix war schon vor v0.8.1 als None-return behandelt
+        // (text-token, kein echter ICAO). Verhalten darf nicht ändern —
+        // sonst würde der neue Strip-Pfad fälschlich den TT-Suffix als
+        // ICAO liefern. `TT` ist purer Buchstabe → kein "vendor tag",
+        // greift den is_vendor_tag-Check nicht.
+        assert_eq!(clean_atc_model("TT:CESSNA"), None);
+    }
+
+    #[test]
+    fn atccom_with_ac_model_still_extracts_icao() {
+        use super::clean_atc_model;
+        // Bestehender Pfad (AC_MODEL-substring) extrahiert die ICAO
+        // VOR dem TT/ATCCOM-Reject-Check. Verhalten darf nicht ändern.
+        assert_eq!(
+            clean_atc_model("ATCCOM.AC_MODEL_C750.0.TEXT"),
+            Some("C750".to_string())
+        );
+    }
+
+    #[test]
+    fn empty_after_strip_falls_back_gracefully() {
+        use super::clean_atc_model;
+        // Nur Prefix ohne Inhalt → kein gültiger ICAO. Wir liefern den
+        // Original-String zurück (None wäre disruptiv für die UI).
+        assert_eq!(clean_atc_model("$$:"), Some("$$:".to_string()));
+    }
+
+    #[test]
+    fn aircraft_mismatch_resolves_with_prefix_strip() {
+        use super::clean_atc_model;
+        // End-to-end: vorher war exp=C750, act=$$:C750 mismatch.
+        // Mit Strip ist act jetzt C750 und strict-equality matched.
+        let raw_sim = "$$:C750";
+        let bid_icao = "C750";
+        let sim_clean = clean_atc_model(raw_sim).unwrap();
+        assert_eq!(sim_clean, bid_icao);
+        assert!(aircraft_types_match(bid_icao, &sim_clean));
     }
 
     /// v0.8.0: VPS-managed alias-overrides werden additiv zur hardcoded
