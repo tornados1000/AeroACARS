@@ -222,33 +222,33 @@ export function RunwayDiagramV2(props: RunwayDiagramV2Props) {
         }}
       >
         <div>
-          <h3
-            style={{
-              fontSize: "1.15rem",
-              margin: 0,
-              marginBottom: 6,
-              display: "flex",
-              alignItems: "center",
-              gap: 8,
-              letterSpacing: 0.2,
-            }}
-          >
-            🛬 Landebahn-Analyse
-          </h3>
+          {/* v2.x: H3-Titel "Landebahn-Analyse" entfernt — die Component
+              wird im Webapp-Card und im Pilot-Client-LandingPanel
+              jeweils schon mit demselben Titel gewrappt. Wäre doppelt
+              gemoppelt. Das 🛬-Icon wandert vor den Airport. */}
           <div
             style={{
-              fontSize: "0.92rem",
+              fontSize: "1.0rem",
               lineHeight: 1.55,
-              opacity: 0.92,
+              display: "flex",
+              alignItems: "baseline",
+              gap: 6,
+              flexWrap: "wrap",
             }}
           >
-            <strong>{props.airport_ident}</strong>
-            {props.airport_name ? ` (${props.airport_name})` : ""}
-            {" · "}
-            <strong>Bahn {props.runway_ident}</strong>
-            {" · "}
-            {props.length_m.toFixed(0)} m
-            {props.surface ? ` · ${surfaceLabel(props.surface)}` : ""}
+            <span style={{ fontSize: "1.1rem" }}>🛬</span>
+            <strong style={{ fontSize: "1.05rem" }}>{props.airport_ident}</strong>
+            {props.airport_name ? <span>({props.airport_name})</span> : null}
+            <span style={{ opacity: 0.5 }}>·</span>
+            <strong style={{ fontSize: "1.05rem" }}>Bahn {props.runway_ident}</strong>
+            <span style={{ opacity: 0.5 }}>·</span>
+            <span>{props.length_m.toFixed(0)} m</span>
+            {props.surface ? (
+              <>
+                <span style={{ opacity: 0.5 }}>·</span>
+                <span>{surfaceLabel(props.surface)}</span>
+              </>
+            ) : null}
           </div>
           <div
             style={{
