@@ -929,7 +929,79 @@ export function RunwayDiagramV2(props: RunwayDiagramV2Props) {
               : "neutral"
           }
         />
-        <AircraftPill props={props} />
+        {/* Flugzeug-bezogene Pills — falls vorhanden. */}
+        {(props.aircraft_icao || props.aircraft_title) && (
+          <Pill
+            label="Flugzeug"
+            value={
+              [
+                props.aircraft_title || props.aircraft_icao,
+                props.aircraft_registration ? `Reg: ${props.aircraft_registration}` : null,
+              ]
+                .filter(Boolean)
+                .join(" · ")
+            }
+          />
+        )}
+        {props.landing_weight_kg != null && (
+          <Pill
+            label="Landegewicht"
+            value={
+              props.planned_ldw_kg != null
+                ? `${(props.landing_weight_kg / 1000).toFixed(1)} t · Δ ${
+                    (props.landing_weight_kg - props.planned_ldw_kg) / 1000 >= 0 ? "+" : ""
+                  }${((props.landing_weight_kg - props.planned_ldw_kg) / 1000).toFixed(1)} t`
+                : `${(props.landing_weight_kg / 1000).toFixed(1)} t`
+            }
+          />
+        )}
+        {props.landing_speed_kt != null && (
+          <Pill label="Touchdown-IAS" value={`${props.landing_speed_kt.toFixed(0)} kt`} />
+        )}
+        {(props.landing_pitch_deg != null || props.landing_bank_deg != null) && (
+          <Pill
+            label="Pitch / Bank"
+            value={`${props.landing_pitch_deg?.toFixed(1) ?? "—"}° / ${props.landing_bank_deg?.toFixed(1) ?? "—"}°`}
+            tone={
+              props.landing_pitch_deg != null && props.landing_pitch_deg < 0
+                ? "bad"
+                : props.landing_bank_deg != null && Math.abs(props.landing_bank_deg) > 5
+                ? "warn"
+                : "neutral"
+            }
+          />
+        )}
+        {props.landing_peak_g_force != null && (
+          <Pill
+            label="Peak-G"
+            value={`${props.landing_peak_g_force.toFixed(2)} g`}
+            tone={
+              props.landing_peak_g_force >= 1.7
+                ? "bad"
+                : props.landing_peak_g_force >= 1.5
+                ? "warn"
+                : "good"
+            }
+          />
+        )}
+        {(props.headwind_kt != null || props.crosswind_kt != null) && (() => {
+          const parts: string[] = [];
+          const hw = props.headwind_kt;
+          const xw = props.crosswind_kt;
+          if (hw != null) {
+            parts.push(hw >= 0 ? `HW ${Math.abs(hw).toFixed(0)} kt` : `TW ${Math.abs(hw).toFixed(0)} kt`);
+          }
+          if (xw != null && Math.abs(xw) >= 1) {
+            const side = xw > 0 ? "RECHTS" : "LINKS";
+            parts.push(`XW ${Math.abs(xw).toFixed(0)} kt ${side}`);
+          }
+          // Tone: TW oder XW > 15 kt → warn, > 25 kt → bad
+          const xwAbs = xw != null ? Math.abs(xw) : 0;
+          const isTw = hw != null && hw < -3;
+          const tone =
+            xwAbs > 25 || isTw ? "bad" : xwAbs > 15 ? "warn" : "neutral";
+          return <Pill label="Wind" value={parts.join(" · ")} tone={tone} />;
+        })()}
       </div>
 
       {glossaryOpen && (
@@ -943,155 +1015,6 @@ export function RunwayDiagramV2(props: RunwayDiagramV2Props) {
 
 // Atomare Stat-Pille — 1 Label + 1 Value, optionale Tone-Farbe am Wert.
 // Ersetzt das alte 3-Box-DetailCard-Layout (v2.2).
-// Flugzeug-Box — wide Pill mit allen für die Landeeinschätzung
-// relevanten Aircraft-Daten. Nur sichtbar wenn aircraft_icao oder
-// aircraft_title oder eine der numerischen Telemetrie-Werte vorhanden
-// ist. Wenn nichts vorhanden → komplett unsichtbar.
-function AircraftPill({ props }: { props: RunwayDiagramV2Props }) {
-  const has =
-    props.aircraft_icao ||
-    props.aircraft_title ||
-    props.landing_weight_kg != null ||
-    props.landing_speed_kt != null ||
-    props.landing_peak_g_force != null;
-  if (!has) return null;
-
-  // Wind-Format: "HW 8 kt · XW 2 kt LINKS"
-  const windStr = (() => {
-    const hw = props.headwind_kt;
-    const xw = props.crosswind_kt;
-    if (hw == null && xw == null) return null;
-    const parts: string[] = [];
-    if (hw != null) {
-      parts.push(hw >= 0 ? `HW ${Math.abs(hw).toFixed(0)} kt` : `TW ${Math.abs(hw).toFixed(0)} kt`);
-    }
-    if (xw != null) {
-      const side = xw > 0 ? "RECHTS" : xw < 0 ? "LINKS" : "";
-      parts.push(`XW ${Math.abs(xw).toFixed(0)} kt${side ? " " + side : ""}`);
-    }
-    return parts.join(" · ");
-  })();
-
-  // Landegewicht mit Δ zu Plan
-  const weightStr = (() => {
-    if (props.landing_weight_kg == null) return null;
-    const realT = (props.landing_weight_kg / 1000).toFixed(1);
-    if (props.planned_ldw_kg == null) return `${realT} t`;
-    const planT = (props.planned_ldw_kg / 1000).toFixed(1);
-    const deltaT = (props.landing_weight_kg - props.planned_ldw_kg) / 1000;
-    const sign = deltaT >= 0 ? "+" : "";
-    return `${realT} t  (Plan ${planT} t · Δ ${sign}${deltaT.toFixed(1)} t)`;
-  })();
-
-  // Pitch / Bank kombiniert
-  const pitchBankStr = (() => {
-    if (props.landing_pitch_deg == null && props.landing_bank_deg == null) return null;
-    const p = props.landing_pitch_deg?.toFixed(1) ?? "—";
-    const b = props.landing_bank_deg?.toFixed(1) ?? "—";
-    return `${p}° / ${b}°`;
-  })();
-
-  // Header-Zeile: Title + Type/Registration
-  const headerTitle =
-    props.aircraft_title || props.aircraft_icao || "Flugzeug";
-  const headerSub = (() => {
-    const parts: string[] = [];
-    if (props.aircraft_icao && props.aircraft_title) parts.push(props.aircraft_icao);
-    if (props.aircraft_registration) parts.push(`Reg: ${props.aircraft_registration}`);
-    return parts.join(" · ");
-  })();
-
-  return (
-    <div
-      style={{
-        padding: "8px 12px",
-        background: "rgba(255,255,255,0.04)",
-        border: "1px solid rgba(255,255,255,0.10)",
-        borderRadius: 8,
-        display: "flex",
-        flexDirection: "column",
-        gap: 4,
-        minWidth: 280,
-        maxWidth: 440,
-        flex: "1 1 auto",
-      }}
-    >
-      <div
-        style={{
-          fontSize: "0.68rem",
-          fontWeight: 700,
-          letterSpacing: 1.1,
-          textTransform: "uppercase",
-          opacity: 0.65,
-        }}
-      >
-        Flugzeug
-      </div>
-      <div style={{ fontSize: "0.95rem", fontWeight: 700, color: "#e2e8f0" }}>
-        {headerTitle}
-      </div>
-      {headerSub && (
-        <div style={{ fontSize: "0.78rem", opacity: 0.7 }}>{headerSub}</div>
-      )}
-      <div
-        style={{
-          marginTop: 4,
-          borderTop: "1px solid rgba(255,255,255,0.08)",
-          paddingTop: 6,
-          display: "grid",
-          gridTemplateColumns: "auto 1fr",
-          rowGap: 3,
-          columnGap: 10,
-          fontSize: "0.82rem",
-        }}
-      >
-        {weightStr != null && (
-          <>
-            <span style={{ opacity: 0.65 }}>Landegewicht</span>
-            <span style={{ fontWeight: 600 }}>{weightStr}</span>
-          </>
-        )}
-        {props.landing_speed_kt != null && (
-          <>
-            <span style={{ opacity: 0.65 }}>Touchdown-IAS</span>
-            <span style={{ fontWeight: 600 }}>{props.landing_speed_kt.toFixed(0)} kt</span>
-          </>
-        )}
-        {pitchBankStr && (
-          <>
-            <span style={{ opacity: 0.65 }}>Pitch / Bank</span>
-            <span style={{ fontWeight: 600 }}>{pitchBankStr}</span>
-          </>
-        )}
-        {props.landing_peak_g_force != null && (
-          <>
-            <span style={{ opacity: 0.65 }}>Peak-G</span>
-            <span
-              style={{
-                fontWeight: 600,
-                color:
-                  props.landing_peak_g_force >= 1.7
-                    ? "#ef4444"
-                    : props.landing_peak_g_force >= 1.5
-                    ? "#fbbf24"
-                    : "#22c55e",
-              }}
-            >
-              {props.landing_peak_g_force.toFixed(2)} g
-            </span>
-          </>
-        )}
-        {windStr && (
-          <>
-            <span style={{ opacity: 0.65 }}>Wind</span>
-            <span style={{ fontWeight: 600 }}>{windStr}</span>
-          </>
-        )}
-      </div>
-    </div>
-  );
-}
-
 function Pill({
   label,
   value,
