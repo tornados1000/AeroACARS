@@ -37,6 +37,20 @@ export interface LandingRunwayMatch {
   centerline_distance_abs_ft: number;
   side: string;
   touchdown_distance_from_threshold_ft: number;
+  // v0.8.0 VPS-Navdata fields — alle optional weil pre-v0.8.0
+  // landing_history.json-Eintraege diese Felder nicht haben.
+  /** "navigraph" | "ourairports_fallback" */
+  source?: string | null;
+  /** AIRAC-Cycle wenn source = "navigraph" */
+  nav_cycle?: string | null;
+  /** Geographic true-course in deg (Threshold → End bearing). */
+  true_course_deg?: number | null;
+  /** Displaced-Threshold in ft. 0 = keine Displacement. */
+  displaced_threshold_ft?: number | null;
+  /** Erwartete Threshold-Crossing-Height in ft (typisch 49-55). */
+  tch_expected_ft?: number | null;
+  /** Glideslope-Winkel in deg (typisch 3.0). */
+  glideslope_angle_deg?: number | null;
 }
 
 export interface LandingRecord {
@@ -184,6 +198,36 @@ export interface LandingRecord {
   /// ISO-8601 UTC — wann der Accident detektiert wurde. Bei Sim-Event-
   /// Pfad kann das mehrere Sekunden vor `touchdown_at` liegen.
   accident_at?: string | null;
+
+  // ─── v0.8.0 VPS-Navdata + Runway-Awareness ────────────────────────
+  // Touchdown-Quality-Assessment-Felder, Spec docs/spec/v0.8.0-vps-
+  // navdata-runway-awareness.md. Identisches Wire-Format zwischen
+  // LandingRecord (lokal) und TouchdownPayload (live MQTT). Alle
+  // optional — pre-v0.8.0-Records haben sie nicht und der
+  // OurAirports-Fallback-Pfad liefert nur die quell-agnostischen Werte
+  // (TDZ/Aim/td_distance) und lässt TCH/DDS leer.
+  /** Signed along-track Distanz Threshold→Touchdown in Metern. */
+  td_distance_from_threshold_m?: number | null;
+  /** F3 TDZ-Result: Touchdown im 900-m-Marker? None bei RWY < 1200 m. */
+  td_in_tdz?: boolean | null;
+  /** 1-indexed Third der RWY (1/2/3) wo der Touchdown sitzt. */
+  td_third?: number | null;
+  /** TDZ-Marker-Länge in Metern (für RunwayDiagram). */
+  td_tdz_length_m?: number | null;
+  /** F4 Aim-Delta in Metern (positiv = past, negativ = short). */
+  aim_delta_m?: number | null;
+  /** F4 Aim-Klassifikation: perfect|short_of_aim|past_aim|long_landing|severe */
+  aim_class?: string | null;
+  /** F4 Aim-Distance vom Threshold in Metern (300 oder 400). */
+  aim_point_m?: number | null;
+  /** F5 actual TCH at threshold-crossing (AGL ft). */
+  tch_actual_ft?: number | null;
+  /** F5 TCH-Delta = actual - expected. */
+  tch_delta_ft?: number | null;
+  /** F5 TCH-Klassifikation: on_profile|slightly_low|slightly_high|high|below_profile */
+  tch_class?: string | null;
+  /** F6 Pilot in Pre-Threshold-Paint gelandet (= illegal DDS-Touchdown). */
+  pre_displaced_threshold?: boolean | null;
 }
 
 /// v0.7.1: Stability-Gate-Window-Metadaten (Spec §5.4).
@@ -551,14 +595,28 @@ function runwayTrustReasonLabel(reason: string | null | undefined): string | nul
 function RunwayDiagram({
   rw,
   rolloutDistanceM,
+  tdzLengthM,
+  tdInTdz,
+  aimPointM,
+  aimClass,
+  preDisplacedThreshold,
 }: {
   rw: LandingRunwayMatch;
   rolloutDistanceM: number | null;
+  // v0.8.0 assessment-Felder. Alle optional — wenn None bzw. undefined
+  // wird der entsprechende Layer nicht gerendert.
+  tdzLengthM?: number | null;
+  tdInTdz?: boolean | null;
+  aimPointM?: number | null;
+  aimClass?: string | null;
+  preDisplacedThreshold?: boolean | null;
 }) {
   const { t } = useTranslation();
   const w = 480;
-  const h = 130;
-  // Runway band
+  const h = 154;
+  // Runway band — slightly taller now (height grew from 130 to 154) so
+  // the new TDZ + Aim + DDS markers don't crowd the existing
+  // threshold/TD labels.
   const rwLeft = 30;
   const rwRight = w - 30;
   const rwTop = h / 2 - 16;
@@ -570,6 +628,11 @@ function RunwayDiagram({
   // Map threshold→far-end onto the rect.
   const tdFrac = Math.min(1, Math.max(0, tdFromThresh / Math.max(1, lengthFt)));
   const tdX = rwLeft + tdFrac * (rwRight - rwLeft);
+  // v0.8.0: Convert meters along the runway to a pixel X coordinate.
+  const mToX = (m: number) =>
+    rwLeft + (Math.max(0, Math.min(lengthM, m)) / Math.max(1, lengthM)) * (rwRight - rwLeft);
+  const displacedFt = rw.displaced_threshold_ft ?? 0;
+  const displacedM = displacedFt * 0.3048;
 
   // Centerline offset → vertical Y inside the strip
   const offsetM = rw.centerline_distance_m;
@@ -607,6 +670,48 @@ function RunwayDiagram({
         fill="#1f2937"
         stroke="rgba(255,255,255,0.3)"
       />
+      {/* v0.8.0 — TDZ-Box: ICAO Annex 14 painted touchdown-zone
+          marker (= erste 900 m oder 1/3 der Bahn). Subtiles Gelb damit
+          es nicht den TD-Punkt überfärbt. */}
+      {tdzLengthM != null && tdzLengthM > 0 && (
+        <rect
+          x={rwLeft}
+          y={rwTop + 2}
+          width={mToX(tdzLengthM) - rwLeft}
+          height={rwBottom - rwTop - 4}
+          fill="rgba(253,224,138,0.18)"
+          stroke="rgba(253,224,138,0.5)"
+          strokeDasharray="3,3"
+        >
+          <title>
+            {t("landing.tdz_box_tooltip", {
+              defaultValue:
+                "TDZ-Marker (ICAO Annex 14) — Soll-Aufsetzbereich (erste 900 m oder 1/3 der Bahn)",
+            })}
+          </title>
+        </rect>
+      )}
+      {/* v0.8.0 — Displaced-Threshold-Paint (verbotene Pre-Threshold-
+          Zone). Bei DDS > 0 färben wir die ersten X m rot, weil dort
+          IRL nicht gelandet werden darf (Hindernisclearance-Slope). */}
+      {displacedM > 0 && (
+        <rect
+          x={rwLeft}
+          y={rwTop}
+          width={mToX(displacedM) - rwLeft}
+          height={rwBottom - rwTop}
+          fill="rgba(124,45,18,0.35)"
+          stroke="rgba(220,38,38,0.6)"
+          strokeDasharray="2,2"
+        >
+          <title>
+            {t("landing.dds_zone_tooltip", {
+              defaultValue:
+                "Displaced Threshold — keine Landung erlaubt. Distanz vom physischen Bahn-Anfang.",
+            })}
+          </title>
+        </rect>
+      )}
       {/* Centerline dashes */}
       <line
         x1={rwLeft + 8}
@@ -617,6 +722,45 @@ function RunwayDiagram({
         strokeWidth="1.4"
         strokeDasharray="10,8"
       />
+      {/* v0.8.0 — Aim-Point-Marker (FAA AIM 8-9-1). 300 m / 400 m past
+          Threshold je nach Bahn-Länge. Tone hängt von aim_class ab. */}
+      {aimPointM != null && aimPointM > 0 && (
+        <g>
+          {(() => {
+            const aimX = mToX(aimPointM);
+            const tone =
+              aimClass === "perfect"
+                ? "#22c55e"
+                : aimClass === "short_of_aim" || aimClass === "past_aim"
+                ? "#fbbf24"
+                : "#ef4444";
+            return (
+              <>
+                <line
+                  x1={aimX}
+                  x2={aimX}
+                  y1={rwTop - 4}
+                  y2={rwBottom + 4}
+                  stroke={tone}
+                  strokeWidth="1.6"
+                  strokeDasharray="4,3"
+                />
+                <polygon
+                  points={`${aimX - 4},${rwTop - 10} ${aimX + 4},${rwTop - 10} ${aimX},${rwTop - 3}`}
+                  fill={tone}
+                >
+                  <title>
+                    {t("landing.aim_marker_tooltip", {
+                      defaultValue:
+                        "Aim-Point: 300 m (kurze Bahn) oder 400 m (lange Bahn) past Threshold",
+                    })}
+                  </title>
+                </polygon>
+              </>
+            );
+          })()}
+        </g>
+      )}
       {/* Rollout band — semi-transparent green strip from TD to exit */}
       {rolloutEndX != null && (
         <>
@@ -658,8 +802,22 @@ function RunwayDiagram({
         stroke="#ffffff"
         strokeWidth="3"
       />
-      {/* Touchdown dot */}
-      <circle cx={tdX} cy={tdY} r="6" fill="#22d3ee" stroke="#000" strokeWidth="1" />
+      {/* Touchdown dot — Tone vom Assessment abgeleitet:
+          rot = DDS-Verstoss, grün = TDZ-Treffer, cyan = sonst */}
+      <circle
+        cx={tdX}
+        cy={tdY}
+        r="6"
+        fill={
+          preDisplacedThreshold === true
+            ? "#ef4444"
+            : tdInTdz === true
+            ? "#22c55e"
+            : "#22d3ee"
+        }
+        stroke="#000"
+        strokeWidth="1"
+      ><title>{`TD · ${tdFromThreshM.toFixed(0)} m past threshold`}</title></circle>
       {/* Labels above the runway */}
       <text x={rwLeft} y={rwTop - 6} fontSize="11" fill="currentColor">
         {rw.runway_ident} · {rw.airport_ident}
@@ -1886,6 +2044,11 @@ function LandingDetail({
               <RunwayDiagram
                 rw={record.runway_match}
                 rolloutDistanceM={record.rollout_distance_m}
+                tdzLengthM={record.td_tdz_length_m}
+                tdInTdz={record.td_in_tdz}
+                aimPointM={record.aim_point_m}
+                aimClass={record.aim_class}
+                preDisplacedThreshold={record.pre_displaced_threshold}
               />
             )}
             <dl className="landing-keyvals landing-keyvals--inline">
@@ -1954,6 +2117,78 @@ function LandingDetail({
                         100
                       ).toFixed(0)}
                       %
+                    </dd>
+                  </div>
+                )}
+              {/* v0.8.0 Navdata-Source + AIRAC-Cycle. Pilot sieht ob die
+                  Bewertung gegen Jeppesen-Daten oder den OurAirports-
+                  Fallback gelaufen ist. */}
+              {geometryTrusted && record.runway_match.source && (
+                <div>
+                  <dt>{t("landing.navdata_source")}</dt>
+                  <dd>
+                    {record.runway_match.source === "navigraph"
+                      ? t("landing.navdata_source_navigraph", {
+                          cycle:
+                            record.runway_match.nav_cycle ?? "?",
+                          defaultValue:
+                            "Navigraph (AIRAC {{cycle}})",
+                        })
+                      : t("landing.navdata_source_fallback", {
+                          defaultValue:
+                            "OurAirports (Fallback — ±10 m möglich)",
+                        })}
+                  </dd>
+                </div>
+              )}
+              {/* v0.8.0 TDZ — nur wenn assessable (= RWY ≥ 1200 m). */}
+              {geometryTrusted && record.td_in_tdz != null && (
+                <div>
+                  <dt>{t("landing.tdz_label")}</dt>
+                  <dd>
+                    {record.td_in_tdz
+                      ? t("landing.tdz_in", { defaultValue: "TDZ ✓" })
+                      : t("landing.tdz_out", {
+                          defaultValue: "ausserhalb TDZ",
+                        })}
+                    {record.td_third != null && record.td_third > 1
+                      ? ` · ${t("landing.runway_third", {
+                          n: record.td_third,
+                          defaultValue: "Drittel {{n}}",
+                        })}`
+                      : ""}
+                  </dd>
+                </div>
+              )}
+              {/* v0.8.0 Aim-Point */}
+              {geometryTrusted &&
+                record.aim_point_m != null &&
+                record.aim_delta_m != null && (
+                  <div>
+                    <dt>{t("landing.aim_label")}</dt>
+                    <dd>
+                      {record.aim_point_m.toFixed(0)} m,{" "}
+                      {record.aim_delta_m >= 0 ? "+" : ""}
+                      {record.aim_delta_m.toFixed(0)} m{" "}
+                      {record.aim_class &&
+                        ` · ${t(`landing.aim_class.${record.aim_class}`, {
+                          defaultValue: record.aim_class,
+                        })}`}
+                    </dd>
+                  </div>
+                )}
+              {/* v0.8.0 DDS — nur surface bei Verstoss damit der pilot
+                  nicht bei jedem normal-Touchdown eine "DDS ok"-Zeile
+                  sieht. */}
+              {geometryTrusted &&
+                record.pre_displaced_threshold === true && (
+                  <div>
+                    <dt>{t("landing.dds_label")}</dt>
+                    <dd style={{ color: "#ef4444" }}>
+                      {t("landing.dds_violation", {
+                        defaultValue:
+                          "⚠ Touchdown im Pre-Threshold-Bereich (illegal IRL)",
+                      })}
                     </dd>
                   </div>
                 )}
