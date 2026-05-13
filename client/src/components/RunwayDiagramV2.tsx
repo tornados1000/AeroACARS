@@ -344,6 +344,31 @@ export function RunwayDiagramV2(props: RunwayDiagramV2Props) {
             </title>
           </g>
 
+          {/* Bahn-Ende rechts — gespiegelte 8 weiße Streifen + solides
+              weißes End-Band. Macht visuell klar dass die Bahn HIER
+              aufhört und nicht endlos weiterläuft (User-Befund). */}
+          <g>
+            {Array.from({ length: 8 }, (_, i) => (
+              <rect
+                key={i}
+                x={padX + innerW - 24}
+                y={rwyTop + 4 + (i * (innerH - 8)) / 8}
+                width={20}
+                height={(innerH - 8) / 8 - 2}
+                fill={TOKENS.threshold}
+                opacity="0.7"
+              />
+            ))}
+            <rect
+              x={padX + innerW - 2}
+              y={rwyTop + 4}
+              width={4}
+              height={innerH - 8}
+              fill="rgba(255,255,255,0.9)"
+            />
+            <title>Bahn-Ende — Ende des landbaren Bahn-Teils.</title>
+          </g>
+
           {/* TDZ-Box — gelbe Schraffur als Bereichs-Indikator + dünner
               Rahmen + Label. Die diagonale Schraffur soll visuell
               vermitteln "hier soll der Touchdown rein". */}
@@ -511,27 +536,21 @@ export function RunwayDiagramV2(props: RunwayDiagramV2Props) {
             props.rollout_m != null &&
             lengthM - (props.td_distance_from_threshold_m + props.rollout_m) >= 200 && (
               <g>
-                {/* Vertikale Linie an der "Bahn-Ende"-Position */}
-                <line
-                  x1={padX + innerW - 4}
-                  y1={rwyTop + 6}
-                  x2={padX + innerW - 4}
-                  y2={rwyBot - 6}
-                  stroke="rgba(255,255,255,0.75)"
-                  strokeWidth="2.5"
-                />
+                {/* (Vertikale "Bahn-Ende"-Linie entfernt — die globalen
+                    End-Streifen + das solide End-Band markieren die
+                    Bahn-Ende-Position bereits eindeutig.) */}
                 {/* Doppelpfeil "von Bremspunkt bis Bahn-Ende" */}
                 <line
                   x1={exitX + 14}
                   y1={rwyCl - 44}
-                  x2={padX + innerW - 8}
+                  x2={padX + innerW - 30}
                   y2={rwyCl - 44}
                   stroke="rgba(226,232,240,0.85)"
                   strokeWidth="2"
                   strokeDasharray="5,3"
                 />
                 <polygon
-                  points={`${padX + innerW - 8},${rwyCl - 44} ${padX + innerW - 16},${rwyCl - 49} ${padX + innerW - 16},${rwyCl - 39}`}
+                  points={`${padX + innerW - 30},${rwyCl - 44} ${padX + innerW - 38},${rwyCl - 49} ${padX + innerW - 38},${rwyCl - 39}`}
                   fill="rgba(226,232,240,0.95)"
                 />
                 <polygon
@@ -702,7 +721,7 @@ export function RunwayDiagramV2(props: RunwayDiagramV2Props) {
             </g>
           )}
 
-          {/* RWY-Designator (groß links). */}
+          {/* RWY-Designator (groß links) — die Landerichtung. */}
           <text
             x={padX / 2 - 4}
             y={rwyCl + 10}
@@ -715,18 +734,35 @@ export function RunwayDiagramV2(props: RunwayDiagramV2Props) {
             {props.runway_ident}
           </text>
 
-          {/* Landerichtungs-Pfeil rechts — Doppel-Chevron für ICAO-look. */}
-          <g>
-            <polygon
-              points={`${W - padX + 14},${rwyCl} ${W - padX - 8},${rwyCl - 22} ${W - padX - 8},${rwyCl + 22}`}
-              fill="rgba(255,255,255,0.55)"
-            />
-            <polygon
-              points={`${W - padX - 6},${rwyCl} ${W - padX - 28},${rwyCl - 22} ${W - padX - 28},${rwyCl + 22}`}
-              fill="rgba(255,255,255,0.30)"
-            />
-            <title>Landerichtung</title>
-          </g>
+          {/* Gegen-RWY-Designator + Bahnlänge rechts. Gegen-Designator
+              zeigt klar dass die Bahn da endet (= Gegen-Richtung,
+              z. B. RWY 32 ↔ RWY 14). Plus Bahn-Gesamtlänge darunter. */}
+          <text
+            x={W - padX / 2 + 8}
+            y={rwyCl - 2}
+            textAnchor="middle"
+            fontSize="20"
+            fill="#94a3b8"
+            fontWeight="700"
+            fontFamily="monospace"
+            opacity="0.85"
+          >
+            {oppositeRunway(props.runway_ident)}
+          </text>
+          <text
+            x={W - padX / 2 + 8}
+            y={rwyCl + 18}
+            textAnchor="middle"
+            fontSize="11"
+            fill="#64748b"
+            fontFamily="monospace"
+          >
+            {props.length_m.toFixed(0)} m
+          </text>
+
+          {/* (Landerichtungs-Pfeil entfernt — die neuen End-Streifen
+              + der Gegen-RWY-Designator zeigen das Bahn-Ende
+              eindeutiger als der Pfeil es konnte.) */}
 
           {/* TD-Label unter dem Dot — nur Distanz. L/R wird durch den
               großen L/R-Pfeil oben dargestellt. Bei Offset < 0.5 m
@@ -1004,6 +1040,19 @@ function LegendDot({ color, label }: { color: string; label: string }) {
 }
 
 // ─── Pure label helpers ─────────────────────────────────────────────
+
+// Gegen-Bahn-Designator. RWY 32 ↔ RWY 14, RWY 24L ↔ RWY 06R, ...
+function oppositeRunway(ident: string): string {
+  const m = ident.match(/^(\d{1,2})([LRC]?)$/i);
+  if (!m) return "?";
+  const num = parseInt(m[1]!, 10);
+  if (Number.isNaN(num) || num < 1 || num > 36) return "?";
+  let opp = num + 18;
+  if (opp > 36) opp -= 36;
+  const suffix = m[2]?.toUpperCase() ?? "";
+  const oppSuffix = suffix === "L" ? "R" : suffix === "R" ? "L" : suffix;
+  return String(opp).padStart(2, "0") + oppSuffix;
+}
 
 function surfaceLabel(s: string): string {
   const map: Record<string, string> = {
