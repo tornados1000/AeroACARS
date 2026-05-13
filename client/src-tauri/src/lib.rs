@@ -12365,6 +12365,13 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
             let prepared_dump = if let Some((edge_at, samples)) = dump_payload {
                 let analysis = compute_landing_analysis(&samples, edge_at);
                 stats.landing_analysis = Some(analysis.clone());
+                // v0.7.19 GAF-707: Heuristik-Klassifikator EINMAL pro
+                // Touchdown am TD-Edge ausfuehren — direkt nachdem die
+                // landing_analysis (mit vs_at_edge_fpm etc) materialisiert
+                // wurde. Spec §Klassifikator-Trigger-Punkte. NICHT im
+                // 50-Hz-Loop. Worst-Case-Aggregation fuer Multi-TD
+                // (Touch-and-Go) ist im Helper.
+                apply_accident_heuristic(&mut stats, &analysis);
                 Some((edge_at, samples, analysis))
             } else {
                 None
@@ -13844,6 +13851,105 @@ fn extract_icao_code(raw: &str) -> Option<String> {
     if cleaned.is_empty() { None } else { Some(cleaned) }
 }
 
+/// v0.7.19 GAF-707 Accident-Detection (Heuristik-Pfad).
+///
+/// Spec §Klassifikator-Trigger-Punkte: wird EINMAL pro Touchdown am
+/// TD-Edge aufgerufen (= direkt nach `stats.landing_analysis = Some(...)`
+/// im Sampler-Loop). NICHT im 50-Hz-Loop.
+///
+/// Behaviour:
+/// - Sim-Event hat schon Confirmed(SimCrash) gelatcht → Reasons mergen,
+///   kind bleibt SimCrash (authoritativ).
+/// - Suspected ueber bestehenden None → Suspected latchen.
+/// - Confirmed ueber bestehenden Suspected → upgraden auf Confirmed.
+/// - Confirmed-vs-Confirmed bei Multi-TD (Touch-and-Go): Reasons werden
+///   nur ersetzt wenn die neue |vs_at_edge_fpm| HOEHER ist (Worst-Case-
+///   Aggregation per Spec §Leitentscheidung 7).
+fn apply_accident_heuristic(stats: &mut FlightStats, analysis: &serde_json::Value) {
+    let input = accident::AccidentHeuristicInput {
+        vs_at_edge_fpm: ana_f32(&Some(analysis.clone()), "vs_at_edge_fpm"),
+        peak_g_load: stats.landing_peak_g_force,
+        sideslip_deg: stats.touchdown_sideslip_deg,
+        landing_wing_strike_severity_pct: stats.landing_wing_strike_severity_pct,
+        approach_stall_warning_count: Some(stats.approach_stall_warning_count),
+        runway_match_found: Some(stats.runway_match.is_some()),
+        rollout_distance_m: stats.rollout_distance_m.map(|m| m as f32),
+    };
+    let new_vs_abs = input.vs_at_edge_fpm.map(|v| v.abs()).unwrap_or(0.0);
+    let decision = accident::classify_accident_heuristic(&input);
+
+    match decision {
+        accident::AccidentDecision::None => {}
+        accident::AccidentDecision::Suspected { kind, reasons } => {
+            if !stats.accident_detected
+                && stats.accident_confidence.is_none()
+            {
+                // Erste Suspected-Klassifikation. Nicht als accident_detected
+                // (das bleibt fuer Confirmed reserviert), aber Felder zur
+                // UI/Webapp-Banner-Anzeige setzen.
+                stats.accident_kind = Some(kind.as_wire_str().into());
+                stats.accident_confidence = Some("medium".into());
+                stats.accident_at = stats.landing_at;
+                stats.accident_reasons.extend(reasons);
+                tracing::warn!(
+                    kind = kind.as_wire_str(),
+                    reasons = ?stats.accident_reasons,
+                    "v0.7.19: heuristic suspected accident"
+                );
+            }
+            // Wenn schon Confirmed → ignorieren (Suspected < Confirmed).
+        }
+        accident::AccidentDecision::Confirmed { kind, reasons } => {
+            let was_sim_crash = stats.accident_kind.as_deref()
+                == Some(accident::AccidentKind::SimCrash.as_wire_str());
+
+            if !stats.accident_detected {
+                // First Confirmed (entweder vom None oder vom Suspected upgrade).
+                stats.accident_detected = true;
+                stats.accident_kind = Some(kind.as_wire_str().into());
+                stats.accident_confidence = Some("high".into());
+                stats.accident_at = stats.accident_at.or(stats.landing_at);
+                stats.accident_reasons.extend(reasons);
+                tracing::warn!(
+                    kind = kind.as_wire_str(),
+                    reasons = ?stats.accident_reasons,
+                    "v0.7.19: heuristic confirmed accident"
+                );
+            } else if was_sim_crash {
+                // Sim-Event hat schon Confirmed(SimCrash) gelatcht. Kind
+                // bleibt; Heuristik-Reasons mergen.
+                stats.accident_reasons.extend(reasons);
+                tracing::info!(
+                    heuristic_kind = kind.as_wire_str(),
+                    "v0.7.19: heuristic reasons merged into sim-crash latch"
+                );
+            } else {
+                // Multi-TD Worst-Case-Aggregation: nur ersetzen wenn die
+                // neue Touchdown-|vs| hoeher ist (Spec §Leitentscheidung 7
+                // Tie-Breaker).
+                let prev_vs_abs = stats
+                    .accident_reasons
+                    .iter()
+                    .find_map(|r| r.strip_prefix("vs_at_edge_fpm="))
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .map(|v| v.abs())
+                    .unwrap_or(0.0);
+                if new_vs_abs > prev_vs_abs {
+                    stats.accident_kind = Some(kind.as_wire_str().into());
+                    stats.accident_reasons = reasons;
+                    stats.accident_at = stats.landing_at;
+                    tracing::warn!(
+                        kind = kind.as_wire_str(),
+                        prev_vs_abs,
+                        new_vs_abs,
+                        "v0.7.19: multi-touchdown worst-case replaced earlier accident"
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn engines_effectively_running(stats: &FlightStats, snap: &SimSnapshot, now: DateTime<Utc>) -> bool {
     if snap.engines_running > 0 { return true; }
     stats
@@ -13855,6 +13961,29 @@ fn engines_effectively_running(stats: &FlightStats, snap: &SimSnapshot, now: Dat
 fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase> {
     let mut stats = flight.stats.lock().expect("flight stats");
     let _now_for_state_update = Utc::now();
+
+    // v0.7.19 GAF-707 Sim-Event-Pfad (Spec §Klassifikator-Trigger-Punkte):
+    // wenn der Adapter `snap.crashed=true` liefert und der aktive Flug
+    // noch nicht gelatcht war, sofort Accident setzen — KEIN Warten auf
+    // Touchdown-Edge. `kind=SimCrash` ist authoritativ; spaeter
+    // greifende Heuristik mergt nur ihre Reasons rein, aendert aber
+    // nicht den kind.
+    //
+    // `CrashReset` aus dem Adapter laesst snap.crashed wieder auf false
+    // fallen, aber der hier gesetzte Latch persistiert bis Flight-End/
+    // Cleanup/neuem Flight-Start (Spec §Leitentscheidung 6).
+    if snap.crashed && !stats.accident_detected {
+        stats.accident_detected = true;
+        stats.accident_at = Some(Utc::now());
+        stats.accident_kind = Some(accident::AccidentKind::SimCrash.as_wire_str().to_string());
+        stats.accident_confidence = Some("high".into());
+        let source = snap.crash_source.clone().unwrap_or_else(|| "sim_event".into());
+        stats.accident_reasons.push(format!("crash_source={source}"));
+        tracing::warn!(
+            crash_source = %source,
+            "v0.7.19: simulator crash event latched on active flight"
+        );
+    }
 
     // v0.5.40: Anti-Flicker-State + Pushback-Active-Tracking refreshen.
     // Muss am Anfang passieren damit alle nachfolgenden Phase-Handler den

@@ -71,6 +71,15 @@ const SIM_START_EVENT_ID: u32 = 300;
 ///
 /// SDK-Doku: https://docs.flightsimulator.com/html/Programming_Tools/SimConnect/API_Reference/Events_And_Data/SimConnect_SubscribeToSystemEvent.htm
 const PAUSE_EX1_EVENT_ID: u32 = 301;
+/// v0.7.19 GAF-707 Accident-Detection: SimConnect-`Crashed`-System-
+/// Event. Wird gefeuert wenn der User-Aircraft im Sim crashed (Boden-
+/// kontakt mit nicht-ueberlebbaren Parametern, Stall ins Terrain etc).
+/// Adapter latcht das in `shared.crashed` — `CrashReset` (= MSFS-UI
+/// Cut-Scene fertig) loescht den raw Flag wieder, aber der aktive
+/// Flug behaelt seinen accident_detected-Latch in lib.rs/FlightStats.
+/// SDK-Doku siehe oben SubscribeToSystemEvent Link.
+const CRASHED_EVENT_ID: u32 = 302;
+const CRASH_RESET_EVENT_ID: u32 = 303;
 const STALE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Public connection state mirrored to the frontend.
@@ -101,6 +110,13 @@ struct Shared {
     /// Pfad lesen kann (= keine zweite IPC-Schiene noetig). Default
     /// false bis der Sim das erste Mal pausiert.
     sim_paused: AtomicBool,
+    /// v0.7.19 GAF-707 Accident-Detection: SimConnect-`Crashed`-
+    /// System-Event setzt das Atomic. Wird beim Snapshot-Build in
+    /// `snap.crashed` gelesen. `CrashReset` (= MSFS-UI Cut-Scene
+    /// quittiert) loescht den raw Flag wieder, aber der aktive Flug
+    /// behaelt seinen `accident_detected`-Latch in lib.rs unabhaengig
+    /// davon bis Flight-End/Cleanup (Spec §Leitentscheidung 6).
+    sim_crashed: AtomicBool,
     /// Last touchdown sample as seen on data definition #2. Updated
     /// asynchronously by SimConnect — we merge it into each emitted
     /// `SimSnapshot` so downstream consumers see a unified view.
@@ -495,6 +511,7 @@ impl MsfsAdapter {
                 snapshot: Mutex::new(None),
                 last_error: Mutex::new(None),
                 sim_paused: AtomicBool::new(false),
+                sim_crashed: AtomicBool::new(false),
                 touchdown: Mutex::new(None),
                 inspector: Mutex::new(InspectorState::default()),
                 pmdg: Mutex::new(PmdgSharedState::default()),
@@ -883,6 +900,19 @@ fn run_dispatch(
                             // Akkumulator auch waehrend MSFS-Esc-Pause
                             // (= eingefrorene Snapshots) korrekt zaehlt.
                             snap.paused = shared.sim_paused.load(Ordering::Relaxed);
+                            // v0.7.19 GAF-707: Crash-Latch aus dem Shared-
+                            // State in den Snapshot mergen. Caller in
+                            // lib.rs/step_flight reagiert auf den Flip
+                            // false→true und setzt FlightStats.accident_*.
+                            // CrashReset setzt das Flag zurueck, ohne den
+                            // FlightStats-Latch zu beruehren (Spec §Leit-
+                            // entscheidung 6).
+                            snap.crashed = shared.sim_crashed.load(Ordering::Relaxed);
+                            snap.crash_source = if snap.crashed {
+                                Some("msfs_crashed_event".into())
+                            } else {
+                                None
+                            };
                             // Merge in the most recent touchdown sample
                             // so consumers see a unified snapshot.
                             if let Some(td) = *shared.touchdown.lock().unwrap() {
@@ -1079,6 +1109,24 @@ fn run_dispatch(
                             data = format!("0x{:x}", data),
                             paused,
                             "MSFS SimConnect Pause_EX1-Event empfangen"
+                        );
+                    } else if event_id == CRASHED_EVENT_ID {
+                        // v0.7.19 GAF-707: latch im Shared-State, der
+                        // Snapshot-Builder mergt ihn ein. Spec §Detection.
+                        shared.sim_crashed.store(true, Ordering::Relaxed);
+                        tracing::warn!(
+                            data = format!("0x{:x}", data),
+                            "MSFS SimConnect Crashed-Event empfangen — Accident wird gelatcht"
+                        );
+                    } else if event_id == CRASH_RESET_EVENT_ID {
+                        // v0.7.19 GAF-707: Adapter-Raw-Flag wieder loeschen.
+                        // Der aktive Flug in lib.rs behaelt seinen
+                        // accident_detected-Latch unabhaengig davon
+                        // (Spec §Leitentscheidung 6).
+                        shared.sim_crashed.store(false, Ordering::Relaxed);
+                        tracing::info!(
+                            data = format!("0x{:x}", data),
+                            "MSFS SimConnect CrashReset-Event empfangen — Adapter-Flag geloescht"
                         );
                     }
                 }
@@ -1570,6 +1618,37 @@ impl Connection {
         if hr != 0 {
             return Err(format!(
                 "SubscribeToSystemEvent(Pause_EX1) returned 0x{hr:08X}"
+            ));
+        }
+
+        // v0.7.19 GAF-707 Accident-Detection: SimConnect-`Crashed` und
+        // `CrashReset` abonnieren. Crashed feuert beim Bodenkontakt mit
+        // nicht-ueberlebbaren Parametern, CrashReset wenn die Cut-Scene
+        // im MSFS-UI quittiert wird.
+        let cevent = std::ffi::CString::new("Crashed").expect("ASCII");
+        let hr = unsafe {
+            sys::SimConnect_SubscribeToSystemEvent(
+                self.handle,
+                CRASHED_EVENT_ID,
+                cevent.as_ptr(),
+            )
+        };
+        if hr != 0 {
+            return Err(format!(
+                "SubscribeToSystemEvent(Crashed) returned 0x{hr:08X}"
+            ));
+        }
+        let cevent = std::ffi::CString::new("CrashReset").expect("ASCII");
+        let hr = unsafe {
+            sys::SimConnect_SubscribeToSystemEvent(
+                self.handle,
+                CRASH_RESET_EVENT_ID,
+                cevent.as_ptr(),
+            )
+        };
+        if hr != 0 {
+            return Err(format!(
+                "SubscribeToSystemEvent(CrashReset) returned 0x{hr:08X}"
             ));
         }
         Ok(())
