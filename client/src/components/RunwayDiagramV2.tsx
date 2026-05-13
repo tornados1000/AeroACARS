@@ -604,12 +604,25 @@ export function RunwayDiagramV2(props: RunwayDiagramV2Props) {
               verschwindet wenn TD und Aim-Position fast übereinander
               liegen. Nur wenn |offset| > 0.5 m. */}
           {Math.abs(props.td_centerline_offset_m) > 0.5 && (() => {
-            const isLeft = props.td_centerline_offset_m < 0;
+            const isLeftOffset = props.td_centerline_offset_m < 0;
             // Pfeil-Group direkt unter der Bahn — über dem TD-Distanz-Label.
             const arrowY = rwyBot + 22;
             const arrowLen = 56;
-            const ax1 = isLeft ? tdX + arrowLen / 2 : tdX - arrowLen / 2;
-            const ax2 = isLeft ? tdX - arrowLen / 2 : tdX + arrowLen / 2;
+            // Pfeil-Richtung folgt dem Offset (LINKS-Offset → Pfeil zeigt
+            // nach links). ABER: wenn der TD-Dot sehr nah am linken oder
+            // rechten SVG-Rand sitzt, würde das Label aus dem SVG raus
+            // gerendert und abgeschnitten werden. In dem Fall klappen
+            // wir die ganze Group horizontal um (Pfeil zeigt auf die
+            // gegenüberliegende Seite des Dots, Label sitzt drin).
+            const labelW = 110; // grobe Pixel-Breite "6.6 m LINKS"
+            const wouldClipLeft = isLeftOffset && (tdX - arrowLen / 2 - labelW) < 0;
+            const wouldClipRight = !isLeftOffset && (tdX + arrowLen / 2 + labelW) > W;
+            const flipped = wouldClipLeft || wouldClipRight;
+            // arrowDir = wo die Spitze hin zeigt (true = nach links)
+            const arrowDir = flipped ? !isLeftOffset : isLeftOffset;
+            const ax1 = arrowDir ? tdX + arrowLen / 2 : tdX - arrowLen / 2;
+            const ax2 = arrowDir ? tdX - arrowLen / 2 : tdX + arrowLen / 2;
+            const isLeft = arrowDir;
             return (
               <g>
                 {/* Dünne Anker-Linie vom TD-Dot zum Pfeil */}
@@ -641,7 +654,9 @@ export function RunwayDiagramV2(props: RunwayDiagramV2Props) {
                   }
                   fill={dotColor}
                 />
-                {/* Großes Label neben dem Pfeil */}
+                {/* Großes Label neben dem Pfeil — Label-Text zeigt die
+                    Offset-Richtung (LINKS/RECHTS), unabhängig davon ob
+                    der Pfeil aus Platzgründen geklappt wurde. */}
                 <text
                   x={isLeft ? ax2 - 14 : ax2 + 14}
                   y={arrowY + 5}
@@ -651,7 +666,7 @@ export function RunwayDiagramV2(props: RunwayDiagramV2Props) {
                   fontFamily="monospace"
                   textAnchor={isLeft ? "end" : "start"}
                 >
-                  {Math.abs(props.td_centerline_offset_m).toFixed(1)} m {isLeft ? "LINKS" : "RECHTS"}
+                  {Math.abs(props.td_centerline_offset_m).toFixed(1)} m {isLeftOffset ? "LINKS" : "RECHTS"}
                 </text>
               </g>
             );
