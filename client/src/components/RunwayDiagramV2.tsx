@@ -1113,7 +1113,12 @@ function Pill({
         flexDirection: "column",
         gap: 2,
         minWidth: 110,
-        maxWidth: 320,
+        // v2.x: maxWidth weg + flex 1 1 auto → Pills wachsen
+        // proportional zum Restplatz ihrer Zeile, sodass jede Zeile
+        // bündig bis zur Container-Kante reicht. Damit AIM-POINT-
+        // Pill oben und FlugzeugBar unten an derselben x-Position
+        // enden.
+        flex: "1 1 auto",
       }}
     >
       <div
