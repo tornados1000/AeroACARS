@@ -523,26 +523,28 @@ export function RunwayDiagramV2(props: RunwayDiagramV2Props) {
                 {/* Doppelpfeil "von Bremspunkt bis Bahn-Ende" */}
                 <line
                   x1={exitX + 14}
-                  y1={rwyCl - 34}
+                  y1={rwyCl - 44}
                   x2={padX + innerW - 8}
-                  y2={rwyCl - 34}
+                  y2={rwyCl - 44}
                   stroke="rgba(226,232,240,0.85)"
                   strokeWidth="2"
                   strokeDasharray="5,3"
                 />
                 <polygon
-                  points={`${padX + innerW - 8},${rwyCl - 34} ${padX + innerW - 16},${rwyCl - 39} ${padX + innerW - 16},${rwyCl - 29}`}
+                  points={`${padX + innerW - 8},${rwyCl - 44} ${padX + innerW - 16},${rwyCl - 49} ${padX + innerW - 16},${rwyCl - 39}`}
                   fill="rgba(226,232,240,0.95)"
                 />
                 <polygon
-                  points={`${exitX + 14},${rwyCl - 34} ${exitX + 22},${rwyCl - 39} ${exitX + 22},${rwyCl - 29}`}
+                  points={`${exitX + 14},${rwyCl - 44} ${exitX + 22},${rwyCl - 49} ${exitX + 22},${rwyCl - 39}`}
                   fill="rgba(226,232,240,0.95)"
                 />
-                {/* "Bahn verbleibend X m" Label — bright + Outline-Stroke
-                    damit es auf dem dunklen Asphalt nicht untergeht. */}
+                {/* Beide Labels jetzt OBERHALB der Centerline gestapelt
+                    (zwischen Doppelpfeil und CL-Dashes) damit das
+                    "(% unbenutzt)" nicht auf den Centerline-Strichen
+                    sitzt. */}
                 <text
                   x={(exitX + padX + innerW) / 2}
-                  y={rwyCl - 12}
+                  y={rwyCl - 26}
                   textAnchor="middle"
                   fontSize="15"
                   fill="#f1f5f9"
@@ -556,7 +558,7 @@ export function RunwayDiagramV2(props: RunwayDiagramV2Props) {
                 </text>
                 <text
                   x={(exitX + padX + innerW) / 2}
-                  y={rwyCl + 10}
+                  y={rwyCl - 8}
                   textAnchor="middle"
                   fontSize="12"
                   fill="#cbd5e1"
