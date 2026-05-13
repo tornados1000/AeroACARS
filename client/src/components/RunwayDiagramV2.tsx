@@ -692,11 +692,17 @@ export function RunwayDiagramV2(props: RunwayDiagramV2Props) {
       </div>
 
       {/* ─── 4. DETAIL-KARTEN ──────────────────────────────────────── */}
+      {/* auto-fill statt auto-fit + capped Cell-Width verhindert dass
+          3 Cards (= TCH-Card fehlt bei OurAirports-Fallback) den
+          ganzen Container ausfüllen und visuell überdimensioniert
+          wirken. Cards bleiben jetzt 220–280 px breit, egal wie
+          viele es sind. */}
       <div
         style={{
           display: "grid",
-          gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+          gridTemplateColumns: "repeat(auto-fill, minmax(220px, 280px))",
           gap: 12,
+          justifyContent: "start",
         }}
       >
         <DetailCard title="Aufsetz-Bewertung" accent="#22c55e">
