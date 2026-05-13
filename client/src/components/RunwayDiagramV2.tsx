@@ -72,7 +72,7 @@ const TOKENS = {
   rwyPaddingY: 95,
   tarmac: "#1a2030",
   tarmacBorder: "rgba(255,255,255,0.18)",
-  threshold: "rgba(255,255,255,0.65)",
+  threshold: "rgba(255,255,255,0.85)",
   centerline: "rgba(255,255,255,0.5)",
   centerlineDashArray: "14,10",
   tdzFill: "rgba(253,224,138,0.18)",
@@ -492,9 +492,52 @@ export function RunwayDiagramV2(props: RunwayDiagramV2Props) {
             </g>
           )}
 
-          {/* Touchdown-Punkt — Glow + Solid Dot. */}
+          {/* Offset-Indikator: senkrechter Pfeil von der Mittellinie zum
+              TD-Dot. Macht das L/R-Offset visuell (statt nur über die
+              y-Position) erkennbar. Nur wenn der Offset > 0.5 m ist —
+              sonst überlappt der Pfeil mit dem Dot selbst. */}
+          {Math.abs(props.td_centerline_offset_m) > 0.5 && (
+            <g>
+              {/* Senkrechte Linie CL → TD */}
+              <line
+                x1={tdX}
+                y1={rwyCl}
+                x2={tdX}
+                y2={tdY > rwyCl ? tdY - 11 : tdY + 11}
+                stroke={dotColor}
+                strokeWidth="1.5"
+                strokeDasharray="3,3"
+                opacity="0.8"
+              />
+              {/* Pfeilspitze am TD-Ende */}
+              <polygon
+                points={
+                  tdY > rwyCl
+                    ? `${tdX},${tdY - 9} ${tdX - 4},${tdY - 14} ${tdX + 4},${tdY - 14}`
+                    : `${tdX},${tdY + 9} ${tdX - 4},${tdY + 14} ${tdX + 4},${tdY + 14}`
+                }
+                fill={dotColor}
+              />
+              {/* Kleine L/R-Label neben dem Dot */}
+              <text
+                x={tdX + 14}
+                y={tdY + 4}
+                fontSize="11"
+                fill={dotColor}
+                fontWeight="800"
+                fontFamily="monospace"
+              >
+                {props.td_centerline_offset_m > 0 ? "→ R" : "← L"}
+                {" "}
+                {Math.abs(props.td_centerline_offset_m).toFixed(1)} m
+              </text>
+            </g>
+          )}
+
+          {/* Touchdown-Punkt — Doppel-Glow + Solid Dot. */}
           <g>
-            <circle cx={tdX} cy={tdY} r="18" fill={dotColor} opacity="0.18" />
+            <circle cx={tdX} cy={tdY} r="22" fill={dotColor} opacity="0.10" />
+            <circle cx={tdX} cy={tdY} r="14" fill={dotColor} opacity="0.22" />
             <circle cx={tdX} cy={tdY} r="9" fill={dotColor} stroke="#0c1628" strokeWidth="2" />
             <title>
               Aufsetzpunkt (Touchdown): {props.td_distance_from_threshold_m.toFixed(0)} m
@@ -548,11 +591,18 @@ export function RunwayDiagramV2(props: RunwayDiagramV2Props) {
             {props.runway_ident}
           </text>
 
-          {/* Landerichtungs-Pfeil rechts. */}
-          <polygon
-            points={`${W - padX + 8},${rwyCl} ${W - padX - 10},${rwyCl - 14} ${W - padX - 10},${rwyCl + 14}`}
-            fill="rgba(255,255,255,0.45)"
-          />
+          {/* Landerichtungs-Pfeil rechts — Doppel-Chevron für ICAO-look. */}
+          <g>
+            <polygon
+              points={`${W - padX + 14},${rwyCl} ${W - padX - 8},${rwyCl - 22} ${W - padX - 8},${rwyCl + 22}`}
+              fill="rgba(255,255,255,0.55)"
+            />
+            <polygon
+              points={`${W - padX - 6},${rwyCl} ${W - padX - 28},${rwyCl - 22} ${W - padX - 28},${rwyCl + 22}`}
+              fill="rgba(255,255,255,0.30)"
+            />
+            <title>Landerichtung</title>
+          </g>
 
           {/* TD-Label unter dem Dot. */}
           <g>
