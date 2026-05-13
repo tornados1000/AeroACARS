@@ -527,70 +527,11 @@ export function RunwayDiagramV2(props: RunwayDiagramV2Props) {
             </g>
           )}
 
-          {/* "Bahn verbleibend X m" — Annotation im leeren Bereich
-              hinter dem Exit-Punkt. Übernommen aus dem Pilot-Client-
-              Legacy-Layout, weil Piloten dort sofort sehen wie viel
-              Bahn sie verschenkt haben. Nur wenn nach Exit noch
-              sinnvoller Platz auf der Bahn ist (≥ 200 m). */}
-          {exitX != null &&
-            props.rollout_m != null &&
-            lengthM - (props.td_distance_from_threshold_m + props.rollout_m) >= 200 && (
-              <g>
-                {/* (Vertikale "Bahn-Ende"-Linie entfernt — die globalen
-                    End-Streifen + das solide End-Band markieren die
-                    Bahn-Ende-Position bereits eindeutig.) */}
-                {/* Doppelpfeil "von Bremspunkt bis Bahn-Ende" */}
-                <line
-                  x1={exitX + 14}
-                  y1={rwyCl - 44}
-                  x2={padX + innerW - 30}
-                  y2={rwyCl - 44}
-                  stroke="rgba(226,232,240,0.85)"
-                  strokeWidth="2"
-                  strokeDasharray="5,3"
-                />
-                <polygon
-                  points={`${padX + innerW - 30},${rwyCl - 44} ${padX + innerW - 38},${rwyCl - 49} ${padX + innerW - 38},${rwyCl - 39}`}
-                  fill="rgba(226,232,240,0.95)"
-                />
-                <polygon
-                  points={`${exitX + 14},${rwyCl - 44} ${exitX + 22},${rwyCl - 49} ${exitX + 22},${rwyCl - 39}`}
-                  fill="rgba(226,232,240,0.95)"
-                />
-                {/* Beide Labels jetzt OBERHALB der Centerline gestapelt
-                    (zwischen Doppelpfeil und CL-Dashes) damit das
-                    "(% unbenutzt)" nicht auf den Centerline-Strichen
-                    sitzt. */}
-                <text
-                  x={(exitX + padX + innerW) / 2}
-                  y={rwyCl - 26}
-                  textAnchor="middle"
-                  fontSize="15"
-                  fill="#f1f5f9"
-                  fontWeight="800"
-                  fontFamily="monospace"
-                  stroke="#0c1628"
-                  strokeWidth="3"
-                  paintOrder="stroke"
-                >
-                  Bahn verbleibend {(lengthM - (props.td_distance_from_threshold_m + props.rollout_m)).toFixed(0)} m
-                </text>
-                <text
-                  x={(exitX + padX + innerW) / 2}
-                  y={rwyCl - 8}
-                  textAnchor="middle"
-                  fontSize="12"
-                  fill="#cbd5e1"
-                  fontWeight="700"
-                  fontFamily="monospace"
-                  stroke="#0c1628"
-                  strokeWidth="3"
-                  paintOrder="stroke"
-                >
-                  ({(((lengthM - (props.td_distance_from_threshold_m + props.rollout_m)) / lengthM) * 100).toFixed(0)} % unbenutzt)
-                </text>
-              </g>
-            )}
+          {/* (Frühere "Bahn verbleibend X m" + Doppelpfeil-Annotation
+              entfernt — war redundant mit der "Bahn-Auslastung X %"-
+              Pill unter dem Diagramm und wirkte visuell laut.
+              Die Bahn-Ende-Streifen rechts zeigen die Bahn-Grenze
+              schon eindeutig, die Pills tragen die Zahlen.) */}
 
           {/* Offset-Indikator: großer Pfeil + Label UNTER der Bahn, mit
               dünner Anker-Linie zum TD-Dot. Bewusst außerhalb der
