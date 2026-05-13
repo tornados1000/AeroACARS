@@ -344,46 +344,52 @@ export function RunwayDiagramV2(props: RunwayDiagramV2Props) {
             </title>
           </g>
 
-          {/* TDZ-Marker — ICAO Annex 14 zeigt die Aufsetzzone als PAARE
-              von weißen Querstreifen entlang der Centerline (bei 150 m,
-              300 m, 450 m, ... innerhalb der TDZ-Länge). Wir rendern
-              genau das statt einer flächigen gelben Schraffur, damit
-              die Optik dem entspricht, was ein Pilot auf einer echten
-              Bahn sieht. Plus dünner gelber Rahmen markiert die
-              TDZ-Grenze. */}
+          {/* TDZ-Box — gelbe Schraffur als Bereichs-Indikator + dünner
+              Rahmen + Label. Die diagonale Schraffur soll visuell
+              vermitteln "hier soll der Touchdown rein". */}
           {tdzEndX != null && tdzEndX > padX + 24 && (
             <g>
-              {/* Subtiler gelber Rahmen, kein Fill */}
+              <defs>
+                <pattern
+                  id="tdz-hatch"
+                  patternUnits="userSpaceOnUse"
+                  width="10"
+                  height="10"
+                  patternTransform="rotate(45)"
+                >
+                  <line
+                    x1="0"
+                    y1="0"
+                    x2="0"
+                    y2="10"
+                    stroke={TOKENS.tdzStroke}
+                    strokeWidth="2"
+                  />
+                </pattern>
+              </defs>
               <rect
                 x={padX + 24}
-                y={rwyTop + 28}
+                y={rwyTop + 30}
                 width={tdzEndX - padX - 24}
-                height={innerH - 56}
-                fill="none"
+                height={innerH - 60}
+                fill="url(#tdz-hatch)"
+                opacity="0.55"
+              />
+              <rect
+                x={padX + 24}
+                y={rwyTop + 30}
+                width={tdzEndX - padX - 24}
+                height={innerH - 60}
+                fill={TOKENS.tdzFill}
                 stroke={TOKENS.tdzStroke}
-                strokeDasharray="5,4"
-                strokeWidth="1.2"
-                opacity="0.7"
+                strokeDasharray="6,5"
+                strokeWidth="1"
               >
                 <title>
                   Aufsetzzone (Touchdown Zone, TDZ): erste {props.td_tdz_length_m?.toFixed(0)} m
                   der Bahn. Soll-Aufsetz-Bereich nach ICAO Annex 14.
                 </title>
               </rect>
-              {/* Weiße TDZ-Streifen-Paare entlang der Centerline */}
-              {[150, 300, 450, 600, 750, 900]
-                .filter((d) => d < (props.td_tdz_length_m ?? 0))
-                .map((d) => {
-                  const mx = mToX(d);
-                  return (
-                    <g key={d}>
-                      <rect x={mx - 14} y={rwyCl - 14} width={10} height={6} fill="rgba(255,255,255,0.85)" />
-                      <rect x={mx + 4} y={rwyCl - 14} width={10} height={6} fill="rgba(255,255,255,0.85)" />
-                      <rect x={mx - 14} y={rwyCl + 8} width={10} height={6} fill="rgba(255,255,255,0.85)" />
-                      <rect x={mx + 4} y={rwyCl + 8} width={10} height={6} fill="rgba(255,255,255,0.85)" />
-                    </g>
-                  );
-                })}
               <text
                 x={padX + 24 + (tdzEndX - padX - 24) / 2}
                 y={rwyTop + 18}
@@ -393,7 +399,7 @@ export function RunwayDiagramV2(props: RunwayDiagramV2Props) {
                 fontFamily="monospace"
                 textAnchor="middle"
               >
-                AUFSETZZONE {props.td_tdz_length_m?.toFixed(0)} m
+                AUFSETZZONE (TDZ) {props.td_tdz_length_m?.toFixed(0)} m
               </text>
             </g>
           )}
@@ -444,24 +450,41 @@ export function RunwayDiagramV2(props: RunwayDiagramV2Props) {
                 fill={TOKENS.aimMarker}
                 opacity="0.95"
               />
+              {/* Pfeilspitze + Label oberhalb der Bahn — zeigt explizit
+                  dass die 4 gelben Quadrate die Aim-Point-Markierungen
+                  sind (wie auf echten Runways gemalt). */}
               <polygon
                 points={`${aimX - 7},${rwyTop - 14} ${aimX + 7},${rwyTop - 14} ${aimX},${rwyTop - 4}`}
                 fill={TOKENS.aimMarker}
               />
               <text
                 x={aimX}
-                y={rwyTop - 18}
+                y={rwyTop - 32}
                 textAnchor="middle"
                 fontSize="13"
                 fill={TOKENS.aimMarker}
                 fontWeight="700"
                 fontFamily="monospace"
               >
-                ZIEL {props.aim_point_m?.toFixed(0)} m
+                AIM-POINT {props.aim_point_m?.toFixed(0)} m
+              </text>
+              <text
+                x={aimX}
+                y={rwyTop - 19}
+                textAnchor="middle"
+                fontSize="10"
+                fill={TOKENS.aimMarker}
+                fontFamily="monospace"
+                opacity="0.85"
+              >
+                ↓ Soll-Aufsetz-Stelle
               </text>
               <title>
-                Ziel-Markierung (Aim Point) — FAA AIM 8-9-1. Soll-Aufsetzpunkt
-                bei {props.aim_point_m?.toFixed(0)} m hinter der Schwelle.
+                Aim-Point — die zwei großen weißen Quadrate auf der echten
+                Bahn (hier gelb gezeichnet). Pilot zielt im Anflug auf
+                diese Markierung; durch den Flare setzt er typisch
+                50–150 m DAHINTER auf (= Anfang der TDZ).
+                Position: {props.aim_point_m?.toFixed(0)} m hinter Schwelle.
               </title>
             </g>
           )}
