@@ -16148,6 +16148,34 @@ fn build_pirep_fields(
         format!("AeroACARS/{}", env!("CARGO_PKG_VERSION")),
     );
 
+    // v0.7.19 GAF-707 Accident-Detection: strukturierte Felder fuer den
+    // VA-Admin PIREP-Detail-View. Spec §PIREP-Payload.
+    f.insert(
+        "Accident Classifier Version".into(),
+        accident::ACCIDENT_CLASSIFIER_VERSION.into(),
+    );
+    if stats.accident_detected {
+        f.insert("Accident".into(), "TRUE".into());
+        if let Some(kind) = stats.accident_kind.as_deref() {
+            f.insert("Accident Kind".into(), kind.into());
+        }
+        if let Some(c) = stats.accident_confidence.as_deref() {
+            f.insert("Accident Confidence".into(), c.into());
+        }
+        if !stats.accident_reasons.is_empty() {
+            f.insert(
+                "Accident Reasons".into(),
+                stats.accident_reasons.join(", "),
+            );
+        }
+        if let Some(t) = stats.accident_at {
+            f.insert(
+                "Accident Detected At".into(),
+                t.format("%H:%M:%S UTC").to_string(),
+            );
+        }
+    }
+
     // v0.3.0: Aircraft-Type / Name / Reg im PIREP-Custom-Field damit
     // VA-Admins auf der phpVMS-Detail-Seite ohne Lookup wissen was
     // geflogen wurde (vorher nur PMDG-Variant; jetzt für jeden
@@ -16539,6 +16567,33 @@ fn humanize_duration_minutes(minutes: i64) -> String {
 fn build_pirep_notes(flight: &ActiveFlight, stats: &FlightStats) -> String {
     use std::fmt::Write;
     let mut s = String::new();
+
+    // v0.7.19 GAF-707 Accident-Detection: bei Confirmed Accident
+    // einen Banner ueber den normalen Header schreiben, damit der
+    // VA-Admin in der PIREP-Liste sofort sieht dass das KEIN
+    // normaler Flug war. Suspected wird hier NICHT als Banner
+    // gezeigt — der Pilot hat den Override-Pfad gewaehlt oder
+    // confirmed via Dialog. Spec §PIREP-Payload / Notes.
+    if stats.accident_detected {
+        if let (Some(kind), Some(confidence)) = (
+            stats.accident_kind.as_deref(),
+            stats.accident_confidence.as_deref(),
+        ) {
+            let kind_enum = match kind {
+                "sim_crash" => accident::AccidentKind::SimCrash,
+                "off_airport_impact" => accident::AccidentKind::OffAirportImpact,
+                _ => accident::AccidentKind::Impact,
+            };
+            let banner = accident::build_accident_notes(
+                kind_enum,
+                confidence,
+                &stats.accident_reasons,
+            );
+            s.push_str("=== ACCIDENT DETECTED ===\n");
+            s.push_str(&banner);
+            s.push_str("\n=========================\n\n");
+        }
+    }
 
     // Header — flight number + route + (when known) callsign airline.
     let _ = write!(
