@@ -833,6 +833,7 @@
     "confirm_cancel_force_yes": "Ja, trotzdem verwerfen",
     "confirm_cancel_force_back": "Zurück",
     "cancel_filed_instead": "✓ Statt verworfen wurde der Flug ordentlich eingereicht — PIREP {{pirep_id}}",
+    "cancel_queued": "⏳ Auto-File wartet in der Queue — wird automatisch eingereicht sobald die Verbindung wieder steht. PIREP {{pirep_id}}",
     "cancel_blocked": "phpVMS lehnt deine Anfragen ab — Account gesperrt oder inaktiv. Bitte VA-Admin kontaktieren, dann erneut versuchen.",
     "forget": "Lokal vergessen",
     "forgetting": "Vergesse…",

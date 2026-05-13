@@ -833,6 +833,7 @@
     "confirm_cancel_force_yes": "Yes, discard anyway",
     "confirm_cancel_force_back": "Back",
     "cancel_filed_instead": "✓ Flight was filed instead of discarded — PIREP {{pirep_id}}",
+    "cancel_queued": "⏳ Auto-file queued — will be submitted automatically once connection is back. PIREP {{pirep_id}}",
     "cancel_blocked": "phpVMS rejects your requests — account suspended or inactive. Please contact your VA admin, then try again.",
     "forget": "Forget locally",
     "forgetting": "Forgetting…",

@@ -10447,15 +10447,39 @@ async fn flight_cancel(
         match flight_end(app.clone(), state.clone(), None).await {
             Ok(()) => {
                 // flight_end hat erfolgreich gefilt ODER gequeued. In
-                // beiden Faellen ist active_flight schon geleert, der
-                // PIREP lebt server-side bzw. im Queue-Worker.
+                // beiden Faellen ist active_flight geleert, der PIREP
+                // lebt server-side bzw. im Queue-Worker.
+                //
+                // v0.7.18 (R1-5): Filed vs Queued unterscheiden — Pilot
+                // soll wissen ob der PIREP schon eingereicht ist oder
+                // noch auf den naechsten Network-Recovery wartet.
+                // flight_end hat keinen Outcome-Type; wir checken die
+                // pirep_queue auf unsere pirep_id.
+                let is_queued = pirep_queue::list_all(&app)
+                    .iter()
+                    .any(|q| q.pirep_id == pirep_id_for_outcome);
+
+                if is_queued {
+                    log_activity(
+                        &state,
+                        ActivityLevel::Warn,
+                        format!(
+                            "Flug statt abgebrochen in der Queue für späteren Retry — PIREP {pirep_id_for_outcome}"
+                        ),
+                        Some(
+                            "B-014 File-First-Pfad: transient-Fehler beim Filing. Der Background-Worker reicht den PIREP ein sobald die Verbindung wieder steht.".into(),
+                        ),
+                    );
+                    return Ok(FlightCancelOutcome::Queued {
+                        pirep_id: pirep_id_for_outcome,
+                    });
+                }
+
                 log_activity(
                     &state,
                     ActivityLevel::Info,
                     format!("Flug statt abgebrochen ordentlich eingereicht — PIREP {pirep_id_for_outcome}"),
-                    Some(
-                        "B-014 File-First-Pfad. Falls die Auto-File in der Queue liegt, übernimmt der Background-Worker.".into(),
-                    ),
+                    Some("B-014 File-First-Pfad: Server hat den PIREP angenommen.".into()),
                 );
                 return Ok(FlightCancelOutcome::FiledInstead {
                     pirep_id: pirep_id_for_outcome,
@@ -10547,8 +10571,13 @@ async fn flight_cancel(
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FlightCancelOutcome {
-    /// File-First-Versuch hat geklappt — PIREP gefilt statt verworfen.
+    /// File-First-Versuch hat geklappt — PIREP wurde direkt an phpVMS
+    /// abgeschickt und akzeptiert.
     FiledInstead { pirep_id: String },
+    /// File-First-Versuch hat transienten Fehler (Netz, 5xx, Timeout)
+    /// produziert — PIREP liegt jetzt in der pirep_queue für Background-
+    /// Retry. Cancel hat NICHT stattgefunden (sonst Datenverlust).
+    Queued { pirep_id: String },
     /// Pilot hat explizit „Trotzdem verwerfen" gewählt ODER File-First
     /// scheiterte mit HardFailed (Validierung) → regulärer Cancel-Pfad
     /// ist gelaufen, PIREP ist CANCELLED auf phpVMS.
@@ -13047,6 +13076,10 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                                 td_resolution.distance_to_destination_nm,
                             airport_nearest_distance_nm:
                                 td_resolution.nearest_distance_nm,
+                            // v0.7.18 (R1-4): Plan-Destination mit-publishen
+                            // damit die Webapp den Off-airport-Banner gegen
+                            // den echten geplanten Wert vergleichen kann.
+                            planned_arr_airport: Some(flight.arr_airport.clone()),
                             lat: stats.landing_lat,
                             lon: stats.landing_lon,
                             heading_true_deg: stats.landing_heading_true_deg,

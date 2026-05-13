@@ -834,6 +834,7 @@
     "confirm_cancel_force_yes": "Sì, scarta comunque",
     "confirm_cancel_force_back": "Indietro",
     "cancel_filed_instead": "✓ Il volo è stato inviato invece di scartato — PIREP {{pirep_id}}",
+    "cancel_queued": "⏳ Invio in coda — sarà inviato automaticamente quando la connessione torna. PIREP {{pirep_id}}",
     "cancel_blocked": "phpVMS rifiuta le tue richieste — account sospeso o inattivo. Contatta l'admin VA, poi riprova.",
     "forget": "Dimentica localmente",
     "forgetting": "Dimenticando…",

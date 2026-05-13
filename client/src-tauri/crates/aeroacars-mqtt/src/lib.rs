@@ -294,6 +294,12 @@ pub struct TouchdownPayload {
     /// Nur gesetzt wenn `airport_source == "nearest_25nm"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub airport_nearest_distance_nm: Option<f32>,
+    /// v0.7.18 (B-012, R1-4): geplante Destination aus dem Bid. Webapp
+    /// braucht das um den Off-airport-Banner zu rendern — `airport` ist
+    /// schon der RESOLVED-Wert und stimmt bei Divert/Off-airport NICHT
+    /// mit der Plan-Destination ueberein.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planned_arr_airport: Option<String>,
     pub lat: Option<f64>,
     pub lon: Option<f64>,
     pub heading_true_deg: Option<f32>,

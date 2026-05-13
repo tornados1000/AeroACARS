@@ -903,7 +903,13 @@ pub struct PirepSummary {
     // alle Option + serde(default). Spec docs/spec/v0.7.18-orphan-flight-
     // cleanup.md §B-011 Datenpfad-Hinweis (Option 1: Schema erweitern und
     // schauen was kommt; bei Bedarf via Fleet-Lookup nachreichen).
-    #[serde(default)]
+    //
+    // v0.7.18 (R1-3): `flight_id` über `de_opt_str_or_int` deserialisieren —
+    // phpVMS liefert je nach Installation als String ("flightid_1") ODER
+    // als Zahl (numeric flight_id). Ohne den Deserializer würde
+    // get_user_pireps() bei einem einzigen numeric-flight_id-PIREP komplett
+    // failen.
+    #[serde(default, deserialize_with = "de_opt_str_or_int")]
     pub flight_id: Option<String>,
     #[serde(default)]
     pub aircraft_icao: Option<String>,
@@ -1149,19 +1155,24 @@ impl Client {
         Ok(())
     }
 
-    /// `DELETE /api/user/bids/{bid_id}` — drop a bid after its PIREP was filed
-    /// (or to give it back). phpVMS does NOT auto-consume bids when the PIREP
-    /// is filed unless we explicitly remove them.
+    /// `DELETE /api/user/bids` — drop a bid after its PIREP was filed
+    /// (or to give it back). phpVMS does NOT auto-consume bids when the
+    /// PIREP is filed unless we explicitly remove them.
     ///
-    /// Some phpVMS deployments (or their reverse proxies / security
-    /// middleware) silently block the DELETE method and return HTTP
-    /// 405 "Method Not Allowed". Standard Laravel workaround: send
-    /// a POST with the `_method=DELETE` form override so Laravel's
-    /// router dispatches the same controller action. We try DELETE
-    /// first (the proper way) and fall back to the override on a
-    /// 405 — this lets us work on the maximum number of phpVMS
-    /// installs without forcing the VA admin to reconfigure their
-    /// server.
+    /// phpVMS routes ALL bid CRUD through `/api/user/bids` (kein `{id}` im
+    /// Pfad). Die ID reist im JSON-Body als `{ "bid_id": ... }` ODER
+    /// `{ "flight_id": ... }`. v0.7.18 (B-011) erlaubt beide Eingaben.
+    ///
+    /// **Body-Auswahl-Reihenfolge** (siehe Spec §B-011 Backend-API):
+    ///   - `bid_id` Some → erster Versuch `{ bid_id }`.
+    ///     Bei 422/400 UND `flight_id` Some → zweiter Versuch
+    ///     `{ flight_id }`.
+    ///   - `bid_id` None, `flight_id` Some → direkt `{ flight_id }`.
+    ///   - beide None → `ApiError::InvalidUrl` (Caller-Bug).
+    ///
+    /// Aus Spec-§B-011 Decision: **kein 405-Fallback hier** (anders als bei
+    /// `cancel_pirep`). Wenn ein VA-Install POST mit `_method=DELETE`
+    /// braucht, machen wir das als separate Aufgabe nach v0.7.18.
     pub async fn delete_bid(
         &self,
         bid_id: Option<i64>,
@@ -1417,12 +1428,54 @@ impl Client {
         self.post_void(&path, body).await
     }
 
-    /// `POST /api/pireps/{pirep_id}/cancel` — cancel an in-flight PIREP.
+    /// `DELETE /api/pireps/{pirep_id}/cancel` — cancel an in-flight PIREP,
+    /// with `PUT` as fallback for VAs that have stricter method routing.
+    ///
+    /// v0.7.18 (R1-1, B-011): vorher `POST`. Standard-phpVMS-Core erwartet
+    /// DELETE; manche VA-Installs (oder hinter Restrictive-Reverse-Proxies)
+    /// liefern dafür 405 und akzeptieren PUT. POST war im Pilot-Client-Code
+    /// ein Pre-v0.7.18-Drift gegen die Server-Spec.
     pub async fn cancel_pirep(&self, pirep_id: &str) -> Result<(), ApiError> {
-        #[derive(Serialize)]
-        struct Empty {}
         let path = format!("/api/pireps/{pirep_id}/cancel");
-        self.post_void(&path, &Empty {}).await
+        let url = self.endpoint(&path)?;
+
+        // 1. Versuch: DELETE — phpVMS-Core-Standard.
+        let response = self
+            .http
+            .delete(url.clone())
+            .header("X-API-Key", &self.conn.api_key)
+            .header(header::ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(ApiError::from)?;
+
+        let status = response.status();
+        if status.is_success() {
+            let _ = response.text().await; // Body verbrauchen
+            return Ok(());
+        }
+        // 405 Method Not Allowed → PUT-Fallback
+        // (manche VA-Installs blockieren DELETE auf API-Routes)
+        if status == StatusCode::METHOD_NOT_ALLOWED {
+            tracing::info!(
+                pirep_id,
+                "cancel_pirep: DELETE returned 405 — versuche PUT-Fallback"
+            );
+            let _ = response.text().await;
+            let response_put = self
+                .http
+                .put(url)
+                .header("X-API-Key", &self.conn.api_key)
+                .header(header::ACCEPT, "application/json")
+                .send()
+                .await
+                .map_err(ApiError::from)?;
+            let _ = check_status(response_put, &path).await?;
+            return Ok(());
+        }
+        // Andere Fehler durch check_status → typisierte ApiError
+        let _ = check_status(response, &path).await?;
+        Ok(())
     }
 
     /// `POST /api/pireps/{pirep_id}/update` — change PIREP status/state during flight.
@@ -1592,7 +1645,12 @@ impl Client {
 
 async fn check_status(response: Response, path: &str) -> Result<Response, ApiError> {
     let status = response.status();
-    if status == StatusCode::OK {
+    // v0.7.18 (R1-2): alle 2xx akzeptieren, nicht nur 200 OK.
+    // DELETE-Endpoints (cancel_pirep, delete_bid) liefern oft 204
+    // No Content. PUT/POST koennen 201 Created liefern.
+    // Vorher wurde 204 als ApiError::Server { status: 204 } behandelt
+    // → B-011 Cancel-Flow scheiterte still gegen Standard-phpVMS.
+    if status.is_success() {
         return Ok(response);
     }
     match status {

@@ -116,13 +116,19 @@ export function ActiveFlightPanel({ info, simSnapshot, onEnded }: Props) {
     try {
       const outcome = (await invoke("flight_cancel", { force })) as
         | { kind: "filed_instead"; pirep_id: string }
+        | { kind: "queued"; pirep_id: string }
         | { kind: "cancelled"; pirep_id: string };
-      // Outcome-spezifisches Feedback. „Cancelled" ist der Normalfall;
-      // „FiledInstead" zeigen wir dem Pilot damit klar ist dass der
-      // Flug eingereicht wurde statt verworfen.
+      // Outcome-spezifisches Feedback je nach v0.7.18 (B-014)-Variante:
+      //   - FiledInstead: PIREP direkt eingereicht, alles fertig.
+      //   - Queued:        Transient-Fehler, PIREP wartet in Queue. Cancel hat NICHT stattgefunden.
+      //   - Cancelled:     regulärer Cancel-Pfad, PIREP ist CANCELLED auf phpVMS.
       if (outcome.kind === "filed_instead") {
         setRefreshMsg(
           t("active_flight.cancel_filed_instead", { pirep_id: outcome.pirep_id }),
+        );
+      } else if (outcome.kind === "queued") {
+        setRefreshMsg(
+          t("active_flight.cancel_queued", { pirep_id: outcome.pirep_id }),
         );
       }
       onEnded?.();
