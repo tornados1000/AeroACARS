@@ -61,11 +61,11 @@ Diese Erklärungen erscheinen 1:1 in der UI — als Tooltips auf Hover und im Gl
 | **Centerline (CL)** | Mittellinie | Die gestrichelte weiße Linie genau in der Mitte der Bahn. |
 | **Centerline-Offset / XTD** | Seitenabweichung | Wie weit links oder rechts von der Mittellinie bist du aufgesetzt? Idealwert: 0 m. |
 | **TDZ — Touchdown Zone** | Aufsetzzone | Der Soll-Bereich zum Aufsetzen: erste 900 m der Bahn oder das erste Drittel (was kürzer ist). Auf echten Bahnen siehst du sie als Gruppen weißer Querstreifen. |
-| **AIM — Aim Point** | Ziel-Markierung | Zwei große weiße Quadrate auf der Bahn. 300 m (kurze Bahn) oder 400 m (lange Bahn ≥ 2400 m) hinter der Schwelle. Da soll dein Blick beim Anflug hin. |
+| **AIM — Aim Point** | Ziel-Markierung | Zwei große weiße Quadrate auf der Bahn — das sind die Aiming-Point-Marken. Im stabilisierten Anflug zielt dein Blick GENAU dort hin, weil der 3°-Glideslope dich exakt zu diesem Punkt führen würde, wenn du nicht abfangen (flaren) würdest. Beim Flare hebst du die Nase, drosselst — und setzt typisch 50–150 m HINTER dem Aim-Point auf (= Anfang der TDZ). Position laut ICAO Annex 14: 400 m hinter der Schwelle bei Bahnen ≥ 2400 m, 300 m bei 1500–2399 m, 250 m bei 1200–1499 m. |
 | **TCH — Threshold Crossing Height** | Schwellen-Überflug-Höhe | Wie hoch warst du über dem Boden, als du die Schwelle überflogen hast? ILS-Anflug typisch 49 ft (≈ 15 m). Zu niedrig: Tail-Strike-Risiko. Zu hoch: Long-Landing. |
 | **DDS — Displaced Threshold** | Versetzte Schwelle | Manche Bahnen haben einen Bereich VOR der echten Landeschwelle, der für die Landung verboten ist (Pfeile auf der Bahn). Aufsetzen davor = illegal. Beispiel: OLBA RWY 35, 820 m DDS. |
 | **Glide Slope** | Anflug-Winkel | ILS-Standard 3°. Du sinkst 1 m für je 19 m vorwärts. |
-| **Rollout** | Ausrollstrecke | Wie viele Meter rollst du nach dem Aufsetzen, bis du langsam genug bist (< 5 kt) zum Abbiegen. |
+| **Rollout** | Ausrollstrecke | Wie viele Meter rollst du nach dem Aufsetzen, bis du auf ~40 kt abgebremst hast — das ist die typische High-Speed-Exit-Geschwindigkeit, mit der du am nächsten Rollwege-Abzweig die Bahn verlässt. Bis zum vollen Stand auf der Bahn rollt fast niemand aus (= ROLLOUT_STOP_GS_KT = 40 in src-tauri/src/lib.rs:4214). |
 | **Bahn-Auslastung** | — | Ausrollstrecke ÷ Bahnlänge × 100 %. 80 % = nur 20 % Bahn übrig (knapp). |
 | **AIRAC-Cycle** | — | Offizielle Aviation-Daten werden alle 28 Tage aktualisiert. „Cycle 2604" = 4. Update 2026. |
 | **VPS Navdata** | — | Zentrale, vom VA-Admin gepflegte AIRAC-Daten auf dem VPS. Pilot-Client zieht sie pro Flugstart. Technische Quelle dahinter: Aerosoft DFD (Lizenz: VA-Admin-Subscription). |

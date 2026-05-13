@@ -43,7 +43,7 @@ const ENTRIES: GlossaryEntry[] = [
     abbr: "AIM — Aim Point",
     full: "Ziel-Markierung",
     explanation:
-      "Zwei große weiße Quadrate auf der Bahn. 300 m (kurze Bahn) oder 400 m (lange Bahn ≥ 2400 m) hinter der Schwelle. Da soll dein Blick beim Anflug hin.",
+      "Zwei große weiße Quadrate auf der Bahn — das sind die Aiming-Point-Marken. Im stabilisierten Anflug zielt dein Blick GENAU dort hin, weil der 3°-Glideslope dich exakt zu diesem Punkt führen würde, wenn du nicht abfangen (flaren) würdest. Beim Flare hebst du die Nase, drosselst — und setzt typisch 50–150 m HINTER dem Aim-Point auf (= Anfang der TDZ). Position laut ICAO Annex 14: 400 m hinter der Schwelle bei Bahnen ≥ 2400 m, 300 m bei 1500–2399 m, 250 m bei 1200–1499 m.",
   },
   {
     abbr: "TCH — Threshold Crossing Height",
@@ -66,7 +66,7 @@ const ENTRIES: GlossaryEntry[] = [
     abbr: "Rollout",
     full: "Ausrollstrecke",
     explanation:
-      "Wie viele Meter rollst du nach dem Aufsetzen, bis du langsam genug bist (< 5 kt) zum Abbiegen.",
+      "Wie viele Meter rollst du nach dem Aufsetzen, bis du auf ~40 kt abgebremst hast — das ist die typische High-Speed-Exit-Geschwindigkeit, mit der du am nächsten Rollwege-Abzweig die Bahn verlässt. Bis zum vollen Stand auf der Bahn rollt fast niemand aus (das wäre verschwendete Bahn).",
   },
   {
     abbr: "Bahn-Auslastung",
