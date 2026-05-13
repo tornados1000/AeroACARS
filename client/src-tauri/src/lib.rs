@@ -7593,6 +7593,13 @@ mod pirep_queue {
         pub last_attempt_at: Option<DateTime<Utc>>,
         pub attempt_count: u32,
         pub last_error: Option<String>,
+        /// v0.7.19 (QS-R2 Finding 2): phpVMS-Flight-ID als Fallback fuer
+        /// `delete_bid` wenn der bid_id-Pfad 400/404/422 liefert. Leer-
+        /// String fuer pre-v0.7.7-Resume-Files; wird beim Aufruf als
+        /// None behandelt. #[serde(default)] damit alte queued-PIREPs
+        /// (vor diesem Feld) weiter laden.
+        #[serde(default)]
+        pub flight_id: String,
     }
 
     fn dir(app: &AppHandle) -> Option<PathBuf> {
@@ -7771,7 +7778,14 @@ fn spawn_pirep_queue_worker(app: AppHandle) {
                         // transientes Scheitern landet in pending_bid_cleanup
                         // und wird im naechsten Tick erneut probiert.
                         consume_bid_best_effort(
-                            &app, &client, &q.pirep_id, q.bid_id, "queued_filed",
+                            &app,
+                            &client,
+                            &q.pirep_id,
+                            q.bid_id,
+                            // v0.7.19 (QS-R2 Finding 2): flight_id-Fallback
+                            // aus dem persistierten QueuedPirep mitgeben.
+                            Some(q.flight_id.as_str()),
+                            "queued_filed",
                         ).await;
                         // Selber Tick: Pending-Bid-Cleanup-Queue drainen
                         drain_pending_bid_cleanup(&app, &client).await;
@@ -9443,31 +9457,65 @@ async fn flight_end(
         .filter(|s| !s.is_empty());
     if let Some(decision) = accident_decision.as_deref() {
         if decision == "as_hard_landing" {
-            let guard = state.active_flight.lock().expect("active_flight lock");
-            if let Some(flight) = guard.as_ref() {
-                let mut stats = flight.stats.lock().expect("flight stats");
-                if stats.accident_detected
-                    || stats.accident_confidence.as_deref() == Some("medium")
-                {
-                    let prev_kind = stats.accident_kind.clone().unwrap_or_default();
-                    let prev_reasons = stats.accident_reasons.join(", ");
-                    stats.accident_detected = false;
-                    stats.accident_kind = None;
-                    stats.accident_confidence = None;
-                    stats.accident_reasons = vec![format!(
-                        "pilot_override=as_hard_landing (was: {prev_kind}; reasons: {prev_reasons})"
-                    )];
-                    // accident_at wird NICHT geloescht — Audit-Spur fuer den
-                    // Override-Zeitpunkt bleibt. Notes-Builder ignoriert sie
-                    // wenn accident_detected=false.
-                    log_activity(
-                        &state,
-                        ActivityLevel::Warn,
-                        "Pilot hat Accident-Klassifikation widersprochen — filing als harte Landung".to_string(),
-                        Some(format!(
-                            "Vorherige Klassifikation: kind={prev_kind}, reasons=[{prev_reasons}]"
-                        )),
-                    );
+            // v0.7.19 (QS-R2 Finding 1): Override-MQTT-Event vorbereiten
+            // BEVOR wir den Stats-Latch clearen — damit wir die Original-
+            // Klassifikation fuer den `previous_*`-Audit-Trail kennen.
+            // Webapp persistierte beim Touchdown-Edge schon `accident=true`;
+            // dieser Korrektur-Event triggert den DB-Update.
+            let override_payload_opt = {
+                let guard = state.active_flight.lock().expect("active_flight lock");
+                if let Some(flight) = guard.as_ref() {
+                    let mut stats = flight.stats.lock().expect("flight stats");
+                    if stats.accident_detected
+                        || stats.accident_confidence.as_deref() == Some("medium")
+                    {
+                        let prev_kind = stats.accident_kind.clone().unwrap_or_default();
+                        let prev_conf = stats.accident_confidence.clone();
+                        let prev_reasons = stats.accident_reasons.join(", ");
+                        stats.accident_detected = false;
+                        stats.accident_kind = None;
+                        stats.accident_confidence = None;
+                        stats.accident_reasons = vec![format!(
+                            "pilot_override=as_hard_landing (was: {prev_kind}; reasons: {prev_reasons})"
+                        )];
+                        // accident_at wird NICHT geloescht — Audit-Spur fuer den
+                        // Override-Zeitpunkt bleibt. Notes-Builder ignoriert sie
+                        // wenn accident_detected=false.
+                        log_activity(
+                            &state,
+                            ActivityLevel::Warn,
+                            "Pilot hat Accident-Klassifikation widersprochen — filing als harte Landung".to_string(),
+                            Some(format!(
+                                "Vorherige Klassifikation: kind={prev_kind}, reasons=[{prev_reasons}]"
+                            )),
+                        );
+
+                        Some(aeroacars_mqtt::TouchdownAccidentOverridePayload {
+                            ts: Utc::now().timestamp_millis(),
+                            pirep_id: flight.pirep_id.clone(),
+                            decision: "as_hard_landing".into(),
+                            accident: false,
+                            accident_kind: None,
+                            accident_confidence: None,
+                            accident_reasons: stats.accident_reasons.clone(),
+                            previous_kind: Some(prev_kind),
+                            previous_confidence: prev_conf,
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+
+            // MQTT-Publish OHNE Locks halten. Best-effort — Recorder
+            // retried den Touchdown-Row-Update unabhaengig.
+            if let Some(payload) = override_payload_opt {
+                let app_state = state.inner();
+                let mqtt_handle = app_state.mqtt.lock().await.clone();
+                if let Some(handle) = mqtt_handle {
+                    handle.touchdown_accident_override(payload);
                 }
             }
         }
@@ -9812,8 +9860,14 @@ async fn flight_end(
         // automatisch beim Recorder an wenn der MQTT-PIREP-Event publisht.
         // Audit Q4-2026-05 (C1).
         // v0.7.19 (QS-R1 Finding 1): Bei delete_bid-fail in pending_bid_cleanup.
+        // QS-R2 Finding 2: flight_id-Fallback mitgeben.
         consume_bid_best_effort(
-            &app, &client, &flight.pirep_id, flight.bid_id, "divert_filed",
+            &app,
+            &client,
+            &flight.pirep_id,
+            flight.bid_id,
+            Some(flight.flight_id.as_str()),
+            "divert_filed",
         ).await;
         // Drop the in-memory active flight: divert is finalized.
         let _ = state.active_flight.lock().expect("active_flight lock").take();
@@ -10124,7 +10178,12 @@ async fn flight_end(
                 "normal_filed"
             };
             consume_bid_best_effort(
-                &app, &client, &flight.pirep_id, flight.bid_id, bid_reason,
+                &app,
+                &client,
+                &flight.pirep_id,
+                flight.bid_id,
+                Some(flight.flight_id.as_str()),
+                bid_reason,
             ).await;
             Ok(())
         }
@@ -10150,6 +10209,11 @@ async fn flight_end(
                     last_attempt_at: Some(Utc::now()),
                     attempt_count: 3, // = die 3 retries die wir grade verbraucht haben
                     last_error: Some(friendly_net_error(&e)),
+                    // v0.7.19 (QS-R2 Finding 2): phpVMS-flight_id mit-
+                    // persistieren damit der Worker-Bid-Cleanup nach
+                    // erfolgreichem queued-Filing den flight_id-Fallback
+                    // hat. Empty-String fuer pre-v0.7.7-Bids ist okay.
+                    flight_id: flight.flight_id.clone(),
                 };
                 if let Err(qe) = pirep_queue::enqueue(&app, &queued) {
                     // Queue selber kaputt — fallback auf altes Verhalten
@@ -10220,17 +10284,27 @@ async fn flight_end(
 /// Background-Worker retried das spaeter. So bleibt nach Accident-FILED
 /// kein Aircraft + Bid auf phpVMS haengen wenn der delete_bid-Aufruf
 /// transient versagt (Netz weg, 5xx). Spec §Pending Bid Cleanup Queue.
+///
+/// v0.7.19 (QS-R2 Finding 2): `flight_id` wird als Fallback mitgegeben.
+/// Wenn `delete_bid(bid_id)` 400/404/422 liefert (Bid existiert nicht
+/// mehr oder VA-Plugin akzeptiert `bid_id` nicht), versucht die
+/// `delete_bid`-Implementation den `flight_id`-Body-Pfad. Ohne den
+/// Fallback haette der Background-Worker 8x denselben kaputten Pfad
+/// retried. Empty-String-`flight_id` (pre-v0.7.7-Bid) wird zu None
+/// gemapped.
 async fn consume_bid_best_effort(
     app: &AppHandle,
     client: &Client,
     pirep_id: &str,
     bid_id: i64,
+    flight_id: Option<&str>,
     reason: &str,
 ) {
     if bid_id <= 0 {
         return;
     }
-    match client.delete_bid(Some(bid_id), None).await {
+    let flight_id_opt = flight_id.filter(|s| !s.is_empty());
+    match client.delete_bid(Some(bid_id), flight_id_opt).await {
         Ok(()) => tracing::info!(bid_id, "bid removed after PIREP filing"),
         Err(e) => {
             tracing::warn!(
@@ -10239,7 +10313,13 @@ async fn consume_bid_best_effort(
                 error = %e,
                 "delete_bid failed — enqueueing for pending_bid_cleanup retry"
             );
-            enqueue_pending_bid_cleanup(app, pirep_id, Some(bid_id), None, reason);
+            enqueue_pending_bid_cleanup(
+                app,
+                pirep_id,
+                Some(bid_id),
+                flight_id_opt.map(|s| s.to_string()),
+                reason,
+            );
         }
     }
 }
@@ -10665,9 +10745,14 @@ async fn flight_end_manual(
                     outcome: FlightOutcome::Manual,
                 },
             );
-            // v0.7.19 (QS-R1 Finding 1).
+            // v0.7.19 (QS-R1 Finding 1) + QS-R2 Finding 2 (flight_id fallback).
             consume_bid_best_effort(
-                &app, &client, &flight.pirep_id, flight.bid_id, "manual_filed",
+                &app,
+                &client,
+                &flight.pirep_id,
+                flight.bid_id,
+                Some(flight.flight_id.as_str()),
+                "manual_filed",
             ).await;
             Ok(())
         }
@@ -13357,6 +13442,10 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                         );
                         aeroacars_mqtt::TouchdownPayload {
                             ts: landing_at.timestamp_millis(),
+                            // v0.7.19 (QS-R2 Finding 1): Recorder/Webapp
+                            // targeted Korrektur-Events per pirep_id auf
+                            // den exakten Touchdown-Row.
+                            pirep_id: Some(flight.pirep_id.clone()),
                             // v0.7.17 (B-015a QS-Round-2): Edge-Wert hat
                             // Vorrang — siehe `score_basis_vs_fpm()` Doc.
                             // Live-Touchdown-MQTT-Top-Level-Wert war
