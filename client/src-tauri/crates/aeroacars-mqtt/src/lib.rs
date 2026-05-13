@@ -630,6 +630,11 @@ pub struct TouchdownPayload {
     /// runways < 1200 m.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub td_in_tdz: Option<bool>,
+    /// 1-indexed third of the runway the touchdown lies in (1/2/3).
+    /// Stable wire-key gegen storage::LandingRecord — Webapp + Pilot-
+    /// Client teilen die Frontend-Logik.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub td_third: Option<u8>,
     /// F3 TDZ-Marker-Laenge in Metern (≤ 900, ≤ length/3).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub td_tdz_length_m: Option<f64>,

@@ -880,11 +880,21 @@ struct ActiveFlight {
     ///
     /// Aktiver Cycle steht zusätzlich in `navdata_cycle` — wird ins
     /// Activity-Log + TouchdownPayload weitergegeben.
+    ///
+    /// Slice-A-Foundation: Field existiert, wird aber noch nicht
+    /// gelesen (Slice B verdrahtet `fetch_navdata_for_flight` beim
+    /// flight_start + die Reads in `record_landing_for_filed_flight`).
+    #[allow(dead_code)]
     navdata: Mutex<NavdataCache>,
 }
 
 /// Pro-Flug-Cache der NavAirport-Daten. Default = leer = OurAirports-
 /// Fallback aktiv für alle ICAOs.
+///
+/// Slice-A-Foundation: ungenutzt bis Slice B den Cache befüllt UND
+/// auf Touchdown abfragt. `dead_code`-Allow entfernen sobald
+/// Slice B gelandet ist.
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 struct NavdataCache {
     /// ICAO (uppercase) → NavAirport.
@@ -896,6 +906,7 @@ struct NavdataCache {
     cycle: Option<String>,
 }
 
+#[allow(dead_code)]
 impl NavdataCache {
     fn get(&self, icao: &str) -> Option<&aeroacars_mqtt::navdata::NavAirport> {
         self.airports.get(&icao.trim().to_uppercase())
@@ -916,11 +927,25 @@ impl NavdataCache {
 ///   * Skippt leere ICAO-Strings (z.B. wenn der Bid keinen Alternate hat).
 ///   * Dedupe per uppercase-ICAO (dep == arr im local-pattern-flight).
 ///   * 404 vom VPS → ICAO nicht im aktiven Cycle → silently skip.
+///   * 401/403 → loggt warn! (Token fehlt/invalid) — alle weiteren
+///     Fetches landen ebenfalls in 401, restliche ICAOs werden trotzdem
+///     versucht damit der Logger sie alle protokolliert.
 ///   * Network-Fehler → loggt warn!, restliche ICAOs werden trotzdem versucht.
+///
+/// `auth_token` ist der Pilot-Bearer-Token (typisch
+/// `ProvisionResponse.password` aus dem MQTT-Provisioning). `None` ist
+/// nur für Tests/Mocks vorgesehen.
+///
+/// Slice-A-Foundation: ungenutzt bis Slice B den flight_start-Hook
+/// einbaut. `dead_code`-Allow entfernen sobald Slice B gelandet ist —
+/// dann ist die Funktion live und ein Warnungs-Wiederauftreten würde
+/// ein versehentlich entferntes Wiring melden.
+#[allow(dead_code)]
 async fn fetch_navdata_for_flight(
     flight: Arc<ActiveFlight>,
     icaos: Vec<String>,
     base_override: Option<String>,
+    auth_token: Option<String>,
 ) {
     let mut wanted: Vec<String> = icaos
         .into_iter()
@@ -936,8 +961,14 @@ async fn fetch_navdata_for_flight(
     let mut handles = Vec::with_capacity(wanted.len());
     for icao in wanted {
         let base = base_override.clone();
+        let token = auth_token.clone();
         handles.push(tokio::spawn(async move {
-            let res = aeroacars_mqtt::navdata::get_airport(&icao, base.as_deref()).await;
+            let res = aeroacars_mqtt::navdata::get_airport(
+                &icao,
+                base.as_deref(),
+                token.as_deref(),
+            )
+            .await;
             (icao, res)
         }));
     }
@@ -8935,8 +8966,10 @@ where
         td_distance_from_threshold_m: None,
         td_in_tdz: None,
         td_third: None,
+        td_tdz_length_m: None,
         aim_delta_m: None,
         aim_class: None,
+        aim_point_m: None,
         tch_actual_ft: None,
         tch_delta_ft: None,
         tch_class: None,
@@ -13934,6 +13967,7 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                             runway_glideslope_angle_deg: None,
                             td_distance_from_threshold_m: None,
                             td_in_tdz: None,
+                            td_third: None,
                             td_tdz_length_m: None,
                             aim_delta_m: None,
                             aim_class: None,

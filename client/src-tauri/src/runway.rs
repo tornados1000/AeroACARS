@@ -538,6 +538,11 @@ pub fn lookup_runway(
 /// Quelle aus der die `RunwayMatch` stammt. Wird im LandingRecord
 /// persistiert und im Activity-Log surface'd damit der Pilot sieht ob
 /// gerade Navigraph-Daten oder der OurAirports-Fallback aktiv war.
+///
+/// Slice-A-Foundation: ungenutzt bis Slice B `lookup_runway_with_fallback`
+/// vom Streamer-Tick aufruft. `dead_code`-Allow entfernen sobald
+/// Slice B gelandet ist (Hinweis dass das Feature unwired bleibt).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunwaySource {
@@ -553,13 +558,22 @@ pub enum RunwaySource {
 /// genauer (Jeppesen-Threshold-Koordinaten statt Community-CSV).
 ///
 /// Verhalten:
-///   * Iteriert über `airport.runways`, wählt die NavRunway deren
-///     `true_course` am besten zu `aircraft_heading_true_deg` passt
-///     (analog zur le_ident vs he_ident-Disambiguation der CSV-Variante).
-///   * Berechnet Cross-Track + Along-Track gegen `threshold` → `end`.
-///   * Returnt `None` wenn das Touchdown > 3 km + runway_length von der
-///     gewählten Schwelle entfernt ist (= Pilot ist nicht auf diesem
-///     Airport gelandet — Caller soll auf OurAirports zurückfallen).
+///   * Filtert NavRunways auf jene mit `heading_diff(aircraft, true_course)
+///     < 90°` (= Landerichtung passt grob, blockt 17 vs 35).
+///   * Rechnet pro verbleibendem Kandidat Cross-Track + Along-Track
+///     gegen `threshold` → `end` und wählt am Ende die Bahn mit dem
+///     kleinsten `|centerline_distance_m|`. **Wichtig für Parallelbahnen
+///     (26L/26R, 09L/09C/09R)** — heading allein kann sie nicht
+///     unterscheiden weil sie identische Magnetic-Courses haben, das
+///     XTD-Minimum schon. Gleiches Tie-Break-Verfahren wie der
+///     OurAirports-Pfad (siehe `lookup_runway`).
+///   * Returnt `None` wenn keine Bahn innerhalb von `3 km + length`
+///     der Schwelle liegt (= Pilot ist nicht auf diesem Airport
+///     gelandet — Caller soll auf OurAirports zurückfallen).
+///
+/// Slice-A-Foundation: ungenutzt bis Slice B den Streamer-Tick
+/// umstellt. `dead_code`-Allow entfernen sobald Slice B gelandet ist.
+#[allow(dead_code)]
 pub fn lookup_runway_in_nav(
     lat: f64,
     lon: f64,
@@ -570,81 +584,86 @@ pub fn lookup_runway_in_nav(
         return None;
     }
 
-    // Pick the runway end whose true_course is closest to the aircraft
-    // heading at touchdown — that's the runway the pilot landed on.
-    let chosen = airport
-        .runways
-        .iter()
-        .min_by(|a, b| {
-            heading_diff(aircraft_heading_true_deg, a.true_course as f32)
-                .partial_cmp(&heading_diff(aircraft_heading_true_deg, b.true_course as f32))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .expect("runways non-empty checked above");
+    let mut best: Option<(RunwayMatch, f64)> = None;
 
-    let threshold_lat = chosen.threshold.lat;
-    let threshold_lon = chosen.threshold.lon;
-    let end_lat = chosen.far_end.lat;
-    let end_lon = chosen.far_end.lon;
-    let runway_ident = chosen.designator.clone();
-    let runway_heading = chosen.true_course as f32;
-    let length_ft = chosen.length_ft as f32;
-    let width_ft = chosen.width_ft.unwrap_or(0) as f32;
-    let surface = chosen.surface.clone().unwrap_or_default();
+    for rwy in &airport.runways {
+        // > 90° heading-diff → other landing direction (17 vs 35).
+        // Skip so parallel-runway tie-break is purely XTD-driven.
+        if heading_diff(aircraft_heading_true_deg, rwy.true_course as f32) > 90.0 {
+            continue;
+        }
 
-    let d_threshold = haversine_m(threshold_lat, threshold_lon, lat, lon);
-    if d_threshold > DEFAULT_MAX_DISTANCE_M + (length_ft as f64 * 0.3048) {
-        return None;
+        let threshold_lat = rwy.threshold.lat;
+        let threshold_lon = rwy.threshold.lon;
+        let end_lat = rwy.far_end.lat;
+        let end_lon = rwy.far_end.lon;
+        let runway_heading = rwy.true_course as f32;
+        let length_ft = rwy.length_ft as f32;
+        let width_ft = rwy.width_ft.unwrap_or(0) as f32;
+        let surface = rwy.surface.clone().unwrap_or_default();
+
+        let d_threshold = haversine_m(threshold_lat, threshold_lon, lat, lon);
+        if d_threshold > DEFAULT_MAX_DISTANCE_M + (length_ft as f64 * 0.3048) {
+            continue;
+        }
+
+        // Same cross-track / along-track math as the CSV path. Kept
+        // verbatim so MS713-equivalent calls reproduce identical signs.
+        let theta_ab = initial_bearing_rad(threshold_lat, threshold_lon, end_lat, end_lon);
+        let theta_ac = initial_bearing_rad(threshold_lat, threshold_lon, lat, lon);
+        let d_ab = d_threshold;
+        let xtd_m = (d_ab / EARTH_RADIUS_M).sin() * (theta_ac - theta_ab).sin();
+        let xtd_m = xtd_m.asin() * EARTH_RADIUS_M;
+        let cos_arg = (d_ab / EARTH_RADIUS_M).cos() / (xtd_m / EARTH_RADIUS_M).cos();
+        let cos_arg = cos_arg.clamp(-1.0, 1.0);
+        let along_m = cos_arg.acos() * EARTH_RADIUS_M;
+        let mut bearing_diff = theta_ac - theta_ab;
+        while bearing_diff > std::f64::consts::PI {
+            bearing_diff -= 2.0 * std::f64::consts::PI;
+        }
+        while bearing_diff <= -std::f64::consts::PI {
+            bearing_diff += 2.0 * std::f64::consts::PI;
+        }
+        let along_signed_m = if bearing_diff.abs() > std::f64::consts::FRAC_PI_2 {
+            -along_m
+        } else {
+            along_m
+        };
+        let along_ft = along_signed_m * 3.280_839_895;
+        let centerline_distance_abs_ft = xtd_m.abs() * 3.280_839_895;
+        let side = if xtd_m.abs() < CENTERLINE_TOLERANCE_M {
+            "CENTER"
+        } else if xtd_m > 0.0 {
+            "RIGHT"
+        } else {
+            "LEFT"
+        };
+
+        let candidate = RunwayMatch {
+            airport_ident: airport.icao.clone(),
+            runway_ident: rwy.designator.clone(),
+            heading_true_deg: runway_heading,
+            length_ft,
+            width_ft,
+            surface,
+            threshold_lat,
+            threshold_lon,
+            end_lat,
+            end_lon,
+            centerline_distance_m: xtd_m,
+            centerline_distance_abs_ft,
+            touchdown_distance_from_threshold_ft: along_ft,
+            side: side.to_string(),
+        };
+
+        let score = xtd_m.abs();
+        match &best {
+            Some((_, best_score)) if *best_score <= score => {}
+            _ => best = Some((candidate, score)),
+        }
     }
 
-    // Same cross-track / along-track math as the CSV path. Kept
-    // verbatim so MS713-equivalent calls reproduce identical signs.
-    let theta_ab = initial_bearing_rad(threshold_lat, threshold_lon, end_lat, end_lon);
-    let theta_ac = initial_bearing_rad(threshold_lat, threshold_lon, lat, lon);
-    let d_ab = d_threshold;
-    let xtd_m = (d_ab / EARTH_RADIUS_M).sin() * (theta_ac - theta_ab).sin();
-    let xtd_m = xtd_m.asin() * EARTH_RADIUS_M;
-    let cos_arg = (d_ab / EARTH_RADIUS_M).cos() / (xtd_m / EARTH_RADIUS_M).cos();
-    let cos_arg = cos_arg.clamp(-1.0, 1.0);
-    let along_m = cos_arg.acos() * EARTH_RADIUS_M;
-    let mut bearing_diff = theta_ac - theta_ab;
-    while bearing_diff > std::f64::consts::PI {
-        bearing_diff -= 2.0 * std::f64::consts::PI;
-    }
-    while bearing_diff <= -std::f64::consts::PI {
-        bearing_diff += 2.0 * std::f64::consts::PI;
-    }
-    let along_signed_m = if bearing_diff.abs() > std::f64::consts::FRAC_PI_2 {
-        -along_m
-    } else {
-        along_m
-    };
-    let along_ft = along_signed_m * 3.280_839_895;
-    let centerline_distance_abs_ft = xtd_m.abs() * 3.280_839_895;
-    let side = if xtd_m.abs() < CENTERLINE_TOLERANCE_M {
-        "CENTER"
-    } else if xtd_m > 0.0 {
-        "RIGHT"
-    } else {
-        "LEFT"
-    };
-
-    Some(RunwayMatch {
-        airport_ident: airport.icao.clone(),
-        runway_ident,
-        heading_true_deg: runway_heading,
-        length_ft,
-        width_ft,
-        surface,
-        threshold_lat,
-        threshold_lon,
-        end_lat,
-        end_lon,
-        centerline_distance_m: xtd_m,
-        centerline_distance_abs_ft,
-        touchdown_distance_from_threshold_ft: along_ft,
-        side: side.to_string(),
-    })
+    best.map(|(m, _)| m)
 }
 
 /// Try Navigraph first, fall back to OurAirports. Returns the match
@@ -654,6 +673,10 @@ pub fn lookup_runway_in_nav(
 /// `airport_nav` is the NavAirport from VPS (None when the pilot
 /// flight had a VPS-outage or an unknown ICAO). Pass `None` to skip
 /// the Navigraph path entirely.
+///
+/// Slice-A-Foundation: ungenutzt bis Slice B den Streamer-Tick
+/// umstellt. `dead_code`-Allow entfernen sobald Slice B gelandet ist.
+#[allow(dead_code)]
 pub fn lookup_runway_with_fallback(
     lat: f64,
     lon: f64,
@@ -977,6 +1000,119 @@ mod tests {
         assert_eq!(src, RunwaySource::OurAirportsFallback);
         assert_eq!(m.airport_ident, "EDDP");
         assert_eq!(m.runway_ident, "26R");
+    }
+
+    /// QS-Finding 2026-05-13: Parallelbahnen müssen via Cross-Track
+    /// disambiguiert werden, nicht via Heading. Wir simulieren EDDF
+    /// mit zwei parallelen Bahnen (07L und 07R, ~520 m seitlich
+    /// versetzt). Die alte `min_by(heading_diff)`-Logik konnte hier die
+    /// falsche Bahn picken weil beide gleichen `true_course` haben.
+    fn parallel_runway_fixture() -> NavAirport {
+        // 07L Threshold bei (50.05, 8.55), 07R 520 m süd-davon
+        // (= ~0.00467° Lat). Beide laufen Richtung 070° (~3000 m lang).
+        let landing_bearing = 70.0_f64.to_radians();
+        let length_m = 3000.0_f64;
+        let thr_07l_lat = 50.05_f64;
+        let thr_07l_lon = 8.55_f64;
+        let (end_07l_lat, end_07l_lon) =
+            destination(thr_07l_lat, thr_07l_lon, landing_bearing, length_m);
+        // Parallel 520 m nach Süden (= rechts der 07L Landerichtung,
+        // bearing + 90° = 160°).
+        let perp_right = landing_bearing + std::f64::consts::FRAC_PI_2;
+        let (thr_07r_lat, thr_07r_lon) =
+            destination(thr_07l_lat, thr_07l_lon, perp_right, 520.0);
+        let (end_07r_lat, end_07r_lon) =
+            destination(thr_07r_lat, thr_07r_lon, landing_bearing, length_m);
+
+        let make_rwy = |des: &str, t_lat, t_lon, e_lat, e_lon| NavRunway {
+            designator: des.to_string(),
+            magnetic_course: 70.0,
+            true_course: 70.0,
+            length_ft: 9842, // ~3000 m
+            width_ft: Some(148),
+            surface: Some("ASP".to_string()),
+            threshold: NavPoint {
+                lat: t_lat,
+                lon: t_lon,
+                elev_ft: Some(364),
+            },
+            far_end: NavPoint {
+                lat: e_lat,
+                lon: e_lon,
+                elev_ft: Some(364),
+            },
+            displaced_threshold_ft: 0,
+            ils: None,
+            glideslope_angle: 3.0,
+            tch_ft: 50,
+        };
+
+        NavAirport {
+            cycle: "2604".to_string(),
+            valid_to: "2026-05-14".to_string(),
+            icao: "EDDF".to_string(),
+            name: "Frankfurt".to_string(),
+            latitude: thr_07l_lat,
+            longitude: thr_07l_lon,
+            elevation_ft: Some(364),
+            runways: vec![
+                make_rwy("07L", thr_07l_lat, thr_07l_lon, end_07l_lat, end_07l_lon),
+                make_rwy("07R", thr_07r_lat, thr_07r_lon, end_07r_lat, end_07r_lon),
+            ],
+        }
+    }
+
+    #[test]
+    fn nav_lookup_disambiguates_parallels_by_xtd() {
+        let apt = parallel_runway_fixture();
+        // Landed 1000 m down 07R, ~5 m right of its centerline.
+        // 07L's centerline is ~520 m away → XTD of 07R must win.
+        let landing_bearing = 70.0_f64.to_radians();
+        let right_perp = landing_bearing + std::f64::consts::FRAC_PI_2;
+        // First reach 07R threshold (520 m perp from 07L)…
+        let (thr_07r_lat, thr_07r_lon) =
+            destination(50.05, 8.55, right_perp, 520.0);
+        // …then 1000 m down 07R…
+        let (along_lat, along_lon) =
+            destination(thr_07r_lat, thr_07r_lon, landing_bearing, 1000.0);
+        // …then 5 m right of the 07R centerline.
+        let (td_lat, td_lon) = destination(along_lat, along_lon, right_perp, 5.0);
+
+        let m = lookup_runway_in_nav(td_lat, td_lon, 70.0, &apt).expect("must resolve");
+        assert_eq!(
+            m.runway_ident, "07R",
+            "got runway {} with xtd {} (expected 07R, xtd ≈ +5 m)",
+            m.runway_ident, m.centerline_distance_m
+        );
+        assert_eq!(m.side, "RIGHT");
+        // Tolerance ±2 m to absorb spherical drift from chained
+        // destination() calls (same as `touchdown_offset_right_and_down_runway`).
+        assert!(
+            (m.centerline_distance_m - 5.0).abs() < 2.0,
+            "xtd = {} (expected ≈ +5)",
+            m.centerline_distance_m
+        );
+    }
+
+    #[test]
+    fn nav_lookup_picks_other_parallel_when_pilot_offset_is_negative() {
+        // Inverse case: pilot lands closer to 07L → must pick 07L
+        // not 07R, regardless of array order in the NavAirport.
+        let apt = parallel_runway_fixture();
+        let landing_bearing = 70.0_f64.to_radians();
+        let right_perp = landing_bearing + std::f64::consts::FRAC_PI_2;
+        // 1000 m down 07L, 3 m LEFT of 07L centerline.
+        let (along_lat, along_lon) =
+            destination(50.05, 8.55, landing_bearing, 1000.0);
+        let (td_lat, td_lon) =
+            destination(along_lat, along_lon, right_perp - std::f64::consts::PI, 3.0);
+
+        let m = lookup_runway_in_nav(td_lat, td_lon, 70.0, &apt).expect("must resolve");
+        assert_eq!(
+            m.runway_ident, "07L",
+            "got runway {} (expected 07L, pilot is between the parallels but closer to L)",
+            m.runway_ident
+        );
     }
 
     #[test]

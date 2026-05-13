@@ -7,9 +7,13 @@
 //! Spec: `docs/spec/v0.8.0-vps-navdata-runway-awareness.md`. Wire-Format
 //! ist 1:1 das was `GET /api/navdata/airport/<ICAO>` zurückgibt.
 //!
-//! Auth: für v0.8.0 read-only-anonymous (Pilot-Client zieht facts-only,
-//! Recorder-Side filtert per Rate-Limit). Token-basierte Auth kann
-//! ergänzt werden ohne den Wire-Type zu ändern.
+//! Auth: Pilot-Token via `Authorization: Bearer <token>`. Spec
+//! `§REST-API-Spec.Auth` verlangt token-authentifizierte Reads — kein
+//! anonymer Pfad. Token kommt aus dem Pilot-MQTT-Provisioning
+//! (`provision.rs::ProvisionResponse.password`) oder einer separaten
+//! Recorder-Konfiguration. Bei `None` wird kein Auth-Header gesendet —
+//! das ist nur für Tests und gegen lokale Mocks; gegen den echten VPS
+//! liefert das 401.
 
 use std::time::Duration;
 
@@ -123,6 +127,8 @@ pub struct NavCycle {
 pub enum NavdataError {
     #[error("airport {0} not in active cycle")]
     NotFound(String),
+    #[error("Pilot-Token missing or invalid (HTTP 401/403)")]
+    Unauthorized,
     #[error("VPS unreachable: {0}")]
     Network(String),
     #[error("VPS error {status}: {body}")]
@@ -156,19 +162,33 @@ fn airport_url(base: &str, icao: &str) -> String {
 /// Fetch one airport's navdata. Returns `NavdataError::NotFound` for
 /// HTTP 404 (= small airport not in the cycle) so the caller can fall
 /// back to OurAirports without treating it as a network failure.
+/// HTTP 401/403 land in `NavdataError::Unauthorized` so the caller can
+/// log a clear "Pilot-Token missing/invalid" hint.
+///
+/// `auth_token` is the Pilot-Bearer-Token from the MQTT-provisioning
+/// response. Pass `None` only in tests against local mocks — the real
+/// VPS rejects unauthenticated reads with 401.
 pub async fn get_airport(
     icao: &str,
     base: Option<&str>,
+    auth_token: Option<&str>,
 ) -> std::result::Result<NavAirport, NavdataError> {
     let base = base.unwrap_or(DEFAULT_NAVDATA_BASE);
     let url = airport_url(base, icao);
     let client = build_client().map_err(|e| NavdataError::Network(e.to_string()))?;
 
-    let response = client.get(&url).send().await?;
+    let mut req = client.get(&url);
+    if let Some(token) = auth_token {
+        req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    let response = req.send().await?;
     let status = response.status();
 
     if status.as_u16() == 404 {
         return Err(NavdataError::NotFound(icao.to_uppercase()));
+    }
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        return Err(NavdataError::Unauthorized);
     }
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
@@ -189,13 +209,23 @@ pub async fn get_airport(
 /// Fetch the currently-active cycle metadata. Used by the Activity-Log
 /// to surface "Navdata AIRAC 2604 geladen". Failures are silent —
 /// the cycle string is informational, not load-bearing.
-pub async fn get_cycle(base: Option<&str>) -> std::result::Result<NavCycle, NavdataError> {
+pub async fn get_cycle(
+    base: Option<&str>,
+    auth_token: Option<&str>,
+) -> std::result::Result<NavCycle, NavdataError> {
     let base = base.unwrap_or(DEFAULT_NAVDATA_BASE);
     let url = format!("{}/api/navdata/cycle", base.trim_end_matches('/'));
     let client = build_client().map_err(|e| NavdataError::Network(e.to_string()))?;
 
-    let response = client.get(&url).send().await?;
+    let mut req = client.get(&url);
+    if let Some(token) = auth_token {
+        req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    let response = req.send().await?;
     let status = response.status();
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        return Err(NavdataError::Unauthorized);
+    }
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
         return Err(NavdataError::Server {

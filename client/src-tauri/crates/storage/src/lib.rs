@@ -484,6 +484,11 @@ pub struct LandingRecord {
     /// 1-indexed third of the runway the touchdown lies in (1/2/3).
     #[serde(default)]
     pub td_third: Option<u8>,
+    /// F3 TDZ-Marker-Länge in Metern (≤ 900, ≤ length/3). UI braucht
+    /// den Wert um die TDZ-Box im RunwayDiagram zu rendern ohne die
+    /// `min(900, length/3)`-Logik im Frontend zu duplizieren.
+    #[serde(default)]
+    pub td_tdz_length_m: Option<f64>,
     /// F4 Aim-Point delta in meters (positive = past aim, negative = short).
     #[serde(default)]
     pub aim_delta_m: Option<f64>,
@@ -491,6 +496,10 @@ pub struct LandingRecord {
     /// "past_aim" | "long_landing" | "severe".
     #[serde(default)]
     pub aim_class: Option<String>,
+    /// F4 Aim-Point-Distanz in Metern (300 m für kurze Bahnen, 400 m
+    /// für lange ≥ 2400 m / 7874 ft). UI rendert daraus den Aim-Marker.
+    #[serde(default)]
+    pub aim_point_m: Option<f64>,
     /// F5 actual TCH measured at threshold-crossing (AGL ft). Captured
     /// by the streamer-tick from the 50 Hz buffer when available.
     #[serde(default)]

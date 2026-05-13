@@ -21,6 +21,13 @@
 //! All distances internal to this module are **meters from the
 //! landing threshold along the centerline** — same sign convention as
 //! `runway::lookup_runway` (positive = past threshold).
+//!
+//! Slice A only stages the pure functions + tests. Slice B wires them
+//! into the streamer-tick + `record_landing_for_filed_flight`. Until
+//! then the items here have no production caller — `#[allow(dead_code)]`
+//! is intentional and **must be removed when Slice B lands** so any
+//! later regression (unwired feature) shows up as a warning again.
+#![allow(dead_code)]
 
 /// FAA AIM aim-point switchover: at or above this length, the standard
 /// aim-point shifts from 300 m to 400 m past the threshold.
