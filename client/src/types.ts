@@ -425,6 +425,23 @@ export interface ActiveFlightInfo {
   sim_zfw_kg: number | null;
   /** Aktuelles Total-Weight (kg) — entspricht TOW während Boarding. */
   sim_tow_kg: number | null;
+
+  // ─── v0.7.19 GAF-707 Accident-Detection ──────────────────────────
+  // (QS-R1 Finding 3): UI muss schon waehrend des aktiven Flugs
+  // sehen ob ein Accident gelatcht wurde — damit der Flight-End-
+  // Dialog die "War das ein Absturz?"-Frage stellen kann statt
+  // den PIREP blind zu filen. Spec §AeroACARS Client Tab "Landung"
+  // + §Active Flight / Flight End.
+  /** True bei Confirmed Accident. Auch Suspected kann den Dialog
+   *  triggern (siehe accident_confidence). */
+  accident_detected?: boolean;
+  /** "sim_crash" | "impact" | "off_airport_impact" */
+  accident_kind?: string | null;
+  /** "high" (Confirmed) | "medium" (Suspected) */
+  accident_confidence?: string | null;
+  accident_reasons?: string[];
+  /** ISO-8601 UTC */
+  accident_at?: string | null;
 }
 
 /** Mirrors the Rust-side `ReleaseNotes` struct. Returned by the

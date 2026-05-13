@@ -22,6 +22,19 @@
       "no_nearest_title": "Atterraggio off-airport senza aeroporto vicino",
       "no_nearest_body": "Touchdown a {{nm}} nmi dalla destinazione pianificata. Nessun aeroporto entro 25 nmi."
     },
+    "accident": {
+      "primary_label": "INCIDENTE RILEVATO",
+      "confirmed_title": "Incidente rilevato",
+      "confirmed_body": "AeroACARS ha classificato questo touchdown come incidente. Non conta come atterraggio normale. Score 0 qui significa 'incidente', non 'atterraggio molto duro'.",
+      "suspected_title": "Possibile incidente — revisione consigliata",
+      "suspected_body": "Gli indicatori suggeriscono un incidente, ma non tutte le soglie 'confermate' sono state superate. Il pilota conferma o annulla la classificazione nel dialogo di filing.",
+      "kind_label": "Tipo",
+      "kind": {
+        "sim_crash": "Evento crash del simulatore",
+        "impact": "Impatto duro",
+        "off_airport_impact": "Impatto fuori pista"
+      }
+    },
     "history": "Ultimi atterraggi",
     "live_preview": "Anteprima live (volo attivo)",
     "preview": "Anteprima",
@@ -836,6 +849,17 @@
     "cancel_filed_instead": "✓ Il volo è stato inviato invece di scartato — PIREP {{pirep_id}}",
     "cancel_queued": "⏳ Invio in coda — sarà inviato automaticamente quando la connessione torna. PIREP {{pirep_id}}",
     "cancel_blocked": "phpVMS rifiuta le tue richieste — account sospeso o inattivo. Contatta l'admin VA, poi riprova.",
+    "accident": {
+      "confirm_title": "Era un incidente?",
+      "suspected_title": "Possibile incidente rilevato — cosa fare?",
+      "confirm_body": "AeroACARS ha rilevato forti indicatori di un incidente:\n\n{{reasons}}\n\nSe corretto, il volo viene archiviato come incidente/revisione con score 0. Altrimenti puoi archiviarlo come atterraggio duro.",
+      "file_as_accident": "Sì, archivia come incidente",
+      "other_action": "Altra azione…",
+      "other_title": "Come archiviare il volo?",
+      "other_body": "Stai annullando la classificazione. Sicuro che fosse un atterraggio duro (non un incidente)? L'override viene registrato nelle note del PIREP.",
+      "file_as_hard": "Archivia come atterraggio duro",
+      "back_or_cancel": "Indietro (o annulla il volo)"
+    },
     "confirm_cancel_after_file_failed_title": "Filing fallito — annullare comunque?",
     "confirm_cancel_after_file_failed_body": "Il tentativo di auto-filing non è riuscito:\n\n{{reason}}\n\nPuoi correggere il problema e ritentare il filing, oppure annullare esplicitamente il PIREP ora. L'annullamento elimina il PIREP — la rotta volata andrà persa.",
     "forget": "Dimentica localmente",

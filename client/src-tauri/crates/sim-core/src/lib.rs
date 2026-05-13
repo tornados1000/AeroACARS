@@ -71,6 +71,21 @@ pub struct SimSnapshot {
     // Forces & flags
     pub g_force: f32,
     pub on_ground: bool,
+    /// v0.7.19 (Accident-Detection): Adapter-Snapshot-Flag, true wenn
+    /// der Sim ein hartes Crash-Signal liefert. MSFS setzt das aus dem
+    /// `Crashed` System-Event (gelatcht im Adapter-Shared-State).
+    /// X-Plane setzt es in v0.7.19 nicht (= immer false; gemeinsame
+    /// Heuristik greift dort statt Sim-Event). `CrashReset` darf den
+    /// Adapter-Flag fuer neue Snapshots loeschen — der aktive Flug
+    /// behaelt seinen Accident-Latch unabhaengig davon bis Flight-End/
+    /// Cleanup. Spec docs/spec/v0.7.19-gaf707-crash-accident-detection.md.
+    #[serde(default)]
+    pub crashed: bool,
+    /// v0.7.19: Welcher Pfad hat den `crashed`-Flag gesetzt? Werte:
+    /// "msfs_crashed_event" | "xplane_crash_dataref" | "heuristic" |
+    /// `None` wenn `crashed=false`.
+    #[serde(default)]
+    pub crash_source: Option<String>,
     /// v0.4.4: X-Plane only — Normal force on the landing gear (N).
     /// 0 in the air, spikes the moment a wheel touches the runway.
     /// Used by the touchdown sampler for sub-frame-accurate edge
@@ -447,6 +462,8 @@ impl Default for SimSnapshot {
             aircraft_wind_z_kt: None,
             g_force: 1.0,
             on_ground: true,
+            crashed: false,
+            crash_source: None,
             gear_normal_force_n: None,
             parking_brake: true,
             stall_warning: false,

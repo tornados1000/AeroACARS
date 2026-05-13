@@ -1258,6 +1258,13 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
         aircraft_wind_z_kt: Some(t.aircraft_wind_z_kt as f32),
         g_force: t.g_force as f32,
         on_ground: t.on_ground,
+        // v0.7.19: crashed/crash_source kommen NICHT aus dem Telemetry-
+        // Tick sondern aus dem SimConnect-System-Event `Crashed`. Der
+        // Adapter latcht das in seinem Shared-State und der Caller
+        // (build_snapshot in adapter.rs) mergt den Wert ein. Telemetry-
+        // Default ist false/None — wird ggf. ueberschrieben.
+        crashed: false,
+        crash_source: None,
         // MSFS-Adapter liefert keinen Gear-Normal-Force-Wert; das
         // X-Plane-Pendant (sampler-side touchdown edge) ist hier
         // nicht aktiv — MSFS hat eh den separaten

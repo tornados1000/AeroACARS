@@ -53,8 +53,106 @@ export function ActiveFlightPanel({ info, simSnapshot, onEnded }: Props) {
 
   if (!info) return null;
 
+  /**
+   * v0.7.19 GAF-707 (QS-R1 Finding 3): wenn der aktive Flug einen
+   * Accident-Latch hat, MUSS vor dem File-Versuch der Pilot bestaetigen
+   * oder widersprechen. Spec §Active Flight / Flight End "War das ein
+   * Absturz?". Drei Auswahlmoeglichkeiten plus Zurueck:
+   *
+   *   1. "Ja, Unfall einreichen"         → flight_end ohne Override.
+   *   2. "Nein, als harte Landung filen" → flight_end mit
+   *      accident_decision="as_hard_landing". Backend clearet den
+   *      Accident-Latch und filed regulaer; Notes enthalten den
+   *      Override-Eintrag fuer die VA-Admin-Spur.
+   *   3. "Flug verwerfen & Cleanup"      → flight_cancel mit force=true.
+   *   4. "Zurueck"                       → kein State-Change.
+   */
+  function isAccidentDetected(): boolean {
+    if (!info) return false;
+    return info.accident_detected === true
+      || info.accident_confidence === "medium";
+  }
+
+  async function handleEndConfirmed(decision: "as_accident" | "as_hard_landing" | null) {
+    setBusy("end");
+    setError(null);
+    try {
+      const payload = decision ? { accident_decision: decision } : undefined;
+      await invoke("flight_end", payload);
+      onEnded?.();
+    } catch (err: unknown) {
+      const e = err as {
+        code?: string;
+        message?: string;
+        details?: { missing?: string[] };
+      };
+      if (e?.code === "flight_validation_failed") {
+        setValidationMissing(e.details?.missing ?? []);
+      } else {
+        const msg =
+          typeof err === "object" && err !== null && "message" in err
+            ? String((err as { message: string }).message)
+            : String(err);
+        setError(msg);
+      }
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function handleEnd() {
     if (busy) return;
+
+    // v0.7.19 GAF-707 (QS-R1 Finding 3): bei aktivem Accident-Latch erst
+    // den 4-Optionen-Dialog zeigen, sonst direkt filen wie bisher.
+    if (isAccidentDetected()) {
+      const isConfirmed = info?.accident_detected === true;
+      // Schritt 1: "War das wirklich ein Absturz?" (oder fuer suspected:
+      // "Moeglicher Absturz erkannt — wie filen?")
+      const reasonsText = (info?.accident_reasons ?? []).join("\n");
+      const yes = await confirm({
+        title: isConfirmed
+          ? t("active_flight.accident.confirm_title")
+          : t("active_flight.accident.suspected_title"),
+        message: t("active_flight.accident.confirm_body", {
+          reasons: reasonsText || "—",
+        }),
+        confirmLabel: t("active_flight.accident.file_as_accident"),
+        cancelLabel: t("active_flight.accident.other_action"),
+        destructive: true,
+      });
+      if (yes) {
+        await handleEndConfirmed("as_accident");
+        return;
+      }
+
+      // Schritt 2: "Andere Aktion" → was genau?
+      const fileAsHard = await confirm({
+        title: t("active_flight.accident.other_title"),
+        message: t("active_flight.accident.other_body"),
+        confirmLabel: t("active_flight.accident.file_as_hard"),
+        cancelLabel: t("active_flight.accident.back_or_cancel"),
+      });
+      if (fileAsHard) {
+        await handleEndConfirmed("as_hard_landing");
+        return;
+      }
+
+      // Schritt 3: Pilot hat "Zurueck oder Cancel" gewaehlt — den
+      // bestehenden Cancel-Flow anbieten.
+      const reallyCancel = await confirm({
+        title: t("active_flight.confirm_cancel_force_title"),
+        message: t("active_flight.confirm_cancel_force_body"),
+        confirmLabel: t("active_flight.confirm_cancel_force_yes"),
+        cancelLabel: t("active_flight.confirm_cancel_force_back"),
+        destructive: true,
+      });
+      if (reallyCancel) {
+        await invokeCancelOrForce(true);
+      }
+      return;
+    }
+
     setBusy("end");
     setError(null);
     try {

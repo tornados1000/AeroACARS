@@ -20,6 +20,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const QUEUE_FILE: &str = "position_queue.json";
+/// v0.7.19 GAF-707: persistente Cleanup-Queue fuer den Fall
+/// "FILED ok, delete_bid hat transient gefailed". Spec §Pending Bid
+/// Cleanup Queue. Eintrag wird durch den Background-Worker mit
+/// `delete_bid(bid_id, flight_id)` retried; erfolgreich → loeschen.
+const PENDING_BID_CLEANUP_FILE: &str = "pending_bid_cleanup.json";
 /// Cap on retained queued positions. Past this point the oldest are
 /// dropped — a multi-hour outage isn't worth blocking forever or
 /// blowing up the file. ~1000 rows ≈ 3 h of cruise-cadence (30 s) or
@@ -428,6 +433,34 @@ pub struct LandingRecord {
     /// / "negative_float_distance"
     #[serde(default)]
     pub runway_geometry_reason: Option<String>,
+
+    // ─── v0.7.19 GAF-707 Accident-Detection ───────────────────────────
+    //
+    // Spec docs/spec/v0.7.19-gaf707-crash-accident-detection.md. Alle
+    // Felder `#[serde(default)]` damit pre-v0.7.19-Records weiter laden.
+    // `landing-scoring` bleibt unangetastet — Score-Werte oben sind
+    // orthogonal zur Accident-Klassifikation.
+    /// True wenn der Touchdown als Accident klassifiziert wurde (Confirmed
+    /// per Spec). Suspected wird hier NICHT als true gespeichert — die
+    /// Frontend-Logik liest `accident_confidence` fuer die Banner-Variante.
+    #[serde(default)]
+    pub accident: bool,
+    /// "sim_crash" | "impact" | "off_airport_impact". None wenn kein Accident.
+    #[serde(default)]
+    pub accident_kind: Option<String>,
+    /// "high" | "medium". `high` = Confirmed, `medium` = Suspected.
+    /// None wenn kein Accident-/Verdachts-Signal.
+    #[serde(default)]
+    pub accident_confidence: Option<String>,
+    /// Begruendungs-Strings (free-form, lesbar fuer Notes/UI), z. B.
+    /// `["vs_at_edge_fpm=-2249.9", "peak_g_load=4.41", "no_runway_match"]`.
+    #[serde(default)]
+    pub accident_reasons: Vec<String>,
+    /// Wann der Accident detektiert wurde. Bei Sim-Event-Pfad kann das
+    /// mehrere Sekunden vor `touchdown_at` liegen (mid-air Crash). Bei
+    /// Heuristik-Pfad gleich `touchdown_at`. None wenn kein Accident.
+    #[serde(default)]
+    pub accident_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// v0.7.1: Stability-Gate-Window-Metadaten (Spec §5.4).
@@ -472,6 +505,132 @@ pub struct ApproachSample {
 /// File-backed JSON store of past landings.
 pub struct LandingStore {
     path: PathBuf,
+}
+
+// ---------------------------------------------------------------------------
+// v0.7.19 GAF-707: Pending bid cleanup queue
+// ---------------------------------------------------------------------------
+//
+// Hintergrund (Spec §Pending Bid Cleanup Queue): wenn `file_pirep`
+// erfolgreich war, `delete_bid` danach aber wegen Netzwerk/5xx/Timeout
+// scheitert, darf der Pilot nicht mit einem filed PIREP und haengendem
+// Bid zurueckbleiben — sonst sieht phpVMS das Aircraft weiterhin als
+// reserviert. Diese Queue persistiert solche Faelle und der
+// Background-Worker (in lib.rs) retried `delete_bid` im naechsten
+// passenden Moment.
+
+/// Ein einzelner pending Cleanup-Eintrag. Persistiert als JSON.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingBidCleanup {
+    /// PIREP der schon erfolgreich geFILED wurde — nur fuer Log/Diagnose,
+    /// der Worker macht KEIN cancel_pirep darauf.
+    pub pirep_id: String,
+    /// Numerischer Bid-Identifier (wenn phpVMS einen liefert).
+    #[serde(default)]
+    pub bid_id: Option<i64>,
+    /// String-Flight-ID — Fallback fuer VAs ohne separates bid_id-Feld.
+    #[serde(default)]
+    pub flight_id: Option<String>,
+    /// Warum landete der Eintrag in der Queue. "accident_filed" |
+    /// "hard_landing_override" | "normal_filed" | spaeter ggf. weitere.
+    pub reason: String,
+    /// Erstellungs-Zeitpunkt.
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Letzter Retry-Zeitpunkt (zum Throttling).
+    #[serde(default)]
+    pub last_attempt_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Anzahl bisheriger Retries.
+    #[serde(default)]
+    pub attempts: u32,
+}
+
+/// File-backed Cleanup-Queue. Klein (in der Praxis selten >1 Eintrag),
+/// keine Cap-Logik — Background-Worker raeumt selber wenn `delete_bid`
+/// erfolgreich war.
+pub struct PendingBidCleanupQueue {
+    path: PathBuf,
+}
+
+impl PendingBidCleanupQueue {
+    pub fn open(app_data_dir: impl AsRef<Path>) -> Result<Self, StorageError> {
+        let dir = app_data_dir.as_ref().to_path_buf();
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self {
+            path: dir.join(PENDING_BID_CLEANUP_FILE),
+        })
+    }
+
+    /// Eintrag anhaengen. Dedupliziert auf pirep_id+bid_id+flight_id —
+    /// wenn ein identischer Eintrag schon drinsteht, wird nicht
+    /// nochmal erstellt (Idempotenz).
+    pub fn enqueue(
+        &self,
+        item: PendingBidCleanup,
+    ) -> Result<usize, StorageError> {
+        let mut items = self.read_all()?;
+        let already_present = items.iter().any(|existing| {
+            existing.pirep_id == item.pirep_id
+                && existing.bid_id == item.bid_id
+                && existing.flight_id == item.flight_id
+        });
+        if !already_present {
+            items.push(item);
+            self.write_all(&items)?;
+        }
+        Ok(items.len())
+    }
+
+    pub fn read_all(&self) -> Result<Vec<PendingBidCleanup>, StorageError> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let bytes = std::fs::read(&self.path)?;
+        if bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+        match serde_json::from_slice(&bytes) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                tracing::warn!(error = %e, "pending_bid_cleanup.json unreadable — starting fresh");
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// Ersetzen aller Eintraege (= nach Retry-Pass). Leere Liste loescht
+    /// die Datei.
+    pub fn replace(
+        &self,
+        items: &[PendingBidCleanup],
+    ) -> Result<(), StorageError> {
+        if items.is_empty() {
+            if self.path.exists() {
+                let _ = std::fs::remove_file(&self.path);
+            }
+            return Ok(());
+        }
+        self.write_all(items)
+    }
+
+    /// Eintrag per pirep_id loeschen. Used vom Worker nach erfolgreichem
+    /// `delete_bid`.
+    pub fn remove(&self, pirep_id: &str) -> Result<(), StorageError> {
+        let mut items = self.read_all()?;
+        let before = items.len();
+        items.retain(|e| e.pirep_id != pirep_id);
+        if items.len() != before {
+            self.replace(&items)?;
+        }
+        Ok(())
+    }
+
+    fn write_all(&self, items: &[PendingBidCleanup]) -> Result<(), StorageError> {
+        let tmp = self.path.with_extension("json.tmp");
+        let bytes = serde_json::to_vec(items)?;
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, &self.path)?;
+        Ok(())
+    }
 }
 
 impl LandingStore {

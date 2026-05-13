@@ -1445,6 +1445,48 @@ button:disabled {
   border-left-color: var(--danger, #d33);
 }
 
+/* v0.7.19 GAF-707 — Accident-Banner als Primary-Klassifikation im
+   LandingPanel. Confirmed = roter Top-Level-Banner (vor Off-airport
+   und Score-Breakdown). Suspected = gelber Review-Banner. */
+.accident-banner {
+  margin: 16px 0;
+  padding: 14px 16px;
+  border-radius: 8px;
+  border-left: 6px solid;
+  font-size: 0.95rem;
+  line-height: 1.45;
+}
+.accident-banner__head {
+  font-weight: 800;
+  font-size: 1.05rem;
+  margin-bottom: 6px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+.accident-banner__body {
+  margin-bottom: 8px;
+}
+.accident-banner__kind {
+  font-size: 0.88rem;
+  margin-bottom: 6px;
+}
+.accident-banner__reasons {
+  margin: 4px 0 0;
+  padding-left: 1.25rem;
+  font-size: 0.82rem;
+  font-family: var(--font-mono);
+  color: var(--fg-dim, var(--text-muted));
+}
+.accident-banner--confirmed {
+  background: color-mix(in srgb, var(--danger, #d33) 18%, var(--surface));
+  border-left-color: var(--danger, #d33);
+  color: var(--text, inherit);
+}
+.accident-banner--suspected {
+  background: color-mix(in srgb, var(--warn, #f59e0b) 12%, var(--surface));
+  border-left-color: var(--warn, #f59e0b);
+}
+
 /* v0.7.18 (B-011) — Orphan-Flight-Cleanup-UI im Settings-Tab.
    Stark eingerueckt + sichtbar abgesetzt (gelbe/rote Akzente), damit
    der Pilot sofort sieht dass das ein Notnagel ist und nicht ein

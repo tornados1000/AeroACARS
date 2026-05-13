@@ -260,6 +260,12 @@ pub struct TakeoffPayload {
 #[derive(Clone, Debug, Serialize)]
 pub struct TouchdownPayload {
     pub ts: i64,
+    /// v0.7.19 (QS-R2 Finding 1): PIREP-ID damit Korrektur-Events
+    /// (TouchdownAccidentOverride) den exakten Touchdown-Row in der
+    /// Webapp-DB targeten koennen. `skip_serializing_if=None` damit
+    /// hypothetische Schema-Migrationen tolerant bleiben.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pirep_id: Option<String>,
     pub vs_fpm: i32,
     pub ias_kt: i32,
     pub gs_kt: Option<i32>,
@@ -554,6 +560,38 @@ pub struct TouchdownPayload {
     /// "icao_mismatch" / "centerline_offset_too_large" / "negative_float_distance"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runway_geometry_reason: Option<String>,
+
+    // ─── v0.7.19 GAF-707 Accident-Detection ──────────────────────────
+    //
+    // Spec docs/spec/v0.7.19-gaf707-crash-accident-detection.md.
+    //
+    // `accident_classifier_version` ist der Sentinel: v0.7.19+ setzt
+    // ihn IMMER (auch bei `accident=false`/None), damit die Webapp
+    // "Classifier lief, kein Accident" von "historischer Payload"
+    // unterscheiden kann. Pre-v0.7.19-Payloads haben das Feld nicht
+    // → Webapp/VPS klassifiziert nach.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accident_classifier_version: Option<String>,
+    /// True wenn Confirmed Accident. Suspected wird NICHT als true
+    /// gesetzt; stattdessen liefert `accident_confidence="medium"`
+    /// das Suspected-Signal. None bei pre-v0.7.19 oder unklassifiziert.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accident: Option<bool>,
+    /// "sim_crash" | "impact" | "off_airport_impact". None wenn kein
+    /// Accident.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accident_kind: Option<String>,
+    /// "high" | "medium". `high`=Confirmed, `medium`=Suspected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accident_confidence: Option<String>,
+    /// Begruendungs-Strings, free-form lesbar.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accident_reasons: Option<Vec<String>>,
+    /// Wann der Accident detektiert wurde. Sim-Event-Pfad: kann
+    /// mehrere Sekunden vor `ts` liegen (mid-air Crash). Heuristik-
+    /// Pfad: gleich `ts`. None wenn kein Accident.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accident_at: Option<i64>,
 }
 
 fn is_false(b: &bool) -> bool { !*b }
@@ -714,6 +752,31 @@ pub struct PirepPayload {
     /// - "negative_float_distance"   — < -100 m
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runway_geometry_reason: Option<String>,
+
+    // ─── v0.7.19 GAF-707 Accident-Detection ──────────────────────────
+    //
+    // Spec docs/spec/v0.7.19-gaf707-crash-accident-detection.md §PIREP-
+    // Payload. Webapp-PIREP-Feed muss auf PIREP-Ebene erkennen koennen
+    // ob ein Flug als Accident eingestuft wurde — sonst kann die VPS-
+    // History nur die einzelnen Touchdowns markieren, der PIREP-Eintrag
+    // bleibt aber unauffaellig. Das ist genau der Worst-Case bei Multi-
+    // Touchdown-Fluegen (T&G + finaler Crash).
+    //
+    // `accident_classifier_version` (Sentinel) wird IMMER gesetzt — auch
+    // wenn kein Accident erkannt wurde. Webapp unterscheidet damit
+    // "Classifier lief, false" von "historischer Payload".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accident_classifier_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accident: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accident_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accident_confidence: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accident_reasons: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accident_at: Option<i64>,
 }
 
 /// Default fuer pre-v0.7.0 PIREPs ohne den marker. Wird von serde
@@ -722,6 +785,39 @@ pub struct PirepPayload {
 #[allow(dead_code)]
 fn default_forensics_version_v1() -> u8 { 1 }
 
+/// v0.7.19 GAF-707 (QS-R2 Finding 1): Korrektur-Event fuer den Fall
+/// dass ein Touchdown bereits als Accident gepublisht und in der
+/// Webapp-DB persistiert wurde, der Pilot aber im Flight-End-Dialog
+/// "Nein, als harte Landung filen" gewaehlt hat. Ohne diesen Event
+/// blieb der Touchdown-Row server-seitig weiter `accident=true`,
+/// obwohl der PIREP regulaer rausging — die Webapp-History haette
+/// "Accident" gezeigt, der phpVMS-PIREP "harte Landung". Spec
+/// §AeroACARS Client Tab "Landung" + QS-R2 Finding 1.
+///
+/// Recorder mappt `decision` zu einem DB-UPDATE auf den Touchdown
+/// (matched per `pirep_id` — Webapp arbeitet pro PIREP mit dem
+/// Worst-Case-Touchdown).
+///   - "as_hard_landing" → accident=false + accident_kind=null +
+///     accident_confidence=null + accident_reasons enthaelt nur den
+///     pilot_override-Eintrag.
+///   - "as_accident"     → unveraendert (expliziter "ja, Unfall"-
+///     Klick; nur fuer Audit).
+#[derive(Clone, Debug, Serialize)]
+pub struct TouchdownAccidentOverridePayload {
+    pub ts: i64,
+    pub pirep_id: String,
+    pub decision: String, // "as_hard_landing" | "as_accident"
+    pub accident: bool,
+    pub accident_kind: Option<String>,
+    pub accident_confidence: Option<String>,
+    pub accident_reasons: Vec<String>,
+    /// Original-Klassifikations-Stand vor dem Override (Audit-Trail).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_confidence: Option<String>,
+}
+
 enum Cmd {
     Position(Box<PositionPayload>),
     Phase(PhasePayload),
@@ -729,6 +825,7 @@ enum Cmd {
     Takeoff(Box<TakeoffPayload>),
     Touchdown(Box<TouchdownPayload>),
     Pirep(Box<PirepPayload>),
+    TouchdownAccidentOverride(Box<TouchdownAccidentOverridePayload>),
     Shutdown,
 }
 
@@ -884,6 +981,26 @@ impl Handle {
         });
     }
 
+    /// v0.7.19 GAF-707 (QS-R2 Finding 1): Korrektur-Publish nach Pilot-
+    /// Override im Flight-End-Dialog. Recorder/VPS aktualisiert den
+    /// bereits persistierten Touchdown-Row entsprechend.
+    pub fn touchdown_accident_override(
+        &self,
+        payload: TouchdownAccidentOverridePayload,
+    ) {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = tokio::time::timeout(
+                Duration::from_millis(500),
+                tx.send(Cmd::TouchdownAccidentOverride(Box::new(payload))),
+            )
+            .await
+            {
+                warn!("dropping touchdown_accident_override publish: {e}");
+            }
+        });
+    }
+
     pub fn shutdown(&self) {
         let _ = self.tx.try_send(Cmd::Shutdown);
     }
@@ -1009,6 +1126,13 @@ pub fn start(cfg: MqttConfig) -> Result<Handle> {
                 Cmd::Takeoff(p) => publish_json(&pub_client, &cfg_for_pub.topic("takeoff"), &p, QoS::AtLeastOnce, true).await,
                 Cmd::Touchdown(p) => publish_json(&pub_client, &cfg_for_pub.topic("touchdown"), &p, QoS::AtLeastOnce, false).await,
                 Cmd::Pirep(p) => publish_json(&pub_client, &cfg_for_pub.topic("pirep"), &p, QoS::AtLeastOnce, false).await,
+                Cmd::TouchdownAccidentOverride(p) => publish_json(
+                    &pub_client,
+                    &cfg_for_pub.topic("touchdown_accident_override"),
+                    &p,
+                    QoS::AtLeastOnce,
+                    false,
+                ).await,
                 Cmd::Shutdown => {
                     let _ = pub_client
                         .publish(cfg_for_pub.topic("status"), QoS::AtLeastOnce, true, STATUS_OFFLINE.as_bytes())

@@ -749,6 +749,11 @@ impl XPlaneState {
             aircraft_wind_z_kt: Some(self.wind_z_ms * KT_PER_MS),
             g_force: self.g_force,
             on_ground: self.on_ground,
+            // v0.7.19: X-Plane setzt `crashed` in v0.7.19 NICHT (kein
+            // verifizierter Crash-DataRef). Die gemeinsame Heuristik
+            // greift bei harten Aufschlaegen. Spec §Leitentscheidung 3.
+            crashed: false,
+            crash_source: None,
             gear_normal_force_n: Some(self.gear_normal_force_n),
             parking_brake: self.parking_brake_ratio > 0.5,
             stall_warning: self.stall_warning,

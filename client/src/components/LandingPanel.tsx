@@ -167,6 +167,23 @@ export interface LandingRecord {
   /// "no_runway_match" / "icao_mismatch" / "centerline_offset_too_large"
   /// / "negative_float_distance"
   runway_geometry_reason?: string | null;
+
+  // ─── v0.7.19 GAF-707 Accident-Detection ──────────────────────────
+  // Spec docs/spec/v0.7.19-gaf707-crash-accident-detection.md.
+  // Alle Felder optional — pre-v0.7.19 LandingRecords haben sie nicht.
+  /// True wenn Confirmed Accident. Suspected wird hier nicht als
+  /// true gespeichert; die Suspected-Variante laeuft ueber
+  /// `accident_confidence === "medium"` ohne `accident=true`.
+  accident?: boolean;
+  /// "sim_crash" | "impact" | "off_airport_impact"
+  accident_kind?: string | null;
+  /// "high" (Confirmed) | "medium" (Suspected)
+  accident_confidence?: string | null;
+  /// Begruendungs-Strings, free-form lesbar.
+  accident_reasons?: string[];
+  /// ISO-8601 UTC — wann der Accident detektiert wurde. Bei Sim-Event-
+  /// Pfad kann das mehrere Sekunden vor `touchdown_at` liegen.
+  accident_at?: string | null;
 }
 
 /// v0.7.1: Stability-Gate-Window-Metadaten (Spec §5.4).
@@ -1142,6 +1159,90 @@ function CoachTip({ subs }: { subs: SubScore[] }) {
 //
 // Match-Resolution mit icao == arr_airport rendert keinen Banner (= normaler Flug).
 
+/**
+ * v0.7.19 GAF-707 Accident-Detection — Banner als Primary-Klassifikation.
+ *
+ * Spec docs/spec/v0.7.19-gaf707-crash-accident-detection.md §AeroACARS
+ * Client Tab "Landung". GAF 707 darf hier NICHT als normale Hard-
+ * Landing/Bone-Rattler erscheinen.
+ *
+ * - `accident === true` (Confirmed): roter Top-Level-Banner "ABSTURZ
+ *   ERKANNT" mit Gruenden-Liste.
+ * - `accident_confidence === "medium"` ohne accident=true (Suspected):
+ *   gelber Review-Hinweis-Banner.
+ * - Sonst: kein Banner.
+ */
+function AccidentBanner({ record }: { record: LandingRecord }) {
+  const { t } = useTranslation();
+
+  const isConfirmed = record.accident === true;
+  const isSuspected =
+    !isConfirmed && record.accident_confidence === "medium";
+
+  if (!isConfirmed && !isSuspected) {
+    return null;
+  }
+
+  const kindLabel = (() => {
+    switch (record.accident_kind) {
+      case "sim_crash":
+        return t("landing.accident.kind.sim_crash");
+      case "impact":
+        return t("landing.accident.kind.impact");
+      case "off_airport_impact":
+        return t("landing.accident.kind.off_airport_impact");
+      default:
+        return null;
+    }
+  })();
+
+  const reasons = record.accident_reasons ?? [];
+
+  if (isConfirmed) {
+    return (
+      <div className="accident-banner accident-banner--confirmed" role="alert">
+        <div className="accident-banner__head">
+          ⚠ {t("landing.accident.confirmed_title")}
+        </div>
+        <div className="accident-banner__body">
+          {t("landing.accident.confirmed_body")}
+        </div>
+        {kindLabel && (
+          <div className="accident-banner__kind">
+            <strong>{t("landing.accident.kind_label")}:</strong> {kindLabel}
+          </div>
+        )}
+        {reasons.length > 0 && (
+          <ul className="accident-banner__reasons">
+            {reasons.map((r) => (
+              <li key={r}>{r}</li>
+            ))}
+          </ul>
+        )}
+      </div>
+    );
+  }
+
+  // Suspected
+  return (
+    <div className="accident-banner accident-banner--suspected" role="alert">
+      <div className="accident-banner__head">
+        ⚠ {t("landing.accident.suspected_title")}
+      </div>
+      <div className="accident-banner__body">
+        {t("landing.accident.suspected_body")}
+      </div>
+      {reasons.length > 0 && (
+        <ul className="accident-banner__reasons">
+          {reasons.map((r) => (
+            <li key={r}>{r}</li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 function OffAirportBanner({ record }: { record: LandingRecord }) {
   const { t } = useTranslation();
 
@@ -1516,7 +1617,15 @@ function LandingDetail({
             {callsign} · {record.dpt_airport} → {record.arr_airport}
           </h2>
           <div className="landing-headline__sub">
-            {record.score_label.toUpperCase()} · {record.score_numeric}/100 ·{" "}
+            {/* v0.7.19 GAF-707: bei Confirmed Accident wird die Primary-
+                Klassifikation auf "ABSTURZ ERKANNT" ueberschrieben. Score
+                bleibt sichtbar (0/100), bekommt aber die Bedeutung
+                "Accident" statt "normale schwere Landung". Spec §AeroACARS
+                Client Tab "Landung". */}
+            {record.accident === true
+              ? t("landing.accident.primary_label")
+              : record.score_label.toUpperCase()}
+            {" "}· {record.score_numeric}/100 ·{" "}
             {fmtDateTime(record.touchdown_at)}
             {isPreview && (
               <span className="landing-preview-badge">{t("landing.preview")}</span>
@@ -1554,6 +1663,12 @@ function LandingDetail({
           </div>
         </div>
       </div>
+
+      {/* v0.7.19 GAF-707 Accident-Detection: rot/gelber Banner als
+          Primary-Klassifikation OBERHALB von Off-Airport + Score-
+          Breakdown. GAF 707 darf hier nicht als normale Hard-Landing
+          erscheinen. Spec §AeroACARS Client Tab "Landung". */}
+      <AccidentBanner record={record} />
 
       {/* v0.7.18 (B-012): Off-airport-Banner wenn der Touchdown nicht
           beim geplanten Destination-Airport war. Quelle ist die

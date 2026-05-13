@@ -22,6 +22,19 @@
       "no_nearest_title": "Off-airport touchdown ohne nahegelegenen Flughafen",
       "no_nearest_body": "Touchdown {{nm}} nmi von der geplanten Destination entfernt. Kein Flughafen innerhalb 25 nmi."
     },
+    "accident": {
+      "primary_label": "ABSTURZ ERKANNT",
+      "confirmed_title": "Absturz erkannt",
+      "confirmed_body": "AeroACARS hat diesen Touchdown als Unfall klassifiziert. Diese Landung gilt nicht als normale, geflogene Landung. Score 0 bedeutet hier „Accident“, nicht „sehr harte Landung“.",
+      "suspected_title": "Möglicher Absturz — Review empfohlen",
+      "suspected_body": "Indizien deuten auf einen Unfall hin, aber die Schwellen für eine bestätigte Klassifikation sind nicht alle erreicht. Der Pilot bestätigt oder verwirft die Einordnung im Filing-Dialog.",
+      "kind_label": "Art",
+      "kind": {
+        "sim_crash": "Simulator-Crash-Event",
+        "impact": "Harter Aufschlag",
+        "off_airport_impact": "Aufschlag abseits der Runway"
+      }
+    },
     "history": "Letzte Landungen",
     "live_preview": "Live-Vorschau (aktiver Flug)",
     "preview": "Vorschau",
@@ -835,6 +848,17 @@
     "cancel_filed_instead": "✓ Statt verworfen wurde der Flug ordentlich eingereicht — PIREP {{pirep_id}}",
     "cancel_queued": "⏳ Auto-File wartet in der Queue — wird automatisch eingereicht sobald die Verbindung wieder steht. PIREP {{pirep_id}}",
     "cancel_blocked": "phpVMS lehnt deine Anfragen ab — Account gesperrt oder inaktiv. Bitte VA-Admin kontaktieren, dann erneut versuchen.",
+    "accident": {
+      "confirm_title": "War das ein Absturz?",
+      "suspected_title": "Möglicher Absturz erkannt — was tun?",
+      "confirm_body": "AeroACARS hat starke Hinweise auf einen Unfall erkannt:\n\n{{reasons}}\n\nWenn das stimmt, wird der Flug als Unfall/Review mit Score 0 eingereicht. Wenn nicht, kannst du ihn als harte Landung weiter einreichen.",
+      "file_as_accident": "Ja, als Unfall einreichen",
+      "other_action": "Andere Aktion…",
+      "other_title": "Wie soll der Flug eingereicht werden?",
+      "other_body": "Du widersprichst der Klassifikation. Sicher, dass das eine harte Landung war (kein Unfall)? Der Override wird in den PIREP-Notes vermerkt.",
+      "file_as_hard": "Als harte Landung einreichen",
+      "back_or_cancel": "Zurück (oder Flug verwerfen)"
+    },
     "confirm_cancel_after_file_failed_title": "Filen ist fehlgeschlagen — trotzdem verwerfen?",
     "confirm_cancel_after_file_failed_body": "Der Auto-File-Versuch hat nicht funktioniert:\n\n{{reason}}\n\nDu kannst den Fehler beheben und erneut filen, oder den PIREP jetzt explizit verwerfen. Verwerfen löscht den PIREP — die geflogene Strecke ist dann verloren.",
     "forget": "Lokal vergessen",
