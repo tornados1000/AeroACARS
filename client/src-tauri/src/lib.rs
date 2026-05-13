@@ -5904,7 +5904,11 @@ fn flight_info(flight: &ActiveFlight) -> ActiveFlightInfo {
         takeoff_at: stats.takeoff_at.map(|t| t.to_rfc3339()),
         landing_at: stats.landing_at.map(|t| t.to_rfc3339()),
         block_on_at: stats.block_on_at.map(|t| t.to_rfc3339()),
-        landing_rate_fpm: stats.landing_rate_fpm,
+        // v0.7.21 (MS713-QS): canonical_landing_rate_fpm() statt
+        // direkt — sonst zeigt das Active-Flight-Panel (vor + waehrend
+        // Filing) den Streamer-Tick-Snapshot, der Tab "Landung" aber
+        // den Engineering-Edge.
+        landing_rate_fpm: stats.canonical_landing_rate_fpm(),
         landing_g_force: stats.landing_g_force,
         was_just_resumed,
         dep_gate: stats.dep_gate.clone(),
@@ -8145,14 +8149,22 @@ pub fn ofp_matches_active_flight(
     candidates.contains(&simbrief_norm)
 }
 
-/// v0.7.17 (B-015a QS-Fix): Single-Source-of-Truth fuer den Score-V/S.
+/// v0.7.21 (Nachhaltiger Fix, GAF/MS713-QS): kanonischer V/S-fpm-Wert.
 ///
-/// QS-Round-1 Befund: Frontend `scoreBasisVs()` priorisierte bereits
-/// `vs_at_edge_fpm`, aber die im Record GESPEICHERTEN sub_scores wurden
-/// im Backend mit `landing_peak_vs_fpm.or(landing_rate_fpm)` gebaut —
-/// ohne den Edge-Wert. Bei `ux_version >= 1` zeigt der Frontend die
-/// gespeicherten Werte direkt (nicht den scoreBasisVs-Pfad), also war
-/// die Korrektur dort wirkungslos.
+/// Hintergrund: drei verschiedene Felder im `FlightStats` haben einen
+/// V/S-Anteil (`landing_rate_fpm`, `landing_peak_vs_fpm`,
+/// `landing_analysis["vs_at_edge_fpm"]`). Vor v0.7.21 wurden je nach
+/// Code-Stelle unterschiedliche Felder direkt referenziert — Resultat:
+/// phpVMS sah einen anderen Wert als Pilot-Client/Webapp/Discord-Bot.
+/// v0.7.17 B-015a hatte einen `score_basis_vs_fpm(&stats)`-Helper
+/// eingefuehrt, aber dessen Anwendung war an einigen Stellen vergessen
+/// worden (FileBody.landing_rate ging direkt auf `landing_rate_fpm`).
+///
+/// Ab v0.7.21: JEDE Anzeige-/Filing-/Publish-Stelle MUSS
+/// `stats.canonical_landing_rate_fpm()` aufrufen statt einzelne Felder
+/// direkt zu lesen. Der freistehende `score_basis_vs_fpm()`-Helper
+/// bleibt als duenner Shim erhalten (delegiert hierhin), damit
+/// bestehender Code nicht broken bricht.
 ///
 /// Cascade-Reihenfolge (matched `scoreBasisVs()` im TS-Frontend):
 ///   1. `vs_at_edge_fpm` aus `stats.landing_analysis` (50-Hz-Buffer-
@@ -8160,19 +8172,34 @@ pub fn ofp_matches_active_flight(
 ///   2. `stats.landing_peak_vs_fpm` (Touchdown-Window-Peak, Streamer-
 ///      Tick-Cadence)
 ///   3. `stats.landing_rate_fpm` (Streamer-Tick-Snapshot am TD-Frame)
-fn score_basis_vs_fpm(stats: &FlightStats) -> Option<f32> {
-    if let Some(edge) = stats
-        .landing_analysis
-        .as_ref()
-        .and_then(|v| v.get("vs_at_edge_fpm"))
-        .and_then(|v| v.as_f64())
-    {
-        let edge_f32 = edge as f32;
-        if edge_f32 < 0.0 {
-            return Some(edge_f32);
+impl FlightStats {
+    /// SSoT fuer den V/S-Wert in fpm den Pilot/PIREP/MQTT/phpVMS sehen.
+    /// Direkter Zugriff auf `stats.landing_rate_fpm` /
+    /// `stats.landing_peak_vs_fpm` ist in Anzeige-/Filing-Pfaden ein
+    /// Bug — siehe MS713-QS-Befund 2026-05-13.
+    pub fn canonical_landing_rate_fpm(&self) -> Option<f32> {
+        if let Some(edge) = self
+            .landing_analysis
+            .as_ref()
+            .and_then(|v| v.get("vs_at_edge_fpm"))
+            .and_then(|v| v.as_f64())
+        {
+            let edge_f32 = edge as f32;
+            if edge_f32 < 0.0 {
+                return Some(edge_f32);
+            }
         }
+        self.landing_peak_vs_fpm.or(self.landing_rate_fpm)
     }
-    stats.landing_peak_vs_fpm.or(stats.landing_rate_fpm)
+}
+
+/// v0.7.17 → v0.7.21 Shim: leitet auf `FlightStats::canonical_landing_
+/// rate_fpm()` um. Neue Anzeige-Pfade sollen direkt die Methode auf
+/// `FlightStats` aufrufen — dieser freistehende Helper wird beim
+/// naechsten Major-Bump entfernt.
+#[inline]
+fn score_basis_vs_fpm(stats: &FlightStats) -> Option<f32> {
+    stats.canonical_landing_rate_fpm()
 }
 
 /// v0.7.18 (B-012) — Resolution-Source.
@@ -8478,7 +8505,11 @@ where
     F: Fn(&str) -> Option<(f64, f64)>,
 {
     let touchdown_at = stats.landing_at?;
-    let landing_rate_fpm = stats.landing_rate_fpm?;
+    // v0.7.21 (MS713-QS): SSoT-Methode statt direkten Feld-Zugriff.
+    // Damit der LandingRecord (= was im Pilot-Client Tab Landung
+    // angezeigt wird) UND der Webapp-Live-Map den IDENTISCHEN Edge-Wert
+    // sehen — nicht den Streamer-Tick-Snapshot.
+    let landing_rate_fpm = stats.canonical_landing_rate_fpm()?;
     let touchdown_class = stats.landing_score?;
     // v0.7.1 P1.3-Fix + Round-2 P2-Fix: score_numeric UND score_label
     // beide aus dem Aggregate-Score, damit sie semantisch zueinander
@@ -9654,9 +9685,17 @@ async fn flight_end(
             rounded.max(0)
         });
         // Native landing rate field — same value as the custom field
-        // but on the native column phpVMS shows on the PIREP
-        // overview.
-        let landing_rate = stats.landing_rate_fpm.map(|v| v as f64);
+        // but on the native column phpVMS shows on the PIREP overview.
+        //
+        // v0.7.21 (MS713-QS): MUSS `canonical_landing_rate_fpm()` sein,
+        // sonst kriegt phpVMS den Streamer-Tick-Snapshot statt des
+        // Engineering-Edge-Wertes. Vorher: -204 (0.5s-Mittel via
+        // landing_rate_fpm), seit Fix: -194 (vs_at_edge_fpm). Diese
+        // Zeile war die letzte uebersehene Stelle aus dem v0.7.17
+        // B-015a-Sweep.
+        let landing_rate = stats
+            .canonical_landing_rate_fpm()
+            .map(|v| v as f64);
         // v0.7.1 P1 (Round-2 Review): phpVMS bekommt jetzt den
         // GLEICHEN gewichteten Aggregate-Score wie App/Web/MQTT
         // (siehe build_landing_record P1.3-Fix). Vorher landete der
@@ -10620,9 +10659,10 @@ async fn flight_end_manual(
                 rounded.max(0)
             })
         });
+        // v0.7.21 (MS713-QS): canonical_landing_rate_fpm() statt direkt.
         let landing_rate = landing_rate_fpm
             .map(|v| v as f64)
-            .or_else(|| stats.landing_rate_fpm.map(|v| v as f64));
+            .or_else(|| stats.canonical_landing_rate_fpm().map(|v| v as f64));
         let score = stats.landing_score.map(|s| s.numeric());
         let resolved_distance = distance_nm
             .filter(|d| *d > 0.0)
@@ -16683,7 +16723,10 @@ fn build_pirep_fields(
             format!("{} ({}) — {}/100", grade, label, numeric),
         );
     }
-    if let Some(rate) = stats.landing_rate_fpm {
+    // v0.7.21 (MS713-QS): canonical_landing_rate_fpm() — sonst zeigt
+    // das PIREP-Custom-Feld "Landing Rate" einen anderen Wert als das
+    // Live-Touchdown und der Pilot-Client.
+    if let Some(rate) = stats.canonical_landing_rate_fpm() {
         // SIGNED — negative on descent. Matches both LandingToast and
         // the latched SimVar reading. Pilots want to see the minus.
         // The peak (post-touchdown refinement) overrides this when
@@ -17073,7 +17116,8 @@ fn build_pirep_notes(flight: &ActiveFlight, stats: &FlightStats) -> String {
     if stats.landing_at.is_some() {
         start_section(&mut s, "TOUCHDOWN");
         wrote_section = true;
-        if let Some(rate) = stats.landing_rate_fpm {
+        // v0.7.21 (MS713-QS): canonical_landing_rate_fpm() statt direkt.
+        if let Some(rate) = stats.canonical_landing_rate_fpm() {
             let _ = writeln!(s, "  Landing rate  {:.0} fpm", rate);
         }
         if let Some(g) = stats.landing_g_force {
@@ -20554,6 +20598,130 @@ mod final_landing_push_condition_tests {
         // Wenn der gleiche Touchdown schon mal gepusht wurde, kein
         // zweiter Push im selben Tick oder Folge-Tick.
         assert!(!should_push(false, t(100), Some(t(100)), Some(t(100))));
+    }
+}
+
+// ----------------------------------------------------------------------
+// v0.7.21 SSoT-Konsistenz fuer canonical_landing_rate_fpm.
+//
+// Anchor-Case: MS713 (HECA→OLBA, B738, X-Plane 12, 13.5.2026). Pilot-
+// Client zeigte -194 (Engineering-Edge), Webapp Live-Touchdown zeigte
+// -194, Discord-Bot zeigte -194 — ABER phpVMS PIREP zeigte -204/-205
+// (Streamer-Tick-Snapshot via FileBody.landing_rate, das einzige
+// vergessene Stueck aus dem v0.7.17 B-015a-Sweep).
+//
+// Ab v0.7.21 ist `FlightStats::canonical_landing_rate_fpm()` die
+// einzige Quelle fuer Anzeige/Filing. Diese Tests halten die Cascade
+// fest, damit niemand mehr stillschweigend eine neue Anzeige-Stelle
+// einbauen kann die direkt `stats.landing_rate_fpm` liest.
+// ----------------------------------------------------------------------
+#[cfg(test)]
+mod canonical_landing_rate_fpm_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn ms713_live_stats() -> FlightStats {
+        // Echte Werte aus der VPS-DB fuer MS713 touchdown id 134:
+        //   vs_at_edge_fpm: -194.057
+        //   vs_smoothed_500ms_fpm: -204.7
+        //   landing_rate_fpm: -204 (streamer-tick snapshot)
+        //   landing_peak_vs_fpm: -204 (touchdown-window peak)
+        let mut stats = FlightStats::default();
+        stats.landing_rate_fpm = Some(-204.69882);
+        stats.landing_peak_vs_fpm = Some(-204.69882);
+        stats.landing_analysis = Some(json!({
+            "vs_at_edge_fpm": -194.057,
+            "vs_smoothed_500ms_fpm": -204.7,
+        }));
+        stats
+    }
+
+    #[test]
+    fn ms713_canonical_returns_edge_value_not_streamer_tick() {
+        // Der Bug-Anchor: vor v0.7.21 lieferten manche Stellen -204
+        // (Streamer-Tick), andere -194 (Edge). canonical MUSS jetzt
+        // ueberall -194 sein.
+        let stats = ms713_live_stats();
+        let v = stats.canonical_landing_rate_fpm().expect("some");
+        assert!(
+            (v - (-194.057)).abs() < 0.001,
+            "expected Engineering-Edge -194.057, got {v}",
+        );
+    }
+
+    #[test]
+    fn ms713_round_to_int_matches_pilot_client_display() {
+        // Das ist der Wert der bei phpVMS als "Landungsrate" landen
+        // soll, und derselbe den der Pilot-Client Tab "Landung" zeigt.
+        let stats = ms713_live_stats();
+        let rounded = stats
+            .canonical_landing_rate_fpm()
+            .map(|v| v.round() as i32);
+        assert_eq!(rounded, Some(-194));
+    }
+
+    #[test]
+    fn shim_score_basis_vs_fpm_delegates_to_canonical() {
+        // Der alte freistehende `score_basis_vs_fpm()` ist ab v0.7.21
+        // nur noch ein Shim auf die Methode. Beide muessen IMMER
+        // dasselbe liefern.
+        let stats = ms713_live_stats();
+        assert_eq!(
+            score_basis_vs_fpm(&stats),
+            stats.canonical_landing_rate_fpm()
+        );
+    }
+
+    #[test]
+    fn no_edge_falls_back_to_peak_then_rate() {
+        // Ohne 50-Hz-Buffer-Dump (= GSG219-Fall): Cascade soll auf
+        // landing_peak_vs_fpm fallen.
+        let mut stats = FlightStats::default();
+        stats.landing_rate_fpm = Some(-300.0);
+        stats.landing_peak_vs_fpm = Some(-450.0);
+        stats.landing_analysis = None;
+        assert_eq!(stats.canonical_landing_rate_fpm(), Some(-450.0));
+
+        // Ohne Peak: auf landing_rate_fpm.
+        let mut stats = FlightStats::default();
+        stats.landing_rate_fpm = Some(-300.0);
+        stats.landing_peak_vs_fpm = None;
+        stats.landing_analysis = None;
+        assert_eq!(stats.canonical_landing_rate_fpm(), Some(-300.0));
+    }
+
+    #[test]
+    fn positive_edge_value_is_ignored_falls_to_cascade() {
+        // Defensiver Guard: edge < 0.0 ist Pflicht (negative = Sinken).
+        // Ein positiver Edge waere ein Sim-Bug → wir nehmen den nicht.
+        let mut stats = FlightStats::default();
+        stats.landing_rate_fpm = Some(-200.0);
+        stats.landing_peak_vs_fpm = Some(-180.0);
+        stats.landing_analysis = Some(json!({
+            "vs_at_edge_fpm": 42.0, // bogus positive
+        }));
+        // Edge wird verworfen → Peak gewinnt.
+        assert_eq!(stats.canonical_landing_rate_fpm(), Some(-180.0));
+    }
+
+    #[test]
+    fn none_when_nothing_set() {
+        let stats = FlightStats::default();
+        assert_eq!(stats.canonical_landing_rate_fpm(), None);
+    }
+
+    #[test]
+    fn b005_anchor_smooth_with_high_g_spike() {
+        // v0.7.17 B-009-Anchor: -116 fpm aber 2.30 G — vor dem Fix
+        // wurde der spurious Edge nicht erkannt. canonical MUSS hier
+        // den Edge liefern, NICHT den Peak.
+        let mut stats = FlightStats::default();
+        stats.landing_rate_fpm = Some(-116.0);
+        stats.landing_peak_vs_fpm = Some(-200.0); // sim strut spike
+        stats.landing_analysis = Some(json!({
+            "vs_at_edge_fpm": -116.0,
+        }));
+        assert_eq!(stats.canonical_landing_rate_fpm(), Some(-116.0));
     }
 }
 
