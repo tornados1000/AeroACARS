@@ -206,6 +206,65 @@ pub async fn get_airport(
         .map_err(|e| NavdataError::BadResponse(format!("parse NavAirport: {e}")))
 }
 
+/// One VPS-managed aircraft-type-alias mapping (one Bid-ICAO to one
+/// substring the sim might report). v0.8.0 Erweiterung — bisher waren
+/// Aliases hardcoded in `runway::aircraft_aliases`; jetzt kann der
+/// VA-Admin pro VPS-Setup zusätzliche Mappings pflegen ohne Pilot-
+/// Client-Release.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AircraftAliasEntry {
+    pub icao: String,
+    pub aliases: Vec<AircraftAliasSingle>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AircraftAliasSingle {
+    pub alias: String,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AircraftAliasesResponse {
+    aliases: Vec<AircraftAliasEntry>,
+}
+
+/// Fetch the VPS-managed aircraft-type-aliases. Pilot-Client merged
+/// das Ergebnis additive zur hardcoded Tabelle in `runway::aircraft_
+/// aliases`. Bei VPS-Outage bleibt nur die hardcoded Liste aktiv.
+pub async fn get_aircraft_aliases(
+    base: Option<&str>,
+    auth_token: Option<&str>,
+) -> std::result::Result<Vec<AircraftAliasEntry>, NavdataError> {
+    let base = base.unwrap_or(DEFAULT_NAVDATA_BASE);
+    let url = format!("{}/api/aircraft-aliases", base.trim_end_matches('/'));
+    let client = build_client().map_err(|e| NavdataError::Network(e.to_string()))?;
+
+    let mut req = client.get(&url);
+    if let Some(token) = auth_token {
+        req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    let response = req.send().await?;
+    let status = response.status();
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        return Err(NavdataError::Unauthorized);
+    }
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(NavdataError::Server {
+            status: status.as_u16(),
+            body: body.chars().take(200).collect(),
+        });
+    }
+    let body = response
+        .text()
+        .await
+        .map_err(|e| NavdataError::BadResponse(format!("read body: {e}")))?;
+    let parsed = serde_json::from_str::<AircraftAliasesResponse>(&body)
+        .map_err(|e| NavdataError::BadResponse(format!("parse aliases: {e}")))?;
+    Ok(parsed.aliases)
+}
+
 /// Fetch the currently-active cycle metadata. Used by the Activity-Log
 /// to surface "Navdata AIRAC 2604 geladen". Failures are silent —
 /// the cycle string is informational, not load-bearing.

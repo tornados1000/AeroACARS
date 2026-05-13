@@ -409,16 +409,39 @@ fn clean_atc_model(raw: &str) -> Option<String> {
 /// counts as a match. Without this, a pilot on a real GSG flight
 /// (Emirates UAE770 EK770, A359 bid, A350-900 sim) got blocked
 /// with "Aircraft mismatch" even though it's the same aircraft.
+/// Test-/Compatibility-Wrapper ohne VPS-Override. Production-Code
+/// nutzt `title_mentions_icao_with_extra` direkt mit dem AppState-
+/// Cache.
+#[cfg(test)]
 fn title_mentions_icao(title: &str, icao: &str) -> bool {
+    title_mentions_icao_with_extra(title, icao, &HashMap::new())
+}
+
+/// v0.8.0: title-substring-Check mit VPS-Alias-Override. Long-form
+/// strings aus dem Sim ("mg hjet ha420 [Preset Default]") werden
+/// gegen die hardcoded + VPS-Alias-Liste auf substring-Match geprüft.
+fn title_mentions_icao_with_extra(
+    title: &str,
+    icao: &str,
+    vps_aliases: &HashMap<String, Vec<String>>,
+) -> bool {
     let title_upper = title.to_uppercase();
     let icao_upper = icao.to_uppercase();
     if title_upper.contains(&icao_upper) {
         return true;
     }
-    // Long-form aliases. If any alias is in the title, accept.
-    aircraft_aliases(&icao_upper)
+    if aircraft_aliases(&icao_upper)
         .iter()
         .any(|alias| title_upper.contains(alias))
+    {
+        return true;
+    }
+    if let Some(extra) = vps_aliases.get(&icao_upper) {
+        if extra.iter().any(|alias| title_upper.contains(alias.as_str())) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Bidirectional alias table for aircraft type identification.
@@ -569,18 +592,47 @@ fn aircraft_aliases(code: &str) -> &'static [&'static str] {
 /// same airframe? Tries both directions: are `actual`'s long-form
 /// aliases mentioned by `expected`? And are `expected`'s aliases
 /// mentioned by `actual`? Plus strict equality fallback.
+/// Test-/Compatibility-Wrapper ohne VPS-Override.
+#[cfg(test)]
 fn aircraft_types_match(expected: &str, actual: &str) -> bool {
+    aircraft_types_match_with_extra(expected, actual, &HashMap::new())
+}
+
+/// v0.8.0: alias-aware comparison with VPS-managed override-table
+/// merged on top of the hardcoded `aircraft_aliases()`. The
+/// `vps_aliases` map is the result of fetching
+/// `/api/aircraft-aliases` from the recorder; key = bid-ICAO
+/// uppercase, value = list of additional alias substrings the sim
+/// might report. VPS aliases are ADDITIVE — a hardcoded mismatch
+/// (e.g. an A330 family) is never relaxed by an empty VPS table.
+fn aircraft_types_match_with_extra(
+    expected: &str,
+    actual: &str,
+    vps_aliases: &HashMap<String, Vec<String>>,
+) -> bool {
     let exp = expected.to_uppercase();
     let act = actual.to_uppercase();
     if exp == act {
         return true;
     }
     // Either side might be the short ICAO form, the other the
-    // long marketing form. Check both directions.
+    // long marketing form. Check both directions against the
+    // hardcoded table first (= offline-safe baseline).
     if aircraft_aliases(&exp).iter().any(|alias| act.contains(alias))
         || aircraft_aliases(&act).iter().any(|alias| exp.contains(alias))
     {
         return true;
+    }
+    // VPS-pflegbare Overrides — additive zur hardcoded Tabelle.
+    if let Some(extra) = vps_aliases.get(&exp) {
+        if extra.iter().any(|alias| act.contains(alias.as_str())) {
+            return true;
+        }
+    }
+    if let Some(extra) = vps_aliases.get(&act) {
+        if extra.iter().any(|alias| exp.contains(alias.as_str())) {
+            return true;
+        }
     }
     false
 }
@@ -643,6 +695,15 @@ struct AppState {
     /// In-process airport-coords cache. Keyed by ICAO uppercase. Populated on
     /// first lookup so we don't re-fetch on every snapshot tick.
     airports: Mutex<HashMap<String, Airport>>,
+    /// v0.8.0 — VPS-managed aircraft-type-aliases. Pulled once per
+    /// app-start (and refreshed on each flight_start, so a freshly-
+    /// added alias takes effect at the next Flight without app-restart).
+    /// Merged additively with the hardcoded `aircraft_aliases` table —
+    /// VPS-Liste wins on conflict (= VA-Admin kann fehlerhaft hardcoded
+    /// Aliases übersteuern). Empty when VPS unreachable or pre-fetch
+    /// not yet completed.
+    /// HashMap<bid-ICAO uppercase, Vec<alias substring uppercase>>.
+    aircraft_aliases_vps: Mutex<HashMap<String, Vec<String>>>,
     /// Auto-start watcher state. When true, a background task polls
     /// `current_snapshot()` and the user's bids; if the aircraft is
     /// parked at one of the bid's departure airports AND the loaded
@@ -951,6 +1012,19 @@ async fn fetch_navdata_for_flight(
         return;
     }
 
+    // v0.8.0: parallel den Aircraft-Aliases-Fetch starten. Damit ist
+    // der AppState-Cache spätestens am Touchdown-Edge warm — und ein
+    // frisch vom VA-Admin im Webapp-Tab hinzugefügter Alias greift
+    // beim nächsten Flight ohne Pilot-Client-Restart.
+    let aliases_handle = {
+        let app_aliases = app.clone();
+        let base_aliases = base_override.clone();
+        let token_aliases = auth_token.clone();
+        tokio::spawn(async move {
+            fetch_aircraft_aliases_into_state(app_aliases, base_aliases, token_aliases).await;
+        })
+    };
+
     let mut handles = Vec::with_capacity(wanted.len());
     for icao in wanted {
         let base = base_override.clone();
@@ -1004,6 +1078,11 @@ async fn fetch_navdata_for_flight(
         }
     }
 
+    // Wait for the aliases-fetch to settle so any debug-logs are
+    // ordered before the Activity-Log line below. Join errors are
+    // harmless — the cache stays empty and the hardcoded table covers.
+    let _ = aliases_handle.await;
+
     // Surface the final state in the Activity-Log so the pilot sees
     // which source backs the runway assessment for this flight.
     let (cycle, loaded): (Option<String>, Vec<String>) = {
@@ -1030,6 +1109,56 @@ async fn fetch_navdata_for_flight(
             "Navdata: OurAirports-Fallback aktiv (VPS nicht erreichbar)".to_string(),
             None,
         );
+    }
+}
+
+/// v0.8.0: Lädt die VPS-managed Aircraft-Aliases und schreibt sie in
+/// `AppState.aircraft_aliases_vps`. Best-effort — bei Netzwerk-Fehlern
+/// bleibt nur die hardcoded `aircraft_aliases`-Tabelle aktiv. Wird
+/// neben dem navdata-Fetch beim flight_start aufgerufen damit ein
+/// frisch im VPS-Admin-Tab hinzugefügter Alias beim nächsten Flight
+/// greift ohne App-Restart.
+async fn fetch_aircraft_aliases_into_state(
+    app: AppHandle,
+    base_override: Option<String>,
+    auth_token: Option<String>,
+) {
+    let res = aeroacars_mqtt::navdata::get_aircraft_aliases(
+        base_override.as_deref(),
+        auth_token.as_deref(),
+    )
+    .await;
+    match res {
+        Ok(list) => {
+            let state = app.state::<AppState>();
+            let mut cache = state
+                .aircraft_aliases_vps
+                .lock()
+                .expect("aircraft_aliases_vps lock");
+            cache.clear();
+            for entry in list {
+                let icao_up = entry.icao.trim().to_uppercase();
+                let aliases: Vec<String> = entry
+                    .aliases
+                    .into_iter()
+                    .map(|a| a.alias.trim().to_uppercase())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !aliases.is_empty() {
+                    cache.insert(icao_up, aliases);
+                }
+            }
+            tracing::info!(
+                count = cache.len(),
+                "aircraft_aliases: VPS-Liste geladen"
+            );
+        }
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "aircraft_aliases: VPS-Fetch fehlgeschlagen, nur hardcoded Tabelle aktiv"
+            );
+        }
     }
 }
 
@@ -6677,12 +6806,22 @@ async fn flight_start(
         .unwrap_or("")
         .to_string();
     if let (Some(expected), Some(actual)) = (expected_icao.as_ref(), sim_icao.as_ref()) {
-        let title_supports_expected = title_mentions_icao(&sim_title, expected);
+        // v0.8.0: VPS-Aliases-Snapshot fuer alias-aware compare —
+        // erlaubt VA-Admin pro Recorder neue Bid↔Sim-Alias-Paare zu
+        // pflegen ohne Pilot-Client-Release.
+        let vps_aliases = state
+            .aircraft_aliases_vps
+            .lock()
+            .expect("aircraft_aliases_vps lock")
+            .clone();
+        let title_supports_expected =
+            title_mentions_icao_with_extra(&sim_title, expected, &vps_aliases);
         // Use alias-aware comparison so e.g. "A359" (ICAO) matches
         // "A350-900" (sim long-form). See `aircraft_types_match`.
         // Live bug 2026-05-04: Emirates UAE770 A359 bid blocked
         // because sim loaded "A350-900 (No Cabin)" — same aircraft.
-        let types_match_loose = aircraft_types_match(expected, actual);
+        let types_match_loose =
+            aircraft_types_match_with_extra(expected, actual, &vps_aliases);
         if !types_match_loose && !title_supports_expected {
             let registration = expected_aircraft
                 .registration
@@ -7581,8 +7720,15 @@ async fn flight_start_manual(
     // Frontend ein gelbes Banner mit "Trotzdem starten"-Button zeigt.
     // Beim zweiten Versuch mit acknowledge=true wird der Check übersprungen.
     if let (Some(expected), Some(actual)) = (expected_icao.as_ref(), sim_icao.as_ref()) {
-        let title_supports_expected = title_mentions_icao(&sim_title, expected);
-        let types_match_loose = aircraft_types_match(expected, actual);
+        let vps_aliases = state
+            .aircraft_aliases_vps
+            .lock()
+            .expect("aircraft_aliases_vps lock")
+            .clone();
+        let title_supports_expected =
+            title_mentions_icao_with_extra(&sim_title, expected, &vps_aliases);
+        let types_match_loose =
+            aircraft_types_match_with_extra(expected, actual, &vps_aliases);
         if !types_match_loose && !title_supports_expected {
             if !plan.acknowledge_aircraft_mismatch {
                 let registration = expected_aircraft
@@ -22075,6 +22221,37 @@ mod aircraft_alias_tests {
         assert!(!aircraft_types_match("HDJT", "C25A"));   // CitationJet
         assert!(!aircraft_types_match("HDJT", "E50P"));   // Phenom 100
         assert!(!aircraft_types_match("HDJT", "TBM9"));   // TBM 930
+    }
+
+    /// v0.8.0: VPS-managed alias-overrides werden additiv zur hardcoded
+    /// Tabelle akzeptiert. Demonstration: ein VA-Admin fügt im Webapp-
+    /// Tab "wenn TBM9 erwartet, akzeptiere TBM-930" hinzu.
+    #[test]
+    fn vps_aliases_extend_hardcoded_table() {
+        use super::{aircraft_types_match_with_extra, title_mentions_icao_with_extra};
+        let mut vps: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        // Hardcoded hat keinen TBM-Alias — VA-Admin pflegt:
+        vps.insert(
+            "TBM9".to_string(),
+            vec!["TBM-930".to_string(), "TBM930".to_string()],
+        );
+        assert!(aircraft_types_match_with_extra("TBM9", "TBM-930", &vps));
+        assert!(aircraft_types_match_with_extra("TBM9", "TBM930", &vps));
+        // Bidirektional (act ist die ICAO-Form, exp die Long-Form):
+        assert!(aircraft_types_match_with_extra("TBM-930", "TBM9", &vps));
+        // Title-Substring-Match: Sim-Title enthält den VPS-Alias.
+        assert!(title_mentions_icao_with_extra(
+            "Asobo TBM-930 [v1]",
+            "TBM9",
+            &vps,
+        ));
+        // Negativ-Sanity — anderes Aircraft matched nicht.
+        assert!(!aircraft_types_match_with_extra("TBM9", "B738", &vps));
+        // Wenn die VPS-Map leer ist, ist das Verhalten identisch zur
+        // hardcoded-only-Variante:
+        let empty = std::collections::HashMap::new();
+        assert!(!aircraft_types_match_with_extra("TBM9", "TBM-930", &empty));
     }
 
     // ─── v0.7.3 Cargo-Aliases (Spec §4 HOHE-Prio Arbeitsliste) ──────
