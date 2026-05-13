@@ -7,6 +7,7 @@ import type { Theme } from "../theme";
 import { SimDebugPanel } from "./SimDebugPanel";
 import { PmdgPremiumPanel } from "./PmdgPremiumPanel";
 import { XPlanePremiumPanel } from "./XPlanePremiumPanel";
+import { OrphanFlightsPanel } from "./OrphanFlightsPanel";
 import { useConfirm } from "./ConfirmDialog";
 
 const ALL_KINDS: SimKind[] = [
@@ -439,6 +440,12 @@ export function SettingsPanel({
           </div>
         )}
       </div>
+
+      {/* v0.7.18 (B-011) — Orphan-Flight-Cleanup. Eigener Bereich unten
+          im Settings-Tab, weil das eine selten gebrauchte Notnagel-
+          Funktion ist und nicht im Cockpit-Tab gehoert (der ist fuer
+          den aktiven Flug). */}
+      <OrphanFlightsPanel />
     </section>
   );
 }

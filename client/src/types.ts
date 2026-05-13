@@ -519,3 +519,25 @@ export interface XPlanePremiumStatus {
    *  while the listener is healthy. */
   last_error: string | null;
 }
+
+/** v0.7.18 (B-011): Verwaister PIREP auf phpVMS — Pilot kann ihn
+ *  über das Settings-Tab cancellen + Bid droppen + Aircraft freigeben.
+ *  Spec docs/spec/v0.7.18-orphan-flight-cleanup.md §B-011. */
+export interface OrphanFlight {
+  pirep_id: string;
+  bid_id: number | null;
+  /** phpVMS flight_id (alphanumerisch, "flightid_1"). Wird für den
+   *  flight_id-Body-Fallback beim Bid-Drop benötigt. */
+  flight_id: string | null;
+  flight_number: string | null;
+  airline_id: number | null;
+  dpt_airport: string | null;
+  arr_airport: string | null;
+  aircraft_id: number | null;
+  aircraft_icao: string | null;
+  aircraft_registration: string | null;
+  /** ISO-8601 UTC timestamp aus phpVMS created_at. */
+  started_at: string | null;
+  /** Minuten seit started_at, vom Backend berechnet. */
+  age_minutes: number | null;
+}

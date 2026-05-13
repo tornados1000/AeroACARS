@@ -898,6 +898,27 @@ pub struct PirepSummary {
     pub dpt_airport_id: Option<String>,
     #[serde(default)]
     pub arr_airport_id: Option<String>,
+    // v0.7.18 (B-011): Felder fuer den Orphan-Cleanup-Pfad. phpVMS liefert
+    // diese je nach Version + VA-Plugin-Config nicht garantiert mit, daher
+    // alle Option + serde(default). Spec docs/spec/v0.7.18-orphan-flight-
+    // cleanup.md §B-011 Datenpfad-Hinweis (Option 1: Schema erweitern und
+    // schauen was kommt; bei Bedarf via Fleet-Lookup nachreichen).
+    //
+    // v0.7.18 (R1-3): `flight_id` über `de_opt_str_or_int` deserialisieren —
+    // phpVMS liefert je nach Installation als String ("flightid_1") ODER
+    // als Zahl (numeric flight_id). Ohne den Deserializer würde
+    // get_user_pireps() bei einem einzigen numeric-flight_id-PIREP komplett
+    // failen.
+    #[serde(default, deserialize_with = "de_opt_str_or_int")]
+    pub flight_id: Option<String>,
+    #[serde(default)]
+    pub aircraft_icao: Option<String>,
+    #[serde(default)]
+    pub aircraft_registration: Option<String>,
+    /// `created_at` aus phpVMS PirepResource — ISO-8601 String. Wird
+    /// vom Frontend zu „vor X h Y min" konvertiert.
+    #[serde(default)]
+    pub created_at: Option<String>,
 }
 
 /// v0.5.33: Subfleet mit nested Aircraft-Liste, wie phpVMS-V7
@@ -1134,20 +1155,29 @@ impl Client {
         Ok(())
     }
 
-    /// `DELETE /api/user/bids/{bid_id}` — drop a bid after its PIREP was filed
-    /// (or to give it back). phpVMS does NOT auto-consume bids when the PIREP
-    /// is filed unless we explicitly remove them.
+    /// `DELETE /api/user/bids` — drop a bid after its PIREP was filed
+    /// (or to give it back). phpVMS does NOT auto-consume bids when the
+    /// PIREP is filed unless we explicitly remove them.
     ///
-    /// Some phpVMS deployments (or their reverse proxies / security
-    /// middleware) silently block the DELETE method and return HTTP
-    /// 405 "Method Not Allowed". Standard Laravel workaround: send
-    /// a POST with the `_method=DELETE` form override so Laravel's
-    /// router dispatches the same controller action. We try DELETE
-    /// first (the proper way) and fall back to the override on a
-    /// 405 — this lets us work on the maximum number of phpVMS
-    /// installs without forcing the VA admin to reconfigure their
-    /// server.
-    pub async fn delete_bid(&self, bid_id: i64) -> Result<(), ApiError> {
+    /// phpVMS routes ALL bid CRUD through `/api/user/bids` (kein `{id}` im
+    /// Pfad). Die ID reist im JSON-Body als `{ "bid_id": ... }` ODER
+    /// `{ "flight_id": ... }`. v0.7.18 (B-011) erlaubt beide Eingaben.
+    ///
+    /// **Body-Auswahl-Reihenfolge** (siehe Spec §B-011 Backend-API):
+    ///   - `bid_id` Some → erster Versuch `{ bid_id }`.
+    ///     Bei 422/400 UND `flight_id` Some → zweiter Versuch
+    ///     `{ flight_id }`.
+    ///   - `bid_id` None, `flight_id` Some → direkt `{ flight_id }`.
+    ///   - beide None → `ApiError::InvalidUrl` (Caller-Bug).
+    ///
+    /// Aus Spec-§B-011 Decision: **kein 405-Fallback hier** (anders als bei
+    /// `cancel_pirep`). Wenn ein VA-Install POST mit `_method=DELETE`
+    /// braucht, machen wir das als separate Aufgabe nach v0.7.18.
+    pub async fn delete_bid(
+        &self,
+        bid_id: Option<i64>,
+        flight_id: Option<&str>,
+    ) -> Result<(), ApiError> {
         // phpVMS routes ALL bid CRUD through `/api/user/bids` — there
         // is NO `/api/user/bids/{id}` or `/api/bids/{id}` route, despite
         // what previous reverse-engineering of vmsACARS' binary
@@ -1162,29 +1192,93 @@ impl Client {
         //             $bid = Bid::findOrFail($request->input('bid_id'));
         //             ...
         //             $this->bidSvc->removeBid($flight, $user);
+        //         } elseif ($request->filled('flight_id')) {
+        //             ...
         //         }
         //     }
         //
-        // → bid_id travels in the request body. JSON is fine because
-        // Laravel's `$request->input(...)` reads from JSON body, form
-        // body, AND query string transparently.
+        // → entweder `bid_id` ODER `flight_id` reisen im Body. JSON ist
+        // fine weil Laravel's `$request->input(...)` JSON-Body / Form-
+        // Body / Query-String transparent liest.
+        //
+        // v0.7.18 (B-011): Signatur akzeptiert beide IDs als Option.
+        // Aufruf-Logik:
+        //   - bid_id Some → erster Versuch `{ bid_id }`. Bei 400/404/422
+        //     UND flight_id Some → zweiter Versuch `{ flight_id }`.
+        //   - bid_id None, flight_id Some → direkt `{ flight_id }`.
+        //   - beide None → InvalidUrl-Error (Caller-Bug).
+        //
+        // v0.7.18 (R2-2): 404 in den Fallback aufgenommen. Wenn die VA
+        // den bid_id-Wert serverseitig schon nicht mehr kennt (verwaister
+        // PIREP, Bid wurde manuell gedroppt etc.), liefert phpVMS 404 statt
+        // 422. Der flight_id-Pfad ist dann der einzige Weg den Bid zu
+        // droppen — genau der Orphan-Cleanup-Fall den B-011 fixt.
+        //
+        // Manche VAs liefern in `PirepSummary` kein `bid_id`, dann ist
+        // der flight_id-Pfad der einzige Weg den Bid serverseitig zu
+        // droppen.
         let path = "/api/user/bids";
-        let url = self.endpoint(path)?;
+
         #[derive(serde::Serialize)]
-        struct Body {
+        struct BidIdBody {
             bid_id: i64,
         }
-        let response = self
-            .http
-            .delete(url)
-            .header("X-API-Key", &self.conn.api_key)
-            .header(header::ACCEPT, "application/json")
-            .json(&Body { bid_id })
-            .send()
-            .await
-            .map_err(ApiError::from)?;
-        let _ = check_status(response, path).await?;
-        Ok(())
+        #[derive(serde::Serialize)]
+        struct FlightIdBody<'a> {
+            flight_id: &'a str,
+        }
+
+        // Versuch 1: bid_id wenn vorhanden.
+        if let Some(bid_id) = bid_id {
+            let url = self.endpoint(path)?;
+            let response = self
+                .http
+                .delete(url)
+                .header("X-API-Key", &self.conn.api_key)
+                .header(header::ACCEPT, "application/json")
+                .json(&BidIdBody { bid_id })
+                .send()
+                .await
+                .map_err(ApiError::from)?;
+            let status = response.status();
+            // Bei 400/404/422 (Validation-Fehler oder „bid nicht gefunden"
+            // vom phpVMS-Plugin) und wenn ein flight_id-Fallback verfuegbar
+            // ist: Versuch 2. Bei allen anderen Status-Codes (inkl. 2xx)
+            // durch check_status laufen lassen.
+            if matches!(status.as_u16(), 400 | 404 | 422) && flight_id.is_some() {
+                tracing::info!(
+                    bid_id,
+                    status = status.as_u16(),
+                    "delete_bid: bid_id-Body abgelehnt, versuche flight_id-Fallback"
+                );
+                // Body verbrauchen damit kein Connection-Reuse-Glitch
+                let _ = response.text().await;
+            } else {
+                let _ = check_status(response, path).await?;
+                return Ok(());
+            }
+        }
+
+        // Versuch 2 (oder direkt wenn bid_id=None): flight_id-Body.
+        if let Some(flight_id) = flight_id {
+            let url = self.endpoint(path)?;
+            let response = self
+                .http
+                .delete(url)
+                .header("X-API-Key", &self.conn.api_key)
+                .header(header::ACCEPT, "application/json")
+                .json(&FlightIdBody { flight_id })
+                .send()
+                .await
+                .map_err(ApiError::from)?;
+            let _ = check_status(response, path).await?;
+            return Ok(());
+        }
+
+        // Beide None → Caller-Bug.
+        Err(ApiError::InvalidUrl(
+            "delete_bid called with both bid_id and flight_id = None".into(),
+        ))
     }
 
     /// `POST /api/pireps/prefile` — create an in-flight PIREP.
@@ -1340,12 +1434,54 @@ impl Client {
         self.post_void(&path, body).await
     }
 
-    /// `POST /api/pireps/{pirep_id}/cancel` — cancel an in-flight PIREP.
+    /// `DELETE /api/pireps/{pirep_id}/cancel` — cancel an in-flight PIREP,
+    /// with `PUT` as fallback for VAs that have stricter method routing.
+    ///
+    /// v0.7.18 (R1-1, B-011): vorher `POST`. Standard-phpVMS-Core erwartet
+    /// DELETE; manche VA-Installs (oder hinter Restrictive-Reverse-Proxies)
+    /// liefern dafür 405 und akzeptieren PUT. POST war im Pilot-Client-Code
+    /// ein Pre-v0.7.18-Drift gegen die Server-Spec.
     pub async fn cancel_pirep(&self, pirep_id: &str) -> Result<(), ApiError> {
-        #[derive(Serialize)]
-        struct Empty {}
         let path = format!("/api/pireps/{pirep_id}/cancel");
-        self.post_void(&path, &Empty {}).await
+        let url = self.endpoint(&path)?;
+
+        // 1. Versuch: DELETE — phpVMS-Core-Standard.
+        let response = self
+            .http
+            .delete(url.clone())
+            .header("X-API-Key", &self.conn.api_key)
+            .header(header::ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(ApiError::from)?;
+
+        let status = response.status();
+        if status.is_success() {
+            let _ = response.text().await; // Body verbrauchen
+            return Ok(());
+        }
+        // 405 Method Not Allowed → PUT-Fallback
+        // (manche VA-Installs blockieren DELETE auf API-Routes)
+        if status == StatusCode::METHOD_NOT_ALLOWED {
+            tracing::info!(
+                pirep_id,
+                "cancel_pirep: DELETE returned 405 — versuche PUT-Fallback"
+            );
+            let _ = response.text().await;
+            let response_put = self
+                .http
+                .put(url)
+                .header("X-API-Key", &self.conn.api_key)
+                .header(header::ACCEPT, "application/json")
+                .send()
+                .await
+                .map_err(ApiError::from)?;
+            let _ = check_status(response_put, &path).await?;
+            return Ok(());
+        }
+        // Andere Fehler durch check_status → typisierte ApiError
+        let _ = check_status(response, &path).await?;
+        Ok(())
     }
 
     /// `POST /api/pireps/{pirep_id}/update` — change PIREP status/state during flight.
@@ -1515,7 +1651,12 @@ impl Client {
 
 async fn check_status(response: Response, path: &str) -> Result<Response, ApiError> {
     let status = response.status();
-    if status == StatusCode::OK {
+    // v0.7.18 (R1-2): alle 2xx akzeptieren, nicht nur 200 OK.
+    // DELETE-Endpoints (cancel_pirep, delete_bid) liefern oft 204
+    // No Content. PUT/POST koennen 201 Created liefern.
+    // Vorher wurde 204 als ApiError::Server { status: 204 } behandelt
+    // → B-011 Cancel-Flow scheiterte still gegen Standard-phpVMS.
+    if status.is_success() {
         return Ok(response);
     }
     match status {
@@ -1907,5 +2048,76 @@ mod tests {
         "#;
         let ofp = parse_simbrief_ofp(xml).expect("parses");
         assert_eq!(ofp.request_id, "");
+    }
+
+    // ── v0.7.18 (B-011 / R2-3): PirepSummary Regression-Guards ───────
+    //
+    // get_user_pireps() ist der Datenpfad für den Orphan-Cleanup-Cluster
+    // (B-011). Wenn nur ein einziger PIREP im Response-Array beim Parsen
+    // failt, schlägt der ganze Aufruf fehl → Pilot sieht keine Orphans.
+    // Diese Tests sichern die drei Shape-Varianten ab, die wir in der
+    // Wild bei phpVMS-Installationen gesehen haben.
+
+    /// flight_id als String — canonical phpVMS-Shape.
+    #[test]
+    fn pirep_summary_parses_string_flight_id() {
+        let json = r#"{
+            "id": "pirep_abc",
+            "flight_id": "flightid_42"
+        }"#;
+        let p: PirepSummary = serde_json::from_str(json).expect("parses");
+        assert_eq!(p.id, "pirep_abc");
+        assert_eq!(p.flight_id.as_deref(), Some("flightid_42"));
+    }
+
+    /// flight_id als Integer — manche VAs liefern numeric IDs (R1-3
+    /// QS-Fix: deserialize_with = "de_opt_str_or_int"). Ohne den
+    /// Deserializer wäre der ganze Array-Parse aus get_user_pireps()
+    /// gebrochen.
+    #[test]
+    fn pirep_summary_parses_integer_flight_id() {
+        let json = r#"{
+            "id": "pirep_abc",
+            "flight_id": 4711
+        }"#;
+        let p: PirepSummary = serde_json::from_str(json).expect("parses");
+        assert_eq!(p.flight_id.as_deref(), Some("4711"));
+    }
+
+    /// flight_id fehlend — Forward-/Backward-Compat für VAs ohne das
+    /// Feld. Darf nicht failen, sondern Option::None liefern.
+    #[test]
+    fn pirep_summary_parses_missing_flight_id_as_none() {
+        let json = r#"{
+            "id": "pirep_abc"
+        }"#;
+        let p: PirepSummary = serde_json::from_str(json).expect("parses");
+        assert_eq!(p.flight_id, None);
+    }
+
+    /// Voller IN_PROGRESS-Orphan wie ihn flight_list_orphans erwartet —
+    /// state=0, alle B-011-Felder dabei. Stellt sicher dass das Frontend
+    /// genug Kontext hat um den Cancel-Button anzuzeigen.
+    #[test]
+    fn pirep_summary_parses_in_progress_orphan_shape() {
+        let json = r#"{
+            "id": "pirep_orphan_1",
+            "state": 0,
+            "status": "ENR",
+            "flight_id": "flight_xyz",
+            "airline_id": 1,
+            "flight_number": "GSG123",
+            "dpt_airport_id": "EDDF",
+            "arr_airport_id": "LEBL",
+            "aircraft_icao": "B738",
+            "aircraft_registration": "D-AGSG"
+        }"#;
+        let p: PirepSummary = serde_json::from_str(json).expect("parses");
+        assert_eq!(p.state, Some(0));
+        assert_eq!(p.status.as_deref(), Some("ENR"));
+        assert_eq!(p.flight_id.as_deref(), Some("flight_xyz"));
+        assert_eq!(p.flight_number.as_deref(), Some("GSG123"));
+        assert_eq!(p.aircraft_icao.as_deref(), Some("B738"));
+        assert_eq!(p.aircraft_registration.as_deref(), Some("D-AGSG"));
     }
 }

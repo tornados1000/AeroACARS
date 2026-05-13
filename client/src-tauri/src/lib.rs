@@ -4054,7 +4054,27 @@ fn landing_get_current(
         .and_then(|s| s.aircraft_icao.as_deref())
         .or(bid_icao_opt);
     let aircraft_title = snapshot.as_ref().and_then(|s| s.aircraft_title.as_deref());
-    build_landing_record(&flight, &stats, sim_label, aircraft_icao, aircraft_title)
+    // v0.7.18 (B-012): airport_lookup-Closure aus dem AppState.airports-Cache.
+    let airport_lookup_data: std::collections::HashMap<String, (f64, f64)> = {
+        let guard = state.airports.lock().expect("airports lock");
+        guard
+            .iter()
+            .filter_map(|(k, v)| match (v.lat, v.lon) {
+                (Some(la), Some(lo)) => Some((k.clone(), (la, lo))),
+                _ => None,
+            })
+            .collect()
+    };
+    let airport_lookup =
+        |icao: &str| airport_lookup_data.get(&icao.to_uppercase()).copied();
+    build_landing_record(
+        &flight,
+        &stats,
+        sim_label,
+        aircraft_icao,
+        aircraft_title,
+        airport_lookup,
+    )
 }
 
 /// Delete a landing record. Lets the user clean up bad/test entries
@@ -8078,6 +8098,115 @@ fn score_basis_vs_fpm(stats: &FlightStats) -> Option<f32> {
     stats.landing_peak_vs_fpm.or(stats.landing_rate_fpm)
 }
 
+/// v0.7.18 (B-012) — Resolution-Source.
+///
+/// Spec docs/spec/v0.7.18-orphan-flight-cleanup.md §B-012. Wire-Format
+/// per Serde snake_case damit Frontend + Webapp das Enum als String
+/// vergleichen können.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TouchdownAirportSource {
+    /// Touchdown-Edge konnte einer Runway zugeordnet werden — autoritativ.
+    RunwayMatch,
+    /// Kein Runway-Match, aber Airport innerhalb 25 nmi. `nearest_distance_nm` gesetzt.
+    Nearest25Nm,
+    /// Total off-airport — fallback auf `flight.arr_airport`.
+    PlannedFallback,
+}
+
+/// v0.7.18 (B-012) — Resolution-Result für den Touchdown-Airport.
+#[derive(Debug, Clone)]
+pub struct TouchdownAirportResolution {
+    pub icao: String,
+    pub source: TouchdownAirportSource,
+    pub distance_to_destination_nm: Option<f32>,
+    pub nearest_distance_nm: Option<f32>,
+}
+
+impl TouchdownAirportSource {
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::RunwayMatch => "runway_match",
+            Self::Nearest25Nm => "nearest_25nm",
+            Self::PlannedFallback => "planned_fallback",
+        }
+    }
+}
+
+/// v0.7.18 (B-012) — Touchdown-Airport-Resolution.
+///
+/// Cascade:
+///   1. `runway_match.airport_ident` — wenn TD-Edge einer Runway zugeordnet wurde.
+///   2. Nearest Airport innerhalb 25 nmi.
+///   3. `planned_arr_airport` als letzter Fallback.
+///
+/// `airport_lookup` ist eine Closure die für gegebene ICAO die Koordinaten
+/// liefert. Caller wählt die Quelle (AppState.airports HashMap, Cache, etc.) —
+/// die Spec gibt keinen konkreten Cache-Typ vor.
+fn resolve_touchdown_airport<F>(
+    runway_match: Option<&runway::RunwayMatch>,
+    landing_lat: Option<f64>,
+    landing_lon: Option<f64>,
+    planned_arr_airport: &str,
+    airport_lookup: F,
+) -> TouchdownAirportResolution
+where
+    F: Fn(&str) -> Option<(f64, f64)>,
+{
+    let planned_coords = airport_lookup(planned_arr_airport);
+    let dist_to_planned = |lat: f64, lon: f64| -> Option<f32> {
+        planned_coords.map(|(plat, plon)| {
+            (geo::distance_m(lat, lon, plat, plon) / 1852.0) as f32
+        })
+    };
+
+    if let Some(rw) = runway_match {
+        let dist = match (landing_lat, landing_lon) {
+            (Some(la), Some(lo)) => dist_to_planned(la, lo),
+            _ => None,
+        };
+        return TouchdownAirportResolution {
+            icao: rw.airport_ident.clone(),
+            source: TouchdownAirportSource::RunwayMatch,
+            distance_to_destination_nm: dist,
+            nearest_distance_nm: None,
+        };
+    }
+
+    if let (Some(lat), Some(lon)) = (landing_lat, landing_lon) {
+        const TD_NEAREST_RADIUS_NM: f64 = 25.0;
+        let nearest = runway::find_nearest_airports(
+            lat,
+            lon,
+            TD_NEAREST_RADIUS_NM * 1852.0,
+            1,
+        );
+        if let Some(closest) = nearest.first() {
+            return TouchdownAirportResolution {
+                icao: closest.icao.clone(),
+                source: TouchdownAirportSource::Nearest25Nm,
+                distance_to_destination_nm: dist_to_planned(lat, lon),
+                nearest_distance_nm: Some(
+                    (closest.distance_m / 1852.0) as f32,
+                ),
+            };
+        }
+        return TouchdownAirportResolution {
+            icao: planned_arr_airport.to_string(),
+            source: TouchdownAirportSource::PlannedFallback,
+            distance_to_destination_nm: dist_to_planned(lat, lon),
+            nearest_distance_nm: None,
+        };
+    }
+
+    TouchdownAirportResolution {
+        icao: planned_arr_airport.to_string(),
+        source: TouchdownAirportSource::PlannedFallback,
+        distance_to_destination_nm: None,
+        nearest_distance_nm: None,
+    }
+}
+
 /// v0.7.1 Helper: actual_trip_burn = takeoff_fuel - landing_fuel
 /// (1:1 wie in build_landing_record line 6527-6530). Damit sub_scores
 /// + aggregate_master_score den gleichen Wert nutzen.
@@ -8260,13 +8389,17 @@ fn finalize_landing_rate(
 /// when there's no usable touchdown captured (e.g. PIREP filed before
 /// landing — synthetic / bug). The record is the immutable snapshot we
 /// show in the Landing tab; once written it never changes.
-fn build_landing_record(
+fn build_landing_record<F>(
     flight: &ActiveFlight,
     stats: &FlightStats,
     sim_kind_label: Option<&str>,
     aircraft_icao: Option<&str>,
     aircraft_title: Option<&str>,
-) -> Option<LandingRecord> {
+    airport_lookup: F,
+) -> Option<LandingRecord>
+where
+    F: Fn(&str) -> Option<(f64, f64)>,
+{
     let touchdown_at = stats.landing_at?;
     let landing_rate_fpm = stats.landing_rate_fpm?;
     let touchdown_class = stats.landing_score?;
@@ -8391,6 +8524,16 @@ fn build_landing_record(
     // ins Record gemoved).
     let gate_window = build_storage_gate_window(&approach_samples);
 
+    // v0.7.18 (B-012): Touchdown-Airport-Resolution einmal berechnen
+    // und in den Record einsetzen.
+    let td_resolution = resolve_touchdown_airport(
+        stats.runway_match.as_ref(),
+        stats.landing_lat,
+        stats.landing_lon,
+        &flight.arr_airport,
+        &airport_lookup,
+    );
+
     Some(LandingRecord {
         pirep_id: flight.pirep_id.clone(),
         touchdown_at,
@@ -8399,6 +8542,16 @@ fn build_landing_record(
         airline_icao: flight.airline_icao.clone(),
         dpt_airport: flight.dpt_airport.clone(),
         arr_airport: flight.arr_airport.clone(),
+        // v0.7.18 (B-012): Touchdown-Airport-Resolution-Werte werden
+        // ueber die `td_resolution`-Bindung weiter unten in der `..` -
+        // Erweiterung gesetzt. Hier nur Hauptfelder; siehe unten.
+        touchdown_airport: Some(td_resolution.icao.clone()),
+        touchdown_airport_source: Some(
+            td_resolution.source.as_wire_str().to_string(),
+        ),
+        touchdown_distance_to_destination_nm:
+            td_resolution.distance_to_destination_nm,
+        touchdown_nearest_distance_nm: td_resolution.nearest_distance_nm,
         aircraft_registration: Some(flight.planned_registration.clone())
             .filter(|s| !s.is_empty()),
         aircraft_icao: aircraft_icao.map(|s| s.to_string()).filter(|s| !s.is_empty()),
@@ -8561,12 +8714,28 @@ fn record_landing_for_filed_flight(
         .or(bid_icao_opt);
     let aircraft_title = snapshot.as_ref().and_then(|s| s.aircraft_title.as_deref());
 
+    // v0.7.18 (B-012): airport_lookup-Closure aus dem AppState.airports-Cache.
+    let airport_lookup_data: std::collections::HashMap<String, (f64, f64)> = {
+        let app_state = app.state::<AppState>();
+        let guard = app_state.airports.lock().expect("airports lock");
+        guard
+            .iter()
+            .filter_map(|(k, v)| match (v.lat, v.lon) {
+                (Some(la), Some(lo)) => Some((k.clone(), (la, lo))),
+                _ => None,
+            })
+            .collect()
+    };
+    let airport_lookup =
+        |icao: &str| airport_lookup_data.get(&icao.to_uppercase()).copied();
+
     let Some(record) = build_landing_record(
         flight,
         stats,
         sim_label,
         aircraft_icao,
         aircraft_title,
+        airport_lookup,
     ) else {
         tracing::debug!(
             pirep_id = %flight.pirep_id,
@@ -9885,7 +10054,10 @@ async fn consume_bid_best_effort(client: &Client, bid_id: i64) {
     if bid_id <= 0 {
         return;
     }
-    match client.delete_bid(bid_id).await {
+    // v0.7.18 (B-011): delete_bid Signatur erweitert um optionalen
+    // flight_id-Fallback. Hier (consume_bid_best_effort) reicht der
+    // bid_id-Pfad — flight_id wird nur im Orphan-Cleanup-Flow gebraucht.
+    match client.delete_bid(Some(bid_id), None).await {
         Ok(()) => tracing::info!(bid_id, "bid removed after PIREP filing"),
         Err(e) => tracing::warn!(
             bid_id,
@@ -10223,12 +10395,158 @@ async fn flight_end_manual(
 async fn flight_cancel(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
-) -> Result<(), UiError> {
+    force: Option<bool>,
+) -> Result<FlightCancelOutcome, UiError> {
+    // SCHRITT 1: Nur LESEN, damit wir is_finalizable bestimmen können.
+    // guard.take() machen wir erst beim eigentlichen Wegräumen weiter
+    // unten — sonst wäre der Flight bei einem zwischenzeitlichen Fehler
+    // weg ohne dass irgendwas passiert ist.
+    //
+    // v0.7.18 (B-014): is_finalizable-Check vor File-First-Versuch.
+    // Spec docs/spec/v0.7.18-orphan-flight-cleanup.md §B-014.
+    let is_finalizable = {
+        let guard = state.active_flight.lock().expect("active_flight lock");
+        let flight = guard
+            .as_ref()
+            .ok_or_else(|| UiError::new("no_active_flight", "no flight is active"))?;
+        let stats = flight.stats.lock().expect("flight stats");
+        // Annahme: solange flight in state.active_flight liegt UND eine
+        // gültige `landing_at`-Markierung gesetzt ist UND die FSM-Phase
+        // eine TD-Phase ist, ist der Flug noch nicht gefiled (gefilte
+        // Flüge räumen `state.active_flight` selber via flight_end-Pfad).
+        matches!(
+            stats.phase,
+            FlightPhase::Landing
+                | FlightPhase::TaxiIn
+                | FlightPhase::BlocksOn
+                | FlightPhase::Arrived
+        ) && stats.landing_at.is_some()
+    };
+
+    let user_forced_cancel = force.unwrap_or(false);
+
+    if is_finalizable && !user_forced_cancel {
+        // PIREP-ID merken bevor flight_end den active_flight-Slot räumt
+        let pirep_id_for_outcome = {
+            let guard = state.active_flight.lock().expect("active_flight lock");
+            guard.as_ref().map(|f| f.pirep_id.clone()).unwrap_or_default()
+        };
+
+        // Best-Effort: erst zu filen versuchen via flight_end-Pfad.
+        // flight_end macht selbst:
+        //   - Validation (not_at_arrival etc.)
+        //   - guard.take() falls Validation OK
+        //   - file_pirep_with_retry (3 attempts, transient → pirep_queue)
+        //   - record_landing + activity_log + record_event + MQTT publish
+        //
+        // Outcome-Mapping (siehe Spec + R2-1):
+        //   Ok(())                  → Filed ODER Queued (beide OK aus Cancel-Sicht)
+        //   Err(code="blocked")     → Err propagieren (B-007 Account-Sperre)
+        //   Err(andere Hard-Fails)  → Err mit code="file_first_failed".
+        //                             Kein Auto-Cancel mehr (R2-1 UX-Fix).
+        //                             active_flight bleibt erhalten, Pilot
+        //                             entscheidet im Frontend nochmal.
+        match flight_end(app.clone(), state.clone(), None).await {
+            Ok(()) => {
+                // flight_end hat erfolgreich gefilt ODER gequeued. In
+                // beiden Faellen ist active_flight geleert, der PIREP
+                // lebt server-side bzw. im Queue-Worker.
+                //
+                // v0.7.18 (R1-5): Filed vs Queued unterscheiden — Pilot
+                // soll wissen ob der PIREP schon eingereicht ist oder
+                // noch auf den naechsten Network-Recovery wartet.
+                // flight_end hat keinen Outcome-Type; wir checken die
+                // pirep_queue auf unsere pirep_id.
+                let is_queued = pirep_queue::list_all(&app)
+                    .iter()
+                    .any(|q| q.pirep_id == pirep_id_for_outcome);
+
+                if is_queued {
+                    log_activity(
+                        &state,
+                        ActivityLevel::Warn,
+                        format!(
+                            "Flug statt abgebrochen in der Queue für späteren Retry — PIREP {pirep_id_for_outcome}"
+                        ),
+                        Some(
+                            "B-014 File-First-Pfad: transient-Fehler beim Filing. Der Background-Worker reicht den PIREP ein sobald die Verbindung wieder steht.".into(),
+                        ),
+                    );
+                    return Ok(FlightCancelOutcome::Queued {
+                        pirep_id: pirep_id_for_outcome,
+                    });
+                }
+
+                log_activity(
+                    &state,
+                    ActivityLevel::Info,
+                    format!("Flug statt abgebrochen ordentlich eingereicht — PIREP {pirep_id_for_outcome}"),
+                    Some("B-014 File-First-Pfad: Server hat den PIREP angenommen.".into()),
+                );
+                return Ok(FlightCancelOutcome::FiledInstead {
+                    pirep_id: pirep_id_for_outcome,
+                });
+            }
+            Err(e) if e.code == "blocked" => {
+                // 401/403 Account-Sperre — Cancel würde ebenfalls 401/403
+                // werfen, also kein Cancel-Versuch. state.active_flight
+                // bleibt unverändert für Re-Try nach VA-Klärung.
+                tracing::warn!(
+                    code = e.code,
+                    "flight_cancel: File-First abgebrochen wegen Account-Sperre"
+                );
+                return Err(e);
+            }
+            Err(e) => {
+                // v0.7.18 (R2-1): Validierungs-/Hard-Fehler beim Auto-File.
+                // Wir fallen NICHT mehr automatisch in den Cancel-Pfad —
+                // der Pilot hat "Lieber filen versuchen" geklickt, nicht
+                // "bei Fehler trotzdem verwerfen". Das wäre UX-seitig eine
+                // versteckte destruktive Aktion.
+                //
+                // state.active_flight bleibt erhalten (flight_end macht
+                // guard.take() nur bei Success), also kann der Pilot:
+                //   1. den Fehler beheben + erneut filen,
+                //   2. den Cancel-Button nochmal drücken und im zweiten
+                //      Dialog explizit "Trotzdem verwerfen" wählen.
+                //
+                // Frontend (ActiveFlightPanel) catched code="file_first_failed"
+                // und zeigt den zweiten Confirm-Dialog.
+                tracing::warn!(
+                    code = e.code,
+                    "flight_cancel: File-First fehlgeschlagen, gebe an UI zurueck statt Auto-Cancel"
+                );
+                log_activity(
+                    &state,
+                    ActivityLevel::Warn,
+                    format!(
+                        "Auto-File vor Cancel fehlgeschlagen ({}) — Pilot muss erneut bestätigen",
+                        e.code
+                    ),
+                    Some(format!("{e:?}")),
+                );
+                return Err(UiError::new(
+                    "file_first_failed",
+                    format!(
+                        "Filen-Versuch vor Cancel fehlgeschlagen: {} ({}). \
+                         Bitte beheben und erneut filen, oder explizit verwerfen.",
+                        e.message, e.code
+                    ),
+                ));
+            }
+        }
+    }
+
+    // SCHRITT 2: Cancel-Pfad. Erst JETZT den Flight aus state.active_flight
+    // herausnehmen (guard.take()) bevor wir destruktiv werden.
     let flight = {
         let mut guard = state.active_flight.lock().expect("active_flight lock");
-        guard
-            .take()
-            .ok_or_else(|| UiError::new("no_active_flight", "no flight is active"))?
+        guard.take().ok_or_else(|| {
+            UiError::new(
+                "no_active_flight",
+                "flight was concurrently removed — likely already filed",
+            )
+        })?
     };
     // v0.6.0: Outbox VOR stop=true leeren — sonst persistiert der
     // phpVMS-Worker beim nächsten Tick (im stop-branch) die noch
@@ -10242,6 +10560,7 @@ async fn flight_cancel(
     // Clear local persistence regardless — the user wants this gone.
     clear_persisted_flight(&app);
     discard_queued_positions_for(&app, &flight.pirep_id);
+    pirep_queue::remove(&app, &flight.pirep_id);
     result?;
     log_activity(
         &state,
@@ -10263,7 +10582,31 @@ async fn flight_cancel(
             outcome: FlightOutcome::Cancelled,
         },
     );
-    Ok(())
+    Ok(FlightCancelOutcome::Cancelled {
+        pirep_id: flight.pirep_id.clone(),
+    })
+}
+
+/// v0.7.18 (B-014) — Outcome eines `flight_cancel`-Aufrufs.
+///
+/// Spec docs/spec/v0.7.18-orphan-flight-cleanup.md §B-014. Frontend
+/// rendert pro Variante eine andere Bestätigung.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FlightCancelOutcome {
+    /// File-First-Versuch hat geklappt — PIREP wurde direkt an phpVMS
+    /// abgeschickt und akzeptiert.
+    FiledInstead { pirep_id: String },
+    /// File-First-Versuch hat transienten Fehler (Netz, 5xx, Timeout)
+    /// produziert — PIREP liegt jetzt in der pirep_queue für Background-
+    /// Retry. Cancel hat NICHT stattgefunden (sonst Datenverlust).
+    Queued { pirep_id: String },
+    /// Pilot hat explizit „Trotzdem verwerfen" gewählt (force=true ODER
+    /// nicht-finalisierbarer Flug). Regulärer Cancel-Pfad ist gelaufen,
+    /// PIREP ist CANCELLED auf phpVMS. (R2-1: File-First-HardFail führt
+    /// hier NICHT mehr automatisch hin — der Pilot muss explizit zweiten
+    /// Confirm-Dialog bestätigen.)
+    Cancelled { pirep_id: String },
 }
 
 /// Confirm an auto-resumed flight: now actually spawn the position streamer.
@@ -10323,6 +10666,306 @@ async fn flight_forget(
         );
     }
     clear_persisted_flight(&app);
+    Ok(())
+}
+
+// ───────────────────────────────────────────────────────────────────
+// v0.7.18 (B-011) Orphan-Flight-Cleanup
+//
+// Spec: docs/spec/v0.7.18-orphan-flight-cleanup.md
+//
+// Drei Tauri-Commands:
+//   - flight_list_orphans       → IN_PROGRESS PIREPs des Piloten, ohne den
+//                                 aktiven lokalen Flight
+//   - flight_cancel_orphan      → cancel_pirep + optional delete_bid (mit
+//                                 bid_id ODER flight_id Body) + lokale
+//                                 Aufraeumung
+//   - flight_forget_remote      → nur lokale Aufraeumung, kein API-Call
+// ───────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OrphanFlight {
+    pub pirep_id: String,
+    pub bid_id: Option<i64>,
+    /// phpVMS `flight_id` (alphanumerisch, z.B. "flightid_1") — wird
+    /// fuer den `{ flight_id }`-Fallback-Body in `delete_bid` benutzt.
+    pub flight_id: Option<String>,
+    pub flight_number: Option<String>,
+    pub airline_id: Option<i64>,
+    pub dpt_airport: Option<String>,
+    pub arr_airport: Option<String>,
+    pub aircraft_id: Option<i64>,
+    pub aircraft_icao: Option<String>,
+    pub aircraft_registration: Option<String>,
+    /// ISO-8601 UTC timestamp from phpVMS `created_at`. Frontend
+    /// konvertiert zu „vor X h Y min".
+    pub started_at: Option<String>,
+    /// Berechnet vom Backend wenn `started_at` gesetzt ist, sonst None.
+    pub age_minutes: Option<i64>,
+}
+
+/// `flight_list_orphans` — listet verwaiste PIREPs (state=IN_PROGRESS)
+/// auf phpVMS, ohne den lokal aktiven Flight (falls vorhanden).
+///
+/// Spec: docs/spec/v0.7.18-orphan-flight-cleanup.md §B-011.
+#[tauri::command]
+async fn flight_list_orphans(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<OrphanFlight>, UiError> {
+    let client = current_client(&state)?;
+
+    // Aktiv-Flight-PIREP-ID (falls vorhanden) — diesen filtern wir raus.
+    let active_pirep_id: Option<String> = {
+        let guard = state.active_flight.lock().expect("active_flight lock");
+        guard.as_ref().map(|f| f.pirep_id.clone())
+    };
+
+    // 1) PIREPs holen, auf IN_PROGRESS filtern
+    let all_pireps = client.get_user_pireps().await.map_err(|e| {
+        tracing::warn!(error = %e, "flight_list_orphans: get_user_pireps failed");
+        UiError::from(e)
+    })?;
+    let in_progress: Vec<_> = all_pireps
+        .into_iter()
+        .filter(|p| p.state == Some(0))
+        .filter(|p| {
+            active_pirep_id
+                .as_deref()
+                .map(|active| active != p.id)
+                .unwrap_or(true)
+        })
+        .collect();
+
+    if in_progress.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // 2) Bids holen fuer Cross-Reference (bid_id / flight_id zu PIREPs zuordnen).
+    //    Best-Effort: wenn Bids-API failt, machen wir die Liste ohne Bid-Info.
+    let bids = client.get_bids().await.unwrap_or_else(|e| {
+        tracing::info!(error = %e, "flight_list_orphans: get_bids failed — continuing without bid info");
+        Vec::new()
+    });
+
+    // 3) Fleet-Lookup-Map fuer Aircraft-ICAO + Registration via aircraft_id.
+    //    Auch best-effort.
+    let fleet = client.get_fleet().await.unwrap_or_else(|e| {
+        tracing::info!(error = %e, "flight_list_orphans: get_fleet failed — continuing without aircraft info");
+        Vec::new()
+    });
+    let aircraft_lookup: std::collections::HashMap<i64, (Option<String>, Option<String>)> = fleet
+        .iter()
+        .flat_map(|sf| sf.aircraft.iter())
+        .map(|ac| (ac.id, (ac.icao.clone(), ac.registration.clone())))
+        .collect();
+
+    // 4) OrphanFlight bauen
+    let now = Utc::now();
+    let orphans: Vec<OrphanFlight> = in_progress
+        .into_iter()
+        .map(|p| {
+            // Bid-Match via flight_id (PirepSummary.flight_id ↔ Bid.flight.id).
+            // Bid.flight.id ist canonical String, PirepSummary.flight_id ist
+            // Option<String>.
+            let matching_bid = bids.iter().find(|b| {
+                p.flight_id
+                    .as_ref()
+                    .map(|fid| &b.flight.id == fid)
+                    .unwrap_or(false)
+            });
+
+            // Aircraft-Anreicherung: erst aus PIREP-Summary direkt
+            // probieren, dann Fleet-Lookup als Fallback.
+            let (aircraft_icao, aircraft_registration) = if p.aircraft_icao.is_some()
+                || p.aircraft_registration.is_some()
+            {
+                (p.aircraft_icao.clone(), p.aircraft_registration.clone())
+            } else if let Some(aid) = p.aircraft_id {
+                aircraft_lookup
+                    .get(&aid)
+                    .cloned()
+                    .unwrap_or((None, None))
+            } else {
+                (None, None)
+            };
+
+            // Age berechnen wenn created_at parsebar ist
+            let (started_at, age_minutes) = match p
+                .created_at
+                .as_deref()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            {
+                Some(dt) => {
+                    let utc_dt = dt.with_timezone(&Utc);
+                    let age = (now - utc_dt).num_minutes();
+                    (Some(utc_dt.to_rfc3339()), Some(age))
+                }
+                None => (p.created_at.clone(), None),
+            };
+
+            OrphanFlight {
+                pirep_id: p.id.clone(),
+                bid_id: matching_bid.map(|b| b.id),
+                flight_id: p.flight_id.clone(),
+                flight_number: p.flight_number.clone(),
+                airline_id: p.airline_id,
+                dpt_airport: p.dpt_airport_id.clone(),
+                arr_airport: p.arr_airport_id.clone(),
+                aircraft_id: p.aircraft_id,
+                aircraft_icao,
+                aircraft_registration,
+                started_at,
+                age_minutes,
+            }
+        })
+        .collect();
+
+    Ok(orphans)
+}
+
+/// `flight_cancel_orphan` — cancelt einen verwaisten PIREP server-side
+/// und droppt optional den dazugehoerigen Bid.
+///
+/// Spec: docs/spec/v0.7.18-orphan-flight-cleanup.md §B-011 Backend-API.
+#[tauri::command]
+async fn flight_cancel_orphan(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    pirep_id: String,
+    bid_id: Option<i64>,
+    flight_id: Option<String>,
+) -> Result<(), UiError> {
+    let client = current_client(&state)?;
+
+    // Sicherheits-Check: NICHT den aktiv laufenden Flight versehentlich
+    // ueber den Orphan-Pfad cancellen. Der hat `flight_cancel`.
+    {
+        let guard = state.active_flight.lock().expect("active_flight lock");
+        if let Some(active) = guard.as_ref() {
+            if active.pirep_id == pirep_id {
+                return Err(UiError::new(
+                    "is_active_flight",
+                    "Dieser PIREP ist der aktive Flug — benutze stattdessen den Cancel-Knopf im Cockpit-Tab.",
+                ));
+            }
+        }
+    }
+
+    // 1) PIREP cancellen
+    match client.cancel_pirep(&pirep_id).await {
+        Ok(()) => {
+            tracing::info!(pirep_id = %pirep_id, "orphan PIREP cancelled");
+        }
+        Err(ApiError::NotFound) => {
+            // PIREP ist serverseitig schon weg — kein Problem, weiter.
+            tracing::info!(
+                pirep_id = %pirep_id,
+                "orphan PIREP already gone on server (404) — continuing to bid cleanup"
+            );
+        }
+        Err(ApiError::Unauthenticated) | Err(ApiError::Forbidden) => {
+            return Err(UiError::new(
+                "blocked",
+                "phpVMS lehnt deine Anfragen ab — Account gesperrt oder inaktiv. VA-Admin kontaktieren.",
+            ));
+        }
+        Err(e) => {
+            tracing::warn!(pirep_id = %pirep_id, error = %e, "cancel_pirep failed");
+            return Err(e.into());
+        }
+    }
+
+    // 2) Bid droppen — nur wenn bid_id ODER flight_id vorhanden ist.
+    if bid_id.is_some() || flight_id.is_some() {
+        match client.delete_bid(bid_id, flight_id.as_deref()).await {
+            Ok(()) => {
+                tracing::info!(
+                    bid_id = ?bid_id,
+                    flight_id = ?flight_id,
+                    "orphan bid dropped"
+                );
+            }
+            Err(ApiError::NotFound) => {
+                // Bid schon weg — ok
+                tracing::info!(bid_id = ?bid_id, "orphan bid already gone on server (404)");
+            }
+            Err(e) => {
+                // PIREP-Cancel war erfolgreich, Bid-Drop nicht — Pilot kann
+                // den Bid via phpVMS-UI manuell loeschen. Aircraft sollte
+                // schon durch cancel_pirep frei sein.
+                tracing::warn!(
+                    bid_id = ?bid_id,
+                    flight_id = ?flight_id,
+                    error = %e,
+                    "delete_bid failed after orphan PIREP cancel — Aircraft sollte trotzdem frei sein"
+                );
+            }
+        }
+    }
+
+    // 3) Lokale Aufraeumung. Wichtig: NICHT den aktiven Flight anfassen
+    // (Sicherheits-Check oben hat schon verhindert dass das hier der
+    // aktive PIREP wird).
+    discard_queued_positions_for(&app, &pirep_id);
+    pirep_queue::remove(&app, &pirep_id);
+
+    log_activity(
+        &state,
+        ActivityLevel::Warn,
+        format!("Verwaister Flug abgebrochen — PIREP {pirep_id}"),
+        Some(format!(
+            "PIREP cancelled, Bid {:?} dropped, lokale Queues bereinigt.",
+            bid_id
+        )),
+    );
+    record_event(
+        &app,
+        &pirep_id,
+        &FlightLogEvent::FlightEnded {
+            timestamp: Utc::now(),
+            pirep_id: pirep_id.clone(),
+            outcome: FlightOutcome::Cancelled,
+        },
+    );
+
+    Ok(())
+}
+
+/// `flight_forget_remote` — lokale Aufraeumung ohne phpVMS-Call.
+/// Fuer Faelle wo `cancel_pirep` mit 404 antwortet aber der Pilot
+/// sicher ist dass der PIREP wirklich weg ist.
+///
+/// Spec: docs/spec/v0.7.18-orphan-flight-cleanup.md §B-011.
+#[tauri::command]
+async fn flight_forget_remote(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    pirep_id: String,
+) -> Result<(), UiError> {
+    // Selbe Sicherheit wie `flight_cancel_orphan`: nicht den aktiven
+    // Flight versehentlich anfassen.
+    {
+        let guard = state.active_flight.lock().expect("active_flight lock");
+        if let Some(active) = guard.as_ref() {
+            if active.pirep_id == pirep_id {
+                return Err(UiError::new(
+                    "is_active_flight",
+                    "Dieser PIREP ist der aktive Flug — benutze stattdessen den Forget-Knopf im Cockpit-Tab.",
+                ));
+            }
+        }
+    }
+
+    discard_queued_positions_for(&app, &pirep_id);
+    pirep_queue::remove(&app, &pirep_id);
+
+    log_activity(
+        &state,
+        ActivityLevel::Info,
+        format!("Verwaister Flug lokal vergessen — PIREP {pirep_id}"),
+        Some("Keine Server-Anfrage gemacht. PIREP-Status auf phpVMS unveraendert.".to_string()),
+    );
+
     Ok(())
 }
 
@@ -11108,6 +11751,30 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
         // `PLANE TOUCHDOWN NORMAL VELOCITY`-SimVar als Primary).
         let mut prev_in_air: Option<bool> = None;
         const GEAR_TOUCHDOWN_THRESHOLD_N: f32 = 1.0;
+        // v0.7.18 (B-013): Sim-Position-Reset-Detection.
+        //
+        // Spec docs/spec/v0.7.18-orphan-flight-cleanup.md §B-013.
+        //
+        // Quelle: GAF 152 Crash 2026-05-12 — MSFS produzierte einen
+        // Sample mit lat/lon ≈ 0/0 / alt=53820 ft mid-flight. Sampler
+        // hat das uebernommen und einen 14-G-Crash daraus geloggt.
+        //
+        // Detection-Kriterien (ein Match reicht zum Verwerfen):
+        //   1. lat/lon ≈ 0/0 (innerhalb 0.1°)         — Null-Island-Reset
+        //   2. Altitude-Sprung > 10.000 ft seit prev  — physikal unmoeglich
+        //   3. Position-Sprung > 10 nmi seit prev     — teleport
+        //
+        // dt-Guard: Jump-Checks nur bei consecutive samples mit
+        // dt <= RESET_CHECK_MAX_DT_SECS. Bei groesserer Luecke
+        // (Pause, Disconnect, App-Hintergrund) sind grosse legitime
+        // Spruenge erwartbar — wir setzen prev_state dann einfach
+        // mit dem neuen Sample neu, kein Reset-Detect.
+        let mut prev_sample_for_reset_check: Option<(f64, f64, f64, DateTime<Utc>)> = None;
+        let mut reset_warning_logged_this_session = false;
+        const RESET_NULL_ISLAND_DEG: f64 = 0.1;
+        const RESET_MAX_ALT_JUMP_FT: f64 = 10_000.0;
+        const RESET_MAX_DIST_NM_PER_TICK: f64 = 10.0;
+        const RESET_CHECK_MAX_DT_SECS: i64 = 2;
         loop {
             // 20 ms = 50 Hz target — matches GEES (`SAMPLE_RATE = 20`),
             // the only open-source reference impl that publishes its
@@ -11123,6 +11790,65 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
                 continue;
             };
             let now = Utc::now();
+
+            // v0.7.18 (B-013) Reset-Detection — vor Buffer-Push + Edge-Detect.
+            let is_null_island = snap.lat.abs() < RESET_NULL_ISLAND_DEG
+                && snap.lon.abs() < RESET_NULL_ISLAND_DEG;
+            let (alt_jump, dist_jump_nm, dt_too_large) = match prev_sample_for_reset_check {
+                Some((p_lat, p_lon, p_alt, p_at)) => {
+                    let dt = (now - p_at).num_seconds();
+                    if dt > RESET_CHECK_MAX_DT_SECS {
+                        // Zu lange her → Jump-Checks skippen, prev_state
+                        // wird unten neu gesetzt mit dem aktuellen Sample.
+                        (0.0, 0.0, true)
+                    } else {
+                        let dist_m =
+                            ::geo::distance_m(p_lat, p_lon, snap.lat, snap.lon);
+                        let dist_nm = dist_m / 1852.0;
+                        let alt_diff =
+                            (snap.altitude_msl_ft - p_alt).abs();
+                        (alt_diff, dist_nm, false)
+                    }
+                }
+                None => (0.0, 0.0, false),
+            };
+            let is_alt_jump = !dt_too_large && alt_jump > RESET_MAX_ALT_JUMP_FT;
+            let is_dist_jump = !dt_too_large && dist_jump_nm > RESET_MAX_DIST_NM_PER_TICK;
+
+            if is_null_island || is_alt_jump || is_dist_jump {
+                if !reset_warning_logged_this_session {
+                    let reason = if is_null_island {
+                        "lat/lon ≈ 0/0 (Null-Island)"
+                    } else if is_alt_jump {
+                        "Altitude-Sprung > 10.000 ft"
+                    } else {
+                        "Position-Sprung > 10 nmi"
+                    };
+                    tracing::warn!(
+                        pirep_id = %flight.pirep_id,
+                        lat = snap.lat,
+                        lon = snap.lon,
+                        alt_ft = snap.altitude_msl_ft,
+                        alt_jump_ft = alt_jump,
+                        dist_jump_nm = dist_jump_nm,
+                        reason = reason,
+                        "Sim-Position-Reset detektiert — Sample verworfen"
+                    );
+                    reset_warning_logged_this_session = true;
+                }
+                // Sample komplett verwerfen — kein Buffer-Push, kein
+                // Edge-Update. prev_sample_for_reset_check absichtlich
+                // NICHT updaten, sonst gewoehnt sich der Detector an
+                // den Reset und der naechste echte Sample springt
+                // wieder >10 nmi von 0/0 weg.
+                continue;
+            }
+
+            // Sample ist OK ODER dt war zu gross (Resume-Fall) →
+            // prev_state mit dem aktuellen Sample neu setzen.
+            prev_sample_for_reset_check =
+                Some((snap.lat, snap.lon, snap.altitude_msl_ft, now));
+
             let mut stats = flight.stats.lock().expect("flight stats");
             stats.snapshot_buffer.push_back(TelemetrySample {
                 at: now,
@@ -12299,10 +13025,35 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
             // std::sync::MutexGuard (not Send) doesn't span the
             // tokio Mutex `.await` below.
             if landing_log_message.is_some() {
+                // v0.7.18 (B-012): Touchdown-Airport-Resolution. Lookup-
+                // Closure greift in den AppState.airports-Cache.
+                let airport_lookup_data: std::collections::HashMap<String, (f64, f64)> = {
+                    let app_state = app.state::<AppState>();
+                    let airports = app_state.airports.lock().expect("airports lock");
+                    airports
+                        .iter()
+                        .filter_map(|(k, v)| match (v.lat, v.lon) {
+                            (Some(la), Some(lo)) => Some((k.clone(), (la, lo))),
+                            _ => None,
+                        })
+                        .collect()
+                };
                 let payload_opt: Option<aeroacars_mqtt::TouchdownPayload> = {
                     let stats = flight.stats.lock().expect("flight stats");
                     stats.landing_at.map(|landing_at| {
                         let rwy_match = stats.runway_match.as_ref();
+                        // B-012: Touchdown-Airport via Cascade aufloesen.
+                        let td_resolution = resolve_touchdown_airport(
+                            rwy_match,
+                            stats.landing_lat,
+                            stats.landing_lon,
+                            &flight.arr_airport,
+                            |icao| {
+                                airport_lookup_data
+                                    .get(&icao.to_uppercase())
+                                    .copied()
+                            },
+                        );
                         aeroacars_mqtt::TouchdownPayload {
                             ts: landing_at.timestamp_millis(),
                             // v0.7.17 (B-015a QS-Round-2): Edge-Wert hat
@@ -12340,7 +13091,20 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                             bounce: Some(stats.bounce_count > 0),
                             bounce_count: Some(stats.bounce_count),
                             runway: stats.approach_runway.clone(),
-                            airport: Some(flight.arr_airport.clone()),
+                            // v0.7.18 (B-012): aufgelöster Touchdown-Airport
+                            // statt blind auf flight.arr_airport zu setzen.
+                            airport: Some(td_resolution.icao.clone()),
+                            airport_source: Some(
+                                td_resolution.source.as_wire_str().to_string(),
+                            ),
+                            airport_distance_to_destination_nm:
+                                td_resolution.distance_to_destination_nm,
+                            airport_nearest_distance_nm:
+                                td_resolution.nearest_distance_nm,
+                            // v0.7.18 (R1-4): Plan-Destination mit-publishen
+                            // damit die Webapp den Off-airport-Banner gegen
+                            // den echten geplanten Wert vergleichen kann.
+                            planned_arr_airport: Some(flight.arr_airport.clone()),
                             lat: stats.landing_lat,
                             lon: stats.landing_lon,
                             heading_true_deg: stats.landing_heading_true_deg,
@@ -18971,6 +19735,10 @@ pub fn run() {
             landing_delete,
             metar_get,
             flight_forget,
+            // v0.7.18 (B-011) Orphan-Flight-Cleanup
+            flight_list_orphans,
+            flight_cancel_orphan,
+            flight_forget_remote,
             flight_discover_resumable,
             flight_adopt,
             flight_resume_confirm,
@@ -19027,6 +19795,51 @@ pub fn run() {
 // a full `ActiveFlight` setup. The integration coverage comes from
 // real in-sim flights against a dev-server PIREP.
 // ----------------------------------------------------------------------
+
+// ----------------------------------------------------------------------
+// v0.7.18 (B-014 / R2-3): FlightCancelOutcome wire-format guard.
+//
+// Das tagged-union JSON-Format (`{ "kind": "filed_instead", "pirep_id": ... }`)
+// ist die Schnittstelle zur Tauri-Frontend. ActiveFlightPanel.tsx machted
+// auf den `kind`-Strings — wenn jemand die Serde-Attribute ändert (Tag-
+// Name, snake_case, Variant-Renames) bricht das stillschweigend die
+// Cancel-Flow-UX. Dieser Test hält die drei Wire-Shapes fest.
+// ----------------------------------------------------------------------
+#[cfg(test)]
+mod flight_cancel_outcome_wire_format_tests {
+    use super::*;
+
+    #[test]
+    fn filed_instead_serializes_with_snake_case_kind() {
+        let v = FlightCancelOutcome::FiledInstead {
+            pirep_id: "pirep_123".into(),
+        };
+        let json: serde_json::Value = serde_json::to_value(v).unwrap();
+        assert_eq!(json["kind"], "filed_instead");
+        assert_eq!(json["pirep_id"], "pirep_123");
+    }
+
+    #[test]
+    fn queued_serializes_with_snake_case_kind() {
+        let v = FlightCancelOutcome::Queued {
+            pirep_id: "pirep_456".into(),
+        };
+        let json: serde_json::Value = serde_json::to_value(v).unwrap();
+        assert_eq!(json["kind"], "queued");
+        assert_eq!(json["pirep_id"], "pirep_456");
+    }
+
+    #[test]
+    fn cancelled_serializes_with_snake_case_kind() {
+        let v = FlightCancelOutcome::Cancelled {
+            pirep_id: "pirep_789".into(),
+        };
+        let json: serde_json::Value = serde_json::to_value(v).unwrap();
+        assert_eq!(json["kind"], "cancelled");
+        assert_eq!(json["pirep_id"], "pirep_789");
+    }
+}
+
 #[cfg(test)]
 mod touch_and_go_go_around_tests {
     use super::*;

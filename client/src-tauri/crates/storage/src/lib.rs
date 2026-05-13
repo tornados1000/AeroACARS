@@ -210,7 +210,27 @@ pub struct LandingRecord {
     pub flight_number: String,
     pub airline_icao: String,
     pub dpt_airport: String,
+    /// Geplante Destination aus dem Bid. Bei Divert / Off-airport-Crash
+    /// **nicht** der tatsaechliche Landeplatz — siehe v0.7.18 (B-012)
+    /// `touchdown_airport_*` Felder weiter unten.
     pub arr_airport: String,
+    /// v0.7.18 (B-012): aufgelöster tatsächlicher Touchdown-Airport.
+    /// - Wenn runway_match zur Runway korreliert wurde: dessen ICAO.
+    /// - Sonst der nächste Airport innerhalb 25 nmi.
+    /// - Sonst fallback auf arr_airport.
+    /// None wenn Pre-v0.7.18-Record (Backwards-Compat).
+    #[serde(default)]
+    pub touchdown_airport: Option<String>,
+    /// Aufloesungs-Quelle: "runway_match" / "nearest_25nm" / "planned_fallback".
+    #[serde(default)]
+    pub touchdown_airport_source: Option<String>,
+    /// Distanz vom TD-Punkt zur geplanten Destination (nmi).
+    #[serde(default)]
+    pub touchdown_distance_to_destination_nm: Option<f32>,
+    /// Distanz vom TD-Punkt zum nearest Airport (nmi), nur bei
+    /// `nearest_25nm`-Source gesetzt.
+    #[serde(default)]
+    pub touchdown_nearest_distance_nm: Option<f32>,
     pub aircraft_registration: Option<String>,
     pub aircraft_icao: Option<String>,
     pub aircraft_title: Option<String>,

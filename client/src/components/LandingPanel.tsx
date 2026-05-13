@@ -47,6 +47,17 @@ export interface LandingRecord {
   airline_icao: string;
   dpt_airport: string;
   arr_airport: string;
+  /** v0.7.18 (B-012): aufgelöster Touchdown-Airport (real, nicht geplant).
+   *  - Wenn `runway_match` zur Runway korreliert: dessen ICAO.
+   *  - Sonst nächster Airport innerhalb 25 nmi.
+   *  - Sonst fallback auf `arr_airport`. */
+  touchdown_airport: string | null;
+  /** Resolution-Source: "runway_match" / "nearest_25nm" / "planned_fallback". */
+  touchdown_airport_source: string | null;
+  /** Distanz vom TD-Punkt zur geplanten Destination (nmi). */
+  touchdown_distance_to_destination_nm: number | null;
+  /** Distanz vom TD-Punkt zum nearest Airport (nmi), nur bei nearest_25nm-Source. */
+  touchdown_nearest_distance_nm: number | null;
   aircraft_registration: string | null;
   aircraft_icao: string | null;
   aircraft_title: string | null;
@@ -1118,6 +1129,117 @@ function CoachTip({ subs }: { subs: SubScore[] }) {
   );
 }
 
+// ---- Off-airport banner (v0.7.18 B-012) -------------------------------
+//
+// Zeigt wenn der echte Touchdown nicht beim geplanten Destination-Airport
+// war — Diversion, Off-airport-Crash (GAF-152-Fall), oder Crash mit
+// Nearest-Airport in Reichweite.
+//
+// Drei sichtbare Fälle:
+//   1. runway_match-Resolution, aber icao != arr_airport → Divert
+//   2. nearest_25nm-Resolution → Off-airport, Nearest gefunden
+//   3. planned_fallback mit Distanz > 5 nmi → Off-airport, kein Nearest
+//
+// Match-Resolution mit icao == arr_airport rendert keinen Banner (= normaler Flug).
+
+function OffAirportBanner({ record }: { record: LandingRecord }) {
+  const { t } = useTranslation();
+
+  const td = record.touchdown_airport;
+  const planned = record.arr_airport;
+  const source = record.touchdown_airport_source;
+  const distToDest = record.touchdown_distance_to_destination_nm;
+  const nearestDist = record.touchdown_nearest_distance_nm;
+
+  // Normaler Fall: gleiche ICAO → kein Banner.
+  if (!td || td === planned) {
+    // Selbst bei runway_match==arr_airport kann ein > 5nm-Distanz
+    // auftreten (Multi-Field-Airports), aber das ist kein Off-airport-Fall.
+    return null;
+  }
+
+  // Spec-konforme Varianten:
+  if (source === "nearest_25nm") {
+    return (
+      <div className="off-airport-banner off-airport-banner--nearest" role="alert">
+        <div className="off-airport-banner__head">
+          ⚠ {t("landing.off_airport.title")}
+        </div>
+        <div className="off-airport-banner__line">
+          {t("landing.off_airport.planned")}:{" "}
+          <strong>{planned}</strong>
+        </div>
+        <div className="off-airport-banner__line">
+          {t("landing.off_airport.actual")}:{" "}
+          <strong>{td}</strong>
+          {nearestDist != null && (
+            <span className="off-airport-banner__hint">
+              {" — "}
+              {t("landing.off_airport.nearest_hint", {
+                nm: nearestDist.toFixed(1),
+              })}
+            </span>
+          )}
+        </div>
+        {distToDest != null && distToDest > 1 && (
+          <div className="off-airport-banner__line">
+            {t("landing.off_airport.distance_to_dest", {
+              nm: distToDest.toFixed(1),
+            })}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  if (source === "planned_fallback") {
+    // Position bekannt aber kein Airport in 25 nmi. Distanz-Hinweis nur
+    // sinnvoll wenn echter Off-airport-Crash (> 5 nmi).
+    if (distToDest == null || distToDest <= 5) return null;
+    return (
+      <div className="off-airport-banner off-airport-banner--no-nearest" role="alert">
+        <div className="off-airport-banner__head">
+          ⚠ {t("landing.off_airport.no_nearest_title")}
+        </div>
+        <div className="off-airport-banner__line">
+          {t("landing.off_airport.planned")}:{" "}
+          <strong>{planned}</strong>
+        </div>
+        <div className="off-airport-banner__line">
+          {t("landing.off_airport.no_nearest_body", {
+            nm: distToDest.toFixed(1),
+          })}
+        </div>
+      </div>
+    );
+  }
+
+  // source == "runway_match" aber td != planned → Diversion.
+  return (
+    <div className="off-airport-banner off-airport-banner--divert" role="alert">
+      <div className="off-airport-banner__head">
+        🛬 {t("landing.off_airport.divert_title")}
+      </div>
+      <div className="off-airport-banner__line">
+        {t("landing.off_airport.planned")}:{" "}
+        <strong>{planned}</strong>
+      </div>
+      <div className="off-airport-banner__line">
+        {t("landing.off_airport.actual")}:{" "}
+        <strong>{td}</strong>
+        {distToDest != null && distToDest > 1 && (
+          <span className="off-airport-banner__hint">
+            {" — "}
+            {t("landing.off_airport.distance_to_dest", {
+              nm: distToDest.toFixed(1),
+            })}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ---- Quick-Flag chips (v0.5.47) ---------------------------------------
 //
 // Auf-einen-Blick-Auffälligkeiten direkt unter dem Headline-Block.
@@ -1432,6 +1554,11 @@ function LandingDetail({
           </div>
         </div>
       </div>
+
+      {/* v0.7.18 (B-012): Off-airport-Banner wenn der Touchdown nicht
+          beim geplanten Destination-Airport war. Quelle ist die
+          backend-resolution (runway_match / nearest_25nm / planned_fallback). */}
+      <OffAirportBanner record={record} />
 
       {/* v0.5.47 — Quick-Flag-Chips direkt unter dem Headline-Block.
           Pilot sieht auf einen Blick was die Auffälligkeiten sind.

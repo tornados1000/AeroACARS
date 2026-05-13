@@ -83,20 +83,88 @@ export function ActiveFlightPanel({ info, simSnapshot, onEnded }: Props) {
     }
   }
 
+  // v0.7.18 (B-014): is_finalizable-Check fuer File-First-Logik.
+  // Spec §B-014 — wenn der Flug fast fertig ist (LANDING/TaxiIn/
+  // BLOCKS_ON/Arrived + valider TD), darf Cancel nicht direkt
+  // verwerfen. Dann zeigen wir 3-Button-Confirm:
+  //   - „Lieber filen versuchen" → flight_cancel ohne force
+  //   - „Abbrechen" → kein Cancel, Dialog zu
+  //   - „Trotzdem verwerfen" → flight_cancel mit force=true
+  function isFinalizable(): boolean {
+    if (!info) return false;
+    const isTdPhase =
+      info.phase === "landing" ||
+      info.phase === "taxi_in" ||
+      info.phase === "blocks_on" ||
+      info.phase === "arrived";
+    return isTdPhase && info.landing_at !== null;
+  }
+
   /** User accepted the cancel option from the validation dialog. */
   async function handleCancelFromDialog() {
     setValidationMissing(null);
+    // Dieser Pfad ist „flight_end hat Validation-Failure geworfen,
+    // Pilot wählt Cancel statt Korrektur". File-First wurde schon
+    // implizit gemacht (via flight_end), also hier force=true setzen
+    // damit der Backend nicht nochmal versucht zu filen.
+    await invokeCancelOrForce(true);
+  }
+
+  async function invokeCancelOrForce(force: boolean) {
     setBusy("cancel");
     setError(null);
     try {
-      await invoke("flight_cancel");
+      const outcome = (await invoke("flight_cancel", { force })) as
+        | { kind: "filed_instead"; pirep_id: string }
+        | { kind: "queued"; pirep_id: string }
+        | { kind: "cancelled"; pirep_id: string };
+      // Outcome-spezifisches Feedback je nach v0.7.18 (B-014)-Variante:
+      //   - FiledInstead: PIREP direkt eingereicht, alles fertig.
+      //   - Queued:        Transient-Fehler, PIREP wartet in Queue. Cancel hat NICHT stattgefunden.
+      //   - Cancelled:     regulärer Cancel-Pfad, PIREP ist CANCELLED auf phpVMS.
+      if (outcome.kind === "filed_instead") {
+        setRefreshMsg(
+          t("active_flight.cancel_filed_instead", { pirep_id: outcome.pirep_id }),
+        );
+      } else if (outcome.kind === "queued") {
+        setRefreshMsg(
+          t("active_flight.cancel_queued", { pirep_id: outcome.pirep_id }),
+        );
+      }
       onEnded?.();
     } catch (err: unknown) {
+      const code =
+        typeof err === "object" && err !== null && "code" in err
+          ? String((err as { code: string }).code)
+          : null;
       const msg =
         typeof err === "object" && err !== null && "message" in err
           ? String((err as { message: string }).message)
           : String(err);
-      setError(msg);
+      if (code === "blocked") {
+        setError(t("active_flight.cancel_blocked"));
+      } else if (code === "file_first_failed") {
+        // v0.7.18 (R2-1): File-First-Versuch ist hart fehlgeschlagen.
+        // Backend hat NICHT automatisch gecancelt — Pilot hatte „filen
+        // versuchen" gewaehlt, nicht „bei Fehler trotzdem verwerfen".
+        // Wir zeigen jetzt explizit den zweiten Confirm: „Filen ist
+        // gescheitert (Grund). Trotzdem verwerfen?"
+        const really = await confirm({
+          title: t("active_flight.confirm_cancel_after_file_failed_title"),
+          message: t("active_flight.confirm_cancel_after_file_failed_body", {
+            reason: msg,
+          }),
+          confirmLabel: t("active_flight.confirm_cancel_force_yes"),
+          cancelLabel: t("active_flight.confirm_cancel_force_back"),
+          destructive: true,
+        });
+        if (really) {
+          // force=true bypasst File-First → direkter Cancel.
+          await invokeCancelOrForce(true);
+        }
+      } else {
+        setError(msg);
+      }
     } finally {
       setBusy(null);
     }
@@ -104,27 +172,50 @@ export function ActiveFlightPanel({ info, simSnapshot, onEnded }: Props) {
 
   async function handleCancel() {
     if (busy) return;
-    if (
-      !(await confirm({
-        message: t("active_flight.confirm_cancel"),
+
+    if (isFinalizable()) {
+      // 3-Button-Dialog: filen / abbrechen / trotzdem verwerfen.
+      // useConfirm liefert nur 2 Buttons → wir machen es seriell:
+      //   1. „Flug eigentlich fast fertig — lieber filen versuchen?"
+      //      [Filen versuchen] vs [Abbrechen]
+      //   2. Wenn „Abbrechen": zweiter Dialog „Wirklich verwerfen?"
+      //      [Trotzdem verwerfen] vs [Zurück]
+      const tryFile = await confirm({
+        title: t("active_flight.confirm_cancel_finalizable_title"),
+        message: t("active_flight.confirm_cancel_finalizable_body"),
+        confirmLabel: t("active_flight.confirm_cancel_finalizable_file"),
+        cancelLabel: t("active_flight.confirm_cancel_finalizable_other"),
+      });
+      if (tryFile) {
+        // File-First: force=false. Backend versucht erst zu filen.
+        // Outcomes:
+        //   - Ok(filed_instead | queued | cancelled) → kein weiterer Dialog.
+        //   - Err(blocked)            → Account-Sperre, Fehlertext.
+        //   - Err(file_first_failed)  → invokeCancelOrForce zeigt
+        //     zweiten Confirm-Dialog (R2-1). Kein Auto-Cancel mehr.
+        await invokeCancelOrForce(false);
+        return;
+      }
+      // Pilot will nicht filen — fragen ob „verwerfen" oder „doch zurueck".
+      const really = await confirm({
+        title: t("active_flight.confirm_cancel_force_title"),
+        message: t("active_flight.confirm_cancel_force_body"),
+        confirmLabel: t("active_flight.confirm_cancel_force_yes"),
+        cancelLabel: t("active_flight.confirm_cancel_force_back"),
         destructive: true,
-      }))
-    )
+      });
+      if (!really) return;
+      await invokeCancelOrForce(true);
       return;
-    setBusy("cancel");
-    setError(null);
-    try {
-      await invoke("flight_cancel");
-      onEnded?.();
-    } catch (err: unknown) {
-      const msg =
-        typeof err === "object" && err !== null && "message" in err
-          ? String((err as { message: string }).message)
-          : String(err);
-      setError(msg);
-    } finally {
-      setBusy(null);
     }
+
+    // Nicht finalisierbar → klassischer Cancel-Dialog mit single confirm.
+    const ok = await confirm({
+      message: t("active_flight.confirm_cancel"),
+      destructive: true,
+    });
+    if (!ok) return;
+    await invokeCancelOrForce(false);
   }
 
   /**
