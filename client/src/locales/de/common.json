@@ -22,6 +22,19 @@
       "no_nearest_title": "Off-airport touchdown ohne nahegelegenen Flughafen",
       "no_nearest_body": "Touchdown {{nm}} nmi von der geplanten Destination entfernt. Kein Flughafen innerhalb 25 nmi."
     },
+    "accident": {
+      "primary_label": "ABSTURZ ERKANNT",
+      "confirmed_title": "Absturz erkannt",
+      "confirmed_body": "AeroACARS hat diesen Touchdown als Unfall klassifiziert. Diese Landung gilt nicht als normale, geflogene Landung. Score 0 bedeutet hier „Accident“, nicht „sehr harte Landung“.",
+      "suspected_title": "Möglicher Absturz — Review empfohlen",
+      "suspected_body": "Indizien deuten auf einen Unfall hin, aber die Schwellen für eine bestätigte Klassifikation sind nicht alle erreicht. Der Pilot bestätigt oder verwirft die Einordnung im Filing-Dialog.",
+      "kind_label": "Art",
+      "kind": {
+        "sim_crash": "Simulator-Crash-Event",
+        "impact": "Harter Aufschlag",
+        "off_airport_impact": "Aufschlag abseits der Runway"
+      }
+    },
     "history": "Letzte Landungen",
     "live_preview": "Live-Vorschau (aktiver Flug)",
     "preview": "Vorschau",

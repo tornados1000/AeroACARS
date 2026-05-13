@@ -22,6 +22,19 @@
       "no_nearest_title": "Atterraggio off-airport senza aeroporto vicino",
       "no_nearest_body": "Touchdown a {{nm}} nmi dalla destinazione pianificata. Nessun aeroporto entro 25 nmi."
     },
+    "accident": {
+      "primary_label": "INCIDENTE RILEVATO",
+      "confirmed_title": "Incidente rilevato",
+      "confirmed_body": "AeroACARS ha classificato questo touchdown come incidente. Non conta come atterraggio normale. Score 0 qui significa 'incidente', non 'atterraggio molto duro'.",
+      "suspected_title": "Possibile incidente — revisione consigliata",
+      "suspected_body": "Gli indicatori suggeriscono un incidente, ma non tutte le soglie 'confermate' sono state superate. Il pilota conferma o annulla la classificazione nel dialogo di filing.",
+      "kind_label": "Tipo",
+      "kind": {
+        "sim_crash": "Evento crash del simulatore",
+        "impact": "Impatto duro",
+        "off_airport_impact": "Impatto fuori pista"
+      }
+    },
     "history": "Ultimi atterraggi",
     "live_preview": "Anteprima live (volo attivo)",
     "preview": "Anteprima",
