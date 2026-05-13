@@ -652,27 +652,35 @@ export function RunwayDiagramV2(props: RunwayDiagramV2Props) {
             <g>
               <circle cx={exitX} cy={tdY} r="11" fill={TOKENS.exitDot} opacity="0.25" />
               <circle cx={exitX} cy={tdY} r="6" fill={TOKENS.exitDot} stroke="#0c1628" strokeWidth="1.5" />
+              {/* Label-Pair mit dunklem Outline-Stroke für Lesbarkeit
+                  über dem Cyan-Rollout-Strich + Tarmac-Hintergrund. */}
               <text
                 x={exitX}
-                y={tdY - 20}
+                y={tdY - 26}
                 textAnchor="middle"
-                fontSize="11"
+                fontSize="14"
                 fill={TOKENS.exitDot}
-                fontWeight="700"
+                fontWeight="800"
                 fontFamily="monospace"
+                stroke="#0c1628"
+                strokeWidth="3"
+                paintOrder="stroke"
               >
-                40 kt
+                Bremspunkt
               </text>
               <text
                 x={exitX}
-                y={tdY - 8}
+                y={tdY - 12}
                 textAnchor="middle"
-                fontSize="9"
+                fontSize="13"
                 fill={TOKENS.exitDot}
+                fontWeight="800"
                 fontFamily="monospace"
-                opacity="0.85"
+                stroke="#0c1628"
+                strokeWidth="3"
+                paintOrder="stroke"
               >
-                Bremspunkt
+                40 kt
               </text>
               <title>
                 Bremspunkt — Ab hier hast du auf ~40 kt abgebremst. Das ist
