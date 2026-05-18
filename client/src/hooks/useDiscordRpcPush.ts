@@ -1,12 +1,17 @@
 // v0.9.0 (#Discord-RPC) — Hook der bei jeder Aenderung von ActiveFlightInfo /
 // SimSnapshot eine neue Presence ans Rust-Backend schiebt.
 //
-// Spec: docs/spec/v0.9.0-discord-rich-presence.md (Trigger-Tabelle)
+// Spec: docs/spec/v0.9.0-discord-rich-presence.md (Trigger-Tabelle + LE8)
 //
 // Design:
 //   - Wenn kein Flug aktiv → discord_rpc_clear_flight()
 //   - Wenn Flug aktiv → discord_rpc_push_state() mit aktueller Phase + Alt
-//   - Backend dedupliziert intern (set_flight prueft ob input geaendert)
+//   - **v0.9.1 F7 (Spec LE8):** waehrend aktivem Flug zusaetzlich
+//     `set_sim_lost(true)` rufen wenn simStatus.state != "connected"
+//     (= Sim-Adapter ist disconnected / connecting / re-tryt). Damit haengt
+//     der naechste Presence-Push das "⚠ Sim getrennt"-Suffix dran. Wieder
+//     auf `false` sobald SimConnect/X-Plane wieder lebt.
+//   - Backend dedupliziert intern (set_flight + set_sim_lost pruefen Aenderung)
 //   - Wenn der Discord-Toggle aus ist, no-ops das Backend ohnehin, also
 //     ist's billig diesen Hook auch bei "RPC off" laufen zu lassen.
 
@@ -66,4 +71,19 @@ export function useDiscordRpcPush({ activeFlight, simStatus, profileUrl }: Args)
     lastPushedRef.current = key;
     void invoke("discord_rpc_push_state", { args: payload }).catch(() => undefined);
   }, [activeFlight, simStatus, profileUrl]);
+
+  // v0.9.1 F7 — LE8 "⚠ Sim getrennt"-Suffix verdrahten. Reagiert auf
+  // simStatus.state-Aenderungen unabhaengig vom push_state-Pfad damit der
+  // Suffix-Status auch dann gepush wird wenn sich sonst nichts veraendert
+  // hat (z.B. waehrend Cruise: Pilot fliegt brav weiter, MSFS kurz weg,
+  // dann zurueck → Presence muss "⚠"-Suffix kurzzeitig zeigen und wieder
+  // entfernen, ohne dass altitude/phase sich aendern).
+  //
+  // Backend (Manager::set_sim_lost) dedupliziert intern — billig.
+  // Nur waehrend aktivem Flug: kein Flug = kein Suffix sinnvoll.
+  useEffect(() => {
+    if (!activeFlight) return;
+    const lost = simStatus ? simStatus.state !== "connected" : true;
+    void invoke("discord_rpc_set_sim_lost", { lost }).catch(() => undefined);
+  }, [activeFlight, simStatus?.state]);
 }

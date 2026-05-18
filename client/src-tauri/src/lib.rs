@@ -21409,6 +21409,8 @@ pub fn run() {
             discord_rpc::discord_rpc_send_test,
             discord_rpc::discord_rpc_push_state,
             discord_rpc::discord_rpc_clear_flight,
+            // v0.9.1 F7: LE8-Suffix "⚠ Sim getrennt" verdrahten
+            discord_rpc::discord_rpc_set_sim_lost,
             // v0.7.14: Discord-Posts macht der Recorder zentral — keine
             // Pilot-Client-Commands mehr fuer Webhook-URL. Audit C1.
             // v0.7.8 SimBrief Integration (Spec §4)

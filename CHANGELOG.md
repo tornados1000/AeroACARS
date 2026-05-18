@@ -17,7 +17,7 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 - **F4:** Tag `route` war in 4 Allowlists aber UI sagte „Route NICHT gesendet" → konsistent geloescht
 - **F5:** UI-Text sagte `live.kant.ovh` statt korrekt `tip.kant.ovh` (DSGVO-Consent-Konsistenz)
 - **F6:** Frontend-Sentry hatte `integrations: []` → deaktivierte alle Default-Integrations (BrowserApiErrors, GlobalHandlers, Breadcrumbs); jetzt aktiv
-- **F7:** `set_sim_lost`-Code existiert aber kein Caller → als Known Issue dokumentiert, v0.9.2-Roadmap
+- **F7:** `set_sim_lost`-Code existiert aber kein Caller → in Runde 5 dann doch verdrahtet (siehe F16)
 - **F8:** CHANGELOG-Behauptung „18 Phasen" → korrigiert auf 20 Phasen (17 FSM-aktiv + 3 v0.10.0-ready)
 
 **Runde 2 (F9-F11) nach 2. QS-Pass:**
@@ -36,7 +36,14 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
   - `set_consent(false)`: `slot.take()` → unsere Arc weg + `client.close(Some(ZERO))` → Transport-Worker signalisiert Pending-Queue zu verwerfen + `Hub::bind_client(None)` → Hub-Referenz weg. Arc-Refcount geht auf 0, Drop laeuft, Transport-Worker-Thread terminiert sauber.
   - `set_consent(true)`: `create_and_bind()` — no-op wenn Client schon da, sonst Neu-Bau.
 - **F14 (P2):** Release-Notes verlinkten `docs/spec/v0.9.1-*` (existiert nicht — Specs heissen `v0.9.0-*`). Fix: alle 4 Spec-Links pro Sprache zurueck auf `v0.9.0-*`.
-- **F15 (P2):** Known-Issue-Block sagte „sim-lost-Suffix kommt in v0.9.1" — aber v0.9.1 ist genau dieses Release. Fix: auf „kommt in einem spaeteren v0.9.x-Release (vorgesehen v0.9.2)" korrigiert.
+- **F15 (P2):** Known-Issue-Block sagte „sim-lost-Suffix kommt in v0.9.1" — aber v0.9.1 ist genau dieses Release. Fix: auf „kommt in einem spaeteren v0.9.x-Release (vorgesehen v0.9.2)" korrigiert. Inzwischen ueberholt durch F16-Implementierung.
+
+**Runde 5 (F16) nach 5. QS-Pass:**
+- **F16 (F7-Auflösung, P2 → done):** statt F7 als Known-Issue auf v0.9.2 zu verschieben, doch noch in v0.9.1 verdrahtet. Spec-LE8 ist damit voll implementiert.
+  - Neuer Tauri-Command `discord_rpc_set_sim_lost(lost: bool)` → ruft `Manager::set_sim_lost`
+  - Frontend-Hook `useDiscordRpcPush` hat zweiten useEffect der auf `simStatus.state`-Aenderungen reagiert: `lost = simStatus.state !== "connected"`, ruft Command. Backend-Manager dedupliziert intern.
+  - Wirkt waehrend aktivem Flug — kein Flug = kein Suffix sinnvoll
+  - Known-Issue-Block dazu entfernt (im aktuellen Release keine offenen Spec-Punkte mehr)
 
 ## [v0.9.0] — 2026-05-18 · INTERN (nie publiziert, kurz als latest sichtbar)
 
@@ -88,10 +95,11 @@ Self-hosted Sentry-kompatible Fehler-Sammelstelle. AeroACARS (Client) + Recorder
 
 Beide Features halten sich an `docs/spec/v0.9.0-telemetry-contract.md` (Sektion 1.3 für die kanonischen Phasen, Sektion 9 für Datenschutz-Gates).
 
-### Bekannte Einschränkungen v0.9.0
+### Bekannte Einschränkungen v0.9.1
 
-- **Discord-RPC „⚠ Sim getrennt"-Suffix:** Der Code ist vorhanden (Spec LE8) und getestet, aber der Caller wird noch nicht von der MQTT-Disconnect-Logik aufgerufen — kommt in einem spaeteren v0.9.x-Release (vorgesehen v0.9.2). Pilot sieht bei MQTT-Drop einfach die letzte Presence stehen statt eine Warn-Variante.
-- **Phase-Expansion (REJECTED-TAKEOFF, GO-AROUND, DEBOARDING):** Spec definiert, Discord-Mapping vorhanden, aber der Rust-FSM emittiert diese Phasen noch nicht — kommt mit v0.10.0 (Phase-Expansion-Release laut Roadmap).
+- **Phase-Expansion (REJECTED-TAKEOFF, GO-AROUND, DEBOARDING):** Spec definiert + Discord-Mapping vorhanden, aber Rust-FSM emittiert diese Phasen noch nicht — kommt mit v0.10.0 (Phase-Expansion-Release laut Roadmap). Heute werden 17 von 20 mappable-Phasen emittiert.
+
+*(Der „Sim getrennt"-Suffix-Hinweis von vorher wurde mit F7/F16 in Runde 5 dieser Releases doch noch verdrahtet — keine known-issue mehr.)*
 
 ### Sonstiges
 

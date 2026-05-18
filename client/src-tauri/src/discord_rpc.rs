@@ -134,6 +134,20 @@ pub async fn discord_rpc_get_status() -> Result<DiscordPresenceState, String> {
     }
 }
 
+/// v0.9.1 F7 — Spec LE8 endgueltig verdrahten: vom Frontend gerufen wenn
+/// SimConnect/X-Plane-Status auf "disconnected" oder "connecting" (= Verbindung
+/// abgebrochen, Re-Connect-Loop) ueber den von der UI beobachteten SimStatus
+/// faellt. Bei `true` wird der naechste Presence-Push das "⚠ Sim getrennt"-
+/// Suffix anhaengen. Bei `false` faellt's wieder weg.
+///
+/// Manager dedupliziert intern (no-op wenn Wert nicht geaendert) — also
+/// billig bei jedem Tick aufrufbar.
+#[tauri::command]
+pub async fn discord_rpc_set_sim_lost(lost: bool) -> Result<(), String> {
+    let Some(m) = manager() else { return Ok(()) };
+    m.set_sim_lost(lost).await.map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn discord_rpc_send_test() -> Result<(), String> {
     let Some(m) = manager() else {
