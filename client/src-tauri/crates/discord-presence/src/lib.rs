@@ -231,20 +231,42 @@ impl DiscordPresenceManager {
     /// Bei `enabled=false` → clear activity + close pipe + stop heartbeat.
     /// Bei Anonym-Toggle change wird das naechste set_activity neu berechnet
     /// (kein Sofort-Push noetig, der Heartbeat-Tick reicht).
+    ///
+    /// **F18-Hotfix v0.9.2: Defense-in-Depth.** Vorher matchte die
+    /// (was_enabled=true, new=true)-Branch nur Settings-Aenderungen und nahm
+    /// stillschweigend an, dass der Client bereits gebunden ist. War aber
+    /// bei Init-Race nicht der Fall → Pipe nie geoeffnet, Status blieb
+    /// Disabled. Jetzt prueft der Code zusaetzlich den tatsaechlichen Client-
+    /// Status: wenn enabled=true UND keine Verbindung → enable() retry, egal
+    /// in welchem Match-Arm. Macht apply_settings idempotent gegen jeden
+    /// inneren Inkonsistenz-Zustand.
     pub async fn apply_settings(self: &Arc<Self>, new_settings: DiscordPresenceSettings) -> Result<()> {
         let was_enabled;
+        let client_bound;
         {
             let mut inner = self.inner.lock().await;
             was_enabled = inner.settings.enabled;
+            client_bound = inner.client.is_some();
             inner.settings = new_settings.clone();
+        }
+
+        // Master-Decision: wenn die neuen Settings "enabled" sagen und wir
+        // KEINEN Client gebunden haben (egal aus welchem Grund: Init-Race,
+        // vorheriger enable()-Fail, Discord-nicht-da-beim-Boot), versuchen
+        // wir zu connecten. enable() ist idempotent + self-heals via
+        // Heartbeat-Loop wenn Discord erst spaeter aufgeht.
+        if new_settings.enabled && !client_bound {
+            return self.enable().await;
         }
 
         match (was_enabled, new_settings.enabled) {
             (false, true) => self.enable().await,
             (true, false) => self.disable().await,
             (true, true) => {
-                // Anonym-Toggle oder Profile-Button-Toggle geaendert → naechster Heartbeat reicht.
-                // Aber: sofortiger Re-Push damit der Pilot die Aenderung gleich sieht.
+                // Client schon gebunden + immer noch enabled → nur
+                // Anonym-Toggle / Profile-Button-Toggle koennte sich geaendert
+                // haben. Sofortiger Re-Push damit der Pilot die Aenderung
+                // gleich sieht.
                 self.push_current_activity().await.ok();
                 Ok(())
             }
