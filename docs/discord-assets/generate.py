@@ -467,24 +467,26 @@ def make_cover() -> None:
     #     Vertical-Gradient von links-volltransparent-schwarz nach
     #     rechts-transparent + Horizontal-Fade damit der Uebergang ins
     #     restliche Bild nahtlos wirkt.
-    scrim = Image.new("RGBA", (COVER_W, COVER_H), (0, 0, 0, 0))
-    sdraw = ImageDraw.Draw(scrim)
-    # Hauptpanel: dunkles Rechteck links — wird mit einem horizontalen
-    # Alpha-Fade verblurrt damit kein harter Edge entsteht.
-    sdraw.rectangle([0, 0, 560, COVER_H], fill=(0, 0, 0, 165))
-    # Fade-Maske: links volldeckend, rechts transparent
+    # Voll-flaechiges dunkles Rechteck — die Fade-Maske MACHT den Uebergang allein.
+    # (Erste Version hatte einen senkrechten Cut weil das Rect bei x=560 hart endete
+    # WAEHREND die Fade-Maske erst bei x=600 auf 0 ist → 40-px-Diskontinuitaet.)
+    scrim = Image.new("RGBA", (COVER_W, COVER_H), (0, 0, 0, 165))
     fade = Image.new("L", (COVER_W, COVER_H), 0)
     fd = ImageDraw.Draw(fade)
-    # Horizontaler Verlauf der Maske (Pixel-fuer-Pixel-Spalte ist OK fuer 1024px)
+    # Horizontaler Soft-Fade-Verlauf: links volldeckend → weicher Tail nach
+    # rechts. Laenge des Fade-Tails grosszuegig (340..720), damit kein
+    # wahrnehmbarer Edge bleibt — Auge erkennt sub-1%-Alpha-Spruenge gut.
     for x in range(COVER_W):
         if x < 340:
             a = 255
-        elif x < 600:
-            a = int(255 * (1.0 - (x - 340) / 260))
+        elif x < 720:
+            # Smoothstep (3t² - 2t³) statt linear → noch sanfterer Uebergang
+            t = (x - 340) / 380
+            sm = t * t * (3 - 2 * t)
+            a = int(255 * (1.0 - sm))
         else:
             a = 0
         fd.line([(x, 0), (x, COVER_H)], fill=a)
-    # Composite mit der Fade-Maske
     scrim_faded = Image.new("RGBA", (COVER_W, COVER_H), (0, 0, 0, 0))
     scrim_faded.paste(scrim, (0, 0), fade)
     canvas.alpha_composite(scrim_faded)
