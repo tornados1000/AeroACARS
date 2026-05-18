@@ -4,7 +4,18 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
-## [v0.9.1] — 2026-05-18 · GlitchTip + Discord Rich Presence (initiales Public-Release nach QS)
+## [v0.9.2] — 2026-05-18 · GlitchTip + Discord Rich Presence (Public-Release)
+
+**Inhaltlich identisch mit v0.9.1.** Nochmal versioniert weil v0.9.1 selbst nach 6 QS-Runden noch einen Bug hatte (F18, siehe Runde 7 unten) und v0.9.0/v0.9.1 schon mehrfach als Draft existierten. Sauberer Cut.
+
+**Runde 7 (F18) nach 7. QS-Pass:**
+- **F18 (P1):** Discord-RPC-Toggle blieb nach AeroACARS-Neustart auf „Deaktiviert" obwohl Checkbox in den Settings AN war. Ursache: `init()` uebergab persistierte Settings an `Manager::new()` (= setzte internen Zustand bereits auf `enabled=true`), danach `apply_settings(same)` matchte den `(was_enabled=true, new=true)`-No-Op-Branch und rief nie `enable()` → Pipe nie geoeffnet → Status blieb Disabled obwohl UI an war. Stiller Feature-Verlust. Fix: Manager mit `DiscordPresenceSettings::default()` (= `enabled=false`) starten, dann persistierte Settings via `apply_settings()` nachschieben → triggert sauberen `(false → true)`-Transition → `enable()` → Discord-Pipe wird wirklich geoeffnet.
+
+## [v0.9.1] — 2026-05-18 · INTERN (Draft, nicht publiziert wegen F18)
+
+7-runden-QS-Cycle. Vor Publish-Klick wurde F18 entdeckt → eskaliert auf v0.9.2.
+
+## [v0.9.1-original] — 2026-05-18 · GlitchTip + Discord Rich Presence (initiales Public-Release nach QS)
 
 **Inhaltlich identisch mit dem internen v0.9.0 das nie produktiv ging.** Versionsnummer-Sprung auf 0.9.1 weil ein interner v0.9.0-Build kurzzeitig (~15 min, 0 Downloads) als `releases/latest` sichtbar war — die Nummer brennt damit, fresher Public-Release startet bei 0.9.1.
 

@@ -55,18 +55,31 @@ fn save_settings(settings: &DiscordPresenceSettings) {
 /// Einmaliger Init im Tauri-setup-Hook. Spawnt den Manager + zieht die
 /// Discord-App-ID vom VPS-Public-Endpoint nach + ruft enable wenn der Pilot
 /// in einem frueheren Run bereits zugestimmt hatte.
+///
+/// **Bugfix F18 (v0.9.2-Hotfix nach v0.9.1-QS):** Vorher wurde der Manager
+/// mit den persistierten Settings erzeugt (inkl. `enabled=true`), dann
+/// `apply_settings(same)` aufgerufen. Das `(was_enabled=true, new=true)`
+/// matchte den No-Op-Branch und enable() lief nie → Pipe nie geoeffnet,
+/// Status blieb "Deaktiviert" obwohl die Checkbox im UI an war. Fix:
+/// Manager mit Default-Settings (enabled=false) erstellen, dann persistierte
+/// Settings via apply_settings nachschieben → korrekter (false→true)-
+/// Transition → enable() → Discord-Pipe wird geoeffnet.
 pub fn init(app: &AppHandle) {
-    let settings = load_settings(app);
-    let manager = DiscordPresenceManager::new(settings.clone());
+    let persisted = load_settings(app);
+    // Manager mit DEFAULT-Settings (enabled=false) starten, NICHT mit den
+    // persistierten Settings. Sonst frisst der no-op-Branch in apply_settings
+    // den enable()-Call (F18-Bug v0.9.1).
+    let manager = DiscordPresenceManager::new(DiscordPresenceSettings::default());
     let _ = MANAGER.set(manager.clone());
-    // App-ID vom Server nachziehen — laufzeit-konfiguriert via Webapp-Admin.
-    // Wenn das fehlschlaegt (Server offline beim Boot), versucht's beim
-    // naechsten Settings-Touch erneut (set_settings ruft refresh_app_id).
     tauri::async_runtime::spawn(async move {
+        // App-ID vom Server nachziehen — laufzeit-konfiguriert via Webapp-
+        // Admin. Wenn das fehlschlaegt (Server offline beim Boot), versucht's
+        // beim naechsten Settings-Touch erneut.
         let _ = refresh_app_id(&manager).await;
-        if settings.enabled {
-            let _ = manager.apply_settings(settings).await;
-        }
+        // Persistierte Settings JETZT anwenden — apply_settings sieht
+        // (enabled=false → enabled=persisted.enabled) und triggert sauberen
+        // enable()-Path falls persisted.enabled=true.
+        let _ = manager.apply_settings(persisted).await;
     });
 }
 
