@@ -569,11 +569,11 @@
   },
   "error_reporting": {
     "section_title": "Error telemetry (anonymous)",
-    "intro": "AeroACARS can automatically send technical crash and error reports to our self-hosted GlitchTip server (live.kant.ovh). This helps fix bugs before they hit many pilots. Fully anonymous, opt-in, can be turned off any time.",
+    "intro": "AeroACARS can automatically send technical crash and error reports to our self-hosted GlitchTip server (tip.kant.ovh). This helps fix bugs before they hit many pilots. Fully anonymous, opt-in, can be turned off any time.",
     "toggle_label": "Send anonymous crash reports",
-    "toggle_hint": "<strong>What is sent?</strong> Crash stack traces, sim name, aircraft ICAO, AeroACARS version, OS.<br/><strong>What is NOT sent?</strong> Position, route, login, IP address, passwords, e-mail.<br/><strong>Where to?</strong> live.kant.ovh (self-hosted, no third party). Privacy per GDPR Art. 6 (1) a.<br/>Toggle takes effect immediately — no restart needed.",
+    "toggle_hint": "<strong>What is sent?</strong> Crash stack traces, sim name, aircraft ICAO, AeroACARS version, OS.<br/><strong>What is NOT sent?</strong> Position, route, login, IP address, passwords, e-mail.<br/><strong>Where to?</strong> tip.kant.ovh (self-hosted, no third party). Privacy per GDPR Art. 6 (1) a.<br/>Toggle takes effect immediately — no restart needed.",
     "banner_title": "Help us improve AeroACARS",
-    "banner_body": "AeroACARS can send anonymous crash reports to our own server (live.kant.ovh) — no position, no login, no IP. It helps us find bugs before they hit many pilots. You can change this any time in Settings.",
+    "banner_body": "AeroACARS can send anonymous crash reports to our own server (tip.kant.ovh) — no position, no login, no IP. It helps us find bugs before they hit many pilots. You can change this any time in Settings.",
     "banner_accept": "Yes, send anonymously",
     "banner_decline": "No, thanks"
   },

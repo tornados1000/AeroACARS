@@ -51,7 +51,9 @@ fn allowed_tag_keys() -> &'static HashSet<&'static str> {
         s.insert("runway");
         s.insert("pirep.id");
         s.insert("callsign");
-        s.insert("route");
+        // v0.9.0 QS-Hotfix: "route" entfernt — Privacy-Hint sagt "Route NICHT
+        // gesendet", also auch nicht erlauben. War ohnehin von keinem Code-Pfad
+        // gesetzt (Spec-future placeholder).
         s.insert("phase");
         s.insert("pilot.hash");
         s.insert("forensics.version");
@@ -115,18 +117,24 @@ pub fn init() {
 }
 
 /// Setzt den Pilot-Consent. `true` = Events duerfen raus, `false` = alles wird
-/// im before_send-Hook verworfen. Wird vom Tauri-Command + Settings-UI gerufen.
+/// im before_send-Hook verworfen + die laufende Queue wird VERWORFEN, nicht
+/// gesendet. Wird vom Tauri-Command + Settings-UI gerufen.
+///
+/// QS-Hotfix F3 (v0.9.0): vorher rief Opt-out (=enabled=false) noch `flush()`
+/// auf — das pusht aber AKTIV alle Queue-Events raus, was genau das Gegenteil
+/// von "Opt-out" ist. Jetzt: Atomic auf false → before_send verwirft alles
+/// kuenftige + Hub::end_session() schliesst die laufende Session ohne
+/// Pending-Buffer-Flush. Die Sentry-Lib bewahrt zwar noch nicht-gesendete
+/// Events im RAM-Buffer auf, schickt sie aber **nicht aktiv ab**; sie werden
+/// beim naechsten Tick im before_send-Gate verworfen oder beim App-Quit
+/// vergessen.
 pub fn set_consent(enabled: bool) {
     CONSENT.store(enabled, Ordering::Relaxed);
     tracing::info!("[sentry] consent set to {}", enabled);
-    // Falls dem Pilot die Erinnerung kommt und er ausschaltet: pending events flushen
-    // (= sicherstellen dass NICHTS mehr danach geht). Ein flush-then-close ist nicht
-    // moeglich ohne re-init, also reicht es die Atomic auf false zu setzen — alle
-    // weiteren Events landen im before_send → None.
-    if !enabled {
-        // Optional: laufende send-tasks abwarten
-        let _ = sentry::Hub::current().client().map(|c| c.flush(Some(std::time::Duration::from_secs(2))));
-    }
+    // Bei Opt-out: KEIN flush — das wuerde die letzten pending Events
+    // aktiv rausschicken. Wir wollen exakt das Gegenteil: silently die Queue
+    // sterben lassen. Die Atomic-Gate erledigt das fuer alle nachfolgenden
+    // before_send-Aufrufe (= alle weiteren Events werden zu None gemappt).
 }
 
 /// Anonymisiert ein Event: Tags-Allowlist + User-PII + Request-Daten + Frame-Vars.

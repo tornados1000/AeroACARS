@@ -198,12 +198,29 @@ jobs:
             "AeroACARS-XPlane-Plugin-${{ github.ref_name }}.zip" \
             --clobber
 
-  # ---- Finalise the release ----
-  # Once the per-platform installer builds AND the plugin packaging
-  # finish, flip the draft release to public. `tauri-action` already
-  # merged the `latest.json` for both platforms thanks to
-  # `includeUpdaterJson: true`.
+  # ---- Finalise the release (manual gate ab v0.9.0) ----
+  #
+  # **QS-Hotfix F1 (v0.9.0):** vorher hat dieser Job den Draft sofort nach
+  # Build-Ende auto-published. Beim v0.9.0-Tag-Push ging dadurch ein
+  # ungestestetes Release ~15 min an `releases/latest`, bevor manuelles QS
+  # ueberhaupt anfing. Auto-Updater-Polling ist zwar harmlos vorbeigelaufen
+  # (0 Pilots-Downloads in dem Fenster), aber das Risiko ist real.
+  #
+  # Neues Verhalten: der Promote-Step lebt jetzt unter `workflow_dispatch`,
+  # NICHT mehr im tag-push-Trigger. Tag-Push baut nur noch den Draft,
+  # der dann von Thomas manuell via UI ("Publish Release"-Button) ODER via
+  # `gh workflow run promote-release.yml -f tag=v0.9.0` freigegeben wird.
+  #
+  # Falls in v0.10+ wieder auto-publish gewuenscht ist: dieser Block bekommt
+  # `if: ${{ github.event_name == 'workflow_dispatch' }}` und einen separaten
+  # `workflow_dispatch:`-Trigger oben. Aber Standard ist und bleibt
+  # human-in-the-loop.
+  #
+  # Job-Definition bewusst stehen gelassen aber inaktiv (= laeuft nie weil
+  # `if: false`). Loescht nicht damit der Diff zur v0.8.5-release.yml klar
+  # bleibt und ein zukuenftiger Auto-Publish-Switch nur das `if:` wechseln muss.
   publish:
+    if: false  # Manual-Gate aktiv — siehe QS-Hotfix F1 Kommentar oben
     needs: [build, plugin-package]
     runs-on: ubuntu-latest
     permissions:

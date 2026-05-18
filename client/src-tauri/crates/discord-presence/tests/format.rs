@@ -26,19 +26,32 @@ fn dummy_input(phase: FlightPhase) -> PresenceInput {
 // ─── phase_to_label: alle 18 Phasen muessen ein Mapping haben ──────────────
 
 #[test]
-fn phase_to_label_covers_all_18_canonical_phases() {
+fn phase_to_label_covers_all_20_phases() {
     use FlightPhase::*;
     let all = [
         Preflight, Boarding, Pushback, TaxiOut, TakeoffRoll, Takeoff,
-        RejectedTakeoff, Climb, Cruise, Descent, Approach, Final,
-        Landing, GoAround, TaxiIn, Arrived, BlocksOn, Deboarding,
+        RejectedTakeoff, Climb, Cruise, Holding, Descent, Approach, Final,
+        Landing, GoAround, TaxiIn, Arrived, BlocksOn, Deboarding, PirepSubmitted,
     ];
-    assert_eq!(all.len(), 18, "Spec sagt 18 kanonische Phasen");
+    // v0.9.0-Hotfix F2: vorher waren's 18 (ohne Holding + PirepSubmitted), jetzt 20.
+    // 17 davon emittiert der heutige Rust-FSM, 3 (RejectedTakeoff, GoAround,
+    // Deboarding) sind fuer v0.10.0 vorgesehen aber bereits hier gemappt.
+    assert_eq!(all.len(), 20, "20 Phasen (17 vom FSM + 3 v0.10.0-ready)");
     for p in all {
         let label = phase_to_label(p);
         assert!(!label.is_empty(), "{:?} ohne Label", p);
         assert!(!label.contains("UNKNOWN"), "{:?} -> {} darf kein UNKNOWN-Fallback sein", p, label);
     }
+}
+
+#[test]
+fn holding_and_pirep_submitted_have_distinct_labels() {
+    // QS-Regression-Test: vorher fielen diese in den parse_phase-Default (Preflight)
+    // und kamen in Discord als "PREFLIGHT" raus. Spec-Garantie ist eigene Beschriftung.
+    assert_eq!(phase_to_label(FlightPhase::Holding), "HOLDING");
+    assert_eq!(phase_to_label(FlightPhase::PirepSubmitted), "PIREP FILED");
+    assert_ne!(phase_to_label(FlightPhase::Holding), phase_to_label(FlightPhase::Preflight));
+    assert_ne!(phase_to_label(FlightPhase::PirepSubmitted), phase_to_label(FlightPhase::Preflight));
 }
 
 #[test]
@@ -62,8 +75,8 @@ fn phase_to_asset_key_uses_only_six_registered_assets() {
     let allowed = ["phase_taxi", "phase_climb", "phase_cruise", "phase_descent", "phase_approach", "phase_landed"];
     for p in [
         Preflight, Boarding, Pushback, TaxiOut, TakeoffRoll, Takeoff,
-        RejectedTakeoff, Climb, Cruise, Descent, Approach, Final,
-        Landing, GoAround, TaxiIn, Arrived, BlocksOn, Deboarding,
+        RejectedTakeoff, Climb, Cruise, Holding, Descent, Approach, Final,
+        Landing, GoAround, TaxiIn, Arrived, BlocksOn, Deboarding, PirepSubmitted,
     ] {
         let key = phase_to_asset_key(p);
         assert!(allowed.contains(&key), "{:?} mapped auf nicht-registriertes Asset '{}'", p, key);

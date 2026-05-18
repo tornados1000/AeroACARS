@@ -29,6 +29,7 @@ import random
 
 OUT = Path(__file__).parent
 SIZE = 1024
+COVER_W, COVER_H = 1024, 576   # Discord Rich-Presence Einladungs-Cover (16:9)
 SOURCE_LOGO = OUT.parent.parent / "client" / "src-tauri" / "icons" / "icon.png"
 
 
@@ -57,15 +58,19 @@ def find_font(size: int, bold: bool = True) -> ImageFont.FreeTypeFont:
 
 
 def linear_gradient(size: int, c1: tuple, c2: tuple, angle_deg: float = 135.0) -> Image.Image:
-    """Erzeugt ein lineares Gradient quadratisch. angle=135 = top-left → bottom-right."""
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    """Quadratisches Lineares Gradient. angle=135 = top-left → bottom-right."""
+    return linear_gradient_rect(size, size, c1, c2, angle_deg)
+
+
+def linear_gradient_rect(w: int, h: int, c1: tuple, c2: tuple, angle_deg: float = 90.0) -> Image.Image:
+    """Lineares Gradient fuer beliebige Rechtecke. angle=90 = top→bottom, 0 = left→right."""
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     px = img.load()
     rad = math.radians(angle_deg)
     dx, dy = math.cos(rad), math.sin(rad)
-    # Projektion jedes Pixels auf Gradient-Achse, normalisiert 0..1
-    diag = abs(dx) * size + abs(dy) * size
-    for y in range(size):
-        for x in range(size):
+    diag = abs(dx) * w + abs(dy) * h
+    for y in range(h):
+        for x in range(w):
             t = ((x * dx) + (y * dy)) / diag
             t = max(0.0, min(1.0, t + 0.5))
             r = int(c1[0] + (c2[0] - c1[0]) * t)
@@ -73,6 +78,32 @@ def linear_gradient(size: int, c1: tuple, c2: tuple, angle_deg: float = 135.0) -
             b = int(c1[2] + (c2[2] - c1[2]) * t)
             a = int(c1[3] + (c2[3] - c1[3]) * t) if len(c1) == 4 else 255
             px[x, y] = (r, g, b, a)
+    return img
+
+
+def multi_stop_vertical(w: int, h: int, stops: list[tuple[float, tuple]]) -> Image.Image:
+    """Mehr-Stop-Vertikalgradient. `stops` ist [(0.0, rgb), (0.4, rgb), (1.0, rgb), ...].
+    Stops MUESSEN sortiert sein nach Position 0..1.
+    """
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    px = img.load()
+    for y in range(h):
+        t = y / max(1, h - 1)
+        # find segment
+        for i in range(len(stops) - 1):
+            t0, c0 = stops[i]
+            t1, c1 = stops[i + 1]
+            if t0 <= t <= t1:
+                local = (t - t0) / max(1e-9, t1 - t0)
+                r = int(c0[0] + (c1[0] - c0[0]) * local)
+                g = int(c0[1] + (c1[1] - c0[1]) * local)
+                b = int(c0[2] + (c1[2] - c0[2]) * local)
+                color = (r, g, b, 255)
+                break
+        else:
+            color = (*stops[-1][1], 255)
+        for x in range(w):
+            px[x, y] = color
     return img
 
 
@@ -352,6 +383,153 @@ def make_logo() -> None:
     print(f"OK aeroacars_logo: {out.name}  ({SIZE}x{SIZE})")
 
 
+def make_cover() -> None:
+    """1024x576 Einladungs-Cover fuer Discord Rich Presence.
+    Cinematic sunset-horizon mit Top-Down-Jet-Silhouette + AeroACARS-Brand-Block.
+    """
+    # 1. Multi-Stop-Sky-Gradient (Space → Twilight → Sunset)
+    canvas = multi_stop_vertical(COVER_W, COVER_H, stops=[
+        (0.00, (8, 18, 42)),        # Space-Navy ganz oben
+        (0.25, (16, 36, 80)),       # Tiefes Twilight
+        (0.55, (38, 84, 160)),      # Klares Mid-Blau
+        (0.72, (210, 110, 64)),     # Sunset-Orange (Horizon-Glow)
+        (0.85, (90, 38, 28)),       # Dunkles Rotbraun (Land unter Horizon)
+        (1.00, (24, 14, 18)),       # Fast-Schwarz am Boden
+    ])
+
+    # 2. Sterne im oberen Drittel
+    rng = random.Random(7)
+    star_overlay = Image.new("RGBA", (COVER_W, COVER_H), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(star_overlay)
+    for _ in range(70):
+        x = rng.randint(20, COVER_W - 20)
+        y = rng.randint(10, int(COVER_H * 0.35))
+        r = rng.choice([1, 1, 1, 2, 2, 3])
+        a = rng.randint(140, 230)
+        sd.ellipse([x - r, y - r, x + r, y + r], fill=(255, 255, 255, a))
+    star_overlay = star_overlay.filter(ImageFilter.GaussianBlur(radius=0.4))
+    canvas.alpha_composite(star_overlay)
+
+    # 3. Horizon-Glow (Soft-Light-Band um 70% Hoehe)
+    glow = Image.new("RGBA", (COVER_W, COVER_H), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    glow_y = int(COVER_H * 0.70)
+    gd.ellipse([COVER_W // 2 - 600, glow_y - 60, COVER_W // 2 + 600, glow_y + 60],
+               fill=(255, 200, 130, 160))
+    glow = glow.filter(ImageFilter.GaussianBlur(radius=40))
+    canvas.alpha_composite(glow)
+
+    # 4. Cloud-Streaks (warm beleuchtet)
+    clouds = Image.new("RGBA", (COVER_W, COVER_H), (0, 0, 0, 0))
+    cd = ImageDraw.Draw(clouds)
+    for i in range(5):
+        cy = int(COVER_H * (0.55 + i * 0.04))
+        w = rng.randint(300, 600)
+        x = rng.randint(-80, COVER_W - 200)
+        h = rng.randint(18, 32)
+        c = (255, 220 - i * 20, 180 - i * 20, 140 - i * 18)
+        cd.ellipse([x, cy, x + w, cy + h], fill=c)
+    clouds = clouds.filter(ImageFilter.GaussianBlur(radius=10))
+    canvas.alpha_composite(clouds)
+
+    # 5. Top-Down-Jet (rechts oben, klein genug damit der Brand-Block links Platz hat)
+    jet_canvas = Image.new("RGBA", (COVER_W, COVER_H), (0, 0, 0, 0))
+    # Jet ist 1024x1024-zentriert; verschoben+scaled rechts-oben.
+    # SCALE so klein dass die Silhouette unter 230 px hoch bleibt → die Brand-Texte
+    # links bleiben frei + der Jet wirkt wie eine elegante Akzent-Ikone.
+    SCALE = 0.28
+    JET_CX = int(COVER_W * 0.82)
+    JET_CY = int(COVER_H * 0.42)
+    poly = [(JET_CX + (px - 512) * SCALE, JET_CY + (py - 512) * SCALE) for px, py in JET_POLY]
+    # Drop-Shadow (weiches Glow nach unten/links fuer Hoehen-Feeling)
+    sh = Image.new("RGBA", (COVER_W, COVER_H), (0, 0, 0, 0))
+    sdraw = ImageDraw.Draw(sh)
+    sdraw.polygon([(p[0] - 14, p[1] + 18) for p in poly], fill=(0, 0, 0, 130))
+    sh = sh.filter(ImageFilter.GaussianBlur(radius=14))
+    jet_canvas.alpha_composite(sh)
+    # Jet-Body — leicht warmes Weiss (Sunset-licht-reflektiert)
+    jd = ImageDraw.Draw(jet_canvas)
+    jd.polygon(poly, fill=(252, 248, 240, 235))
+    canvas.alpha_composite(jet_canvas)
+
+    # 6. Vignette (cinematic Tiefe an Raendern)
+    vignette = Image.new("RGBA", (COVER_W, COVER_H), (0, 0, 0, 0))
+    vd = ImageDraw.Draw(vignette)
+    for i in range(6):
+        vd.rectangle([i * 4, i * 4, COVER_W - i * 4, COVER_H - i * 4],
+                     outline=(0, 0, 0, 18 + i * 10), width=4)
+    canvas.alpha_composite(vignette)
+
+    # 7. Brand-Block links: Logo + Wordmark + Tagline
+    # 7a. Dark-Scrim-Overlay hinter dem Brand-Block damit der Text auf jedem
+    #     Hintergrund-Pixel lesbar bleibt — der Sunset-Glow im mittleren Band
+    #     hat sonst weisse Schrift weggewischt. Wir bauen einen weichen
+    #     Vertical-Gradient von links-volltransparent-schwarz nach
+    #     rechts-transparent + Horizontal-Fade damit der Uebergang ins
+    #     restliche Bild nahtlos wirkt.
+    # Voll-flaechiges dunkles Rechteck — die Fade-Maske MACHT den Uebergang allein.
+    # (Erste Version hatte einen senkrechten Cut weil das Rect bei x=560 hart endete
+    # WAEHREND die Fade-Maske erst bei x=600 auf 0 ist → 40-px-Diskontinuitaet.)
+    scrim = Image.new("RGBA", (COVER_W, COVER_H), (0, 0, 0, 165))
+    fade = Image.new("L", (COVER_W, COVER_H), 0)
+    fd = ImageDraw.Draw(fade)
+    # Horizontaler Soft-Fade-Verlauf: links volldeckend → weicher Tail nach
+    # rechts. Laenge des Fade-Tails grosszuegig (340..720), damit kein
+    # wahrnehmbarer Edge bleibt — Auge erkennt sub-1%-Alpha-Spruenge gut.
+    for x in range(COVER_W):
+        if x < 340:
+            a = 255
+        elif x < 720:
+            # Smoothstep (3t² - 2t³) statt linear → noch sanfterer Uebergang
+            t = (x - 340) / 380
+            sm = t * t * (3 - 2 * t)
+            a = int(255 * (1.0 - sm))
+        else:
+            a = 0
+        fd.line([(x, 0), (x, COVER_H)], fill=a)
+    scrim_faded = Image.new("RGBA", (COVER_W, COVER_H), (0, 0, 0, 0))
+    scrim_faded.paste(scrim, (0, 0), fade)
+    canvas.alpha_composite(scrim_faded)
+
+    # 7b. Logo links oben
+    if SOURCE_LOGO.exists():
+        logo = Image.open(SOURCE_LOGO).convert("RGBA").resize((140, 140), Image.LANCZOS)
+        # Sanfter Glow hinter dem Logo damit es vom Hintergrund abgehoben ist
+        lg = Image.new("RGBA", (COVER_W, COVER_H), (0, 0, 0, 0))
+        ld = ImageDraw.Draw(lg)
+        ld.ellipse([50, 50, 220, 220], fill=(0, 0, 0, 110))
+        lg = lg.filter(ImageFilter.GaussianBlur(radius=18))
+        canvas.alpha_composite(lg)
+        canvas.alpha_composite(logo, (60, 60))
+
+    # 7c. Wordmark unter dem Logo
+    draw = ImageDraw.Draw(canvas)
+    font_wordmark = find_font(82)
+    font_tagline = find_font(28, bold=False)
+    # Tiefer-Schatten + Hauptschrift in reinweiss — durch den Scrim jetzt
+    # auch im Sunset-Band gut lesbar.
+    draw.text((64, 220), "AeroACARS", font=font_wordmark, fill=(0, 0, 0, 200))
+    draw.text((60, 216), "AeroACARS", font=font_wordmark, fill=(255, 255, 255, 255))
+
+    # Tagline (kurzer Brand-Claim)
+    draw.text((63, 327), "Pilot Client · Live-Tracking · Touchdown-Forensik",
+              font=font_tagline, fill=(0, 0, 0, 200))
+    draw.text((62, 326), "Pilot Client · Live-Tracking · Touchdown-Forensik",
+              font=font_tagline, fill=(232, 240, 252, 240))
+
+    # Untere Status-Linie
+    font_meta = find_font(22, bold=False)
+    draw.text((63, 373), "phpVMS 7 · MSFS 2020/2024 · X-Plane 11/12",
+              font=font_meta, fill=(0, 0, 0, 180))
+    draw.text((62, 372), "phpVMS 7 · MSFS 2020/2024 · X-Plane 11/12",
+              font=font_meta, fill=(196, 214, 234, 230))
+
+    # 8. Save (kein Rounded-Corner — Discord crop't das Cover selbst zu seiner UI)
+    out = OUT / "rich_presence_cover.png"
+    canvas.save(out, "PNG", optimize=True)
+    print(f"OK rich_presence_cover: {out.name}  ({COVER_W}x{COVER_H})")
+
+
 def main() -> None:
     print("--- AeroACARS Discord-RPC Asset Generator v2 ---\n")
     make_logo()
@@ -386,7 +564,8 @@ def main() -> None:
         accent=(18, 70, 50),
         bg_motif="x_roundel",
     )
-    print("\nFertig. 5 PNGs in:", OUT)
+    make_cover()
+    print("\nFertig. 6 PNGs in:", OUT)
 
 
 if __name__ == "__main__":

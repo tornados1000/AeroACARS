@@ -219,6 +219,10 @@ fn parse_phase(s: &str) -> DPhase {
         "REJECTED_TAKE_OFF" | "REJECTED_TAKEOFF" | "REJECTEDTAKEOFF" => DPhase::RejectedTakeoff,
         "CLIMB" => DPhase::Climb,
         "CRUISE" => DPhase::Cruise,
+        // v0.9.0 QS-Hotfix F2: Holding + PirepSubmitted wurden vom FSM emittiert
+        // aber hier nicht erkannt → fielen auf "PREFLIGHT" zurueck. Pilot im
+        // Holding-Pattern sah falsch "PREFLIGHT" in Discord. Jetzt korrekt.
+        "HOLDING" => DPhase::Holding,
         "DESCENT" => DPhase::Descent,
         "APPROACH" => DPhase::Approach,
         "FINAL" => DPhase::Final,
@@ -228,7 +232,10 @@ fn parse_phase(s: &str) -> DPhase {
         "ARRIVED" => DPhase::Arrived,
         "BLOCKS_ON" | "BLOCKSON" => DPhase::BlocksOn,
         "DEBOARDING" => DPhase::Deboarding,
-        // Fallback: Preflight — nichts in der Spec, aber niemals crashen
+        "PIREP_SUBMITTED" | "PIREPSUBMITTED" => DPhase::PirepSubmitted,
+        // Fallback: Preflight — falls eine neue Phase auftaucht die wir noch
+        // nicht kennen, niemals crashen. Sollte aber heute keine Phase mehr
+        // hier landen (alle FSM-Werte sind oben gemapped).
         _ => DPhase::Preflight,
     }
 }

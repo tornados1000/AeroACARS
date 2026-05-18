@@ -569,11 +569,11 @@
   },
   "error_reporting": {
     "section_title": "Telemetria errori (anonima)",
-    "intro": "AeroACARS può inviare automaticamente report di crash ed errori al nostro server GlitchTip self-hosted (live.kant.ovh). Questo aiuta a correggere bug prima che colpiscano molti piloti. Completamente anonimo, opt-in, disattivabile in qualsiasi momento.",
+    "intro": "AeroACARS può inviare automaticamente report di crash ed errori al nostro server GlitchTip self-hosted (tip.kant.ovh). Questo aiuta a correggere bug prima che colpiscano molti piloti. Completamente anonimo, opt-in, disattivabile in qualsiasi momento.",
     "toggle_label": "Invia report di crash anonimi",
-    "toggle_hint": "<strong>Cosa viene inviato?</strong> Stack trace dei crash, nome simulatore, ICAO velivolo, versione AeroACARS, sistema operativo.<br/><strong>Cosa NON viene inviato?</strong> Posizione, rotta, login, indirizzo IP, password, e-mail.<br/><strong>Dove?</strong> live.kant.ovh (self-hosted, nessuna terza parte). Privacy secondo GDPR Art. 6 (1) a.<br/>Il toggle ha effetto immediato — nessun riavvio necessario.",
+    "toggle_hint": "<strong>Cosa viene inviato?</strong> Stack trace dei crash, nome simulatore, ICAO velivolo, versione AeroACARS, sistema operativo.<br/><strong>Cosa NON viene inviato?</strong> Posizione, rotta, login, indirizzo IP, password, e-mail.<br/><strong>Dove?</strong> tip.kant.ovh (self-hosted, nessuna terza parte). Privacy secondo GDPR Art. 6 (1) a.<br/>Il toggle ha effetto immediato — nessun riavvio necessario.",
     "banner_title": "Aiutaci a migliorare AeroACARS",
-    "banner_body": "AeroACARS può inviare report di crash anonimi al nostro server (live.kant.ovh) — senza posizione, senza login, senza IP. Ci aiuta a trovare bug prima che colpiscano molti piloti. Puoi cambiare questa scelta in qualsiasi momento nelle Impostazioni.",
+    "banner_body": "AeroACARS può inviare report di crash anonimi al nostro server (tip.kant.ovh) — senza posizione, senza login, senza IP. Ci aiuta a trovare bug prima che colpiscano molti piloti. Puoi cambiare questa scelta in qualsiasi momento nelle Impostazioni.",
     "banner_accept": "Sì, invia anonimamente",
     "banner_decline": "No, grazie"
   },
