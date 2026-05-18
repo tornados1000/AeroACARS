@@ -4,7 +4,30 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
-## [v0.9.0] — 2026-05-18 · GlitchTip + Discord Rich Presence
+## [v0.9.1] — 2026-05-18 · GlitchTip + Discord Rich Presence (initiales Public-Release nach QS)
+
+**Inhaltlich identisch mit dem internen v0.9.0 das nie produktiv ging.** Versionsnummer-Sprung auf 0.9.1 weil ein interner v0.9.0-Build kurzzeitig (~15 min, 0 Downloads) als `releases/latest` sichtbar war — die Nummer brennt damit, fresher Public-Release startet bei 0.9.1.
+
+### Zusaetzlich zu v0.9.0-Inhalten — QS-Hotfix-Findings F1-F11 bereinigt:
+
+**Runde 1 (F1-F8):**
+- **F1:** Release-Workflow auto-publishte den Draft sofort nach Build → jetzt `if: false`-Gate, Publish muss manuell in der UI geklickt werden
+- **F2:** Discord-RPC zeigte fuer Phasen `HOLDING` + `PIREP FILED` faelschlich „PREFLIGHT" → 20 Phasen jetzt komplett gemappt + Regression-Tests
+- **F3:** Sentry-Opt-Out rief `flush()` (= pushed Events AKTIV raus statt zu verwerfen) → entfernt
+- **F4:** Tag `route` war in 4 Allowlists aber UI sagte „Route NICHT gesendet" → konsistent geloescht
+- **F5:** UI-Text sagte `live.kant.ovh` statt korrekt `tip.kant.ovh` (DSGVO-Consent-Konsistenz)
+- **F6:** Frontend-Sentry hatte `integrations: []` → deaktivierte alle Default-Integrations (BrowserApiErrors, GlobalHandlers, Breadcrumbs); jetzt aktiv
+- **F7:** `set_sim_lost`-Code existiert aber kein Caller → als Known Issue dokumentiert, v0.9.2-Roadmap
+- **F8:** CHANGELOG-Behauptung „18 Phasen" → korrigiert auf 20 Phasen (17 FSM-aktiv + 3 v0.10.0-ready)
+
+**Runde 2 (F9-F11) nach 2. QS-Pass:**
+- **F9:** Sentry-Opt-Out-Rest-Risiko — Atomic-Gate verhinderte zwar kuenftige Events, aber im Transport-Buffer pending events haetten noch beim naechsten Tick rausgehen koennen → jetzt `Hub::current().bind_client(None)` droppt den Transport hart, Buffer-Inhalt geht verloren statt gesendet zu werden. **DS7 hart erfuellt: „ab Klick geht nichts mehr raus".**
+- **F10:** Webapp-Allowlist hatte noch `ui.route` als Backdoor fuer spaeter-versehentliches Route-Tag-Setting → entfernt
+- **F11:** Code-Kommentar-Drift in `sentry_init.rs` (Kommentar referenzierte `Hub::end_session()`, Code rief es nicht) → Kommentar synchronisiert auf tatsaechliche `bind_client(None)`-Implementierung
+
+## [v0.9.0] — 2026-05-18 · INTERN (nie publiziert, kurz als latest sichtbar)
+
+Versionsnummer **verbrannt** wegen ~15-min-Sichtbarkeits-Fenster im `releases/latest` waehrend QS noch lief. Inhalt vollstaendig in v0.9.1 enthalten. Tag bleibt im Git-Log fuer Audit-Trail, keine Pilot-Distribution.
 
 🚀 **Doppel-Feature-Release: Anonyme Fehler-Telemetrie an self-hosted GlitchTip + Pilot-Flugstatus live im Discord-Profil. Beide Features sind Opt-In, Default = aus, jederzeit per Toggle abschaltbar.**
 

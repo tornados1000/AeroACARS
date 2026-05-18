@@ -117,24 +117,39 @@ pub fn init() {
 }
 
 /// Setzt den Pilot-Consent. `true` = Events duerfen raus, `false` = alles wird
-/// im before_send-Hook verworfen + die laufende Queue wird VERWORFEN, nicht
-/// gesendet. Wird vom Tauri-Command + Settings-UI gerufen.
+/// im before_send-Hook verworfen UND der Transport aktiv gedroppt — pending
+/// Events im RAM-Buffer der Sentry-Lib gehen damit verloren statt noch
+/// rausgesendet zu werden. Wird vom Tauri-Command + Settings-UI gerufen.
 ///
-/// QS-Hotfix F3 (v0.9.0): vorher rief Opt-out (=enabled=false) noch `flush()`
-/// auf — das pusht aber AKTIV alle Queue-Events raus, was genau das Gegenteil
-/// von "Opt-out" ist. Jetzt: Atomic auf false → before_send verwirft alles
-/// kuenftige + Hub::end_session() schliesst die laufende Session ohne
-/// Pending-Buffer-Flush. Die Sentry-Lib bewahrt zwar noch nicht-gesendete
-/// Events im RAM-Buffer auf, schickt sie aber **nicht aktiv ab**; sie werden
-/// beim naechsten Tick im before_send-Gate verworfen oder beim App-Quit
-/// vergessen.
+/// QS-Hotfix Verlauf v0.9.x:
+///  - v0.9.0 (initial): set_consent(false) rief flush() — das pushed pending
+///    Events AKTIV raus, exakt das Gegenteil von Opt-out.
+///  - v0.9.0 Hotfix Runde 1 (F3): flush() entfernt. Atomic-Gate verhindert
+///    kuenftige Events, ABER pending im Transport-Buffer war noch da und
+///    haette beim naechsten Tick rausgehen koennen (= P1-Rest-Risiko).
+///  - v0.9.1 Hotfix Runde 2: zusaetzlich Hub::current().bind_client(None)
+///    → Transport wird gedroppt, Buffer-Inhalt geht verloren, nicht ans
+///    Netz. Defense-in-Depth: Atomic-Gate (vor before_send) + Transport-
+///    Drop (kein Sendekanal mehr). Damit ist DS7 hart erfuellt:
+///    "ab Klick geht nichts mehr raus".
+///
+/// Bei Re-Opt-In nach Drop muesste der Client neu initialisiert werden
+/// (= App-Restart). Das ist akzeptabel weil Opt-Out selten geklickt wird
+/// und Pilot dann nicht binnen Sekunden zurueck-toggeln will.
 pub fn set_consent(enabled: bool) {
     CONSENT.store(enabled, Ordering::Relaxed);
     tracing::info!("[sentry] consent set to {}", enabled);
-    // Bei Opt-out: KEIN flush — das wuerde die letzten pending Events
-    // aktiv rausschicken. Wir wollen exakt das Gegenteil: silently die Queue
-    // sterben lassen. Die Atomic-Gate erledigt das fuer alle nachfolgenden
-    // before_send-Aufrufe (= alle weiteren Events werden zu None gemappt).
+    if !enabled {
+        // Defense-in-Depth: Atomic-Gate alleine reicht zwar fuer alle
+        // before_send-Aufrufe ab jetzt — aber im Transport-Buffer der
+        // sentry-Lib koennen noch Events sitzen die vor dem Toggle die
+        // before_send-Gate passiert haben. Wir wollen DS7 hart erfuellen
+        // ("ab Klick geht nichts mehr raus"), also dropen wir den Transport.
+        // bind_client(None) entfernt den Client aus dem Hub → der Drop des
+        // Clients schliesst den Transport → pending Buffer wird verworfen
+        // statt gesendet.
+        sentry::Hub::current().bind_client(None);
+    }
 }
 
 /// Anonymisiert ein Event: Tags-Allowlist + User-PII + Request-Daten + Frame-Vars.
