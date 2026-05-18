@@ -461,7 +461,35 @@ def make_cover() -> None:
     canvas.alpha_composite(vignette)
 
     # 7. Brand-Block links: Logo + Wordmark + Tagline
-    # Logo links oben
+    # 7a. Dark-Scrim-Overlay hinter dem Brand-Block damit der Text auf jedem
+    #     Hintergrund-Pixel lesbar bleibt — der Sunset-Glow im mittleren Band
+    #     hat sonst weisse Schrift weggewischt. Wir bauen einen weichen
+    #     Vertical-Gradient von links-volltransparent-schwarz nach
+    #     rechts-transparent + Horizontal-Fade damit der Uebergang ins
+    #     restliche Bild nahtlos wirkt.
+    scrim = Image.new("RGBA", (COVER_W, COVER_H), (0, 0, 0, 0))
+    sdraw = ImageDraw.Draw(scrim)
+    # Hauptpanel: dunkles Rechteck links — wird mit einem horizontalen
+    # Alpha-Fade verblurrt damit kein harter Edge entsteht.
+    sdraw.rectangle([0, 0, 560, COVER_H], fill=(0, 0, 0, 165))
+    # Fade-Maske: links volldeckend, rechts transparent
+    fade = Image.new("L", (COVER_W, COVER_H), 0)
+    fd = ImageDraw.Draw(fade)
+    # Horizontaler Verlauf der Maske (Pixel-fuer-Pixel-Spalte ist OK fuer 1024px)
+    for x in range(COVER_W):
+        if x < 340:
+            a = 255
+        elif x < 600:
+            a = int(255 * (1.0 - (x - 340) / 260))
+        else:
+            a = 0
+        fd.line([(x, 0), (x, COVER_H)], fill=a)
+    # Composite mit der Fade-Maske
+    scrim_faded = Image.new("RGBA", (COVER_W, COVER_H), (0, 0, 0, 0))
+    scrim_faded.paste(scrim, (0, 0), fade)
+    canvas.alpha_composite(scrim_faded)
+
+    # 7b. Logo links oben
     if SOURCE_LOGO.exists():
         logo = Image.open(SOURCE_LOGO).convert("RGBA").resize((140, 140), Image.LANCZOS)
         # Sanfter Glow hinter dem Logo damit es vom Hintergrund abgehoben ist
@@ -472,22 +500,27 @@ def make_cover() -> None:
         canvas.alpha_composite(lg)
         canvas.alpha_composite(logo, (60, 60))
 
-    # Wordmark unter dem Logo
+    # 7c. Wordmark unter dem Logo
     draw = ImageDraw.Draw(canvas)
     font_wordmark = find_font(82)
     font_tagline = find_font(28, bold=False)
-    # Schatten + Hauptschrift
-    draw.text((64, 220), "AeroACARS", font=font_wordmark, fill=(0, 0, 0, 180))
-    draw.text((60, 216), "AeroACARS", font=font_wordmark, fill=(255, 255, 255, 250))
+    # Tiefer-Schatten + Hauptschrift in reinweiss — durch den Scrim jetzt
+    # auch im Sunset-Band gut lesbar.
+    draw.text((64, 220), "AeroACARS", font=font_wordmark, fill=(0, 0, 0, 200))
+    draw.text((60, 216), "AeroACARS", font=font_wordmark, fill=(255, 255, 255, 255))
 
     # Tagline (kurzer Brand-Claim)
+    draw.text((63, 327), "Pilot Client · Live-Tracking · Touchdown-Forensik",
+              font=font_tagline, fill=(0, 0, 0, 200))
     draw.text((62, 326), "Pilot Client · Live-Tracking · Touchdown-Forensik",
-              font=font_tagline, fill=(220, 230, 245, 220))
+              font=font_tagline, fill=(232, 240, 252, 240))
 
     # Untere Status-Linie
     font_meta = find_font(22, bold=False)
+    draw.text((63, 373), "phpVMS 7 · MSFS 2020/2024 · X-Plane 11/12",
+              font=font_meta, fill=(0, 0, 0, 180))
     draw.text((62, 372), "phpVMS 7 · MSFS 2020/2024 · X-Plane 11/12",
-              font=font_meta, fill=(180, 200, 220, 200))
+              font=font_meta, fill=(196, 214, 234, 230))
 
     # 8. Save (kein Rounded-Corner — Discord crop't das Cover selbst zu seiner UI)
     out = OUT / "rich_presence_cover.png"
