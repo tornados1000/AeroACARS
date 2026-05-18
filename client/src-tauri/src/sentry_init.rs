@@ -66,43 +66,50 @@ fn allowed_tag_keys() -> &'static HashSet<&'static str> {
     })
 }
 
+/// Baut die ClientOptions — wird sowohl im initial-init() als auch beim
+/// Re-Opt-In (rebind_client) genutzt damit Sentry-Re-Init im selben App-Lauf
+/// moeglich ist (siehe set_consent). Returns None wenn keine DSN konfiguriert.
+fn build_options() -> Option<sentry::ClientOptions> {
+    let dsn = option_env!("AEROACARS_SENTRY_DSN").unwrap_or("").trim();
+    if dsn.is_empty() {
+        return None;
+    }
+    let release = format!("aeroacars-client@{}", env!("CARGO_PKG_VERSION"));
+    let environment = if cfg!(debug_assertions) {
+        "development"
+    } else {
+        "production"
+    };
+    Some(sentry::ClientOptions {
+        dsn: dsn.parse().ok(),
+        release: Some(release.into()),
+        environment: Some(environment.into()),
+        send_default_pii: false,
+        traces_sample_rate: 0.0,
+        attach_stacktrace: true,
+        before_send: Some(std::sync::Arc::new(|event| {
+            // Consent-Gate
+            if !CONSENT.load(Ordering::Relaxed) {
+                return None;
+            }
+            Some(redact_event(event))
+        })),
+        ..Default::default()
+    })
+}
+
 /// Initialisiert Sentry. No-Op wenn DSN nicht in env zur Build-Zeit gesetzt war.
 ///
 /// MUSS frueh in `lib.rs::run()` aufgerufen werden, vor dem Tauri-Builder,
 /// damit auch Bootstrap-Panics gefangen werden.
 pub fn init() {
     SENTRY_GUARD.get_or_init(|| {
-        // build.rs setzt AEROACARS_SENTRY_DSN als compile-time env.
-        // Wenn beim Build leer → option_env! gibt None → kein Init.
-        let dsn = option_env!("AEROACARS_SENTRY_DSN").unwrap_or("").trim();
-        if dsn.is_empty() {
+        let Some(options) = build_options() else {
             tracing::info!("[sentry] no DSN configured (AEROACARS_SENTRY_DSN at build-time); skipping init");
             return None;
-        }
-
-        let release = format!("aeroacars-client@{}", env!("CARGO_PKG_VERSION"));
-        let environment = if cfg!(debug_assertions) {
-            "development"
-        } else {
-            "production"
         };
-
-        let guard = sentry::init(sentry::ClientOptions {
-            dsn: dsn.parse().ok(),
-            release: Some(release.clone().into()),
-            environment: Some(environment.into()),
-            send_default_pii: false,
-            traces_sample_rate: 0.0,
-            attach_stacktrace: true,
-            before_send: Some(std::sync::Arc::new(|event| {
-                // Consent-Gate
-                if !CONSENT.load(Ordering::Relaxed) {
-                    return None;
-                }
-                Some(redact_event(event))
-            })),
-            ..Default::default()
-        });
+        let release_tag = options.release.as_ref().map(|c| c.to_string()).unwrap_or_default();
+        let guard = sentry::init(options);
 
         // Initial-Scope: Komponenten-Tags
         sentry::configure_scope(|scope| {
@@ -111,43 +118,61 @@ pub fn init() {
             scope.set_tag("os", std::env::consts::OS);
         });
 
-        tracing::info!("[sentry] initialized for release {}", release);
+        tracing::info!("[sentry] initialized for release {}", release_tag);
         Some(guard)
     });
 }
 
-/// Setzt den Pilot-Consent. `true` = Events duerfen raus, `false` = alles wird
-/// im before_send-Hook verworfen UND der Transport aktiv gedroppt — pending
-/// Events im RAM-Buffer der Sentry-Lib gehen damit verloren statt noch
-/// rausgesendet zu werden. Wird vom Tauri-Command + Settings-UI gerufen.
+/// Setzt den Pilot-Consent. Symmetrisch beide Richtungen:
+///  - `false` → CONSENT-Atomic = false + Transport hart gedroppt
+///    (`bind_client(None)`). Pending events im Transport-Buffer der
+///    sentry-Lib gehen verloren statt rausgesendet zu werden. DS7
+///    hart erfuellt: "ab Klick geht nichts mehr raus".
+///  - `true`  → CONSENT-Atomic = true + (falls Client nicht mehr
+///    gebunden ist) neuen Client mit identischen Options binden.
+///    So funktioniert Re-Opt-In im selben App-Run, ohne Neustart.
 ///
 /// QS-Hotfix Verlauf v0.9.x:
-///  - v0.9.0 (initial): set_consent(false) rief flush() — das pushed pending
+///  - v0.9.0 initial: set_consent(false) rief flush() — das pushed pending
 ///    Events AKTIV raus, exakt das Gegenteil von Opt-out.
-///  - v0.9.0 Hotfix Runde 1 (F3): flush() entfernt. Atomic-Gate verhindert
+///  - v0.9.0 Runde 1 (F3): flush() entfernt. Atomic-Gate verhindert
 ///    kuenftige Events, ABER pending im Transport-Buffer war noch da und
 ///    haette beim naechsten Tick rausgehen koennen (= P1-Rest-Risiko).
-///  - v0.9.1 Hotfix Runde 2: zusaetzlich Hub::current().bind_client(None)
-///    → Transport wird gedroppt, Buffer-Inhalt geht verloren, nicht ans
-///    Netz. Defense-in-Depth: Atomic-Gate (vor before_send) + Transport-
-///    Drop (kein Sendekanal mehr). Damit ist DS7 hart erfuellt:
-///    "ab Klick geht nichts mehr raus".
-///
-/// Bei Re-Opt-In nach Drop muesste der Client neu initialisiert werden
-/// (= App-Restart). Das ist akzeptabel weil Opt-Out selten geklickt wird
-/// und Pilot dann nicht binnen Sekunden zurueck-toggeln will.
+///  - v0.9.1 Runde 2 (F9): zusaetzlich Hub::current().bind_client(None)
+///    → Transport wird gedroppt. Aber Re-Opt-In war damit kaputt
+///    (= Settings-Hint "wirkt sofort, kein Neustart noetig" wurde fuer
+///    den Re-Opt-In-Fall zur Luege).
+///  - v0.9.1 Runde 3 (F12): symmetrischer Re-Init bei opt-in via
+///    build_options() + Hub::bind_client(Arc::new(Client::from(options))).
+///    Damit ist Hint wieder ehrlich: aus-an-aus-an funktioniert in einem
+///    App-Lauf.
 pub fn set_consent(enabled: bool) {
     CONSENT.store(enabled, Ordering::Relaxed);
     tracing::info!("[sentry] consent set to {}", enabled);
-    if !enabled {
-        // Defense-in-Depth: Atomic-Gate alleine reicht zwar fuer alle
-        // before_send-Aufrufe ab jetzt — aber im Transport-Buffer der
-        // sentry-Lib koennen noch Events sitzen die vor dem Toggle die
-        // before_send-Gate passiert haben. Wir wollen DS7 hart erfuellen
-        // ("ab Klick geht nichts mehr raus"), also dropen wir den Transport.
+    if enabled {
+        // Re-Init falls Client nicht mehr gebunden ist (= nach vorherigem
+        // Opt-Out im selben App-Run). Wenn schon ein Client gebunden ist
+        // (= initialer Init lief gerade, oder noch nie opt-out geklickt),
+        // brauchen wir nichts zu tun — das Atomic-Gate reicht.
+        let hub = sentry::Hub::current();
+        if hub.client().is_none() {
+            if let Some(options) = build_options() {
+                let client = sentry::Client::from(options);
+                hub.bind_client(Some(std::sync::Arc::new(client)));
+                // Initial-Scope nochmal setzen — der frische Client hat keinen
+                // Scope mehr von der ersten init()-Runde.
+                sentry::configure_scope(|scope| {
+                    scope.set_tag("app.component", "client");
+                    scope.set_tag("app.version", env!("CARGO_PKG_VERSION"));
+                    scope.set_tag("os", std::env::consts::OS);
+                });
+                tracing::info!("[sentry] re-bound after opt-in (within-app re-init)");
+            }
+        }
+    } else {
         // bind_client(None) entfernt den Client aus dem Hub → der Drop des
         // Clients schliesst den Transport → pending Buffer wird verworfen
-        // statt gesendet.
+        // statt gesendet. Defense-in-Depth zusaetzlich zum before_send-Gate.
         sentry::Hub::current().bind_client(None);
     }
 }

@@ -25,6 +25,9 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 - **F10:** Webapp-Allowlist hatte noch `ui.route` als Backdoor fuer spaeter-versehentliches Route-Tag-Setting → entfernt
 - **F11:** Code-Kommentar-Drift in `sentry_init.rs` (Kommentar referenzierte `Hub::end_session()`, Code rief es nicht) → Kommentar synchronisiert auf tatsaechliche `bind_client(None)`-Implementierung
 
+**Runde 3 (F12) nach 3. QS-Pass:**
+- **F12:** Asymmetrischer Opt-In nach Opt-Out — F9 droppte den Client hart bei Opt-Out, aber Opt-In schaltete nur die Atomic wieder an ohne Client neu zu binden. Pilot der "aus → an" klickte hatte native Crash-Reports kaputt bis App-Neustart. Settings-Hint sagte aber "wirkt sofort, kein Neustart noetig". Fix: `build_options()` aus `init()` extrahiert, `set_consent(true)` baut bei fehlendem Client einen neuen via `Client::from(options)` + `Hub::bind_client(Some(...))` + Initial-Scope. Aus-an-aus-an funktioniert jetzt symmetrisch in einem App-Run, ohne Neustart.
+
 ## [v0.9.0] — 2026-05-18 · INTERN (nie publiziert, kurz als latest sichtbar)
 
 Versionsnummer **verbrannt** wegen ~15-min-Sichtbarkeits-Fenster im `releases/latest` waehrend QS noch lief. Inhalt vollstaendig in v0.9.1 enthalten. Tag bleibt im Git-Log fuer Audit-Trail, keine Pilot-Distribution.
