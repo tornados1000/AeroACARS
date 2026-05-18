@@ -10,6 +10,7 @@ import { XPlanePremiumPanel } from "./XPlanePremiumPanel";
 import { OrphanFlightsPanel } from "./OrphanFlightsPanel";
 import { useConfirm } from "./ConfirmDialog";
 import { getConsent, setConsent } from "../lib/sentry";
+import { DiscordRpcPanel } from "./DiscordRpcPanel";
 
 const ALL_KINDS: SimKind[] = [
   "msfs2024",
@@ -408,6 +409,10 @@ export function SettingsPanel({
       {/* v0.9.0 (#GlitchTip): Anonyme Fehler-Telemetrie.
           Opt-In, Default = aus. Pflicht laut DSGVO Art. 6 (1) a. */}
       <ErrorReportingPanel />
+
+      {/* v0.9.0 (#Discord-RPC): Rich-Presence im Discord-Profil.
+          Opt-In, Default = aus. Eigener Panel-Komponente. */}
+      <DiscordRpcPanel />
 
       {/* v0.7.17 (F-001): Beta-Toggle entfernt. Fenix A32x wird jetzt
        *  automatisch erkannt (AircraftProfile::is_fenix()), die LVAR-

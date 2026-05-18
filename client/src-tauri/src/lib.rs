@@ -15,6 +15,9 @@ mod xplane_plugin_install;
 // v0.9.0 (#GlitchTip): Sentry-Init + Allowlist + Redaction. Opt-In, Default OFF.
 // Spec: docs/spec/v0.9.0-glitchtip-self-hosted.md
 mod sentry_init;
+// v0.9.0 (#Discord-RPC): Wiring zum discord-presence crate. Opt-In, Default OFF.
+// Spec: docs/spec/v0.9.0-discord-rich-presence.md
+mod discord_rpc;
 // v0.6.0 — neuer zentraler State-Owner. Aktiviert wenn die Env-Var
 // AEROACARS_LEGACY_STREAMER NICHT gesetzt ist (Default = neu). Bei
 // Problemen kann der Pilot auf Legacy zurueck via Env-Var ohne Re-Install.
@@ -21313,6 +21316,11 @@ pub fn run() {
             // have an AppHandle. After this, save_activity_log() can
             // run without a handle (uses the OnceLock cache).
             init_activity_log_path(&app.handle());
+
+            // v0.9.0 (#Discord-RPC): Manager initialisieren + ggf. die
+            // persistente Pilot-Entscheidung anwenden. Default = aus, also
+            // nichts passiert solang der Pilot nicht in Settings zustimmt.
+            discord_rpc::init(&app.handle());
             // Persist the boot-time state (restored log + banner)
             // immediately so a crash before any activity event still
             // keeps the banner visible on next launch.
@@ -21394,6 +21402,13 @@ pub fn run() {
             set_minimize_to_tray,
             // v0.9.0 (#GlitchTip): Opt-In fuer anonyme Fehler-Telemetrie.
             error_reporting_set_consent,
+            // v0.9.0 (#Discord-RPC): Settings + Status + Push-State + Test.
+            discord_rpc::discord_rpc_get_settings,
+            discord_rpc::discord_rpc_set_settings,
+            discord_rpc::discord_rpc_get_status,
+            discord_rpc::discord_rpc_send_test,
+            discord_rpc::discord_rpc_push_state,
+            discord_rpc::discord_rpc_clear_flight,
             // v0.7.14: Discord-Posts macht der Recorder zentral — keine
             // Pilot-Client-Commands mehr fuer Webhook-URL. Audit C1.
             // v0.7.8 SimBrief Integration (Spec §4)

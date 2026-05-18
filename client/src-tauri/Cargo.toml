@@ -12,6 +12,8 @@ members = [
     "crates/metar",
     "crates/aeroacars-mqtt",
     "crates/landing-scoring",
+    # v0.9.0 (#Discord-RPC) — Pilot-Flugstatus im Discord-Profil
+    "crates/discord-presence",
 ]
 resolver = "2"
 
@@ -157,6 +159,8 @@ geo.workspace = true
 metar.workspace = true
 aeroacars-mqtt.workspace = true
 landing-scoring.workspace = true
+# v0.9.0 (#Discord-RPC): Pilot-Flugstatus im Discord-Profil
+discord-presence = { path = "crates/discord-presence" }
 
 # MSFS adapter is Windows-only
 [target.'cfg(target_os = "windows")'.dependencies]
