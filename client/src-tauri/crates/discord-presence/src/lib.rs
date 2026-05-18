@@ -109,8 +109,20 @@ pub struct PresenceInput {
     pub profile_url: Option<String>,
 }
 
-/// 18 kanonische Phasen aus Telemetry-Contract Sektion 1.3.
+/// Vollstaendige Phasen-Liste die der Discord-RPC darstellen kann.
+///
+/// Stand v0.9.0 sind 20 Werte definiert:
+///   - 17 Phasen die der aktuelle Rust-FSM (sim_core::FlightPhase) wirklich emittiert
+///     — inklusive `Holding` (v0.5.11) und `PirepSubmitted` (Post-Flight-State).
+///   - 3 Phasen aus dem Telemetry-Contract Sektion 1.3 die fuer v0.10.0 vorgesehen
+///     sind: `RejectedTakeoff`, `GoAround`, `Deboarding`. Werden vom FSM heute nicht
+///     emittiert, das Mapping liegt aber schon hier damit der RPC-Code beim Phase-
+///     Expansion-Release nicht angefasst werden muss.
+///
 /// Pflicht: jede dieser Phasen MUSS in format::phase_to_label() ein Mapping haben.
+/// QS-Befund F2 (v0.9.0 Hotfix) — vorherige Version vermisste Holding +
+/// PirepSubmitted, mit der Folge dass Discord PREFLIGHT statt der echten Phase
+/// zeigte. Tests in tests/format.rs verifizieren das fuer alle 20 Werte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlightPhase {
     Preflight,
@@ -122,6 +134,8 @@ pub enum FlightPhase {
     RejectedTakeoff,
     Climb,
     Cruise,
+    /// v0.5.11 — sustained Holding-Pattern (bank > 15°, |VS| < 200 fpm, > 90s)
+    Holding,
     Descent,
     Approach,
     Final,
@@ -131,6 +145,8 @@ pub enum FlightPhase {
     Arrived,
     BlocksOn,
     Deboarding,
+    /// Post-Flight: PIREP wurde an phpVMS gefilt — Flight ist offiziell zu.
+    PirepSubmitted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

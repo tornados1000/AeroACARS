@@ -29,7 +29,8 @@ const ALLOWED_TAG_KEYS: ReadonlySet<string> = new Set([
   "runway",
   "pirep.id",
   "callsign",
-  "route",
+  // v0.9.0 QS-Hotfix: "route" entfernt — Privacy-Hint sagt "Route NICHT
+  // gesendet", also auch nicht erlauben.
   "phase",
   "pilot.hash",
   "forensics.version",
@@ -85,7 +86,11 @@ export function initSentry(appVersion: string): boolean {
     environment: import.meta.env.PROD ? "production" : "development",
     sendDefaultPii: false,
     tracesSampleRate: 0,
-    integrations: [],
+    // v0.9.0 QS-Hotfix F6: KEIN `integrations: []` mehr — das hatte ALLE
+    // Default-Integrations deaktiviert. Pilots-JS-Crashes ausserhalb React-
+    // ErrorBoundary (window.onerror, unhandled-promise-rejections) gingen
+    // verloren. Jetzt: Defaults aktiv. Replay/Profiling sind opt-in,
+    // werden also nicht aktiviert.
     beforeSend(event) {
       // Consent-Gate. Wird live aus localStorage gelesen, damit Toggle sofort wirkt.
       if (!getConsent()) return null;

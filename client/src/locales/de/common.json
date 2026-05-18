@@ -569,11 +569,11 @@
   },
   "error_reporting": {
     "section_title": "Fehler-Telemetrie (anonym)",
-    "intro": "AeroACARS kann technische Crash- und Fehlerberichte automatisch an unseren self-hosted GlitchTip-Server (live.kant.ovh) senden. Das hilft Bugs zu fixen, bevor sie viele Piloten treffen. Alles anonym, freiwillig, jederzeit abschaltbar.",
+    "intro": "AeroACARS kann technische Crash- und Fehlerberichte automatisch an unseren self-hosted GlitchTip-Server (tip.kant.ovh) senden. Das hilft Bugs zu fixen, bevor sie viele Piloten treffen. Alles anonym, freiwillig, jederzeit abschaltbar.",
     "toggle_label": "Anonyme Crash-Berichte senden",
-    "toggle_hint": "<strong>Was wird gesendet?</strong> Crash-Stack-Traces, Sim-Name, Aircraft-ICAO, AeroACARS-Version, OS.<br/><strong>Was wird NICHT gesendet?</strong> Position, Route, Login, IP-Adresse, Passwörter, E-Mail.<br/><strong>Wohin?</strong> live.kant.ovh (selbst gehostet, kein 3rd-Party). Datenschutz nach DSGVO Art. 6 (1) a.<br/>Toggle wirkt sofort — kein Neustart nötig.",
+    "toggle_hint": "<strong>Was wird gesendet?</strong> Crash-Stack-Traces, Sim-Name, Aircraft-ICAO, AeroACARS-Version, OS.<br/><strong>Was wird NICHT gesendet?</strong> Position, Route, Login, IP-Adresse, Passwörter, E-Mail.<br/><strong>Wohin?</strong> tip.kant.ovh (selbst gehostet, kein 3rd-Party). Datenschutz nach DSGVO Art. 6 (1) a.<br/>Toggle wirkt sofort — kein Neustart nötig.",
     "banner_title": "Hilf uns AeroACARS zu verbessern",
-    "banner_body": "AeroACARS kann anonyme Crash-Berichte an unseren eigenen Server (live.kant.ovh) senden — ohne Position, ohne Login, ohne IP. Das hilft uns Bugs zu finden, bevor sie viele Piloten treffen. Du kannst diese Wahl jederzeit in den Settings ändern.",
+    "banner_body": "AeroACARS kann anonyme Crash-Berichte an unseren eigenen Server (tip.kant.ovh) senden — ohne Position, ohne Login, ohne IP. Das hilft uns Bugs zu finden, bevor sie viele Piloten treffen. Du kannst diese Wahl jederzeit in den Settings ändern.",
     "banner_accept": "Ja, anonym senden",
     "banner_decline": "Nein, danke"
   },

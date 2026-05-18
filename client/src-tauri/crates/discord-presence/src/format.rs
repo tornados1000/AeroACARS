@@ -50,10 +50,14 @@ pub fn phase_to_asset_key(phase: FlightPhase) -> &'static str {
     match phase {
         Preflight | Boarding | Pushback | TaxiOut | TaxiIn | RejectedTakeoff => "phase_taxi",
         TakeoffRoll | Takeoff | Climb | GoAround => "phase_climb",
-        Cruise => "phase_cruise",
+        // Holding ist hoehen-stabil → semantisch wie Cruise (auch wenn's manchmal
+        // im Approach passiert; gemeinsamer Cruise-Asset ist trotzdem sauberer
+        // als Approach-Asset weil Holding immer "stable level" bedeutet).
+        Cruise | Holding => "phase_cruise",
         Descent => "phase_descent",
         Approach | Final => "phase_approach",
-        Landing | Arrived | BlocksOn | Deboarding => "phase_landed",
+        // PirepSubmitted = nach Block-On, semantisch landed.
+        Landing | Arrived | BlocksOn | Deboarding | PirepSubmitted => "phase_landed",
     }
 }
 
@@ -79,6 +83,7 @@ pub fn phase_to_label(phase: FlightPhase) -> &'static str {
         RejectedTakeoff => "⚠ REJECTED TAKE-OFF",
         Climb => "CLIMB",
         Cruise => "CRUISE",
+        Holding => "HOLDING",
         Descent => "DESCENT",
         Approach => "APPROACH",
         Final => "FINAL",
@@ -88,13 +93,18 @@ pub fn phase_to_label(phase: FlightPhase) -> &'static str {
         Arrived => "ARRIVED",
         BlocksOn => "SHUTDOWN",
         Deboarding => "DEBOARDING",
+        PirepSubmitted => "PIREP FILED",
     }
 }
 
 /// Welche Phasen zeigen die Altitude im State-Text? Boden-Phasen nicht.
+/// Holding zeigt Altitude (= stable level macht den Wert besonders aussagekraeftig).
 fn phase_uses_altitude(phase: FlightPhase) -> bool {
     use FlightPhase::*;
-    matches!(phase, Climb | Cruise | Descent | Approach | Final | GoAround)
+    matches!(
+        phase,
+        Climb | Cruise | Holding | Descent | Approach | Final | GoAround
+    )
 }
 
 /// Altitude-Display-Regel aus Spec:

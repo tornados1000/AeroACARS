@@ -18,7 +18,7 @@ Pilots können ihren aktuellen Flugstatus live ins Discord-Profil spiegeln. Ande
   - **"Profil öffnen"-Button anzeigen** (= phpVMS-Profil-Link in der Presence)
 - **Live-Status**: grüner/grauer/roter Dot zeigt Verbindung zu Discord, alle 5s aktualisiert
 - **Test-Presence-Button**: sendet 15s eine Dummy-Presence — Pilot kann verifizieren ohne echten Flug
-- **18 Phasen** korrekt gemappt (kein UNKNOWN-Fallback): Preflight → Boarding → Pushback → … → REJECTED-TAKEOFF (⚠) → … → GO-AROUND (⚠) → … → Deboarding
+- **20 Phasen** korrekt gemappt (kein UNKNOWN-Fallback): Preflight, Boarding, Pushback, Taxi-Out, Takeoff-Roll, Takeoff, **REJECTED-TAKE-OFF** ⚠ (v0.10.0-ready), Climb, Cruise, **Holding** (v0.5.11), Descent, Approach, Final, Landing, **GO-AROUND** ⚠ (v0.10.0-ready), Taxi-In, Arrived, Shutdown, **DEBOARDING** (v0.10.0-ready), PIREP-Filed. — Heutiger Rust-FSM emittiert 17 davon, die 3 v0.10.0-Phasen sind vorbereitet aber feuern erst mit dem Phase-Expansion-Release.
 - **60s Heartbeat + sofortiger Update bei Phase-Wechsel**
 - **Graceful Fallback**: wenn Discord nicht installiert oder offen → Status "NotFound", kein Crash, kein Toast-Spam
 - **Wirkt sofort**: Toggle aus = Pipe wird geschlossen + Activity gecleart binnen 5s
@@ -50,7 +50,12 @@ Self-hosted Sentry-kompatible Fehler-Sammelstelle. AeroACARS (Client) + Recorder
 
 ### Telemetry-Contract
 
-Beide Features halten sich an `docs/spec/v0.9.0-telemetry-contract.md` (Sektion 1.3 für die 18 kanonischen Phasen, Sektion 9 für Datenschutz-Gates).
+Beide Features halten sich an `docs/spec/v0.9.0-telemetry-contract.md` (Sektion 1.3 für die kanonischen Phasen, Sektion 9 für Datenschutz-Gates).
+
+### Bekannte Einschränkungen v0.9.0
+
+- **Discord-RPC „⚠ Sim getrennt"-Suffix:** Der Code ist vorhanden (Spec LE8) und getestet, aber der Caller wird noch nicht von der MQTT-Disconnect-Logik aufgerufen — kommt in v0.9.1. Pilot sieht bei MQTT-Drop einfach die letzte Presence stehen statt eine Warn-Variante.
+- **Phase-Expansion (REJECTED-TAKEOFF, GO-AROUND, DEBOARDING):** Spec definiert, Discord-Mapping vorhanden, aber der Rust-FSM emittiert diese Phasen noch nicht — kommt mit v0.10.0 (Phase-Expansion-Release laut Roadmap).
 
 ### Sonstiges
 
