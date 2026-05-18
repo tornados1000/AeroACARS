@@ -58,6 +58,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # v0.9.0 (#GlitchTip): DSNs zur Build-Zeit eingebrannt.
+          # Rust liest sie per option_env!() in src-tauri/src/sentry_init.rs,
+          # React liest sie per import.meta.env.VITE_SENTRY_DSN_CLIENT in
+          # client/src/lib/sentry.ts. Wenn Secrets nicht gesetzt sind,
+          # initialisiert Sentry sich nicht (No-Op, kein Crash) — der
+          # Build laeuft trotzdem durch.
+          AEROACARS_SENTRY_DSN: ${{ secrets.AEROACARS_SENTRY_DSN }}
+          VITE_SENTRY_DSN_CLIENT: ${{ secrets.VITE_SENTRY_DSN_CLIENT }}
         with:
           projectPath: client
           tagName: ${{ github.ref_name }}
