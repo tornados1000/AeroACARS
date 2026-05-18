@@ -9,6 +9,8 @@ import { PmdgPremiumPanel } from "./PmdgPremiumPanel";
 import { XPlanePremiumPanel } from "./XPlanePremiumPanel";
 import { OrphanFlightsPanel } from "./OrphanFlightsPanel";
 import { useConfirm } from "./ConfirmDialog";
+import { getConsent, setConsent } from "../lib/sentry";
+import { DiscordRpcPanel } from "./DiscordRpcPanel";
 
 const ALL_KINDS: SimKind[] = [
   "msfs2024",
@@ -404,6 +406,14 @@ export function SettingsPanel({
         </label>
       </div>
 
+      {/* v0.9.0 (#GlitchTip): Anonyme Fehler-Telemetrie.
+          Opt-In, Default = aus. Pflicht laut DSGVO Art. 6 (1) a. */}
+      <ErrorReportingPanel />
+
+      {/* v0.9.0 (#Discord-RPC): Rich-Presence im Discord-Profil.
+          Opt-In, Default = aus. Eigener Panel-Komponente. */}
+      <DiscordRpcPanel />
+
       {/* v0.7.17 (F-001): Beta-Toggle entfernt. Fenix A32x wird jetzt
        *  automatisch erkannt (AircraftProfile::is_fenix()), die LVAR-
        *  Overrides laufen ohne weiteres Zutun des Piloten. Settings →
@@ -447,6 +457,58 @@ export function SettingsPanel({
           den aktiven Flug). */}
       <OrphanFlightsPanel />
     </section>
+  );
+}
+
+/**
+ * v0.9.0 (#GlitchTip) — Anonyme Fehler-Telemetrie an unseren self-hosted
+ * GlitchTip-Server. Opt-In, Default = aus. Wenn an: nur anonymisierte
+ * Crash/Error-Events ohne PII, Auth-Header, Position oder Routen-
+ * Details. Tag-Allowlist + Redaction-Hook strippen alles vor dem Send.
+ *
+ * Spec: docs/spec/v0.9.0-glitchtip-self-hosted.md (LE4)
+ *     + docs/spec/v0.9.0-telemetry-contract.md Sektion 9 (DSGVO).
+ *
+ * Persistence: localStorage `aeroacars.errorReporting.enabled`
+ * + Mirror in den Rust-Backend per `error_reporting_set_consent`.
+ * UI-Hint zeigt sofort an dass der Toggle sofort wirkt (vor jedem
+ * Sentry-Event wird die Consent-Atomic geprueft).
+ */
+function ErrorReportingPanel() {
+  const { t } = useTranslation();
+  const [enabled, setEnabledState] = useState<boolean>(() => getConsent());
+
+  const handleToggle = (next: boolean) => {
+    setEnabledState(next);
+    setConsent(next);
+    // Mirror in Rust-Backend (Atomic-Gate). Wenn der Command nicht
+    // existiert (alter Build), ignorieren — Default bleibt OFF.
+    void invoke("error_reporting_set_consent", { enabled: next }).catch(
+      () => undefined,
+    );
+  };
+
+  return (
+    <div className="settings__section">
+      <h3>{t("error_reporting.section_title")}</h3>
+      <p className="settings__row-hint">{t("error_reporting.intro")}</p>
+      <label className="settings__checkbox">
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={(e) => handleToggle(e.target.checked)}
+        />
+        <span>
+          <strong>{t("error_reporting.toggle_label")}</strong>
+          <span
+            className="settings__row-hint"
+            dangerouslySetInnerHTML={{
+              __html: t("error_reporting.toggle_hint"),
+            }}
+          />
+        </span>
+      </label>
+    </div>
   );
 }
 

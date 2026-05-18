@@ -549,6 +549,34 @@
     "minimize_to_tray_label": "Riduci a icona nella system tray alla chiusura",
     "minimize_to_tray_hint": "Invece di terminare, AeroACARS viene minimizzato nella system tray (Mac: nella barra dei menu). Click sull'icona riapre la finestra. Tramite il menu tray → „Esci\" l'app viene effettivamente chiusa.<br/><br/>Consigliato durante voli attivi: AeroACARS continua in background e invia heartbeat + posizioni a phpVMS."
   },
+  "discord_rpc": {
+    "section_title": "Discord Rich Presence",
+    "intro": "Mostra lo stato del tuo volo dal vivo nel profilo Discord. Gli altri membri della VA vedono ad es. \"Pilota X sta volando GSG3184 EDDB→KMRH CRUISE\". Opt-in, disattivabile in qualsiasi momento — se Discord non è in esecuzione, non succede nulla.",
+    "loading": "Caricamento stato Discord-RPC …",
+    "enable_label": "Attiva Discord Rich Presence",
+    "enable_hint": "<strong>Cosa viene mostrato?</strong> Callsign, rotta (ICAO), velivolo, fase, quota.<br/><strong>Cosa resta privato?</strong> Posizione, identità del pilota, IP — Discord vede solo ciò che pubblicheresti tu stesso.<br/>Default = off. Effetto immediato.",
+    "anonymize_label": "Anonimizza callsign",
+    "anonymize_hint": "Mostra \"GSG-Flight\" invece di \"GSG3184\". La rotta resta visibile.",
+    "profile_button_label": "Mostra pulsante \"Apri profilo\"",
+    "profile_button_hint": "Gli amici Discord possono aprire il tuo profilo phpVMS direttamente dalla presence.",
+    "test_button": "Invia presence di test",
+    "test_hint": "Mostra una presence fittizia per 15 s — verifica senza volare.",
+    "status_connected": "✓ Connesso a Discord",
+    "status_not_found": "Discord non trovato — l'app è in esecuzione?",
+    "status_disabled": "Disattivato",
+    "status_error": "Errore: {{msg}}",
+    "status_unknown": "Stato sconosciuto"
+  },
+  "error_reporting": {
+    "section_title": "Telemetria errori (anonima)",
+    "intro": "AeroACARS può inviare automaticamente report di crash ed errori al nostro server GlitchTip self-hosted (live.kant.ovh). Questo aiuta a correggere bug prima che colpiscano molti piloti. Completamente anonimo, opt-in, disattivabile in qualsiasi momento.",
+    "toggle_label": "Invia report di crash anonimi",
+    "toggle_hint": "<strong>Cosa viene inviato?</strong> Stack trace dei crash, nome simulatore, ICAO velivolo, versione AeroACARS, sistema operativo.<br/><strong>Cosa NON viene inviato?</strong> Posizione, rotta, login, indirizzo IP, password, e-mail.<br/><strong>Dove?</strong> live.kant.ovh (self-hosted, nessuna terza parte). Privacy secondo GDPR Art. 6 (1) a.<br/>Il toggle ha effetto immediato — nessun riavvio necessario.",
+    "banner_title": "Aiutaci a migliorare AeroACARS",
+    "banner_body": "AeroACARS può inviare report di crash anonimi al nostro server (live.kant.ovh) — senza posizione, senza login, senza IP. Ci aiuta a trovare bug prima che colpiscano molti piloti. Puoi cambiare questa scelta in qualsiasi momento nelle Impostazioni.",
+    "banner_accept": "Sì, invia anonimamente",
+    "banner_decline": "No, grazie"
+  },
   "release_notes": {
     "modal_title": "Novità in {{version}}",
     "published_prefix": "pubblicato il",

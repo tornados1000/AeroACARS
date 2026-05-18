@@ -4,6 +4,64 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.9.0] — 2026-05-18 · GlitchTip + Discord Rich Presence
+
+🚀 **Doppel-Feature-Release: Anonyme Fehler-Telemetrie an self-hosted GlitchTip + Pilot-Flugstatus live im Discord-Profil. Beide Features sind Opt-In, Default = aus, jederzeit per Toggle abschaltbar.**
+
+### F-001 · Discord Rich Presence
+
+Pilots können ihren aktuellen Flugstatus live ins Discord-Profil spiegeln. Andere VA-Mitglieder sehen so „Pilot X fliegt GSG3184 EDDB→KMRH CRUISE" direkt in der Mitglieder-Liste — ohne dass irgendjemand den Pilot-Client öffnen oder ins Webapp-Dashboard schauen muss.
+
+- **Settings → Discord Rich Presence**: 3 Toggles
+  - **Master-Toggle** (Default OFF, DSGVO-Opt-In)
+  - **Callsign anonymisieren** ("GSG3184" → "GSG-Flight", Route bleibt sichtbar)
+  - **"Profil öffnen"-Button anzeigen** (= phpVMS-Profil-Link in der Presence)
+- **Live-Status**: grüner/grauer/roter Dot zeigt Verbindung zu Discord, alle 5s aktualisiert
+- **Test-Presence-Button**: sendet 15s eine Dummy-Presence — Pilot kann verifizieren ohne echten Flug
+- **18 Phasen** korrekt gemappt (kein UNKNOWN-Fallback): Preflight → Boarding → Pushback → … → REJECTED-TAKEOFF (⚠) → … → GO-AROUND (⚠) → … → Deboarding
+- **60s Heartbeat + sofortiger Update bei Phase-Wechsel**
+- **Graceful Fallback**: wenn Discord nicht installiert oder offen → Status "NotFound", kein Crash, kein Toast-Spam
+- **Wirkt sofort**: Toggle aus = Pipe wird geschlossen + Activity gecleart binnen 5s
+
+#### Asset-Layout
+
+- `large_image` = AeroACARS-Logo (Brand-Konsistenz)
+- `small_image` = Sim-Badge unten-rechts (MSFS 2024/2020, X-Plane 11/12 — vier eigene Designs mit Aviation-Top-Down-Jet)
+- Phase wird als Text in der Status-Zeile angezeigt, nicht als Icon (bei 30×30 px lesbar)
+
+#### Architektur
+
+- **Discord-App-ID NICHT im Client-Binary** — der VA-Owner pflegt sie einmal im Webapp-Admin (Settings → Discord → "Discord-Application-ID"), Pilot-Client zieht sie zur Laufzeit via Public-Endpoint nach. Vorteil: kein Re-Release wenn die VA die Discord-App wechselt, Forks funktionieren automatisch gegen die eigene VPS.
+- Neuer Rust-Workspace-Crate `discord-presence` (~600 LOC + 24 pure-fn Tests)
+- Settings persistieren in `<app_data_dir>/discord_rpc_settings.json` über App-Restarts
+
+### F-002 · GlitchTip — anonyme Crash-Telemetrie
+
+Self-hosted Sentry-kompatible Fehler-Sammelstelle. AeroACARS (Client) + Recorder (VPS) + Webapp (Admin-UI) senden anonymisierte Crash- und Error-Events automatisch hin, sodass der VA-Owner Bugs sieht **bevor** Pilots im Discord klagen.
+
+- **Settings → Fehler-Telemetrie (anonym)**: 1 Toggle (Default OFF, DSGVO-Opt-In)
+- **First-Run-Banner** beim ersten v0.9.0-Start mit klarer Erklärung was gesendet wird / was nicht
+- **Privacy-Guarantien** (DSGVO Art. 6 (1) a):
+  - **Was wird gesendet**: Crash-Stack-Traces, Sim-Name, Aircraft-ICAO, App-Version, OS
+  - **Was wird NICHT gesendet**: Position, Route, Login, IP-Adresse, Passwörter, E-Mail
+  - **Wohin**: VA-eigener self-hosted GlitchTip (`tip.kant.ovh`), kein 3rd-Party
+- **Tag-Allowlist + Redaction** beidseitig (Rust + TS): selbst wenn anderer Code versehentlich PII setzt, wird es im `beforeSend`/`before_send`-Hook gestrippt
+- **Self-hosted GlitchTip-Stack** auf der VPS: Docker-Compose (postgres + redis + web + worker), Caddy mit auto Let's-Encrypt-Cert, 4 Uptime-Monitore eingerichtet (Recorder + GlitchTip self + GSG-phpVMS + GSG-API)
+
+### Telemetry-Contract
+
+Beide Features halten sich an `docs/spec/v0.9.0-telemetry-contract.md` (Sektion 1.3 für die 18 kanonischen Phasen, Sektion 9 für Datenschutz-Gates).
+
+### Sonstiges
+
+- **Webapp**: JSONL-Forensik-Importer lädt jetzt **lazy** statt automatisch — Settings-Tab öffnet sofort, Import-Section zeigt "📂 Dateien jetzt laden"-Button
+- **i18n**: alle neuen UI-Strings DE/EN/IT
+- **CI**: GH-Actions-Release-Workflow leitet `AEROACARS_SENTRY_DSN` und `VITE_SENTRY_DSN_CLIENT` an `tauri-action` weiter (signed Builds haben die GlitchTip-DSN eingebacken)
+- **VPS-Deploy**: `deploy-recorder.sh` reicht `VITE_SENTRY_DSN_WEBAPP` vom env-File zum Vite-Build durch
+- **Recorder fix**: `package.json`-Import in `src/index.ts` per `fs.readFileSync` statt static-`import-with-json` (vorher: tsc warf rootDir auf Repo-Root → dist landete unter `dist/src/`, systemd brach)
+
+---
+
 ## [v0.7.17] — 2026-05-12 · Fenix-Polish + Bug-Bündel
 
 🛠️ **Bug-Sammel-Release nach Tester-Feedback zu v0.7.16. Fenix-Profil ist jetzt default-on (kein Toggle mehr), Squawk + Aircraft-Type bei Fenix bereinigt, SimBrief-Refresh greift beim Flug-Start, Bahn-Auslastung-Score endlich aircraft-aware, Auto-Start sagt jetzt warum er nicht feuert.**

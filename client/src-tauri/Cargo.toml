@@ -12,11 +12,13 @@ members = [
     "crates/metar",
     "crates/aeroacars-mqtt",
     "crates/landing-scoring",
+    # v0.9.0 (#Discord-RPC) — Pilot-Flugstatus im Discord-Profil
+    "crates/discord-presence",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.8.5"
+version = "0.9.0"
 edition = "2021"
 license = "MIT"
 authors = ["Thomas Kant <github@MANFahrer-GF>", "AeroACARS contributors"]
@@ -140,6 +142,13 @@ regex = "1"
 # Actions' `zip` action uses. No native deps.
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
+# v0.9.0 (#GlitchTip): Sentry-Rust SDK. Sendet anonymisierte Panics +
+# capture_message-Calls an GlitchTip (Sentry-API-kompatibel). DSN
+# kommt aus build-time-env AEROACARS_SENTRY_DSN (in CI/Build gesetzt,
+# nicht ins Repo). Wenn leer = kein Init = No-Op.
+# Wir nutzen rustls-tls (kein OpenSSL) konsistent mit reqwest.
+sentry = { version = "0.34", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
+
 # Internal crates — wired up for use as the project grows
 api-client.workspace = true
 sim-core.workspace = true
@@ -150,6 +159,8 @@ geo.workspace = true
 metar.workspace = true
 aeroacars-mqtt.workspace = true
 landing-scoring.workspace = true
+# v0.9.0 (#Discord-RPC): Pilot-Flugstatus im Discord-Profil
+discord-presence = { path = "crates/discord-presence" }
 
 # MSFS adapter is Windows-only
 [target.'cfg(target_os = "windows")'.dependencies]

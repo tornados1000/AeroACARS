@@ -36,13 +36,19 @@ var __generator = (this && this.__generator) || function (thisArg, body) {
 };
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
-// @ts-expect-error process is a nodejs global
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 var host = process.env.TAURI_DEV_HOST;
+// v0.9.0 (#GlitchTip): Client-Version fuer Sentry-release-tag
+var pkg = JSON.parse(readFileSync(fileURLToPath(new URL("./package.json", import.meta.url)), "utf8"));
 // https://vite.dev/config/
 export default defineConfig(function () { return __awaiter(void 0, void 0, void 0, function () {
     return __generator(this, function (_a) {
         return [2 /*return*/, ({
                 plugins: [react()],
+                define: {
+                    __APP_VERSION__: JSON.stringify(pkg.version),
+                },
                 // v0.8.3: Chunk-Splitting. Vorher landete alles in einem 824 KB
                 // index-*.js — Vite warnte "chunks larger than 500 kB". Tauri laedt
                 // den Frontend-Bundle aus dem Filesystem (kein Netz-Latenz-Impact),
