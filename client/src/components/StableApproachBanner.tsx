@@ -43,7 +43,11 @@ interface Props {
 /** FAA AC 120-71B Stable-Approach-Kriterien:
  *  - Bank ≤ 5°
  *  - V/S in [-1100, -300] fpm (auch zu langsame Sinkrate ist suspekt)
- *  - Gear & Flaps konfiguriert (gear ≥ 0.95, flaps > 0.2)
+ *  - Gear & Flaps konfiguriert (gear ≥ 0.99, flaps ≥ 0.70)
+ *
+ *  v0.8.5: Thresholds an Backend (lib.rs compute_approach_stability_v2)
+ *  angeglichen. Vorher 0.95/0.2, das war zu lax — siehe Item 4 im
+ *  Landing-Analyse-Bundle.
  */
 function evaluateApproach(snap: SimSnapshot, phase: string): Advisory | null {
   const isApproachPhase =
