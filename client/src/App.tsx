@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { applyTheme, getInitialTheme, type Theme } from "./theme";
@@ -241,10 +241,24 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Sync localStorage + Backend bei jeder Änderung. Backend persistiert
-  // selbst (siehe write_auto_start_persisted), localStorage ist nur
-  // schneller Frontend-Cache fürs nächste Mount.
+  // Sync den Backend-Wert bei jeder echten Toggle-Änderung. Backend
+  // persistiert selbst (siehe write_auto_start_persisted), localStorage
+  // ist nur schneller Frontend-Cache fürs nächste Mount.
+  //
+  // v0.12.1 (Stream D): den ERSTEN Mount überspringen. Die Backend-Datei
+  // `auto_start.json` ist die Source of Truth — Effect A oben liest sie.
+  // Würde dieser Effect den (evtl. aus leerem localStorage stammenden)
+  // Frontend-Wert beim Mount nach unten pushen, überschriebe er den
+  // korrekt persistierten Backend-Stand. Genau das brach Auto-Start nach
+  // macOS-Auto-Updates: das WebView-localStorage war zurückgesetzt →
+  // `false` wurde gepusht und der gespeicherte `true`-Stand zerstört.
+  // Nur bei einer echten Nutzer-Änderung syncen.
+  const autoStartSyncDidMount = useRef(false);
   useEffect(() => {
+    if (!autoStartSyncDidMount.current) {
+      autoStartSyncDidMount.current = true;
+      return;
+    }
     void invoke("auto_start_set_enabled", { enabled: autoStart }).catch(() => {});
   }, [autoStart]);
   const simState = simStatus?.state ?? "disconnected";
