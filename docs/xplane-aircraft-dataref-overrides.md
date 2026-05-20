@@ -41,7 +41,10 @@ vom Add-on. Hier nie etwas suchen.
 
 Position, Höhe (MSL/AGL), Heading, Pitch/Bank, Vertical Speed, Groundspeed,
 IAS/TAS, G-Force, On-Ground, Gear-Normal-Force, Gewicht (leer/total),
-Treibstoffmenge, Wind, Mach, OAT, QNH.
+Treibstoffmenge, Wind, Mach, OAT, QNH — sowie die **Body-Velocity**
+(`sim/flightmodel/forces/local_vx` / `local_vz`), die AeroACARS für die
+Sideslip- und Touchdown-Auswertung nutzt. Alles Flugmodell-Werte: jedes
+Add-on treibt sie korrekt, hier nie etwas suchen.
 
 ---
 
@@ -101,6 +104,7 @@ korrekten CL650-DataRef könnte die Landing-Config wieder echt bewertet werden.
 | Funktion | Standard-DataRef | CL650-spezifisch (im DataRefTool unter `CL650/` suchen) |
 |---|---|---|
 | Flaps-Stellung | `sim/flightmodel2/controls/flap_handle_deploy_ratio` | `____________________` ← **bitte nachtragen** |
+| Gear-Stellung | `sim/flightmodel2/gear/deploy_ratio[0]` | `____________________` |
 | Triebwerk 1/2 läuft | `ENGN_running[0]` / `[1]` | `____________________` |
 | Parkbremse | `parking_brake_ratio` | `____________________` |
 | (weitere nach Bedarf — Tabelle Teil 2) | | |
