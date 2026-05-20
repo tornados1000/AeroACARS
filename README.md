@@ -25,6 +25,36 @@ shippt saubere PIREPs zu deinem phpVMS-Server.
 
 ---
 
+## Für wen läuft AeroACARS? · Who can run AeroACARS?
+
+🇩🇪 **Der Quellcode ist frei — die offiziellen Apps laufen nur für die German Sky Group.**
+
+AeroACARS ist Open Source (MIT-Lizenz). Jede Virtual Airline darf den Code
+klonen, anpassen und für ihre **eigene** phpVMS-7-Instanz selbst bauen — das ist
+ausdrücklich erwünscht.
+
+Die **offiziell veröffentlichten Builds** (die Installer aus den
+[GitHub-Releases](https://github.com/MANFahrer-GF/AeroACARS/releases)) sind
+dagegen fest auf die German Sky Group konfiguriert: Login, Live-Tracking und
+PIREP-Submission funktionieren ausschließlich mit einem GSG-Pilotenaccount —
+ein Account einer anderen VA wird abgewiesen. Wer AeroACARS für eine andere VA
+nutzen möchte, baut sich aus dem Quellcode einen eigenen Client gegen die
+eigene Infrastruktur.
+
+🇬🇧 **The source is free — the official apps only run for German Sky Group.**
+
+AeroACARS is open source (MIT). Any virtual airline is welcome to clone, adapt
+and build the code for its **own** phpVMS 7 instance.
+
+The **officially released builds** (the installers in the
+[GitHub releases](https://github.com/MANFahrer-GF/AeroACARS/releases)) are, by
+contrast, hard-wired to the German Sky Group: login, live tracking and PIREP
+submission only work with a GSG pilot account — accounts of other VAs are
+rejected. To use AeroACARS for a different VA, build your own client from
+source against your own infrastructure.
+
+---
+
 ## Installation
 
 Lade dir das Paket für deine Plattform aus dem [Latest Release](https://github.com/MANFahrer-GF/AeroACARS/releases/latest) herunter.
