@@ -4,6 +4,12 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.12.3] — 2026-05-21 · Landing-G FOQA-konforme Messung
+
+Spec: `docs/spec/v0.12.3-landing-g-foqa-measurement.md` (SPEC ACCEPTED, QS R0→R5).
+
+Die Aufsetz-G-Kraft wurde bisher als **roher 50-Hz-Einzelframe-Peak** gescort — schärfer, als ihn ein echter Flugschreiber je aufzeichnen würde (Befund TAP533: 1.95 g für eine an sich saubere Landung). Ab v0.12.3 wird die G-Kraft wie eine echte Flugdaten-Überwachung (FOQA/FDM) gemessen: ein framerate-unabhängiger EMA-Filter (τ ≈ 100 ms) glättet das G-Signal leicht, dann wird der Spitzenwert über das Touchdown-Fenster genommen. Der so gescorte Wert (`scored_g`) speist konsistent **alle** Konsumenten — `sub_g_force`-Score, Touchdown-Klassifikation, G-Force-Forensik-Card, Activity-/ACARS-Text, das phpVMS-PIREP-Feld „Landing G-Force", QuickFlags, das RunwayDiagram, das `LandingScored`-Event und die VPS-Webapp. Der rohe 50-Hz-Peak (`peak_g_load`) bleibt überall als Forensik-Detail erhalten — backward-kompatibel, alte PIREPs/JSONL-Logs deserialisieren unverändert. Die Accident-/Crash-Erkennung nutzt bewusst weiter den rohen Extremwert (Extremwert-Detektion, kein faires Scoring). Methode ist sim-agnostisch — identisch für MSFS und X-Plane. Begleitend: die G-Force-Forensik-Card (Pilot-Client + VPS-Webapp) wurde inhaltlich überarbeitet (gescorter Wert als Headline, Roh-Werte als Forensik-Detail), das `aeroacars-live`-Repo zog parallel nach.
+
 ## [v0.12.2] — 2026-05-20 · X-Plane Aircraft-DataRef-Profile (CL650) · Discord-Push-Diagnose
 
 Zwei Streams. Spec: `docs/spec/v0.12.2-xplane-aircraft-dataref-profiles.md`.
