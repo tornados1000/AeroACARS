@@ -176,10 +176,23 @@ export function RunwayUtilizationHelpModal({ onClose }: Props) {
                   "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
                 fontSize: "0.92rem",
                 color: "#bbf7d0",
+                whiteSpace: "pre-line",
               }}
             >
               {t("landing.runway_utilization_help.formula")}
             </div>
+          </Section>
+
+          {/* v0.12.0 (#runway-utilization-refinement, LE6): Float-Toleranz —
+              die ersten 15 % der LDA an Float kosten keine Punkte. */}
+          <Section
+            heading={t(
+              "landing.runway_utilization_help.float_tolerance_heading",
+            )}
+          >
+            <p style={paragraphStyle}>
+              {t("landing.runway_utilization_help.float_tolerance_body")}
+            </p>
           </Section>
 
           <Section heading={t("landing.runway_utilization_help.terms_heading")}>
@@ -209,6 +222,7 @@ export function RunwayUtilizationHelpModal({ onClose }: Props) {
                 padding: "10px 14px",
                 fontSize: "0.88rem",
                 lineHeight: 1.5,
+                whiteSpace: "pre-line",
               }}
             >
               {t("landing.runway_utilization_help.example")}
@@ -303,6 +317,17 @@ export function RunwayUtilizationHelpModal({ onClose }: Props) {
           >
             <p style={paragraphStyle}>
               {t("landing.runway_utilization_help.pre_displaced_body")}
+            </p>
+          </Section>
+
+          {/* v0.12.0 (#runway-utilization-refinement, LE6): long_float —
+              das Gegenstück zum Pre-Displaced-Cap. „Bremsweg top, nur
+              zu spät aufgesetzt." */}
+          <Section
+            heading={t("landing.runway_utilization_help.long_float_heading")}
+          >
+            <p style={paragraphStyle}>
+              {t("landing.runway_utilization_help.long_float_body")}
             </p>
           </Section>
 
