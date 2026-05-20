@@ -613,14 +613,15 @@ pub fn xplane_xpdr_mode_label(mode: u8) -> &'static str {
 }
 
 impl XPlaneState {
-    /// Apply one (index, value) pair from an RREF response.
-    pub fn apply(&mut self, index: i32, value: f32) {
-        let Some(entry) = CATALOG.get(index as usize) else {
-            tracing::trace!(index, value, "RREF index out of range");
-            return;
-        };
+    /// Apply one decoded value to its `FieldId`.
+    ///
+    /// v0.12.2: the caller (the UDP listener) resolves the RREF index →
+    /// active-catalog entry → `FieldId`, and applies any profile
+    /// `ValueMapping`, before calling this. This function just writes
+    /// the already-mapped value onto the right field.
+    pub fn apply_field(&mut self, field: FieldId, value: f32) {
         self.got_first_packet = true;
-        match entry.field {
+        match field {
             FieldId::Latitude => self.lat = value as f64,
             FieldId::Longitude => self.lon = value as f64,
             // MSL: DataRef now delivers FEET (`altitude_ft_pilot`).

@@ -34,9 +34,16 @@ use sim_core::{SimKind, SimSnapshot, Simulator};
 
 use crate::dataref::{XPlaneState, CATALOG};
 use crate::premium::{PremiumListener, PremiumStatus, PremiumTouchdown};
+use crate::profile::{build_active_catalog, profile_index_for_title, ActiveEntry, PROFILES};
 use crate::rref::{decode_response, encode_request};
 use crate::web_api::{AircraftInfo, DrefIdCache, WebApiClient};
 use crate::{SUBSCRIPTION_HZ, XPLANE_LISTEN_PORT};
+
+/// v0.12.2 (LE1): RREF index base for the aircraft-profile probes.
+/// Probe subscriptions get one index each starting here — far above any
+/// `CATALOG` index, so a probe packet is unambiguously identifiable and
+/// never collides with a real catalog entry.
+const DISCOVERY_INDEX_BASE: i32 = 10_000;
 
 /// How often the Web API poller asks X-Plane for the aircraft info.
 /// Aircraft identity rarely changes mid-flight (load a new plane =
@@ -77,6 +84,12 @@ struct AdapterShared {
     seen: Mutex<Vec<bool>>,
     /// Per-index last raw float value (for debug panel display).
     last_values: Mutex<Vec<f32>>,
+    /// v0.12.2 (LE6): the **active catalog** the listener is currently
+    /// subscribed to — the static `CATALOG` with the detected aircraft
+    /// profile's dataref overrides applied. Same length/indices as
+    /// `CATALOG`. The listener owns the working copy and publishes it
+    /// here so the debug panel shows the dataref names actually in use.
+    active_catalog: Mutex<Vec<ActiveEntry>>,
     /// Aircraft identity from the X-Plane 12.1+ Web API. Empty
     /// `AircraftInfo` (all fields None) until the poller's first
     /// successful response, OR forever if the Web API is unreachable
@@ -120,6 +133,7 @@ impl XPlaneAdapter {
             parsed: Mutex::new(XPlaneState::default()),
             seen: Mutex::new(vec![false; CATALOG.len()]),
             last_values: Mutex::new(vec![0.0; CATALOG.len()]),
+            active_catalog: Mutex::new(build_active_catalog(None)),
             aircraft: Mutex::new(AircraftInfo::default()),
             stop: AtomicBool::new(false),
         });
@@ -147,6 +161,9 @@ impl XPlaneAdapter {
         *self.shared.last_error.lock().unwrap() = None;
         *self.shared.parsed.lock().unwrap() = XPlaneState::default();
         *self.shared.aircraft.lock().unwrap() = AircraftInfo::default();
+        // v0.12.2: a fresh run starts on the base catalog — profile
+        // detection re-runs from scratch against the new sim session.
+        *self.shared.active_catalog.lock().unwrap() = build_active_catalog(None);
         for v in self.shared.seen.lock().unwrap().iter_mut() {
             *v = false;
         }
@@ -276,12 +293,16 @@ impl XPlaneAdapter {
 
     /// Return the catalog with each DataRef's most recent received
     /// value. Used by the Settings → Debug panel — analogous to the
-    /// MSFS Inspector but auto-populated (no add-watch UI needed
-    /// because the X-Plane catalog is fixed at compile time).
+    /// MSFS Inspector but auto-populated.
+    ///
+    /// v0.12.2: reads the **active catalog** so the panel shows the
+    /// dataref names actually in use — including a detected aircraft
+    /// profile's overrides (e.g. the CL650 flaps dataref).
     pub fn subscribed_datarefs(&self) -> Vec<DatarefSample> {
         let seen = self.shared.seen.lock().unwrap();
         let last = self.shared.last_values.lock().unwrap();
-        CATALOG
+        let active = self.shared.active_catalog.lock().unwrap();
+        active
             .iter()
             .enumerate()
             .map(|(i, e)| DatarefSample {
@@ -300,10 +321,15 @@ impl Drop for XPlaneAdapter {
     }
 }
 
-/// The blocking listener thread. Binds a UDP socket on an
-/// ephemeral local port, sends one RREF subscription per CATALOG
-/// entry to 127.0.0.1:49000, then loops decoding responses until
+/// The blocking listener thread. Binds a UDP socket on an ephemeral
+/// local port, subscribes the active catalog (+ aircraft-profile
+/// probes) to 127.0.0.1:49000, then loops decoding responses until
 /// `shared.stop` flips to `true`.
+///
+/// v0.12.2: the listener also runs aircraft-profile detection (LE1) —
+/// title-match via the Web API overlay plus an RREF probe — and on a
+/// match rebuilds the active catalog with the profile's dataref
+/// overrides and re-subscribes (LE6).
 fn run_listener(shared: Arc<AdapterShared>) {
     use std::net::UdpSocket;
 
@@ -329,21 +355,24 @@ fn run_listener(shared: Arc<AdapterShared>) {
 
     let xplane_addr = format!("127.0.0.1:{XPLANE_LISTEN_PORT}");
 
+    // ---- v0.12.2: active catalog + aircraft-profile state ----
+    // `active` is the static CATALOG with the detected profile's
+    // dataref overrides applied (LE6) — same length/indices as CATALOG.
+    let mut active: Vec<ActiveEntry> = build_active_catalog(None);
+    // Index into PROFILES of the active profile, None until detected.
+    let mut active_profile: Option<usize> = None;
+    // Which profiles' probe datarefs X-Plane has answered (LE1 stage 2).
+    let mut probe_responded: Vec<bool> = vec![false; PROFILES.len()];
+    // Last aircraft title evaluated — to detect an aircraft swap.
+    let mut last_title: Option<String> = None;
+
     // ---- Hard-armoured re-subscribe (v0.3.0) ----
-    // Send the full RREF subscription set. Called both at startup AND
-    // periodically from the worker loop whenever we're not Connected,
-    // so we recover from:
-    //   * AeroACARS started before X-Plane (initial subscribe lands on
-    //     a closed port, no-one to receive it)
-    //   * Pilot quits X-Plane and starts a fresh instance — the new
-    //     X-Plane has no record of our subscription
-    //   * X-Plane crashed and was restarted by the pilot
-    //   * Pilot loads a different aircraft (RREF state is preserved
-    //     usually but on some hot-reload paths gets lost)
-    // The subscribe is idempotent on X-Plane's side — duplicate
-    // RREF requests at the same index just refresh the rate.
-    let send_all_subscriptions = |sock: &UdpSocket| {
-        for (i, entry) in CATALOG.iter().enumerate() {
+    // Send the full RREF subscription set for the given catalog. Called
+    // at startup, on profile activation, and periodically while not
+    // Connected. Idempotent on X-Plane's side — a duplicate RREF at the
+    // same index just refreshes the rate / re-binds the dataref.
+    let subscribe_catalog = |sock: &UdpSocket, cat: &[ActiveEntry]| {
+        for (i, entry) in cat.iter().enumerate() {
             let req = encode_request(SUBSCRIPTION_HZ as i32, i as i32, entry.name);
             if let Err(e) = sock.send_to(&req, &xplane_addr) {
                 tracing::trace!(
@@ -354,10 +383,28 @@ fn run_listener(shared: Arc<AdapterShared>) {
             }
         }
     };
+    // v0.12.2 (LE1 stage 2): one probe subscription per profile, at a
+    // reserved discovery index. Low rate — we only need to learn the
+    // dataref exists, not stream it.
+    let subscribe_probes = |sock: &UdpSocket| {
+        for (pi, prof) in PROFILES.iter().enumerate() {
+            let req = encode_request(1, DISCOVERY_INDEX_BASE + pi as i32, prof.probe_dataref);
+            let _ = sock.send_to(&req, &xplane_addr);
+        }
+    };
+    // Cancel all probe subscriptions (freq = 0) — done once a profile
+    // is active, the probe has served its purpose.
+    let unsubscribe_probes = |sock: &UdpSocket| {
+        for (pi, prof) in PROFILES.iter().enumerate() {
+            let stop = encode_request(0, DISCOVERY_INDEX_BASE + pi as i32, prof.probe_dataref);
+            let _ = sock.send_to(&stop, &xplane_addr);
+        }
+    };
 
-    // Initial subscribe — most of the time X-Plane is already running
-    // and this is the only call needed.
-    send_all_subscriptions(&socket);
+    // Initial subscribe — base catalog + profile probes.
+    subscribe_catalog(&socket, &active);
+    subscribe_probes(&socket);
+    *shared.active_catalog.lock().unwrap() = active.clone();
 
     // Listen.
     let mut buf = vec![0u8; 8192];
@@ -365,9 +412,7 @@ fn run_listener(shared: Arc<AdapterShared>) {
     let mut last_resubscribe_at = Instant::now();
     /// How often to re-send the full subscription set while we're
     /// not yet Connected. 5 seconds matches `STALE_TIMEOUT` so the
-    /// recovery feels coherent. Faster would spam X-Plane on cold-
-    /// start; slower would feel laggy after the pilot restarts the
-    /// sim.
+    /// recovery feels coherent.
     const RESUBSCRIBE_INTERVAL: Duration = Duration::from_secs(5);
 
     while !shared.stop.load(Ordering::SeqCst) {
@@ -382,12 +427,30 @@ fn run_listener(shared: Arc<AdapterShared>) {
                 let mut seen = shared.seen.lock().unwrap();
                 let mut last = shared.last_values.lock().unwrap();
                 for p in pairs {
-                    parsed.apply(p.index, p.value);
-                    if let Some(slot) = seen.get_mut(p.index as usize) {
-                        *slot = true;
+                    // v0.12.2 (LE1): discovery-index packets are PROBE
+                    // responses — they only prove a profile's dataref
+                    // exists. Intercepted BEFORE `apply_field`; they
+                    // never mutate a snapshot value.
+                    if p.index >= DISCOVERY_INDEX_BASE {
+                        let pi = (p.index - DISCOVERY_INDEX_BASE) as usize;
+                        if let Some(slot) = probe_responded.get_mut(pi) {
+                            *slot = true;
+                        }
+                        continue;
                     }
-                    if let Some(slot) = last.get_mut(p.index as usize) {
-                        *slot = p.value;
+                    // Normal catalog packet: index → active entry →
+                    // FieldId, with the profile's ValueMapping applied.
+                    if let Some(entry) = active.get(p.index as usize) {
+                        if let Some(mapped) = entry.mapping.map(p.value) {
+                            parsed.apply_field(entry.field, mapped);
+                        }
+                        // seen/last reflect the RAW value X-Plane sent.
+                        if let Some(slot) = seen.get_mut(p.index as usize) {
+                            *slot = true;
+                        }
+                        if let Some(slot) = last.get_mut(p.index as usize) {
+                            *slot = p.value;
+                        }
                     }
                 }
                 if parsed.got_first_packet {
@@ -408,15 +471,52 @@ fn run_listener(shared: Arc<AdapterShared>) {
             }
         }
 
+        // ---- v0.12.2 (LE1/LE6): aircraft-profile detection ----
+        // Read the current aircraft title (Web API overlay; may be None
+        // when the Web API is off or under X-Plane 11).
+        let current_title = shared.aircraft.lock().unwrap().descrip.clone();
+        // Aircraft swap → reset detection back to the base catalog.
+        if current_title != last_title {
+            if last_title.is_some() && active_profile.is_some() {
+                tracing::info!("X-Plane: aircraft changed — resetting dataref profile");
+                active_profile = None;
+                for r in probe_responded.iter_mut() {
+                    *r = false;
+                }
+                active = build_active_catalog(None);
+                *shared.active_catalog.lock().unwrap() = active.clone();
+                subscribe_catalog(&socket, &active);
+                subscribe_probes(&socket);
+            }
+            last_title = current_title.clone();
+        }
+        // Detect a profile while none is active — title OR probe (LE1).
+        if active_profile.is_none() {
+            let by_title = current_title.as_deref().and_then(profile_index_for_title);
+            let by_probe = probe_responded.iter().position(|&r| r);
+            if let Some(pi) = by_title.or(by_probe) {
+                let via = if by_title.is_some() { "title" } else { "probe" };
+                tracing::info!(
+                    profile = PROFILES[pi].name,
+                    via,
+                    "X-Plane: aircraft DataRef profile activated"
+                );
+                active_profile = Some(pi);
+                // Rebuild the active catalog + re-subscribe with fresh
+                // dataref names (LE6); the probes have done their job.
+                active = build_active_catalog(Some(&PROFILES[pi]));
+                *shared.active_catalog.lock().unwrap() = active.clone();
+                subscribe_catalog(&socket, &active);
+                unsubscribe_probes(&socket);
+            }
+        }
+
         // Stale-snapshot guard: if we WERE connected but haven't
         // seen any packet for STALE_TIMEOUT, treat the connection
         // as dropped — clear the parsed state (so snapshot() returns
         // None until fresh data arrives) and downgrade the connection
-        // state. The next packet will repopulate parsed and snap us
-        // back to Connected without intervention. Without this, if
-        // the pilot quits X-Plane and re-loads at a different airport,
-        // our snapshot() would silently keep serving the old position
-        // until a new packet overwrites every relevant DataRef.
+        // state. The next packet repopulates parsed and snaps us back
+        // to Connected without intervention.
         if let Some(at) = last_packet_at {
             if at.elapsed() > STALE_TIMEOUT {
                 let mut parsed = shared.parsed.lock().unwrap();
@@ -443,28 +543,28 @@ fn run_listener(shared: Arc<AdapterShared>) {
 
         // ---- Hard-armoured re-subscribe poll (v0.3.0) ----
         // Whenever we're not Connected, periodically resend the full
-        // subscription set. This covers the "AeroACARS started before
-        // X-Plane" case (where last_packet_at is still None and the
-        // stale-timeout block above never fires) AND the "X-Plane was
-        // restarted" case (where the new X-Plane instance has no
-        // record of our subscription). Pilot does not need to touch
-        // any UI button — connection just comes back.
+        // subscription set (active catalog + probes) so the connection
+        // recovers from a cold start or an X-Plane restart on its own.
         let state_now = *shared.state.lock().unwrap();
         if state_now != ConnectionState::Connected
             && last_resubscribe_at.elapsed() >= RESUBSCRIBE_INTERVAL
         {
             tracing::debug!("X-Plane: not connected — re-sending RREF subscriptions");
-            send_all_subscriptions(&socket);
+            subscribe_catalog(&socket, &active);
+            if active_profile.is_none() {
+                subscribe_probes(&socket);
+            }
             last_resubscribe_at = Instant::now();
         }
     }
 
-    // Best-effort: send freq=0 RREF for every catalog entry so we
-    // don't leave X-Plane streaming into the void after we exit.
-    for (i, entry) in CATALOG.iter().enumerate() {
+    // Best-effort: send freq=0 RREF for every active catalog entry and
+    // every probe so we don't leave X-Plane streaming into the void.
+    for (i, entry) in active.iter().enumerate() {
         let req = encode_request(0, i as i32, entry.name);
         let _ = socket.send_to(&req, &xplane_addr);
     }
+    unsubscribe_probes(&socket);
     tracing::info!("X-Plane UDP listener stopped");
 }
 

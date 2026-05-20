@@ -46,6 +46,7 @@ mod adapter;
 mod dataref;
 mod premium;
 mod probe;
+mod profile;
 mod rref;
 mod web_api;
 
