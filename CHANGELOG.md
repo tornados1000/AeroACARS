@@ -4,6 +4,14 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.12.2] — 2026-05-20 · X-Plane Aircraft-DataRef-Profile (CL650) · Discord-Push-Diagnose
+
+Zwei Streams. Spec: `docs/spec/v0.12.2-xplane-aircraft-dataref-profiles.md`.
+
+**Stream 1 — X-Plane Aircraft-DataRef-Profile (echte Lösung für Study-Level-Add-ons).** Study-Level-X-Plane-Add-ons wie die Hot-Start Challenger 650 fahren Cockpit-/Systemfunktionen über eigene DataRefs und bedienen die Standard-`sim/...`-DataRefs nicht — AeroACARS sah die CL650-Flaps nie (GSG225-Befund). v0.12.1 hat das fail-soft abgefangen; v0.12.2 liefert die echte Lösung. Ein Profil-System erkennt ein bekanntes Study-Level-Flugzeug über den Web-API-Flugzeugtitel **oder** eine RREF-Probe auf einen Signatur-DataRef und abonniert dann dessen add-on-eigene DataRefs. Erstes Profil: die Hot-Start Challenger 650 — Flaps (Hebel 0/20/30/45, gegen die Hersteller-Doku `Wires.txt` verifiziert), Battery-Master, Beacon- und Taxi-Light. LANDING-CONFIG-Prüfung und Approach-Stability-Scoring funktionieren damit für die CL650 wieder voll. Bei einem Flugzeugwechsel zur Laufzeit fällt der Adapter automatisch auf den Standard-Katalog zurück; Flugzeuge ohne Profil bleiben unverändert. Code-QS-Findings R4 (P1: Reset ohne Web-API-Titel) + R5 (P2: stale Titel überstimmt retirete Probe nicht) eingearbeitet.
+
+**Stream 2 — Discord-Push-Diagnose.** Piloten meldeten, die Discord-Live-Presence verschwand nach den Updates, während der Test-Button weiter funktioniert (= Verbindung ok, aber der Flug-Push landet nicht). Der Push-Pfad verschluckte jede Fehlermeldung still. Das Discord-Panel (Einstellungen → Discord) zeigt jetzt „Letzter Discord-Push: vor X s" plus die letzte Fehlermeldung — bleibt die Zeit während eines Flugs stehen, kommt der Push nicht durch. Reine Anzeige/Logging-Erweiterung, kein Wire-Format-Wechsel.
+
 ## [v0.12.1] — 2026-05-20 · Pilot-Befunde · Phase-FSM, VA-Härtung, Approach-Stability, Autostart, Resume
 
 Fünf unabhängige Befunde aus dem Piloten-Feedback eines Tages, in einer Release zusammengefasst. Spec: `docs/spec/v0.12.1-phase-fsm-fix-and-va-hardening.md`.
