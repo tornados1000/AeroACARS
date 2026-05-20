@@ -101,13 +101,26 @@ gesetzt sind. AeroACARS behandelt das ab v0.12.1 fail-soft (LANDING CONFIG =
 „nicht bewertbar" statt rotem „INCOMPLETE", kein Punktabzug). Mit dem
 korrekten CL650-DataRef könnte die Landing-Config wieder echt bewertet werden.
 
-| Funktion | Standard-DataRef | CL650-spezifisch (im DataRefTool unter `CL650/` suchen) |
-|---|---|---|
-| Flaps-Stellung | `sim/flightmodel2/controls/flap_handle_deploy_ratio` | `____________________` ← **bitte nachtragen** |
-| Gear-Stellung | `sim/flightmodel2/gear/deploy_ratio[0]` | `____________________` |
-| Triebwerk 1/2 läuft | `ENGN_running[0]` / `[1]` | `____________________` |
-| Parkbremse | `parking_brake_ratio` | `____________________` |
-| (weitere nach Bedarf — Tabelle Teil 2) | | |
+**Erfasst von Michel (2026-05-20), DataRefTool:**
+
+| Funktion | Standard-DataRef | CL650-spezifischer DataRef | Typ / Wert |
+|---|---|---|---|
+| Flaps-Stellung | `sim/flightmodel2/controls/flap_handle_deploy_ratio` | `abus/CL650/ARINC429/L-DCU-7/words/FCTL/0/FLAPS_LVR` | **int 0–3** (Hebel-Detent: 0 / 1 / 20 / 30) |
+| Battery-Master | `sim/cockpit2/electrical/battery_on[0]` | `abus/CL650/modules/DC_ELEC/0/wires/BATT_CTRL_PWR` | int 0/1 |
+| Beacon | `sim/cockpit2/switches/beacon_on` | `CL650/overhead/ext_lts/beacon` | int 0/1 |
+| Taxi-Light | `sim/cockpit2/switches/taxi_light_on` | `CL650/overhead/land_lts/recog_taxi` | int 0/1 |
+
+**Wichtig — Flaps ist ein Hebel-Detent, kein Deploy-Ratio.** `FLAPS_LVR`
+liefert `0,1,2,3` (entspricht Flaps 0 / 1 / 20 / 30), AeroACARS erwartet aber
+`0.0–1.0`. Das Aircraft-Profil muss umrechnen — für die LANDING-CONFIG-Prüfung
+gilt: **Hebel ≥ 2 = Landing-Konfiguration** (Flaps 20 und 30 sind beides
+gültige Lande-Stellungen der CL650).
+
+**Standard-DataRefs, die beim CL650 schon korrekt sind** (kein Override nötig —
+verifiziert am GSG225-Flugschrieb): Gear (`gear/deploy_ratio[0]` las korrekt
+`1.0`), Triebwerke + Bewegung (saubere Phasenkette Boarding→…→Takeoff),
+Parkbremse. Für die score-relevante Lücke beim CL650 reicht damit **die
+Flaps-DataRef** — der Rest oben ist Priorität-B-Komfort (PIREP-Felder).
 
 ---
 
