@@ -9334,10 +9334,9 @@ fn compute_aggregate_master_score(
         // `score_basis_vs_fpm()` Doc.
         vs_fpm: score_basis_vs_fpm(stats),
         peak_g_load: stats.landing_peak_g_force,
-        // v0.12.3 (LE8): EMA-geglätteter Scored-G aus der Forensik-Analyse.
-        // `sub_g_force` scort diesen Wert; ist er None (kein Touchdown-
-        // Fenster), fällt es auf den rohen `peak_g_load` zurück.
-        scored_g_load: ana_f32(&stats.landing_analysis, "scored_g"),
+        // v0.12.3 (LE8): zentraler Scored-G-Helper — EMA-Wert aus der
+        // Forensik, sonst raw_fallback. Nie `None` an den Score (QS-P2).
+        scored_g_load: Some(score_g_for_stats(stats).scored_g),
         // v0.7.6 P2-B: zentraler Helper statt direkten Read.
         bounce_count: Some(scored_bounce_count_for_score(stats)),
         approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
@@ -9523,10 +9522,9 @@ where
         // `score_basis_vs_fpm()` Doc.
         vs_fpm: score_basis_vs_fpm(stats),
         peak_g_load: stats.landing_peak_g_force,
-        // v0.12.3 (LE8): EMA-geglätteter Scored-G aus der Forensik-Analyse.
-        // `sub_g_force` scort diesen Wert; ist er None (kein Touchdown-
-        // Fenster), fällt es auf den rohen `peak_g_load` zurück.
-        scored_g_load: ana_f32(&stats.landing_analysis, "scored_g"),
+        // v0.12.3 (LE8): zentraler Scored-G-Helper — EMA-Wert aus der
+        // Forensik, sonst raw_fallback. Nie `None` an den Score (QS-P2).
+        scored_g_load: Some(score_g_for_stats(stats).scored_g),
         // v0.7.6 P2-B: zentraler Helper statt direkten Read.
         bounce_count: Some(scored_bounce_count_for_score(stats)),
         approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
@@ -11102,9 +11100,9 @@ async fn flight_end(
                             // v0.7.17 (B-015a QS-Fix): Edge-Wert hat Vorrang.
                             vs_fpm: score_basis_vs_fpm(&stats),
                             peak_g_load: stats.landing_peak_g_force,
-                            // v0.12.3 (LE8): EMA-Scored-G aus der Forensik;
-                            // sub_g_force scort diesen Wert (sonst raw-Fallback).
-                            scored_g_load: ana_f32(&stats.landing_analysis, "scored_g"),
+                            // v0.12.3 (LE8): zentraler Scored-G-Helper —
+                            // EMA-Wert, sonst raw_fallback; nie None (QS-P2).
+                            scored_g_load: Some(score_g_for_stats(&stats).scored_g),
                             // v0.7.6 P2-B: zentraler Helper statt direkten Read.
                             bounce_count: Some(scored_bounce_count_for_score(&stats)),
                             approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
@@ -12949,6 +12947,30 @@ fn ana_str(v: &Option<serde_json::Value>, key: &str) -> Option<String> {
     Some(v.as_ref()?.get(key)?.as_str()?.to_string())
 }
 
+/// v0.12.3 (LE8): **der eine** Scored-G-Wert, den jeder Pfad eines
+/// `FlightStats` nutzt — Touchdown-Klassifikation, Activity-/ACARS-Text,
+/// MQTT-Touchdown-Payload und das `LandingScored`-Event.
+///
+/// Liest den EMA-geglätteten `scored_g` aus der Forensik-Analyse. Gibt es
+/// kein Touchdown-Fenster (`landing_analysis` ist `None`), fällt der Wert
+/// definiert auf den rohen Peak zurück (`raw_fallback`, LE8) — **kein**
+/// Pfad bekommt je `None`/`0` an den Score.
+fn score_g_for_stats(stats: &FlightStats) -> recorder::ScoredG {
+    if let Some(scored) = ana_f32(&stats.landing_analysis, "scored_g") {
+        let method = match ana_str(&stats.landing_analysis, "scored_g_method").as_deref() {
+            Some("raw_fallback") => recorder::ScoredGMethod::RawFallback,
+            _ => recorder::ScoredGMethod::EmaMax,
+        };
+        recorder::ScoredG {
+            scored_g: scored,
+            raw_peak: stats.landing_peak_g_force.unwrap_or(scored),
+            method,
+        }
+    } else {
+        recorder::scored_g_raw_fallback(stats.landing_peak_g_force.unwrap_or(0.0))
+    }
+}
+
 /// v0.5.39: Forensik-Bewertung der Landung aus dem 50-Hz-Sample-Buffer
 /// um den TD-Edge. Gibt JSON-Map zurück, die im LandingAnalysis-Event in
 /// die JSONL geschrieben + im MQTT-Touchdown-Payload mit-publisht wird.
@@ -14110,8 +14132,11 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
                         .unwrap_or(s.bounce_count);
                     s.bounce_count = scored_bounce;
                     let peak_vs = s.landing_peak_vs_fpm.unwrap_or(0.0);
-                    let peak_g = s.landing_peak_g_force.unwrap_or(0.0);
-                    let new_score = LandingScore::classify(peak_vs, peak_g, scored_bounce);
+                    // v0.12.3 (LE8/QS-P1): classify on the EMA-scored G, not
+                    // the raw 50 Hz peak — a single raw spike must not push
+                    // the landing to Hard/Severe on its own.
+                    let scored_g = score_g_for_stats(&s).scored_g;
+                    let new_score = LandingScore::classify(peak_vs, scored_g, scored_bounce);
                     s.landing_score = Some(new_score);
                     s.landing_score_finalized = true;
                     // Reset announcement-flag damit announce_landing_score den
@@ -14703,12 +14728,12 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                             bank_deg: stats.landing_bank_deg,
                             g_load: stats.landing_g_force,
                             peak_g_load: stats.landing_peak_g_force,
-                            // v0.12.3 (LE7): EMA-geglätteter Scored-G + Methode
-                            // aus der Forensik-Analyse. peak_g_load bleibt roh.
-                            scored_g_load: ana_f32(&stats.landing_analysis, "scored_g"),
-                            scored_g_method: ana_str(
-                                &stats.landing_analysis,
-                                "scored_g_method",
+                            // v0.12.3 (LE7/LE8): zentraler Scored-G-Helper —
+                            // EMA-Wert, sonst raw_fallback; nie None (QS-P2).
+                            // peak_g_load (oben) bleibt der rohe Wert.
+                            scored_g_load: Some(score_g_for_stats(&stats).scored_g),
+                            scored_g_method: Some(
+                                score_g_for_stats(&stats).method.as_str().to_string(),
                             ),
                             sideslip_deg: stats.touchdown_sideslip_deg,
                             headwind_kt: stats.landing_headwind_kt,
@@ -17365,8 +17390,10 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                     // Touchdown-Event wird im PIREP als „score not
                     // captured" markiert.
                     if let Some(peak_vs) = stats.landing_peak_vs_fpm {
-                        let peak_g = stats.landing_peak_g_force.unwrap_or(0.0);
-                        let score = LandingScore::classify(peak_vs, peak_g, stats.bounce_count);
+                        // v0.12.3 (LE8/QS-P1): classify on the scored G
+                        // (raw_fallback here — no forensics window).
+                        let scored_g = score_g_for_stats(&stats).scored_g;
+                        let score = LandingScore::classify(peak_vs, scored_g, stats.bounce_count);
                         stats.landing_score = Some(score);
                     } else {
                         tracing::warn!(
@@ -18758,10 +18785,9 @@ fn build_pirep_notes(flight: &ActiveFlight, stats: &FlightStats) -> String {
         // `score_basis_vs_fpm()` Doc.
         vs_fpm: score_basis_vs_fpm(stats),
         peak_g_load: stats.landing_peak_g_force,
-        // v0.12.3 (LE8): EMA-geglätteter Scored-G aus der Forensik-Analyse.
-        // `sub_g_force` scort diesen Wert; ist er None (kein Touchdown-
-        // Fenster), fällt es auf den rohen `peak_g_load` zurück.
-        scored_g_load: ana_f32(&stats.landing_analysis, "scored_g"),
+        // v0.12.3 (LE8): zentraler Scored-G-Helper — EMA-Wert aus der
+        // Forensik, sonst raw_fallback. Nie `None` an den Score (QS-P2).
+        scored_g_load: Some(score_g_for_stats(stats).scored_g),
         // v0.7.6 P2-B: zentraler Helper statt direkten Read.
         bounce_count: Some(scored_bounce_count_for_score(stats)),
         approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
@@ -18979,11 +19005,10 @@ fn announce_landing_score(app: &AppHandle, flight: &ActiveFlight) -> Option<Stri
     let peak_vs = stats.landing_peak_vs_fpm.unwrap_or(0.0);
     let peak_g = stats.landing_peak_g_force.unwrap_or(0.0);
     let bounces = stats.bounce_count;
-    // v0.12.3 (LE7): EMA-Scored-G + Methode aus der Forensik-Analyse —
-    // additiv ins persistierte `LandingScored`-Event. `peak_g` (oben)
-    // bleibt der rohe Wert.
-    let scored_g = ana_f32(&stats.landing_analysis, "scored_g");
-    let scored_g_method = ana_str(&stats.landing_analysis, "scored_g_method");
+    // v0.12.3 (LE7/LE8): der gescorte G-Wert (EMA, sonst raw_fallback) —
+    // für den Activity-/ACARS-Text UND das persistierte LandingScored-
+    // Event. `peak_g` (oben) bleibt der rohe Wert für `peak_g_force`.
+    let sg = score_g_for_stats(&stats);
     let level = match score {
         LandingScore::Smooth | LandingScore::Acceptable => ActivityLevel::Info,
         LandingScore::Firm => ActivityLevel::Info,
@@ -19057,7 +19082,7 @@ fn announce_landing_score(app: &AppHandle, flight: &ActiveFlight) -> Option<Stri
         Some(format!(
             "V/S {:.0} fpm, G {:.2}{} — {}",
             peak_vs, // signed: negative = descent, matches the PIREP
-            peak_g,
+            sg.scored_g, // v0.12.3 (LE7): scored (EMA) G, not the raw peak
             bounce_part,
             master_text,
         )),
@@ -19081,8 +19106,8 @@ fn announce_landing_score(app: &AppHandle, flight: &ActiveFlight) -> Option<Stri
             peak_g_force: peak_g,
             bounce_count: bounces,
             // v0.12.3 (LE7): EMA-Scored-G additiv; peak_g_force bleibt roh.
-            scored_g_force: scored_g,
-            scored_g_method,
+            scored_g_force: Some(sg.scored_g),
+            scored_g_method: Some(sg.method.as_str().to_string()),
         },
     );
     // Re-acquire to flag it as announced.
@@ -19093,7 +19118,7 @@ fn announce_landing_score(app: &AppHandle, flight: &ActiveFlight) -> Option<Stri
         touchdown_grade,
         score.label(),
         peak_vs,
-        peak_g,
+        sg.scored_g, // v0.12.3 (LE7): scored (EMA) G, not the raw peak
         bounce_part,
         master_text,
     ))
