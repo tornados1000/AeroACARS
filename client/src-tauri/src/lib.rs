@@ -3775,6 +3775,23 @@ fn estimate_xplane_touchdown_vs_lua_style(
 const APPROACH_STABILITY_AGL_CAP_FT: f32 = 1500.0;
 const APPROACH_FLARE_CUTOFF_MS: i64 = 3000;
 
+/// v0.12.1 (Stream C LE12): the `max V/S deviation < 500 ft` metric
+/// ignores samples below this height. A V/S excursion at < 50 ft is the
+/// flare / ground-effect, not approach instability — counting it produced
+/// a spurious 826 fpm "deviation" on GSG225 from a small flare balloon.
+/// The 3-second time-based flare cutoff doesn't reach far enough back
+/// when the pilot flares early/long; this height floor is the backstop.
+const MAX_VS_DEV_FLOOR_FT: f32 = 50.0;
+
+/// v0.12.1 (Stream C LE11): if flaps read 0 across the whole approach
+/// gate while the gear is down AND the gate-entry speed is below this
+/// IAS, the flaps dataref is untrustworthy (study-level X-Plane add-ons
+/// such as the Hot-Start CL650 don't drive the standard flap dataref) —
+/// a genuine flapless landing would be considerably faster. The
+/// LANDING-CONFIG check then reports "not assessable" instead of a
+/// false "INCOMPLETE".
+const FLAPS_UNREADABLE_MAX_IAS_KT: f32 = 160.0;
+
 fn compute_approach_stddev(
     buf: &std::collections::VecDeque<ApproachBufferSample>,
     td_ts: Option<DateTime<Utc>>,
@@ -4013,8 +4030,24 @@ fn compute_approach_stability_v2(
         .max_by(|a, b| height_for(a).partial_cmp(&height_for(b)).unwrap())
     {
         let gear_ok = gate_entry.gear_position >= 0.99;
-        let flaps_ok = gate_entry.flaps_position >= 0.70;
-        out.stable_config = Some(gear_ok && flaps_ok);
+        // v0.12.1 (Stream C LE11): detect an unreadable flaps dataref.
+        // Study-level X-Plane add-ons (Hot-Start CL650 etc.) don't drive
+        // the standard flap dataref → flaps_position stays 0 the whole
+        // approach. If gear is down and the gate-entry speed is in the
+        // landing range, flaps-0 is a broken reading, not "pilot forgot
+        // flaps" — report the config as not-assessable (None) rather than
+        // a false "INCOMPLETE" fail. A genuine flapless approach would be
+        // far faster than FLAPS_UNREADABLE_MAX_IAS_KT.
+        let flaps_all_zero = gate_samples.iter().all(|s| s.flaps_position < 0.01);
+        let flaps_unreadable = flaps_all_zero
+            && gear_ok
+            && gate_entry.ias_kt < FLAPS_UNREADABLE_MAX_IAS_KT;
+        if flaps_unreadable {
+            out.stable_config = None;
+        } else {
+            let flaps_ok = gate_entry.flaps_position >= 0.70;
+            out.stable_config = Some(gear_ok && flaps_ok);
+        }
     }
 
     // 7) V/S-Deviation vs 3° ILS-Profil (sekundaer, nur informativ).
@@ -4024,7 +4057,11 @@ fn compute_approach_stability_v2(
         let target_vs = -(s.gs_kt as f64) * 5.31;
         let dev = (s.vs_fpm as f64 - target_vs).abs();
         sum_dev += dev;
-        if height_for(s) <= 500.0 {
+        // v0.12.1 (Stream C LE12): the "< 500 ft" band excludes the
+        // flare / ground-effect regime — a V/S excursion below
+        // MAX_VS_DEV_FLOOR_FT is the flare, not approach instability.
+        let h = height_for(s);
+        if h <= 500.0 && h >= MAX_VS_DEV_FLOOR_FT {
             let dev_f32 = dev as f32;
             if dev_f32 > max_dev_below_500 {
                 max_dev_below_500 = dev_f32;
@@ -24003,6 +24040,100 @@ mod sim_pause_tests {
             52.0,
             10.0,
         ));
+    }
+
+    // ---- v0.12.1 Stream C — approach-stability fixes (LE11 + LE12) ----
+
+    fn approach_sample(
+        agl: f32,
+        gs: f32,
+        ias: f32,
+        vs: f32,
+        gear: f32,
+        flaps: f32,
+    ) -> ApproachBufferSample {
+        ApproachBufferSample {
+            at: Utc::now(),
+            agl_ft: agl,
+            msl_ft: agl,
+            gs_kt: gs,
+            ias_kt: ias,
+            vs_fpm: vs,
+            bank_deg: 0.0,
+            heading_true_deg: 0.0,
+            gear_position: gear,
+            flaps_position: flaps,
+            selected_runway: None,
+            stall_warning: false,
+        }
+    }
+
+    #[test]
+    fn landing_config_softfails_when_flaps_unreadable() {
+        // GSG225 / Hot-Start CL650: flaps dataref reads 0 the whole
+        // approach, gear is down, speed is in the landing range. The
+        // LANDING-CONFIG check must report not-assessable (None), not a
+        // false "INCOMPLETE".
+        let buf: std::collections::VecDeque<ApproachBufferSample> = [
+            approach_sample(900.0, 130.0, 132.0, -650.0, 1.0, 0.0),
+            approach_sample(600.0, 128.0, 130.0, -620.0, 1.0, 0.0),
+            approach_sample(300.0, 125.0, 128.0, -600.0, 1.0, 0.0),
+        ]
+        .into_iter()
+        .collect();
+        let out = compute_approach_stability_v2(&buf, None, None);
+        assert_eq!(out.stable_config, None, "flaps unreadable → not assessable");
+    }
+
+    #[test]
+    fn landing_config_still_fails_genuine_no_flaps() {
+        // Flaps 0 but the approach speed is far too high for a flapped
+        // landing — this is a genuine no-flaps approach, keep the fail.
+        let buf: std::collections::VecDeque<ApproachBufferSample> = [
+            approach_sample(900.0, 200.0, 200.0, -650.0, 1.0, 0.0),
+            approach_sample(600.0, 195.0, 195.0, -620.0, 1.0, 0.0),
+            approach_sample(300.0, 190.0, 190.0, -600.0, 1.0, 0.0),
+        ]
+        .into_iter()
+        .collect();
+        let out = compute_approach_stability_v2(&buf, None, None);
+        assert_eq!(out.stable_config, Some(false), "genuine no-flaps → fail");
+    }
+
+    #[test]
+    fn landing_config_ok_with_flaps_extended() {
+        let buf: std::collections::VecDeque<ApproachBufferSample> = [
+            approach_sample(900.0, 130.0, 132.0, -650.0, 1.0, 0.85),
+            approach_sample(600.0, 128.0, 130.0, -620.0, 1.0, 0.85),
+            approach_sample(300.0, 125.0, 128.0, -600.0, 1.0, 0.85),
+        ]
+        .into_iter()
+        .collect();
+        let out = compute_approach_stability_v2(&buf, None, None);
+        assert_eq!(out.stable_config, Some(true));
+    }
+
+    #[test]
+    fn max_vs_dev_excludes_flare_balloon_below_50ft() {
+        // GSG225: a +200 fpm flare balloon at 9 ft AGL must NOT show up
+        // as an approach-stability deviation; a real -300 fpm excursion
+        // at 200 ft must. Without the height floor the 9 ft sample
+        // produced a spurious ~840 fpm "deviation".
+        let buf: std::collections::VecDeque<ApproachBufferSample> = [
+            approach_sample(800.0, 120.0, 130.0, -640.0, 1.0, 0.85),
+            approach_sample(200.0, 120.0, 128.0, -300.0, 1.0, 0.85),
+            approach_sample(9.0, 120.0, 120.0, 200.0, 1.0, 0.85),
+        ]
+        .into_iter()
+        .collect();
+        let out = compute_approach_stability_v2(&buf, None, None);
+        let max_dev = out
+            .max_vs_deviation_below_500_fpm
+            .expect("a sub-500 ft sample exists");
+        // target at 120 kt ≈ -637 fpm; 200 ft sample dev ≈ 337,
+        // 9 ft balloon dev ≈ 837 — the balloon must be excluded.
+        assert!(max_dev < 500.0, "flare balloon excluded, got {max_dev}");
+        assert!(max_dev > 200.0, "real 200 ft excursion kept, got {max_dev}");
     }
 }
 
