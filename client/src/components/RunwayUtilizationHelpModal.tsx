@@ -1,12 +1,16 @@
-// Pilot-Hilfe-Modal für den "Bahn-Auslastung"-Sub-Score (v0.10.0 LDA-basiert).
+// Pilot-Hilfe-Modal für den "Bahn-Auslastung"-Sub-Score (LDA-basiert,
+// v0.12.0 mit 15 %-Float-Toleranz).
 //
 // Wird über einen "🛬 Wie wird das berechnet?"-Button am Boden der
 // rollout-Card im LandingPanel geöffnet. Inhalt erklärt Formel, die
-// fünf Punkte-Bänder, Heavy-Bonus, Pre-Displaced-Cap und Skip-Reasons —
-// in einfacher Pilot-Sprache, mit derselben Modal-Hülle wie GlossaryModal.
+// Float-Toleranz, die fünf Punkte-Bänder, Heavy-Bonus, Pre-Displaced-Cap,
+// den long_float-Fall und Skip-Reasons — in einfacher Pilot-Sprache, mit
+// derselben Modal-Hülle wie GlossaryModal.
 //
-// Spec-Quelle für den Inhalt: docs/spec/v0.10.0-runway-utilization-score.md
-// (Algorithmus in client/src-tauri/crates/landing-scoring/src/sub_rollout.rs).
+// Spec-Quelle für den Inhalt: docs/spec/v0.12.0-runway-utilization-
+// refinement.md (Float-Toleranz-Refinement; baut auf v0.10.0-runway-
+// utilization-score.md auf). Algorithmus in
+// client/src-tauri/crates/landing-scoring/src/sub_rollout.rs.
 //
 // Accessible: ESC schließt, Focus-Trap auf Modal, role="dialog". DE/EN/IT
 // via `landing.runway_utilization_help.*`.
@@ -176,10 +180,23 @@ export function RunwayUtilizationHelpModal({ onClose }: Props) {
                   "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
                 fontSize: "0.92rem",
                 color: "#bbf7d0",
+                whiteSpace: "pre-line",
               }}
             >
               {t("landing.runway_utilization_help.formula")}
             </div>
+          </Section>
+
+          {/* v0.12.0 (#runway-utilization-refinement, LE6): Float-Toleranz —
+              die ersten 15 % der LDA an Float kosten keine Punkte. */}
+          <Section
+            heading={t(
+              "landing.runway_utilization_help.float_tolerance_heading",
+            )}
+          >
+            <p style={paragraphStyle}>
+              {t("landing.runway_utilization_help.float_tolerance_body")}
+            </p>
           </Section>
 
           <Section heading={t("landing.runway_utilization_help.terms_heading")}>
@@ -209,6 +226,7 @@ export function RunwayUtilizationHelpModal({ onClose }: Props) {
                 padding: "10px 14px",
                 fontSize: "0.88rem",
                 lineHeight: 1.5,
+                whiteSpace: "pre-line",
               }}
             >
               {t("landing.runway_utilization_help.example")}
@@ -303,6 +321,17 @@ export function RunwayUtilizationHelpModal({ onClose }: Props) {
           >
             <p style={paragraphStyle}>
               {t("landing.runway_utilization_help.pre_displaced_body")}
+            </p>
+          </Section>
+
+          {/* v0.12.0 (#runway-utilization-refinement, LE6): long_float —
+              das Gegenstück zum Pre-Displaced-Cap. „Bremsweg top, nur
+              zu spät aufgesetzt." */}
+          <Section
+            heading={t("landing.runway_utilization_help.long_float_heading")}
+          >
+            <p style={paragraphStyle}>
+              {t("landing.runway_utilization_help.long_float_body")}
             </p>
           </Section>
 

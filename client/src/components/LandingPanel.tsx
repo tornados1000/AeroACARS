@@ -415,6 +415,114 @@ function computeSubScores(r: LandingRecord): SubScore[] {
   return getSubScores(r);
 }
 
+// ─── v0.12.0 (#runway-utilization-refinement) — TS-gerenderte Extra-Zeilen ──
+//
+// Spec docs/spec/v0.12.0-runway-utilization-refinement.md LE5: ab
+// `score_algorithm_version >= 3` lässt das Rust-Crate das `extra`-Feld
+// LEER. Die drei Bahn-Auslastungs-Extra-Zeilen (Aufsetzpunkt, Ausroll-
+// strecke, Bahn) baut stattdessen der TS-Renderer aus den ohnehin
+// vorhandenen Record-Feldern + i18n — damit sie sprach-fähig sind statt
+// hardcoded-Deutsch. Alt-v2-Records (`< 3`) behalten ihre gespeicherten
+// `extra`-Strings (Legacy).
+
+/** Minimaler t-Typ — reicht für die Extra-Zeilen-Interpolation. */
+type RolloutTFn = (key: string, opts?: Record<string, string | number>) => string;
+
+/** Erste score_algorithm_version mit TS-gerenderten Extra-Zeilen. */
+const ROLLOUT_ALGO_V3 = 3;
+
+/** True wenn der Record v3-Scoring nutzt (TS rendert die Extra-Zeilen). */
+export function isRolloutV3(r: LandingRecord): boolean {
+  return (r.score_algorithm_version ?? 0) >= ROLLOUT_ALGO_V3;
+}
+
+/**
+ * LDA in Metern aus dem (nested) Pilot-Client `runway_match`.
+ * Spec LE5: `LDA_m = (length_ft − displaced_threshold_ft) × 0.3048`.
+ * Liefert null wenn die Geometrie unbrauchbar ist (length ≤ 0, LDA ≤ 0).
+ */
+export function rolloutLdaMeters(rm: LandingRunwayMatch): number | null {
+  if (!Number.isFinite(rm.length_ft) || rm.length_ft <= 0) return null;
+  const displacedFt = rm.displaced_threshold_ft ?? 0;
+  const lda = (rm.length_ft - displacedFt) * 0.3048;
+  return lda > 0 ? lda : null;
+}
+
+/**
+ * v0.12.0 LE4 — sprach-lokalisiertes Value-Label für die rollout-Card.
+ * Zeigt die ECHTE Auslastung (raw, nicht toleranzbereinigt). Liefert null
+ * wenn Felder fehlen — der Caller fällt dann auf den sprachneutralen
+ * `value`-String des Rust-Crates zurück.
+ */
+export function buildRolloutValueLabel(
+  r: LandingRecord,
+  t: RolloutTFn,
+): string | null {
+  const rm = r.runway_match;
+  if (!rm) return null;
+  const lda = rolloutLdaMeters(rm);
+  if (lda == null) return null;
+  const td = r.td_distance_from_threshold_m;
+  const rollout = r.rollout_distance_m;
+  if (td == null || rollout == null) return null;
+  const used = Math.max(td + rollout, rollout);
+  return t("landing.rollout_extra.value_label", {
+    pct: Math.round((used / lda) * 100),
+    used: Math.round(used),
+    lda: Math.round(lda),
+  });
+}
+
+/**
+ * v0.12.0 LE5 — die drei TS-gerenderten Extra-Zeilen der rollout-Card.
+ * Reihenfolge: Aufsetzpunkt → Ausrollstrecke → Bahn. Jede Zeile entfällt
+ * einzeln wenn ihr Quell-Feld fehlt (z.B. kein `runway_match` → keine
+ * Bahn-Zeile, die anderen zwei bleiben).
+ *
+ * R2-P2-Fix: negatives `td_distance` (Aufsetzen VOR der Schwelle) wählt
+ * den `_before`-Key und übergibt den BETRAG — nie „−50 m hinter …".
+ */
+export function buildRolloutExtraLines(
+  r: LandingRecord,
+  t: RolloutTFn,
+): string[] {
+  const lines: string[] = [];
+
+  const td = r.td_distance_from_threshold_m;
+  if (td != null) {
+    const m = Math.round(Math.abs(td));
+    const key =
+      td < 0
+        ? "landing.rollout_extra.touchdown_point_before"
+        : "landing.rollout_extra.touchdown_point";
+    lines.push(t(key, { m }));
+  }
+
+  if (r.rollout_distance_m != null) {
+    lines.push(
+      t("landing.rollout_extra.rollout_distance", {
+        m: Math.round(r.rollout_distance_m),
+      }),
+    );
+  }
+
+  const rm = r.runway_match;
+  if (rm) {
+    const lda = rolloutLdaMeters(rm);
+    if (lda != null) {
+      lines.push(
+        t("landing.rollout_extra.runway", {
+          icao: rm.airport_ident,
+          ident: rm.runway_ident,
+          lda: Math.round(lda),
+        }),
+      );
+    }
+  }
+
+  return lines;
+}
+
 /** Rationale → i18n key for the coach tip. We point straight at the
  *  fully-qualified `landing.tip.*` path so a missing translation
  *  shows up as the key (easier to spot in QA) rather than as a
@@ -1260,7 +1368,13 @@ function InfoBadge({ explanation }: { explanation: string }) {
 
 // ---- Score breakdown card grid -----------------------------------------
 
-function ScoreBreakdown({ subs }: { subs: SubScore[] }) {
+function ScoreBreakdown({
+  subs,
+  record,
+}: {
+  subs: SubScore[];
+  record: LandingRecord;
+}) {
   const { t } = useTranslation();
   // v0.11.0-dev: Pilot-Hilfe-Modal für den "Bahn-Auslastung"-Sub-Score.
   // Wird über den "🛬 Wie wird das berechnet?"-Button am Boden der
@@ -1324,7 +1438,18 @@ function ScoreBreakdown({ subs }: { subs: SubScore[] }) {
         // Felder durch (undefined) und das Rendering ist No-op.
         const hasWarning =
           typeof s.warning === "string" && s.warning.length > 0;
-        const extraLines = s.extra ?? [];
+        // v0.12.0 (#runway-utilization-refinement, LE4/LE5): die rollout-
+        // Card rendert ab score_algorithm_version >= 3 ihr Value-Label
+        // und ihre Extra-Zeilen sprach-lokalisiert aus den Record-Feldern.
+        // Alt-v2-Records (< 3) zeigen den sprachneutralen Rust-`value`
+        // bzw. die gespeicherten `extra`-Strings unverändert (Legacy).
+        const isV3Rollout = s.key === "rollout" && isRolloutV3(record);
+        const extraLines = isV3Rollout
+          ? buildRolloutExtraLines(record, t)
+          : (s.extra ?? []);
+        const valueText = isV3Rollout
+          ? (buildRolloutValueLabel(record, t) ?? s.value)
+          : s.value;
         return (
           <div
             key={s.key}
@@ -1342,7 +1467,7 @@ function ScoreBreakdown({ subs }: { subs: SubScore[] }) {
               </span>
               <span className="landing-subscore__points">{s.points} PTS</span>
             </div>
-            <div className="landing-subscore__value">{s.value}</div>
+            <div className="landing-subscore__value">{valueText}</div>
             <div className="landing-subscore__bar">
               <div
                 className="landing-subscore__fill"
@@ -2003,7 +2128,7 @@ function LandingDetail({
           {t("landing.score_breakdown")}
           <InfoBadge explanation={t("landing.info.score_section")} />
         </h3>
-        <ScoreBreakdown subs={subs} />
+        <ScoreBreakdown subs={subs} record={record} />
         <CoachTip subs={subs} />
       </section>
 
