@@ -177,7 +177,15 @@ impl SubScoreEntry {
 #[derive(Debug, Clone, Default)]
 pub struct LandingScoringInput {
     pub vs_fpm: Option<f32>,
+    /// Roher 50-Hz-Einzelframe-G-Peak. **Forensik / Backward-Fallback** —
+    /// `sub_g_force` scort dies NICHT mehr direkt, sondern `scored_g_load`
+    /// falls vorhanden (v0.12.3 LE7/LE8).
     pub peak_g_load: Option<f32>,
+    /// v0.12.3 (LE8): EMA-geglätteter Fenster-Peak (FOQA-Methode). Wenn
+    /// gesetzt, scort `sub_g_force` diesen Wert; sonst Fallback auf
+    /// `peak_g_load`. `None` bei pre-v0.12.3-Callern → identisches
+    /// Alt-Verhalten (Roh-Peak).
+    pub scored_g_load: Option<f32>,
     pub bounce_count: Option<u32>,
     pub approach_vs_stddev_fpm: Option<f32>,
     pub approach_bank_stddev_deg: Option<f32>,
@@ -249,7 +257,9 @@ pub fn compute_sub_scores(input: &LandingScoringInput) -> Vec<SubScoreEntry> {
     if let Some(vs) = input.vs_fpm {
         out.push(sub_landing_rate::sub_landing_rate(vs));
     }
-    if let Some(g) = input.peak_g_load {
+    // v0.12.3 (LE8): score the EMA-smoothed `scored_g_load` when present;
+    // fall back to the raw `peak_g_load` for pre-v0.12.3 callers.
+    if let Some(g) = input.scored_g_load.or(input.peak_g_load) {
         out.push(sub_g_force::sub_g_force(g));
     }
     out.push(sub_bounces::sub_bounces(input.bounce_count.unwrap_or(0)));
@@ -479,6 +489,33 @@ pub fn classify_landing(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v0.12.3 (LE8): `sub_g_force` scores `scored_g_load` when present,
+    /// else falls back to the raw `peak_g_load`.
+    #[test]
+    fn sub_g_force_uses_scored_g() {
+        let g_value = |input: &LandingScoringInput| -> String {
+            compute_sub_scores(input)
+                .into_iter()
+                .find(|s| s.key == "g_force")
+                .and_then(|s| s.value)
+                .expect("g_force sub-score present")
+        };
+        // scored_g present → it is scored, not the raw peak.
+        let with_scored = LandingScoringInput {
+            peak_g_load: Some(1.95),
+            scored_g_load: Some(1.78),
+            ..Default::default()
+        };
+        assert_eq!(g_value(&with_scored), "1.78 G");
+        // No scored_g (pre-v0.12.3 caller) → falls back to the raw peak.
+        let legacy = LandingScoringInput {
+            peak_g_load: Some(1.95),
+            scored_g_load: None,
+            ..Default::default()
+        };
+        assert_eq!(g_value(&legacy), "1.95 G");
+    }
 
     #[test]
     fn band_thresholds_match_ts() {

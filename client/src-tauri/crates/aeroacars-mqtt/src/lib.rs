@@ -292,7 +292,19 @@ pub struct TouchdownPayload {
     pub pitch_deg: Option<f32>,
     pub bank_deg: Option<f32>,
     pub g_load: Option<f32>,
+    /// Roher 50-Hz-Einzelframe-G-Peak. **Bleibt roh** (v0.12.3 LE7) —
+    /// backward-kompatibel; alte Consumer lesen weiter diesen Wert.
     pub peak_g_load: Option<f32>,
+    /// v0.12.3 (LE7): EMA-geglätteter Fenster-Peak (FOQA-Methode) — der
+    /// gescorte G-Wert. Additiv; `skip_serializing_if`-frei, damit der
+    /// Recorder das Feld zuverlässig sieht. Pre-v0.12.3-Payloads ohne
+    /// das Feld deserialisieren via `serde(default)` zu `None`.
+    #[serde(default)]
+    pub scored_g_load: Option<f32>,
+    /// v0.12.3 (LE8): `"ema_max"` | `"raw_fallback"` — wie `scored_g_load`
+    /// abgeleitet wurde.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scored_g_method: Option<String>,
     pub sideslip_deg: Option<f32>,
     pub headwind_kt: Option<f32>,
     pub crosswind_kt: Option<f32>,

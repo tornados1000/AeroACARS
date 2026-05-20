@@ -89,8 +89,19 @@ pub enum FlightLogEvent {
         timestamp: DateTime<Utc>,
         score: String,
         peak_vs_fpm: f32,
+        /// Raw 50 Hz single-frame G peak. **Stays raw** (v0.12.3 LE7) —
+        /// backward-compatible, never re-purposed to the EMA value.
         peak_g_force: f32,
         bounce_count: u8,
+        /// v0.12.3 (LE7): EMA-smoothed window-peak G — the value the
+        /// landing is actually scored on. Additive + `serde(default)` so
+        /// pre-v0.12.3 JSONL logs without it still deserialize (→ `None`).
+        #[serde(default)]
+        scored_g_force: Option<f32>,
+        /// v0.12.3 (LE8): how `scored_g_force` was derived —
+        /// `"ema_max"` (normal) or `"raw_fallback"` (no touchdown window).
+        #[serde(default)]
+        scored_g_method: Option<String>,
     },
     /// v0.5.34: vollstaendiger Touchdown-Forensik-Payload (gleiche Daten
     /// wie der MQTT-`touchdown`-Topic). Enthaelt ALLE Felder die der
@@ -248,6 +259,130 @@ pub struct TouchdownWindowSample {
     pub total_weight_kg: Option<f32>,
 }
 
+// ─── v0.12.3: FOQA-konforme Scored-G-Berechnung ──────────────────────────
+//
+// Spec: docs/spec/v0.12.3-landing-g-foqa-measurement.md (LE1–LE3, LE8).
+//
+// Der gescorte Touchdown-G-Wert ist NICHT der rohe 50-Hz-Einzelframe-Peak,
+// sondern der Peak eines leicht geglätteten Signals — so misst echte
+// Flugdaten-Überwachung (FOQA/FDM): Anti-Aliasing-Filter, dann Peak. Die
+// Glättung ist ein framerate-unabhängiger EMA (tau = 100 ms).
+
+/// v0.12.3 (LE2): EMA-Zeitkonstante für den Scored-G-Filter (Sekunden).
+pub const SCORED_G_TAU_SECS: f64 = 0.100;
+/// v0.12.3 (LE3): der `max()` wird über `[edge, edge + dies]` genommen.
+pub const SCORED_G_WINDOW_SECS: f64 = 1.0;
+/// v0.12.3 (LE2): Fallback-`dt`, wenn zwei Samples keinen positiven
+/// Zeitabstand haben (doppelter Timestamp o. ä.).
+const SCORED_G_NOMINAL_DT_SECS: f64 = 0.020;
+
+/// v0.12.3 (LE8): wie `ScoredG::scored_g` zustande kam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScoredGMethod {
+    /// EMA-geglätteter Fenster-Peak — der normale FOQA-konforme Pfad.
+    EmaMax,
+    /// Kein Touchdown-Fenster vorhanden → `scored_g` == roher G-Wert.
+    RawFallback,
+}
+
+impl ScoredGMethod {
+    /// Wire-/Event-String-Form (`scored_g_method`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScoredGMethod::EmaMax => "ema_max",
+            ScoredGMethod::RawFallback => "raw_fallback",
+        }
+    }
+}
+
+/// v0.12.3 (LE1–LE3, LE8): Ergebnis der Scored-G-Berechnung.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScoredG {
+    /// Der Wert, auf dem die Landung gescort wird (EMA-max bzw. roh bei
+    /// Fallback). Speist `sub_g_force`, Card-Headline, Activity-Text.
+    pub scored_g: f32,
+    /// Der rohe 50-Hz-Einzelframe-Peak — bleibt als Forensik-Detail.
+    pub raw_peak: f32,
+    /// Wie `scored_g` abgeleitet wurde.
+    pub method: ScoredGMethod,
+}
+
+/// v0.12.3 (LE1–LE3): den FOQA-konformen Scored-G aus dem 50-Hz-
+/// Touchdown-Fenster berechnen. Das rohe G-Signal wird per
+/// framerate-unabhängigem EMA (tau = 100 ms) leicht geglättet, dann der
+/// Peak des geglätteten Signals über `[edge, edge + 1.0 s]` genommen.
+///
+/// `samples` muss nicht vorsortiert sein — wird hier nach Timestamp
+/// sortiert (LE2). Nicht-finite `g_force`-Werte werden übersprungen. Hat
+/// das Fenster kein brauchbares Post-Edge-Sample, fällt das Ergebnis auf
+/// den rohen Peak zurück (`RawFallback`).
+pub fn compute_scored_g(samples: &[TouchdownWindowSample], edge_at: DateTime<Utc>) -> ScoredG {
+    // LE2 Regel 1 + 4: nach Timestamp sortieren, nicht-finite Samples raus.
+    let mut ordered: Vec<&TouchdownWindowSample> =
+        samples.iter().filter(|s| s.g_force.is_finite()).collect();
+    ordered.sort_by_key(|s| s.at);
+
+    let window_end =
+        edge_at + chrono::Duration::milliseconds((SCORED_G_WINDOW_SECS * 1000.0) as i64);
+    let in_window = |s: &TouchdownWindowSample| s.at >= edge_at && s.at <= window_end;
+
+    // Roher Peak im Post-Edge-Fenster (Forensik-Referenz + Fallback).
+    let mut raw_peak = f32::NEG_INFINITY;
+    for s in &ordered {
+        if in_window(s) && s.g_force > raw_peak {
+            raw_peak = s.g_force;
+        }
+    }
+
+    // EMA über das gesamte (auch Pre-Edge-)Set — LE2 Regel 2/3/5.
+    let mut smoothed: Option<f64> = None;
+    let mut prev_at: Option<DateTime<Utc>> = None;
+    let mut scored = f32::NEG_INFINITY;
+    for s in &ordered {
+        let g = s.g_force as f64;
+        smoothed = Some(match smoothed {
+            None => g, // LE2 Regel 2: Init beim ersten finiten Sample.
+            Some(prev) => {
+                let dt = prev_at
+                    .map(|p| {
+                        (s.at - p).num_microseconds().unwrap_or(0) as f64 / 1_000_000.0
+                    })
+                    .filter(|&d| d > 0.0)
+                    .unwrap_or(SCORED_G_NOMINAL_DT_SECS);
+                let alpha = 1.0 - (-dt / SCORED_G_TAU_SECS).exp();
+                prev + alpha * (g - prev)
+            }
+        });
+        prev_at = Some(s.at);
+        if in_window(s) {
+            if let Some(sm) = smoothed {
+                if (sm as f32) > scored {
+                    scored = sm as f32;
+                }
+            }
+        }
+    }
+
+    if scored.is_finite() {
+        ScoredG {
+            scored_g: scored,
+            raw_peak: if raw_peak.is_finite() { raw_peak } else { scored },
+            method: ScoredGMethod::EmaMax,
+        }
+    } else {
+        // Kein brauchbares Post-Edge-Sample → definierter Fallback (LE8).
+        let raw = if raw_peak.is_finite() { raw_peak } else { 0.0 };
+        ScoredG { scored_g: raw, raw_peak: raw, method: ScoredGMethod::RawFallback }
+    }
+}
+
+/// v0.12.3 (LE8): definierter Fallback für Score-Pfade **ohne**
+/// Touchdown-Fenster (z. B. spätes Roh-Peak-Tracking). `scored_g` ist der
+/// rohe G-Wert, als `RawFallback` markiert.
+pub fn scored_g_raw_fallback(raw_g: f32) -> ScoredG {
+    ScoredG { scored_g: raw_g, raw_peak: raw_g, method: ScoredGMethod::RawFallback }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FlightOutcome {
@@ -384,4 +519,176 @@ pub fn flight_logs_purge_older_than(
         }
     }
     Ok(removed)
+}
+
+#[cfg(test)]
+mod scored_g_tests {
+    use super::*;
+
+    /// Build a `TouchdownWindowSample` with only `at` + `g_force` set —
+    /// the only two fields `compute_scored_g` looks at.
+    fn s(at: DateTime<Utc>, g: f32) -> TouchdownWindowSample {
+        TouchdownWindowSample {
+            at,
+            vs_fpm: 0.0,
+            g_force: g,
+            on_ground: false,
+            agl_ft: 0.0,
+            heading_true_deg: 0.0,
+            groundspeed_kt: 0.0,
+            indicated_airspeed_kt: 0.0,
+            lat: 0.0,
+            lon: 0.0,
+            pitch_deg: 0.0,
+            bank_deg: 0.0,
+            gear_normal_force_n: None,
+            total_weight_kg: None,
+        }
+    }
+
+    /// Sample a continuous g(t) curve every `dt_ms` from -300 ms to
+    /// +1000 ms around the edge (t = 0).
+    fn sampled(edge: DateTime<Utc>, dt_ms: i64, g: impl Fn(f64) -> f32) -> Vec<TouchdownWindowSample> {
+        let mut out = Vec::new();
+        let mut t_ms = -300_i64;
+        while t_ms <= 1000 {
+            out.push(s(edge + chrono::Duration::milliseconds(t_ms), g(t_ms as f64 / 1000.0)));
+            t_ms += dt_ms;
+        }
+        out
+    }
+
+    /// TAP533-shaped touchdown: airborne ~0.95 g, then a sustained
+    /// ~1.9 g plateau for ~160 ms, decaying afterwards.
+    fn tap533_like(t: f64) -> f32 {
+        let g: f64 = if t < 0.0 {
+            0.95
+        } else if t < 0.11 {
+            0.95 + (1.95 - 0.95) * (t / 0.11) // rise to the raw peak
+        } else if t < 0.27 {
+            1.92 // sustained plateau
+        } else {
+            (1.92 - (t - 0.27) * 4.0).max(0.8) // decay
+        };
+        g as f32
+    }
+
+    #[test]
+    fn ema_keeps_sustained_peak() {
+        let edge = Utc::now();
+        let r = compute_scored_g(&sampled(edge, 22, tap533_like), edge);
+        // A genuine ~160 ms plateau is kept (lightly lagged), not flattened.
+        assert!(r.scored_g > 1.65 && r.scored_g < 1.90, "scored_g={}", r.scored_g);
+        // Raw peak ~= the sampled plateau (1.92) — far above the smoothed
+        // value, confirming the smoothing demotes the raw single-frame max.
+        assert!(r.raw_peak >= 1.90, "raw_peak={}", r.raw_peak);
+        assert!(r.raw_peak > r.scored_g, "raw should exceed scored");
+        assert_eq!(r.method, ScoredGMethod::EmaMax);
+    }
+
+    #[test]
+    fn tap533_shaped_window_scores_around_1_78() {
+        // The TAP533-shaped trace at ~22 ms (~45 Hz) → ~1.78 g (spec table).
+        let edge = Utc::now();
+        let r = compute_scored_g(&sampled(edge, 22, tap533_like), edge);
+        assert!(r.scored_g > 1.70 && r.scored_g < 1.86, "scored_g={}", r.scored_g);
+    }
+
+    #[test]
+    fn ema_frame_rate_independent() {
+        // The SAME g(t) curve sampled at 50 Hz vs 30 Hz must score equal.
+        let edge = Utc::now();
+        let at_50 = compute_scored_g(&sampled(edge, 20, tap533_like), edge).scored_g;
+        let at_30 = compute_scored_g(&sampled(edge, 33, tap533_like), edge).scored_g;
+        assert!((at_50 - at_30).abs() < 0.04, "50Hz={at_50} 30Hz={at_30}");
+    }
+
+    #[test]
+    fn ema_attenuates_single_frame_spike() {
+        // Constant 1.10 g with ONE 20 ms frame at 3.0 g. The EMA cannot
+        // fully erase it, but attenuates it far below the raw peak — the
+        // raw peak (3.0) stays available as forensic detail.
+        let edge = Utc::now();
+        let mut v = sampled(edge, 20, |_| 1.10);
+        // Spike one in-window frame.
+        for x in v.iter_mut() {
+            if (x.at - edge).num_milliseconds() == 200 {
+                x.g_force = 3.0;
+            }
+        }
+        let r = compute_scored_g(&v, edge);
+        assert!((r.raw_peak - 3.0).abs() < 0.001, "raw_peak={}", r.raw_peak);
+        assert!(r.scored_g < 1.7, "spike not attenuated: scored_g={}", r.scored_g);
+    }
+
+    #[test]
+    fn ema_non_finite_samples_ignored() {
+        let edge = Utc::now();
+        let mut v = sampled(edge, 22, tap533_like);
+        for x in v.iter_mut() {
+            if (x.at - edge).num_milliseconds() == 110 {
+                x.g_force = f32::NAN;
+            }
+            if (x.at - edge).num_milliseconds() == 132 {
+                x.g_force = f32::INFINITY;
+            }
+        }
+        let r = compute_scored_g(&v, edge);
+        assert!(r.scored_g.is_finite(), "scored_g not finite");
+        assert!(r.scored_g > 1.5 && r.scored_g < 1.9, "scored_g={}", r.scored_g);
+    }
+
+    #[test]
+    fn ema_init_from_first_finite_sample() {
+        // No pre-edge samples: the EMA must init at the first in-window
+        // sample, not at a constant — a steady 1.30 g window scores ~1.30.
+        let edge = Utc::now();
+        let v: Vec<_> = (0..40)
+            .map(|i| s(edge + chrono::Duration::milliseconds(i * 22), 1.30))
+            .collect();
+        let r = compute_scored_g(&v, edge);
+        assert!((r.scored_g - 1.30).abs() < 0.01, "scored_g={}", r.scored_g);
+    }
+
+    #[test]
+    fn raw_fallback_when_no_window_samples() {
+        // Only pre-edge samples → no post-edge data → RawFallback.
+        let edge = Utc::now();
+        let v: Vec<_> = (1..10)
+            .map(|i| s(edge - chrono::Duration::milliseconds(i * 22), 1.0))
+            .collect();
+        let r = compute_scored_g(&v, edge);
+        assert_eq!(r.method, ScoredGMethod::RawFallback);
+    }
+
+    #[test]
+    fn scored_g_raw_fallback_helper() {
+        let r = scored_g_raw_fallback(1.42);
+        assert_eq!(r.scored_g, 1.42);
+        assert_eq!(r.raw_peak, 1.42);
+        assert_eq!(r.method, ScoredGMethod::RawFallback);
+        assert_eq!(r.method.as_str(), "raw_fallback");
+    }
+
+    #[test]
+    fn old_landing_scored_event_deserializes() {
+        // A pre-v0.12.3 LandingScored row without the new fields must
+        // still deserialize (scored_g_* default to None).
+        let json = r#"{"type":"landing_scored","timestamp":"2026-05-20T19:55:45Z",
+            "score":"hard","peak_vs_fpm":-339.0,"peak_g_force":1.95,"bounce_count":0}"#;
+        let ev: FlightLogEvent = serde_json::from_str(json).expect("deserialize old event");
+        match ev {
+            FlightLogEvent::LandingScored {
+                peak_g_force,
+                scored_g_force,
+                scored_g_method,
+                ..
+            } => {
+                assert_eq!(peak_g_force, 1.95);
+                assert_eq!(scored_g_force, None);
+                assert_eq!(scored_g_method, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
 }
