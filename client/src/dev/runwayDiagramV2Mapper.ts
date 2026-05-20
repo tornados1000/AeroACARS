@@ -62,6 +62,8 @@ export function mapLandingRecordToV2Props(
     landing_pitch_deg: record.landing_pitch_deg ?? null,
     landing_bank_deg: record.landing_bank_deg ?? null,
     landing_peak_g_force: record.landing_peak_g_force ?? null,
+    // v0.12.3 (LE9): EMA-scored G into the RunwayDiagram mapping path.
+    landing_scored_g_force: record.landing_scored_g_force ?? null,
     headwind_kt: record.headwind_kt ?? null,
     crosswind_kt: record.crosswind_kt ?? null,
     locale: "de",

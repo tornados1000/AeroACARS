@@ -218,6 +218,9 @@ function subFuel(efficiencyPct: number | null | undefined): SubScore | null {
 export function computeSubScores(p: {
   vs_fpm?: number | null;
   peak_g_load?: number | null;
+  /** v0.12.3 (LE8): EMA-smoothed scored G. When set, subGForce scores
+   *  this value; else it falls back to the raw peak_g_load. */
+  scored_g_load?: number | null;
   bounce_count?: number | null;
   approach_vs_stddev_fpm?: number | null;
   approach_bank_stddev_deg?: number | null;
@@ -226,7 +229,9 @@ export function computeSubScores(p: {
 }): SubScore[] {
   const out: SubScore[] = [];
   if (p.vs_fpm != null) out.push(subLandingRate(p.vs_fpm));
-  if (p.peak_g_load != null) out.push(subGForce(p.peak_g_load));
+  // v0.12.3 (LE8): score the EMA-smoothed scored_g_load when present.
+  const gForScore = p.scored_g_load ?? p.peak_g_load;
+  if (gForScore != null) out.push(subGForce(gForScore));
   out.push(subBounces(p.bounce_count ?? 0));
   const stab = subStability(p.approach_vs_stddev_fpm, p.approach_bank_stddev_deg);
   if (stab) out.push(stab);

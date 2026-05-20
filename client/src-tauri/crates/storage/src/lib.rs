@@ -353,6 +353,16 @@ pub struct LandingRecord {
     /// Peak G im 500 ms post-Edge — der echte Gear-Compression-Spike.
     #[serde(default)]
     pub peak_g_post_500ms: Option<f32>,
+    /// v0.12.3 (LE4/LE7): EMA-geglätteter gescorter G-Wert (FOQA-Methode)
+    /// — der Wert, auf dem die Landung gescort wird und den die
+    /// G-Force-Card als Headline zeigt. `peak_g_post_*` bleibt der rohe
+    /// Forensik-Peak.
+    #[serde(default)]
+    pub landing_scored_g_force: Option<f32>,
+    /// v0.12.3 (LE8): `"ema_max"` | `"raw_fallback"` — wie
+    /// `landing_scored_g_force` abgeleitet wurde.
+    #[serde(default)]
+    pub scored_g_method: Option<String>,
     /// Peak G im 1000 ms post-Edge.
     #[serde(default)]
     pub peak_g_post_1000ms: Option<f32>,

@@ -130,6 +130,12 @@ export interface LandingRecord {
   vs_smoothed_1500ms_fpm?: number | null;
   peak_g_post_500ms?: number | null;
   peak_g_post_1000ms?: number | null;
+  /** v0.12.3 (LE4/LE7): EMA-geglätteter gescorter G-Wert (FOQA-Methode).
+   *  Der Wert, auf dem die Landung gescort wird + den die G-Force-Card
+   *  als Headline zeigt. `peak_g_post_*` bleibt der rohe Forensik-Peak. */
+  landing_scored_g_force?: number | null;
+  /** v0.12.3 (LE8): "ema_max" | "raw_fallback". */
+  scored_g_method?: string | null;
   // v0.7.17 (B-009): G-Force-Forensik (analog vs_smoothed_*)
   g_at_edge?: number | null;
   g_smoothed_250ms_post?: number | null;
@@ -401,6 +407,9 @@ function getSubScores(r: LandingRecord): SubScore[] {
   const subs: LibSubScore[] = libComputeSubScores({
     vs_fpm: peakVs,
     peak_g_load: r.landing_peak_g_force,
+    // v0.12.3 (LE8): EMA-Scored-G → sub_g_force scort diesen Wert,
+    // sonst Fallback auf den rohen peak_g_load.
+    scored_g_load: r.landing_scored_g_force,
     bounce_count: r.bounce_count,
     approach_vs_stddev_fpm: r.approach_vs_stddev_fpm,
     approach_bank_stddev_deg: r.approach_bank_stddev_deg,
@@ -1767,6 +1776,15 @@ function OffAirportBanner({ record }: { record: LandingRecord }) {
 // (B:124-133) — Pilot sieht im Client und im Live-Monitor exakt dieselben
 // Flags. Nur die wirklichen Auffälligkeiten anzeigen — keine "OK"-Chips.
 
+/** v0.12.3 (LE9): the G value the client scores / flags / colours on —
+ *  the EMA-smoothed scored G when present, else the raw 50 Hz peak.
+ *  The raw `landing_peak_g_force` is forensic-only after v0.12.3. */
+export function scoreG(
+  r: Pick<LandingRecord, "landing_scored_g_force" | "landing_peak_g_force">,
+): number | null {
+  return r.landing_scored_g_force ?? r.landing_peak_g_force ?? null;
+}
+
 function QuickFlags({ record }: { record: LandingRecord }) {
   const { t } = useTranslation();
   const flags: { label: string; tone: "warn" | "err" }[] = [];
@@ -1774,16 +1792,18 @@ function QuickFlags({ record }: { record: LandingRecord }) {
   // HARD LANDING — V/S oder Peak-G erreichen Hard/Severe-Schwellen
   // (gespiegelt aus landingScoring.ts T_VS_HARD_FPM / T_G_HARD).
   // v0.7.17 (B-015): vs_at_edge_fpm bevorzugen — siehe scoreBasisVs Doc.
+  // v0.12.3 (LE9): G-Flag auf dem gescorten (EMA) Wert, nicht dem Roh-Peak.
   const peakVs =
     (record.vs_at_edge_fpm != null && record.vs_at_edge_fpm < 0
       ? record.vs_at_edge_fpm
       : null) ??
     record.landing_peak_vs_fpm ??
     record.landing_rate_fpm;
+  const gForFlag = scoreG(record) ?? 0;
   const isHardVs = Math.abs(peakVs) >= 600;
-  const isHardG = (record.landing_peak_g_force ?? 0) >= 1.7;
+  const isHardG = gForFlag >= 1.7;
   if (isHardVs || isHardG) {
-    const severe = Math.abs(peakVs) >= 1000 || (record.landing_peak_g_force ?? 0) >= 2.1;
+    const severe = Math.abs(peakVs) >= 1000 || gForFlag >= 2.1;
     flags.push({
       label: severe ? t("landing.flag.severe") : t("landing.flag.hard"),
       tone: "err",

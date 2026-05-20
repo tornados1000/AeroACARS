@@ -70,6 +70,9 @@ export interface RunwayDiagramV2Props {
   landing_pitch_deg?: number | null;
   landing_bank_deg?: number | null;
   landing_peak_g_force?: number | null;
+  /** v0.12.3 (LE9): EMA-scored G — shown/coloured instead of the raw
+   *  peak when present. */
+  landing_scored_g_force?: number | null;
   headwind_kt?: number | null;
   crosswind_kt?: number | null;
 
@@ -1021,6 +1024,7 @@ function FlugzeugBar({ props }: { props: RunwayDiagramV2Props }) {
     props.landing_weight_kg != null ||
     props.landing_speed_kt != null ||
     props.landing_peak_g_force != null ||
+    props.landing_scored_g_force != null ||
     props.headwind_kt != null ||
     props.crosswind_kt != null;
   if (!has) return null;
@@ -1071,14 +1075,17 @@ function FlugzeugBar({ props }: { props: RunwayDiagramV2Props }) {
     });
   }
 
-  // Peak-G
-  if (props.landing_peak_g_force != null) {
-    const g = props.landing_peak_g_force;
-    items.push({
-      label: t("runway_v2.flugzeug_peakg"),
-      value: `${g.toFixed(2)} g`,
-      color: g >= 1.7 ? "#ef4444" : g >= 1.5 ? "#fbbf24" : "#22c55e",
-    });
+  // G-Kraft — v0.12.3 (LE9): den gescorten (EMA) Wert zeigen/färben,
+  // sonst Fallback auf den rohen Peak.
+  {
+    const g = props.landing_scored_g_force ?? props.landing_peak_g_force ?? null;
+    if (g != null) {
+      items.push({
+        label: t("runway_v2.flugzeug_peakg"),
+        value: `${g.toFixed(2)} g`,
+        color: g >= 1.7 ? "#ef4444" : g >= 1.5 ? "#fbbf24" : "#22c55e",
+      });
+    }
   }
 
   // Wind

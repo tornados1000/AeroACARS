@@ -9776,6 +9776,10 @@ where
         vs_smoothed_1500ms_fpm: ana_f32(&stats.landing_analysis, "vs_smoothed_1500ms_fpm"),
         peak_g_post_500ms: ana_f32(&stats.landing_analysis, "peak_g_post_500ms"),
         peak_g_post_1000ms: ana_f32(&stats.landing_analysis, "peak_g_post_1000ms"),
+        // v0.12.3 (LE4/LE7): gescorter G (EMA, sonst raw_fallback) + Methode
+        // — die G-Force-Card headlinet diesen Wert.
+        landing_scored_g_force: Some(score_g_for_stats(stats).scored_g),
+        scored_g_method: Some(score_g_for_stats(stats).method.as_str().to_string()),
         // v0.7.17 (B-009): G-Force-Forensik
         g_at_edge: ana_f32(&stats.landing_analysis, "g_at_edge"),
         g_smoothed_250ms_post: ana_f32(&stats.landing_analysis, "g_smoothed_250ms_post"),

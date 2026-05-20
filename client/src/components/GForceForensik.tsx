@@ -113,6 +113,10 @@ export function GForceForensik({ record }: { record: LandingRecord }) {
   if (!hasGForensics(record)) return null;
 
   const peakG = record.peak_g_post_500ms ?? null;
+  // v0.12.3 (LE4): the value the landing is SCORED on — the EMA-smoothed
+  // window peak (FOQA method). `peakG` above stays the raw 50 Hz peak,
+  // shown only as forensic detail.
+  const scoredG = record.landing_scored_g_force ?? peakG;
   const tipKey = pickGCoachingTip({
     vsAtEdgeFpm: record.vs_at_edge_fpm,
     gPeak: peakG,
@@ -211,7 +215,8 @@ export function GForceForensik({ record }: { record: LandingRecord }) {
           {t("landing.gforce_forensik.score_section_subtitle")}
         </div>
         <GScoreBasisTile
-          peakG={peakG}
+          scoredG={scoredG}
+          rawPeakG={peakG}
           gearForceN={record.max_gear_force_n ?? null}
           vsAtEdge={record.vs_at_edge_fpm ?? null}
         />
@@ -272,21 +277,25 @@ function GTile({
 }
 
 function GScoreBasisTile({
-  peakG,
+  scoredG,
+  rawPeakG,
   gearForceN,
   vsAtEdge,
 }: {
-  peakG: number | null;
+  scoredG: number | null;
+  rawPeakG: number | null;
   gearForceN: number | null;
   vsAtEdge: number | null;
 }) {
   const { t } = useTranslation();
-  const tone = gTone(peakG);
+  // v0.12.3 (LE4): Tone + Wert kommen vom gescorten (EMA) G — nicht vom
+  // rohen Peak. Der Roh-Peak steht unten als Forensik-Detail.
+  const tone = gTone(scoredG);
   // V/S-fuehrt-Hinweis: wenn V/S smooth (< 200 fpm) und G hoch → Master-
   // Score wird trotzdem als Smooth/Acceptable klassifiziert (B-009 Score-
   // Logik). Erklaer das hier dem Piloten.
   const vsSmooth = vsAtEdge != null && Math.abs(vsAtEdge) < 200;
-  const gHigh = peakG != null && peakG >= 1.40;
+  const gHigh = scoredG != null && scoredG >= 1.40;
   const showVsLeadsNote = vsSmooth && gHigh;
   return (
     <div className={`sinkrate-score-tile ${tone ? `sinkrate-score-tile--${tone}` : ""}`}>
@@ -297,9 +306,18 @@ function GScoreBasisTile({
         {t("landing.gforce_forensik.score_basis_sublabel")}
       </div>
       <div className="sinkrate-score-tile__value">
-        {peakG != null ? peakG.toFixed(2) : "—"}
+        {scoredG != null ? scoredG.toFixed(2) : "—"}
         <span className="sinkrate-score-tile__unit"> G</span>
       </div>
+      {/* v0.12.3 (LE4): roher 50-Hz-Peak als Forensik-Detail — NICHT
+          der gescorte Wert. */}
+      {rawPeakG != null && (
+        <div className="sinkrate-score-tile__source">
+          {t("landing.gforce_forensik.raw_peak_detail", {
+            g: rawPeakG.toFixed(2),
+          })}
+        </div>
+      )}
       {gearForceN != null && gearForceN > 0 && (
         <div className="sinkrate-score-tile__source">
           {t("landing.gforce_forensik.score_strut_force", {
