@@ -4778,8 +4778,10 @@ fn app_info() -> AppInfo {
 /// continuity but the value is overwritten before validation.
 const ALLOWED_PHPVMS_HOST: &str = "german-sky-group.eu";
 
-/// v0.12.1 (Stream B) — phpVMS 7 `UserState::ACTIVE`. The other states
-/// (0 PENDING, 2 REJECTED, 3 ON_LEAVE, 4 SUSPENDED) all block login.
+/// v0.12.1 (Stream B) — phpVMS 7 `UserState::ACTIVE`. Verified against
+/// the official phpVMS source (`app/Enums/UserState.php`): the enum is
+/// `PENDING=0, ACTIVE=1, REJECTED=2, ON_LEAVE=3, SUSPENDED=4, DELETED=5`.
+/// Every state except ACTIVE blocks login.
 const USER_STATE_ACTIVE: i32 = 1;
 
 /// v0.12.1 (Stream B LE6): map a pilot profile's `state` to a login
@@ -4795,7 +4797,10 @@ fn pilot_state_block_reason(profile: &api_client::Profile) -> Option<&'static st
         Some(0) => Some("pilot_pending"),
         Some(2) => Some("pilot_rejected"),
         Some(3) => Some("pilot_on_leave"),
-        Some(4) => Some("pilot_suspended"),
+        // 4 SUSPENDED + 5 DELETED — both are a hard, definitive block.
+        // The "suspended" message ("account blocked, contact the VA")
+        // fits a deleted account too, so no separate i18n string.
+        Some(4) | Some(5) => Some("pilot_suspended"),
         // None (field absent) or any unexpected integer → fail-closed.
         _ => Some("pilot_state_unknown"),
     }
@@ -24285,6 +24290,17 @@ mod sim_pause_tests {
     fn pilot_state_suspended_blocks() {
         assert_eq!(
             pilot_state_block_reason(&profile_with_state(Some(4))),
+            Some("pilot_suspended"),
+        );
+    }
+
+    #[test]
+    fn pilot_state_deleted_blocks() {
+        // phpVMS UserState::DELETED = 5 — verified against the official
+        // enum. A deleted account is a hard block (uses the suspended
+        // message: "account blocked, contact the VA").
+        assert_eq!(
+            pilot_state_block_reason(&profile_with_state(Some(5))),
             Some("pilot_suspended"),
         );
     }
