@@ -866,7 +866,12 @@
     "status_not_found": "Discord not found — is the app running?",
     "status_disabled": "Disabled",
     "status_error": "Error: {{msg}}",
-    "status_unknown": "Status unknown"
+    "status_unknown": "Status unknown",
+    "diag_last_push": "Last Discord push: {{when}}",
+    "diag_push_never": "none sent yet",
+    "diag_ago_seconds": "{{n}} s ago",
+    "diag_ago_minutes": "{{n}} min ago",
+    "diag_push_error": "Last push error: {{msg}}"
   },
   "error_reporting": {
     "section_title": "Error telemetry (anonymous)",

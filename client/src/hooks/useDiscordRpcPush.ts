@@ -36,7 +36,11 @@ export function useDiscordRpcPush({ activeFlight, simStatus, profileUrl }: Args)
       // Sauberes Clear nur einmal (wenn vorher was anderes drin war).
       if (lastPushedRef.current !== "CLEARED") {
         lastPushedRef.current = "CLEARED";
-        void invoke("discord_rpc_clear_flight").catch(() => undefined);
+        // v0.12.2: log instead of silently swallowing — a failing
+        // Discord push must be diagnosable, not invisible.
+        void invoke("discord_rpc_clear_flight").catch((e) =>
+          console.warn("[discord-rpc] clear_flight failed", e),
+        );
       }
       return;
     }
@@ -69,7 +73,11 @@ export function useDiscordRpcPush({ activeFlight, simStatus, profileUrl }: Args)
     if (key === lastPushedRef.current) return; // nichts geaendert
 
     lastPushedRef.current = key;
-    void invoke("discord_rpc_push_state", { args: payload }).catch(() => undefined);
+    // v0.12.2: surface push failures (command rejected, args invalid,
+    // Discord pipe down) instead of swallowing them.
+    void invoke("discord_rpc_push_state", { args: payload }).catch((e) =>
+      console.warn("[discord-rpc] push_state failed", e),
+    );
   }, [activeFlight, simStatus, profileUrl]);
 
   // v0.9.1 F7 — LE8 "⚠ Sim getrennt"-Suffix verdrahten. Reagiert auf
@@ -84,6 +92,8 @@ export function useDiscordRpcPush({ activeFlight, simStatus, profileUrl }: Args)
   useEffect(() => {
     if (!activeFlight) return;
     const lost = simStatus ? simStatus.state !== "connected" : true;
-    void invoke("discord_rpc_set_sim_lost", { lost }).catch(() => undefined);
+    void invoke("discord_rpc_set_sim_lost", { lost }).catch((e) =>
+      console.warn("[discord-rpc] set_sim_lost failed", e),
+    );
   }, [activeFlight, simStatus?.state]);
 }

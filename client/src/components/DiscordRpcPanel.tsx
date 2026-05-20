@@ -124,6 +124,22 @@ export function DiscordRpcPanel() {
     }
   })();
 
+  // Diagnose-Zeile (v0.12.2): wann landete der letzte Presence-Push?
+  // `last_update_at` setzt das Backend bei jedem erfolgreichen
+  // `set_activity`. Während eines aktiven Flugs muss der Wert alle paar
+  // Sekunden frisch werden — bleibt er stehen, kommt der Flug-Push nicht
+  // durch (TAP533-Befund). Reine Anzeige, die Daten hat der Manager eh.
+  const lastPushLabel = (() => {
+    if (!status?.last_update_at) return t("discord_rpc.diag_push_never");
+    const secs = Math.max(
+      0,
+      Math.round((Date.now() - new Date(status.last_update_at).getTime()) / 1000),
+    );
+    return secs < 120
+      ? t("discord_rpc.diag_ago_seconds", { n: secs })
+      : t("discord_rpc.diag_ago_minutes", { n: Math.round(secs / 60) });
+  })();
+
   return (
     <div className="settings__section">
       <h3>{t("discord_rpc.section_title")}</h3>
@@ -145,27 +161,36 @@ export function DiscordRpcPanel() {
         </span>
       </label>
 
-      {/* Status-Indikator (Dot + Text) — nur sichtbar wenn enabled */}
+      {/* Status-Indikator (Dot + Text) + Diagnose — nur wenn enabled */}
       {settings.enabled && (
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-            margin: "4px 0 12px 28px",
-            fontSize: "0.9rem",
-          }}
-        >
-          <span
+        <div style={{ margin: "4px 0 12px 28px" }}>
+          <div
             style={{
-              display: "inline-block",
-              width: 10,
-              height: 10,
-              borderRadius: "50%",
-              background: statusInfo.dot,
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              fontSize: "0.9rem",
             }}
-          />
-          <span>{statusInfo.text}</span>
+          >
+            <span
+              style={{
+                display: "inline-block",
+                width: 10,
+                height: 10,
+                borderRadius: "50%",
+                background: statusInfo.dot,
+              }}
+            />
+            <span>{statusInfo.text}</span>
+          </div>
+          <div style={{ marginTop: 3, fontSize: "0.82rem", color: "#9ca3af" }}>
+            {t("discord_rpc.diag_last_push", { when: lastPushLabel })}
+          </div>
+          {status?.error_message && (
+            <div style={{ marginTop: 2, fontSize: "0.82rem", color: "#f87171" }}>
+              {t("discord_rpc.diag_push_error", { msg: status.error_message })}
+            </div>
+          )}
         </div>
       )}
 
