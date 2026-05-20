@@ -4,6 +4,24 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.12.0] — 2026-05-20 · Bahn-Auslastung · Float-Toleranz fürs faire Brems-Scoring
+
+**Pilot-Beschwerde (BTX8815, Fenix A319, EDVE→LOWS):** exzellent gebremst — kurze Ausrollstrecke (442 m) — und trotzdem nur 80 PT „Bahn-Auslastung". Nachgerechnet: der Score war nach der v0.10.0-Formel korrekt, ABER die Formel gewichtete die Float-Strecke (zu spätes Aufsetzen) 1:1 wie die Ausrollstrecke (das eigentliche Bremsen). Bei diesem Flug waren 55 % der „Bahn-Auslastung" Float — die fehlenden 20 PT kamen vom späten Aufsetzen, nicht vom Bremsen.
+
+**Float-Toleranz (15 % der LDA):** Float innerhalb der ersten 15 % der nutzbaren Bahnlänge gilt jetzt als normal und kostet keine Punkte — nur der Float-Überschuss darüber fließt ins Punkte-Banding ein. Die Ausrollstrecke zählt weiterhin voll. Damit trennt der Score faire Aufsetz-Toleranz von echter Brems-Disziplin. Der genannte Flug springt von 80 auf 100 PT.
+
+**Neue Begründung „long_float":** wenn der Punktverlust ausschließlich vom späten Aufsetzen kam (die Ausrollstrecke allein wäre exzellent gewesen), zeigt die Card jetzt „Bremsweg top — aber spät aufgesetzt" statt einer brems-kritischen Begründung — mit Coach-Tipp Richtung Aim-Point.
+
+**UI:** die Bahn-Auslastungs-Card rendert ihre Info-Zeilen (Aufsetzpunkt, Ausrollstrecke, Bahn) jetzt sprach-lokalisiert (DE/EN/IT). Das „🛬 Wie wird das berechnet?"-Modal erklärt die Float-Toleranz mit einer konkreten Beispiel-Rechnung. Terminologie bereinigt: die Ausrollstrecke endet beim Abrollen von der Bahn (~40 kt), nicht beim Stillstand.
+
+**Sicherheit unverändert:** das Overrun-Risiko (zu nah am Bahnende) wird weiterhin auf der echten, ungekürzten Gesamtdistanz geprüft — die Float-Toleranz versteckt kein echtes Overrun.
+
+**Score-Versionierung:** `score_algorithm_version` 2 → 3. Forward-only — alte PIREPs behalten ihren gespeicherten Score, es wird nichts rückwirkend neu gerechnet. In der „Meine Flüge"-Historie kann dadurch zwischen v2- und v3-Flügen ein kleiner Knick bei der Bahn-Auslastung sichtbar werden; das ist erwartet.
+
+Spec: `docs/spec/v0.12.0-runway-utilization-refinement.md`. Webapp-Mirror (`aeroacars-live`) zieht die identische Score-Logik nach.
+
+---
+
 ## [v0.11.2] — 2026-05-18 · Pilotenwunsch · Touchdown-Chart auch 3 s nach TD
 
 **Pilotenwunsch (ViolonC im Discord):** das Sinkrate-Chart im Landing-Detail soll nicht hart am TD-Punkt enden, sondern auch die ersten 3 Sekunden nach dem Aufsetzen zeigen (Strut-Compression + Rebound + Stabilisierung).
