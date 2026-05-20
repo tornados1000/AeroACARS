@@ -181,6 +181,23 @@ jobs:
         working-directory: client
         run: npm ci
 
+      - name: Load bilingual release notes
+        id: relnotes
+        shell: bash
+        run: |
+          set -euo pipefail
+          # release-preflight has already verified this file exists +
+          # is bilingual (🇩🇪 + 🇬🇧). tauri-action writes `releaseBody`
+          # into BOTH the GitHub release body AND latest.json `notes` —
+          # so the in-app updater modal renders these notes. Heredoc to
+          # $GITHUB_OUTPUT preserves the multi-line Markdown verbatim.
+          NOTES="docs/release-notes/${GITHUB_REF_NAME}.md"
+          {
+            echo "body<<AEROACARS_NOTES_EOF"
+            cat "$NOTES"
+            echo "AEROACARS_NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build + sign (Tauri)
         uses: tauri-apps/tauri-action@v0
         env:
@@ -199,10 +216,11 @@ jobs:
           projectPath: client
           tagName: ${{ github.ref_name }}
           releaseName: 'AeroACARS ${{ github.ref_name }}'
-          releaseBody: |
-            Auto-generated release. See [latest.json](https://github.com/MANFahrer-GF/AeroACARS/releases/latest/download/latest.json) for the updater manifest.
-
-            Pilots already on AeroACARS just see the in-app update banner — no manual download needed.
+          # The full bilingual (🇩🇪 + 🇬🇧) release notes from
+          # docs/release-notes/v{tag}.md — loaded in the step above.
+          # tauri-action puts this into the GitHub release body AND the
+          # latest.json `notes` field the in-app update modal renders.
+          releaseBody: ${{ steps.relnotes.outputs.body }}
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: true
