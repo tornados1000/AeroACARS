@@ -1517,7 +1517,7 @@
     "flugzeug_weight": "Gewicht",
     "flugzeug_iast": "TD-IAS",
     "flugzeug_pb": "P / B",
-    "flugzeug_peakg": "Peak-G",
+    "flugzeug_peakg": "G-Kraft",
     "flugzeug_wind": "Wind",
     "pill_bahn": "Bahn",
     "pill_laenge": "Länge",
