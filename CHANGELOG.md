@@ -4,6 +4,24 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.12.1] — 2026-05-20 · Pilot-Befunde · Phase-FSM, VA-Härtung, Approach-Stability, Autostart, Resume
+
+Fünf unabhängige Befunde aus dem Piloten-Feedback eines Tages, in einer Release zusammengefasst. Spec: `docs/spec/v0.12.1-phase-fsm-fix-and-va-hardening.md`.
+
+**Stream A — Phasenwechsel Boarding→Pushback gegen Sim-Reload-Glitches gehärtet.** Am Flug BTX8815 sprang die Phase 65 s nach Flugstart auf „Pushback" — ausgelöst von einem einzelnen Telemetrie-Glitch direkt nach einem Sim-Reload (kurzer Geschwindigkeits-Spike, obwohl das Flugzeug mit gesetzter Parkbremse stillstand). Der Übergang verlangt jetzt **echte Bewegung**: Geschwindigkeit über zwei aufeinanderfolgende Messungen plus eine echte Positionsverschiebung von mindestens 5 m. Zusätzlich erkennt der Recorder eine Reload-Lücke (> 10 s ohne Telemetrie) und verwirft das erste, glitch-anfällige Sample danach. Folgefehler behoben: die Off-Block-Zeit (und damit die Blockzeit im PIREP) stimmt wieder.
+
+**Stream B — VA-Härtung: nur aktive GSG-Piloten.** Login, Live-Tracking und PIREP-Provisioning prüfen jetzt den Piloten-Status aus phpVMS. Nur ein **aktiver** Account kommt durch — wartende, abgelehnte, beurlaubte, gesperrte oder gelöschte Accounts werden mit einer status-spezifischen Meldung abgewiesen. Die Durchsetzung läuft client- **und** server-seitig (Recorder). Hintergrund: GitHub-Issue #16.
+
+**Stream C — Approach-Stability fairer bei Study-Level-Add-ons.** Auf Flug GSG225 (Hot-Start Challenger 650, X-Plane) zeigte die Approach-Stability-Card „LANDING CONFIG: INCOMPLETE", obwohl Gear und Flaps gesetzt waren — das Study-Add-on bedient die Standard-Flaps-DataRef nicht. Lässt sich die Flaps-Stellung nicht zuverlässig lesen, wird die Landing-Config jetzt als „nicht bewertbar" angezeigt statt fälschlich rot — und fließt nicht als Strafe in den Score. Außerdem: der Kennwert „max. V/S-Abweichung < 500 ft" ignoriert jetzt Werte unter 50 ft AGL — ein kurzer Ballon im Flare ist kein Anflug-Stabilitätsproblem mehr.
+
+**Stream D — Auto-Start nach Update repariert (macOS).** Nach einem App-Update griff der Auto-Start nicht mehr, bis man ihn einmal aus- und wieder einschaltete. Ursache: ein Frontend-Timing-Fehler überschrieb den gespeicherten Auto-Start-Status beim Start. Behoben — der gespeicherte Stand bleibt jetzt erhalten.
+
+**Stream E — Resume nach Crash sicherer.** Nach einem Sim-Crash lädt das Flugzeug oft an einer beliebigen Boden-Position neu. Bisher übernahm der Resume diese Glitch-Position nach einem 10-Sekunden-Countdown automatisch in den laufenden Flug. Jetzt: passt die Sim-Position nicht zum gespeicherten Flug (Flug war in der Luft, Sim meldet Boden — oder große Distanz-Abweichung), wird **nicht automatisch** fortgesetzt — der Pilot muss aktiv „Flug fortsetzen" bestätigen.
+
+Webapp-Mirror (`aeroacars-live`) zieht die Stream-B-Recorder-Härtung nach.
+
+---
+
 ## [v0.12.0] — 2026-05-20 · Bahn-Auslastung · Float-Toleranz fürs faire Brems-Scoring
 
 **Pilot-Beschwerde (BTX8815, Fenix A319, EDVE→LOWS):** exzellent gebremst — kurze Ausrollstrecke (442 m) — und trotzdem nur 80 PT „Bahn-Auslastung". Nachgerechnet: der Score war nach der v0.10.0-Formel korrekt, ABER die Formel gewichtete die Float-Strecke (zu spätes Aufsetzen) 1:1 wie die Ausrollstrecke (das eigentliche Bremsen). Bei diesem Flug waren 55 % der „Bahn-Auslastung" Float — die fehlenden 20 PT kamen vom späten Aufsetzen, nicht vom Bremsen.
