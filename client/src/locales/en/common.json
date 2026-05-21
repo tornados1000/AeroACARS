@@ -699,6 +699,12 @@
     "pirep_filed_title": "PIREP filed successfully",
     "pirep_filed_detail": "{{callsign}} · {{dpt}} → {{arr}} — flight submitted to phpVMS. It's now in the Landing tab and on the phpVMS website.",
     "pirep_filed_dismiss": "Dismiss",
+    "cancelled_title": "Flight discarded",
+    "cancelled_detail": "The flight was discarded — no PIREP was filed.",
+    "filed_instead_title": "Flight filed instead of discarded",
+    "filed_instead_detail": "You chose to cancel, but the flight was already complete — it was submitted as PIREP {{pirep_id}} instead.",
+    "queued_title": "PIREP queued",
+    "queued_detail": "Connection unavailable — PIREP {{pirep_id}} will be submitted automatically once the connection is back.",
     "loadsheet": {
       "title": "Live loadsheet",
       "label": "Loadsheet",
@@ -912,7 +918,14 @@
     "manual_modal_submit": "File with this destination",
     "manual_modal_cancel": "Cancel",
     "submitting": "Submitting…",
-    "filed_ok": "PIREP filed — {{from}} → {{to}}"
+    "filed_ok": "PIREP filed — {{from}} → {{to}}",
+    "confirm_title": "Confirm divert",
+    "confirm_body": "You're filing this flight as a divert to <strong>{{actual}}</strong> instead of the planned <strong>{{planned}}</strong>.",
+    "confirm_reason_label": "Reason for the divert (required)",
+    "confirm_reason_placeholder": "e.g. destination weather below minimums, technical issue, ATC reroute…",
+    "confirm_reason_required": "Please enter a reason before filing the divert.",
+    "confirm_submit": "File divert",
+    "confirm_cancel": "Cancel"
   },
   "phpvms_status": {
     "title": "phpVMS API",
@@ -1304,6 +1317,8 @@
       "block_fuel_hint": "Ramp fuel before pushback",
       "fuel_used_label": "Fuel used (kg)",
       "fuel_used_hint": "Block − remaining. Blank = computed",
+      "remaining_fuel_label": "Fuel still in tank (kg)",
+      "remaining_fuel_hint": "Fuel left after landing. AeroACARS computes used = block − remaining",
       "notes_placeholder": "e.g. weather, anomalies, technical issues …"
     }
   },

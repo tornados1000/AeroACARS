@@ -699,6 +699,12 @@
     "pirep_filed_title": "PIREP erfolgreich eingereicht",
     "pirep_filed_detail": "{{callsign}} · {{dpt}} → {{arr}} — Flug wurde an phpVMS übermittelt. Du findest ihn jetzt im Landung-Tab und auf der phpVMS-Webseite.",
     "pirep_filed_dismiss": "Schließen",
+    "cancelled_title": "Flug verworfen",
+    "cancelled_detail": "Der Flug wurde verworfen — es wurde kein PIREP eingereicht.",
+    "filed_instead_title": "Flug eingereicht statt verworfen",
+    "filed_instead_detail": "Du wolltest abbrechen — der Flug war aber bereits abgeschlossen und wurde stattdessen als PIREP {{pirep_id}} eingereicht.",
+    "queued_title": "PIREP in Warteschlange",
+    "queued_detail": "Keine Verbindung — PIREP {{pirep_id}} wird automatisch eingereicht, sobald die Verbindung wieder steht.",
     "loadsheet": {
       "title": "Loadsheet Live",
       "label": "Loadsheet",
@@ -912,7 +918,14 @@
     "manual_modal_submit": "Mit diesem Ziel einreichen",
     "manual_modal_cancel": "Abbrechen",
     "submitting": "Sende…",
-    "filed_ok": "PIREP eingereicht — {{from}} → {{to}}"
+    "filed_ok": "PIREP eingereicht — {{from}} → {{to}}",
+    "confirm_title": "Divert bestätigen",
+    "confirm_body": "Du reichst diesen Flug als Divert nach <strong>{{actual}}</strong> ein — statt zum geplanten Ziel <strong>{{planned}}</strong>.",
+    "confirm_reason_label": "Grund für den Divert (Pflichtfeld)",
+    "confirm_reason_placeholder": "z.B. Wetter am Ziel unter Minimum, technisches Problem, ATC-Umleitung…",
+    "confirm_reason_required": "Bitte gib einen Grund an, bevor du den Divert einreichst.",
+    "confirm_submit": "Divert einreichen",
+    "confirm_cancel": "Abbrechen"
   },
   "phpvms_status": {
     "title": "phpVMS API",
@@ -1304,6 +1317,8 @@
       "block_fuel_hint": "Ramp-Treibstoff vor Pushback",
       "fuel_used_label": "Verbrauchter Treibstoff (kg)",
       "fuel_used_hint": "Block − Rest. Leer = automatisch berechnet",
+      "remaining_fuel_label": "Noch im Tank (kg)",
+      "remaining_fuel_hint": "Treibstoff nach der Landung. AeroACARS rechnet Verbrauch = Block − Rest",
       "notes_placeholder": "z. B. Wetter, Besonderheiten, technische Probleme …"
     }
   },

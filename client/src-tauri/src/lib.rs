@@ -436,6 +436,15 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// bevor phpVMS' Live-Tracking-Cron (default ~2h) den PIREP killt.
 const SIM_DISCONNECT_THRESHOLD_S: i64 = 30;
 
+/// v0.12.5 (Spec docs/spec/v0.12.5-divert-and-manual-pirep.md, LE9):
+/// Maximales Alter eines Sim-Snapshots, ab dem das Resume-Sim-Gate den
+/// Flug scharfschaltet. Bewusst ENGER als `SIM_DISCONNECT_THRESHOLD_S` —
+/// letzteres ist Disconnect-Erkennung im laufenden Flug, hier geht es ums
+/// Scharfschalten NACH Resume: ein alter, vor dem Neustart persistierter
+/// Snapshot darf nicht zählen. ≤ 5 s ⇒ frisch genug, dass der Sim jetzt
+/// gerade Daten liefert.
+const SIM_GATE_FRESH_SECS: i64 = 5;
+
 /// Spec sim-disconnect-auto-resume F2 (Drift-Stufen):
 ///
 /// Schwellen fuer die Activity-Log-Eskalation beim Resume. Drift NM
@@ -3091,6 +3100,38 @@ pub struct DivertHint {
     pub kind: &'static str,
 }
 
+/// v0.12.5 (Spec v0.12.5-divert-and-manual-pirep.md, LE3): Vorbefüll-
+/// Werte für das manuelle Filing-Formular (`ManualFileDialog`). Alle aus
+/// FSM-Stats bzw. `DivertHint` — der Pilot korrigiert nur Abweichungen,
+/// statt jedes Feld blank einzutippen. Alle Werte optional; `null` =
+/// FSM hat den Wert (noch) nicht.
+#[derive(Serialize)]
+pub struct ManualFilingDefaults {
+    /// FSM-gemessene Distanz in NM.
+    distance_nm: Option<f64>,
+    /// FSM Peak-Altitude, auf 100 ft gerundet.
+    cruise_level_ft: Option<i32>,
+    /// Flugzeit Takeoff→Landing in Minuten.
+    flight_time_minutes: Option<i32>,
+    /// FSM Touchdown-Rate (canonical edge value).
+    landing_rate_fpm: Option<f32>,
+    /// FSM Block-Off-Zeit (RFC-3339).
+    block_off_at: Option<String>,
+    /// FSM Block-On-Zeit (RFC-3339).
+    block_on_at: Option<String>,
+    /// FSM Block-Fuel in kg.
+    block_fuel_kg: Option<f32>,
+    /// Resttreibstoff im Tank (kg) — letzter beobachteter Sim-Fuel.
+    /// LE4: das UI-Feld fragt „noch im Tank", nicht „verbraucht".
+    remaining_fuel_kg: Option<f32>,
+    /// Erkanntes Ausweich-ICAO aus dem `DivertHint`. None = kein Divert.
+    divert_to: Option<String>,
+    /// Der ursprünglich geplante Zielflughafen (Bid/Flugplan).
+    planned_arr_icao: String,
+    /// true wenn ein Divert erkannt wurde → Begründung ist Pflicht.
+    requires_reason: bool,
+}
+
 #[derive(Serialize)]
 pub struct ActiveFlightInfo {
     pirep_id: String,
@@ -3226,6 +3267,9 @@ pub struct ActiveFlightInfo {
     accident_confidence: Option<String>,
     accident_reasons: Vec<String>,
     accident_at: Option<String>,
+
+    /// v0.12.5 (LE3): Vorbefüll-Werte fürs manuelle Filing-Formular.
+    manual_filing_defaults: ManualFilingDefaults,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -6645,6 +6689,33 @@ fn flight_info(flight: &ActiveFlight, resume_position_suspect: bool) -> ActiveFl
         accident_confidence: stats.accident_confidence.clone(),
         accident_reasons: stats.accident_reasons.clone(),
         accident_at: stats.accident_at.map(|t| t.to_rfc3339()),
+
+        // v0.12.5 (LE3): Manual-Filing-Vorbefüllung aus den FSM-Stats.
+        manual_filing_defaults: ManualFilingDefaults {
+            distance_nm: if stats.distance_nm > 0.0 {
+                Some(stats.distance_nm)
+            } else {
+                None
+            },
+            cruise_level_ft: stats.peak_altitude_ft.map(|ft| {
+                (((ft / 100.0).round() * 100.0) as i32).max(0)
+            }),
+            flight_time_minutes: match (stats.takeoff_at, stats.landing_at) {
+                (Some(t), Some(l)) if l > t => Some((l - t).num_minutes() as i32),
+                _ => None,
+            },
+            landing_rate_fpm: stats.canonical_landing_rate_fpm(),
+            block_off_at: stats.block_off_at.map(|t| t.to_rfc3339()),
+            block_on_at: stats.block_on_at.map(|t| t.to_rfc3339()),
+            block_fuel_kg: stats.block_fuel_kg.filter(|kg| *kg > 0.0),
+            remaining_fuel_kg: stats.last_fuel_kg.filter(|kg| *kg >= 0.0),
+            divert_to: stats
+                .divert_hint
+                .as_ref()
+                .and_then(|h| h.actual_icao.clone()),
+            planned_arr_icao: flight.arr_airport.clone(),
+            requires_reason: stats.divert_hint.is_some(),
+        },
     }
 }
 
@@ -8436,6 +8507,16 @@ mod pirep_queue {
         /// (vor diesem Feld) weiter laden.
         #[serde(default)]
         pub flight_id: String,
+        /// v0.12.5 (Spec v0.12.5-divert-and-manual-pirep.md, LE1b): das
+        /// fertig gebaute MQTT-PIREP-Payload als JSON. Der Queue-Worker
+        /// publisht das nach erfolgreichem phpVMS-`/file` via
+        /// `finalize_filed_pirep` — vorher publizierte der Worker GAR
+        /// KEIN MQTT-PIREP, gequeuete Diverts/Flüge fehlten dauerhaft in
+        /// den VPS-Reports. `#[serde(default)]` = `Value::Null` für alte
+        /// queued-Files (vor diesem Feld); der Worker behandelt Null als
+        /// „kein MQTT-Publish" statt zu crashen.
+        #[serde(default)]
+        pub pirep_payload_json: serde_json::Value,
     }
 
     fn dir(app: &AppHandle) -> Option<PathBuf> {
@@ -8625,6 +8706,22 @@ fn spawn_pirep_queue_worker(app: AppHandle) {
                         ).await;
                         // Selber Tick: Pending-Bid-Cleanup-Queue drainen
                         drain_pending_bid_cleanup(&app, &client).await;
+                        // v0.12.5 (LE1b): JSONL-PirepFiled-Event schreiben
+                        // + MQTT-PIREP nachträglich publishen — sonst fehlt
+                        // der gequeuete Flug dauerhaft in den VPS-Reports.
+                        // QS-P1: `finalize_filed_pirep` schreibt das JSONL-
+                        // Event IMMER (auch ohne MQTT-Handle) — Voraussetzung
+                        // für den Recorder-seitigen JSONL-Gap-Fill.
+                        // Null = altes queued-File ohne das Feld → skip.
+                        if !q.pirep_payload_json.is_null() {
+                            let mqtt = state.mqtt.lock().await;
+                            finalize_filed_pirep(
+                                &app,
+                                mqtt.as_ref(),
+                                &q.pirep_id,
+                                q.pirep_payload_json.clone(),
+                            );
+                        }
                         // Best-effort: JSONL-Upload (wenn das Recorder-File noch da ist)
                         spawn_flight_log_upload(&app, q.pirep_id.clone());
                     }
@@ -9262,6 +9359,303 @@ where
         distance_to_destination_nm: None,
         nearest_distance_nm: None,
     }
+}
+
+/// v0.12.5 (Spec v0.12.5-divert-and-manual-pirep.md, LE2b): bestimmt die
+/// `divert`/`diverted_to`-Marker fürs PIREP-Payload. Pure function — damit
+/// ohne ein volles `ActiveFlight` testbar.
+///
+/// `effective_arr_icao != planned_arr_icao` ⇒ aktiv geflogener Divert:
+/// `divert = Some(true)`, `diverted_to = Some(effective)`. Sonst Fallback
+/// auf den passiv erkannten `DivertHint` — die FSM hat ein Ausweichfeld
+/// erkannt, der Pilot hat den Flug aber nicht als Divert gefilt.
+fn divert_payload_markers(
+    effective_arr_icao: &str,
+    planned_arr_icao: &str,
+    divert_hint: Option<&DivertHint>,
+) -> (Option<bool>, Option<String>) {
+    if effective_arr_icao != planned_arr_icao {
+        (Some(true), Some(effective_arr_icao.to_string()))
+    } else {
+        (
+            divert_hint.map(|_| true),
+            divert_hint.and_then(|h| h.actual_icao.clone()),
+        )
+    }
+}
+
+/// v0.12.5 (Spec v0.12.5-divert-and-manual-pirep.md, LE1): zentraler
+/// MQTT-PirepPayload-Builder — eine Stelle für alle 4 Filing-Pfade
+/// (normal /file, Divert, manuell, Queue-Worker). Vorher war dieser
+/// ~200-Zeilen-Block inline im `flight_end`-Command dupliziert; Divert-
+/// und Manual-Pfad publizierten gar kein MQTT-PIREP → Reports verschluckt.
+///
+/// `effective_arr_icao` = der tatsächliche Ankunftsflughafen (bei Divert
+/// das Ausweich-ICAO, sonst == `planned_arr_icao`). `planned_arr_icao` =
+/// der ursprünglich geplante Zielflughafen. Ist `effective != planned`,
+/// werden `divert`/`diverted_to` gesetzt; Rollout-/Runway-Geometrie wird
+/// gegen `effective_arr_icao` aufgelöst.
+fn build_pirep_payload(
+    flight: &ActiveFlight,
+    body: &api_client::FileBody,
+    effective_arr_icao: &str,
+    planned_arr_icao: &str,
+) -> aeroacars_mqtt::PirepPayload {
+    let stats = flight.stats.lock().expect("flight stats");
+    let touchdown_count = stats.touchdown_events.len() as u32;
+    // v0.12.5 (LE2b): divert/diverted_to via pure Helper bestimmen.
+    let (divert_flag, diverted_to) = divert_payload_markers(
+        effective_arr_icao,
+        planned_arr_icao,
+        stats.divert_hint.as_ref(),
+    );
+    // v0.7.1 P1.3-Fix: Sub-Scores einmal berechnen,
+    // dann sowohl als sub_scores ins Payload als auch
+    // als landing_score (gewichteter Aggregate) nutzen.
+    let actual_burn = actual_burn_for_record(&stats);
+    let mut scoring_input = landing_scoring::LandingScoringInput {
+        // v0.7.17 (B-015a QS-Fix): Edge-Wert hat Vorrang.
+        vs_fpm: score_basis_vs_fpm(&stats),
+        peak_g_load: stats.landing_peak_g_force,
+        // v0.12.3 (LE8): zentraler Scored-G-Helper —
+        // EMA-Wert, sonst raw_fallback; nie None (QS-P2).
+        scored_g_load: Some(score_g_for_stats(&stats).scored_g),
+        // v0.7.6 P2-B: zentraler Helper statt direkten Read.
+        bounce_count: Some(scored_bounce_count_for_score(&stats)),
+        approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
+        approach_bank_stddev_deg: stats.approach_bank_stddev_deg,
+        rollout_distance_m: stats
+            .rollout_distance_m
+            .map(|m| m as f32),
+        planned_burn_kg: stats.planned_burn_kg,
+        actual_trip_burn_kg: actual_burn,
+        planned_zfw_kg: stats.planned_zfw_kg,
+        planned_tow_kg: stats.planned_tow_kg,
+        // v0.7.17 (N-002): aircraft-aware rollout score
+        aircraft_icao: Some(flight.aircraft_icao.clone()),
+        ..Default::default()
+    };
+    // v0.10.0 (#runway-utilization-score): LDA-basierter
+    // Bahn-Auslastungs-Score. Markiert weiter unten am
+    // PirepPayload via score_algorithm_version: Some(3)
+    // (v0.12.0: Float-Toleranz-Refinement).
+    fill_v2_rollout_fields(&mut scoring_input, &stats, effective_arr_icao);
+    let payload_sub_scores =
+        landing_scoring::compute_sub_scores(&scoring_input);
+    let aggregate_master =
+        landing_scoring::aggregate_master_score(&payload_sub_scores);
+    let payload_landing_score = aggregate_master
+        .map(|m| m as i32)
+        .or_else(|| stats.landing_score.map(|s| s.numeric()));
+    aeroacars_mqtt::PirepPayload {
+        ts: Utc::now().timestamp_millis(),
+        // v0.11.1: Pilot-Client-Version mitsenden
+        // damit Reports-Uebersicht die Pill ohne
+        // Touchdown-Join zeigen kann.
+        client_version: Some(env!("CARGO_PKG_VERSION")),
+        pirep_id: flight.pirep_id.clone(),
+        flight_number: format_callsign(
+            &flight.airline_icao,
+            &flight.flight_number,
+        ),
+        dep: flight.dpt_airport.clone(),
+        arr: effective_arr_icao.to_string(),
+        block_time_min: body.flight_time,
+        flight_time_min: body.flight_time,
+        distance_nm: body.distance.map(|d| d as f32),
+        // v0.12.5 (LE4, QS-R2-P2): `body.fuel_used` ist die phpVMS-Site-
+        // Unit = POUND. Das MQTT-Feld heißt `fuel_used_kg` — also explizit
+        // lb→kg zurückrechnen. Vorher floss der lb-Wert ungewandelt in ein
+        // `_kg`-Feld (Recorder/Web sah ~2,2× zu viel „kg").
+        fuel_used_kg: body.fuel_used.map(|lb| (lb / KG_TO_LB) as f32),
+        planned_burn_kg: stats.planned_burn_kg,
+        block_fuel_kg: stats.block_fuel_kg,
+        takeoff_fuel_kg: stats.takeoff_fuel_kg,
+        landing_fuel_kg: stats.landing_fuel_kg,
+        // v0.7.6 P1-1: Trip-Burn als SSoT fuer OFP-Vergleich.
+        actual_trip_burn_kg: actual_burn,
+        takeoff_weight_kg: stats.takeoff_weight_kg.map(|w| w as f32),
+        landing_weight_kg: stats.landing_weight_kg.map(|w| w as f32),
+        planned_tow_kg: stats.planned_tow_kg,
+        planned_ldw_kg: stats.planned_ldw_kg,
+        peak_altitude_ft: stats.peak_altitude_ft.map(|v| v.round() as i32),
+        landing_vs_fpm: body.landing_rate.map(|r| r as i32),
+        // v0.7.1 P1.3-Fix: gewichteter Aggregate-Score
+        // (Fuel/Loadsheet/Stability/Rollout fliessen ein),
+        // mit Fallback auf Touchdown-Klassifikation.
+        landing_score: payload_landing_score,
+        go_around_count: Some(stats.go_around_count),
+        touchdown_count: Some(touchdown_count),
+        dep_gate: stats.dep_gate.clone(),
+        arr_gate: stats.arr_gate.clone(),
+        approach_runway: stats.approach_runway.clone(),
+        // v0.12.5 (LE2b): bei Divert sind divert/diverted_to gesetzt;
+        // sonst Fallback auf den passiven divert_hint (via Helper oben).
+        divert: divert_flag,
+        diverted_to,
+        notes: None,
+        // v0.7.0 — Touchdown-Forensik v2 marker (P2 fix)
+        forensics_version: touchdown_v2::FORENSICS_VERSION,
+
+        // ─── v0.7.1 Felder (Spec §5.1) ────────────────
+        ux_version: 1,
+        landing_confidence: stats.landing_confidence.clone(),
+        landing_source: stats.landing_source.clone(),
+        // F6: Flare-Felder aus dem 50-Hz-Sampler-Buffer
+        // (landing_analysis ist Option<Value>)
+        flare_detected: stats
+            .landing_analysis
+            .as_ref()
+            .and_then(|v| v.get("flare_detected"))
+            .and_then(|v| v.as_bool()),
+        flare_reduction_fpm: stats
+            .landing_analysis
+            .as_ref()
+            .and_then(|v| v.get("flare_reduction_fpm"))
+            .and_then(|v| v.as_f64())
+            .map(|x| x as f32),
+        flare_quality_score: stats
+            .landing_analysis
+            .as_ref()
+            .and_then(|v| v.get("flare_quality_score"))
+            .and_then(|v| v.as_i64())
+            .map(|x| x.clamp(0, 100) as u8),
+        // F7: Stability-v2-Felder (P2.1-A: bestehende
+        // Backend-Felder exponieren)
+        approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
+        approach_bank_stddev_deg: stats.approach_bank_stddev_deg,
+        approach_vs_jerk_fpm: stats.approach_vs_jerk_fpm,
+        approach_ias_stddev_kt: stats.approach_ias_stddev_kt,
+        approach_stable_config: stats.approach_stable_config,
+        approach_excessive_sink: Some(stats.approach_excessive_sink),
+        // v0.7.1 Round-2 P2-Fix: gate_window aus echten
+        // Approach-Samples + TD-Timestamp gerechnet.
+        gate_window: build_mqtt_gate_window_from_stats(&stats),
+        // P1.5 + Phase 2 (F1/F2/F3) + P1.3-Fix:
+        // bereits oben berechnet, hier nur durchreichen.
+        sub_scores: payload_sub_scores,
+        // v0.7.6 P1-3: Runway-Geometry-Trust. Pure-
+        // function Check + reason-string ins Payload.
+        runway_geometry_trusted: {
+            let (trusted, _) = runway_geometry_trust_check(
+                stats.runway_match.as_ref()
+                    .map(|m| m.airport_ident.as_str()),
+                effective_arr_icao,
+                stats.divert_hint.as_ref()
+                    .and_then(|h| h.actual_icao.as_deref()),
+                stats.runway_match.as_ref()
+                    .map(|m| m.centerline_distance_m as f32),
+                stats.landing_float_distance_m,
+            );
+            Some(trusted)
+        },
+        runway_geometry_reason: {
+            let (_, reason) = runway_geometry_trust_check(
+                stats.runway_match.as_ref()
+                    .map(|m| m.airport_ident.as_str()),
+                effective_arr_icao,
+                stats.divert_hint.as_ref()
+                    .and_then(|h| h.actual_icao.as_deref()),
+                stats.runway_match.as_ref()
+                    .map(|m| m.centerline_distance_m as f32),
+                stats.landing_float_distance_m,
+            );
+            reason.map(String::from)
+        },
+        // v0.7.19 GAF-707 Accident-Detection: Accident-Felder
+        // gelatcht; Sentinel wird IMMER gesetzt.
+        accident_classifier_version: Some(
+            accident::ACCIDENT_CLASSIFIER_VERSION.into(),
+        ),
+        accident: if stats.accident_detected {
+            Some(true)
+        } else {
+            None
+        },
+        accident_kind: stats.accident_kind.clone(),
+        accident_confidence: stats
+            .accident_confidence
+            .clone(),
+        accident_reasons: if stats
+            .accident_reasons
+            .is_empty()
+        {
+            None
+        } else {
+            Some(stats.accident_reasons.clone())
+        },
+        accident_at: stats
+            .accident_at
+            .map(|t| t.timestamp_millis()),
+        // v0.10.0 (#runway-utilization-score): markiert
+        // dass die sub_scores oben vom LDA-basierten
+        // Bahn-Auslastungs-Algorithmus stammen.
+        score_algorithm_version: Some(3),
+    }
+}
+
+/// v0.12.5 (Spec v0.12.5-divert-and-manual-pirep.md, LE1): zentraler
+/// Filing-Abschluss — schreibt das PIREP-Forensik-Event ins JSONL und
+/// publisht das PIREP via MQTT. Arbeitet bewusst auf der bereits
+/// serialisierten JSON-Form (`serde_json::Value`), damit der PIREP-Queue-
+/// Worker — der nur die persistierte JSON-Form besitzt — exakt denselben
+/// Abschluss-Pfad nutzt wie die Live-Pfade. Vorher publizierten der
+/// Divert-, der Manual- und der Queue-Pfad GAR KEIN MQTT-PIREP →
+/// Reports/Logfile verschluckt (Bug A/B/C der Spec).
+///
+/// QS-P1: `handle` ist **`Option`**. Das `PirepFiled`-JSONL-Event MUSS
+/// immer geschrieben werden — auch ohne MQTT-Verbindung — sonst kann der
+/// Recorder-Importer den PIREP nicht aus dem hochgeladenen JSONL nachlegen
+/// (`importer.ts` legt `pireps` nur bei `pirep_filed` an). MQTT-Publish ist
+/// best-effort und entfällt sauber, wenn kein Handle da ist.
+fn finalize_filed_pirep(
+    app: &AppHandle,
+    handle: Option<&aeroacars_mqtt::Handle>,
+    pirep_id: &str,
+    pirep_payload_json: serde_json::Value,
+) {
+    // v0.5.34: PIREP-Forensik ins JSONL — damit das Recovery-Tool
+    // Pireps + abhaengige Stats rekonstruieren kann. IMMER, unabhängig
+    // vom MQTT-Status (QS-P1: JSONL-Gap-Fill-Durabilität).
+    record_event(
+        app,
+        pirep_id,
+        &FlightLogEvent::PirepFiled {
+            timestamp: Utc::now(),
+            payload: pirep_payload_json.clone(),
+        },
+    );
+    // MQTT-Publish nur wenn eine Verbindung steht — best-effort.
+    if let Some(handle) = handle {
+        handle.pirep_json(pirep_payload_json);
+    }
+}
+
+/// v0.12.5 (LE7-QS): emittiert das `LandingFinalized`-JSONL-Event mit dem
+/// finalen V/S + Score (Spec touchdown-forensics-v2 §7.2). Gerufen vom
+/// Normal-, Divert- UND Manual-Filing-Pfad — alle drei haben eine lebende
+/// `ActiveFlight`. Der PIREP-Queue-Worker kann es nicht: dort ist die
+/// `ActiveFlight` beim Queueing bereits verworfen.
+fn emit_landing_finalized(app: &AppHandle, flight: &ActiveFlight) {
+    // Aktuell: nimmt den letzten validated TD-Score (single-shot, bis
+    // Multi-TD-Episodes voll integriert sind).
+    let (final_vs, final_score_label) = {
+        let s = flight.stats.lock().expect("flight stats");
+        (
+            s.landing_rate_fpm,
+            s.landing_score.map(|sc| format!("{:?}", sc)),
+        )
+    };
+    record_event(
+        app,
+        &flight.pirep_id,
+        &FlightLogEvent::LandingFinalized {
+            timestamp: Utc::now(),
+            forensics_version: touchdown_v2::FORENSICS_VERSION,
+            final_vs_fpm: final_vs,
+            final_score: final_score_label,
+        },
+    );
 }
 
 /// v0.7.1 Helper: actual_trip_burn = takeoff_fuel - landing_fuel
@@ -10666,12 +11060,27 @@ async fn flight_end(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
     divert_to: Option<String>,
+    divert_reason: Option<String>,
     accident_decision: Option<String>,
 ) -> Result<(), UiError> {
     let divert_to = divert_to
         .as_deref()
         .map(|s| s.trim().to_uppercase())
         .filter(|s| !s.is_empty());
+    // v0.12.5 (Spec v0.12.5-divert-and-manual-pirep.md, LE2): die
+    // Divert-Begründung. Pflichtfeld sobald `divert_to` gesetzt ist —
+    // das Bestätigungs-Modal validiert frontend-seitig, dieser Guard
+    // schließt den API-Contract serverseitig ab.
+    let divert_reason = divert_reason
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if divert_to.is_some() && divert_reason.is_none() {
+        return Err(UiError::new(
+            "divert_reason_required",
+            "a divert PIREP requires a reason",
+        ));
+    }
 
     // v0.7.19 GAF-707 (QS-R1 Finding 3): Pilot-Override-Pfad. Werte:
     // - None / "auto"        → Stats-Werte bleiben unveraendert.
@@ -10918,10 +11327,16 @@ async fn flight_end(
         // immediately on the PIREP page that this wasn't a normal
         // arrival. Format mirrors what most ACARS clients write
         // ("DIVERT: <planned> → <actual>") so admins can grep.
+        // v0.12.5 (LE2): die Pflicht-Begründung steht direkt unter dem
+        // Banner — ein Audit-Eintrag pro Divert für den VA-Admin.
         if let Some(actual) = divert_to.as_deref() {
+            let reason_line = divert_reason
+                .as_deref()
+                .map(|r| format!("Reason: {r}\n\n"))
+                .unwrap_or_default();
             notes = format!(
-                "DIVERT: {} → {} (planned destination not reached)\n\n{}",
-                arr_icao, actual, notes
+                "DIVERT: {} → {} (planned destination not reached)\n{}\n{}",
+                arr_icao, actual, reason_line, notes
             );
         }
 
@@ -11097,6 +11512,45 @@ async fn flight_end(
                 outcome: FlightOutcome::Filed,
             },
         );
+        // v0.12.5 (Spec v0.12.5-divert-and-manual-pirep.md, Bug A/B):
+        // Divert-Pfad publisht jetzt — wie der normale /file-Pfad — das
+        // MQTT-PIREP-Event und lädt das JSONL-Forensik-Logfile hoch.
+        // Vorher kehrte dieser Branch via `return Ok(())` zurück OHNE
+        // beides → diverted Flüge fehlten dauerhaft in den VPS-Reports
+        // und es gab kein Logfile. `effective_arr_icao` = das Divert-
+        // ICAO, `planned_arr_icao` = das ursprüngliche Ziel → der
+        // Helper setzt `divert`/`diverted_to` korrekt.
+        {
+            let effective_arr = divert_to
+                .as_deref()
+                .unwrap_or(&flight.arr_airport);
+            let mut pirep_payload = build_pirep_payload(
+                &flight,
+                &body,
+                effective_arr,
+                &flight.arr_airport,
+            );
+            // v0.12.5 (LE2): Divert-Begründung auch ins MQTT-Payload
+            // (Audit) — der Recorder/JSONL hält damit den Grund.
+            pirep_payload.notes = divert_reason.clone();
+            let pirep_payload_json = serde_json::to_value(&pirep_payload)
+                .unwrap_or(serde_json::Value::Null);
+            // QS-P1: JSONL-PirepFiled IMMER schreiben, MQTT-Publish nur
+            // wenn ein Handle da ist.
+            let mqtt = state.mqtt.lock().await;
+            finalize_filed_pirep(
+                &app,
+                mqtt.as_ref(),
+                &flight.pirep_id,
+                pirep_payload_json,
+            );
+        }
+        // v0.12.5 (LE7-QS): LandingFinalized-JSONL-Event auch beim Divert
+        // — vor dem Upload, damit es im hochgeladenen Logfile steht.
+        emit_landing_finalized(&app, &flight);
+        // v0.12.5 (Bug A): Forensik-Upload auch beim Divert — gzip +
+        // POST des kompletten JSONL-Logfiles an aeroacars-live.
+        spawn_flight_log_upload(&app, flight.pirep_id.clone());
         // v0.7.14: Pilot-Client-Discord-Post fuer Divert entfernt — Recorder
         // postet das jetzt zentral (= eine Quelle, kein Doppel-Post). Die
         // Divert-Info ist im PirepPayload (divert + diverted_to) und kommt
@@ -11180,248 +11634,34 @@ async fn flight_end(
             // fire-and-forget. Monitor uses this to mark a flight
             // as completed in the live history.
             {
+                // v0.12.5 (Spec v0.12.5-divert-and-manual-pirep.md, LE1):
+                // Der MQTT-PirepPayload-Build ist in `build_pirep_payload`
+                // ausgelagert — eine Stelle für alle Filing-Pfade. Normaler
+                // /file-Pfad: effective == planned == flight.arr_airport.
+                let pirep_payload = build_pirep_payload(
+                    &flight,
+                    &body,
+                    &flight.arr_airport,
+                    &flight.arr_airport,
+                );
+                // v0.12.5 (LE1): JSONL-Forensik + MQTT-Publish über den
+                // zentralen Finalizer — gleicher Pfad wie Divert/Manual/Queue.
+                // QS-P1: JSONL-PirepFiled IMMER, MQTT nur bei Handle.
+                let pirep_payload_json = serde_json::to_value(&pirep_payload)
+                    .unwrap_or(serde_json::Value::Null);
                 let mqtt = state.mqtt.lock().await;
-                if let Some(handle) = mqtt.as_ref() {
-                    // Snapshot the rich stats inside a short-lived scope so
-                    // the std::sync::MutexGuard doesn't span any later
-                    // .await — same pattern as the touchdown publish.
-                    let pirep_payload = {
-                        let stats = flight.stats.lock().expect("flight stats");
-                        let touchdown_count = stats.touchdown_events.len() as u32;
-                        // v0.7.1 P1.3-Fix: Sub-Scores einmal berechnen,
-                        // dann sowohl als sub_scores ins Payload als auch
-                        // als landing_score (gewichteter Aggregate) nutzen.
-                        let actual_burn = actual_burn_for_record(&stats);
-                        let mut scoring_input = landing_scoring::LandingScoringInput {
-                            // v0.7.17 (B-015a QS-Fix): Edge-Wert hat Vorrang.
-                            vs_fpm: score_basis_vs_fpm(&stats),
-                            peak_g_load: stats.landing_peak_g_force,
-                            // v0.12.3 (LE8): zentraler Scored-G-Helper —
-                            // EMA-Wert, sonst raw_fallback; nie None (QS-P2).
-                            scored_g_load: Some(score_g_for_stats(&stats).scored_g),
-                            // v0.7.6 P2-B: zentraler Helper statt direkten Read.
-                            bounce_count: Some(scored_bounce_count_for_score(&stats)),
-                            approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
-                            approach_bank_stddev_deg: stats.approach_bank_stddev_deg,
-                            rollout_distance_m: stats
-                                .rollout_distance_m
-                                .map(|m| m as f32),
-                            planned_burn_kg: stats.planned_burn_kg,
-                            actual_trip_burn_kg: actual_burn,
-                            planned_zfw_kg: stats.planned_zfw_kg,
-                            planned_tow_kg: stats.planned_tow_kg,
-                            // v0.7.17 (N-002): aircraft-aware rollout score
-                            aircraft_icao: Some(flight.aircraft_icao.clone()),
-                            ..Default::default()
-                        };
-                        // v0.10.0 (#runway-utilization-score): LDA-basierter
-                        // Bahn-Auslastungs-Score. Markiert weiter unten am
-                        // PirepPayload via score_algorithm_version: Some(3)
-                        // (v0.12.0: Float-Toleranz-Refinement).
-                        fill_v2_rollout_fields(&mut scoring_input, &stats, &flight.arr_airport);
-                        let payload_sub_scores =
-                            landing_scoring::compute_sub_scores(&scoring_input);
-                        let aggregate_master =
-                            landing_scoring::aggregate_master_score(&payload_sub_scores);
-                        let payload_landing_score = aggregate_master
-                            .map(|m| m as i32)
-                            .or_else(|| stats.landing_score.map(|s| s.numeric()));
-                        aeroacars_mqtt::PirepPayload {
-                            ts: Utc::now().timestamp_millis(),
-                            // v0.11.1: Pilot-Client-Version mitsenden
-                            // damit Reports-Uebersicht die Pill ohne
-                            // Touchdown-Join zeigen kann.
-                            client_version: Some(env!("CARGO_PKG_VERSION")),
-                            pirep_id: flight.pirep_id.clone(),
-                            flight_number: format_callsign(
-                                &flight.airline_icao,
-                                &flight.flight_number,
-                            ),
-                            dep: flight.dpt_airport.clone(),
-                            arr: flight.arr_airport.clone(),
-                            block_time_min: body.flight_time,
-                            flight_time_min: body.flight_time,
-                            distance_nm: body.distance.map(|d| d as f32),
-                            fuel_used_kg: body.fuel_used.map(|kg| kg as f32),
-                            planned_burn_kg: stats.planned_burn_kg,
-                            block_fuel_kg: stats.block_fuel_kg,
-                            takeoff_fuel_kg: stats.takeoff_fuel_kg,
-                            landing_fuel_kg: stats.landing_fuel_kg,
-                            // v0.7.6 P1-1: Trip-Burn als SSoT fuer OFP-Vergleich.
-                            // `actual_burn` ist bereits oben (~Zeile 8045) via
-                            // actual_burn_for_record(&stats) berechnet =
-                            // takeoff_fuel_kg - landing_fuel_kg, mit Plausibilitaets-
-                            // Filtern. Web/Monitor/Discord lesen ab v0.7.6
-                            // bevorzugt dieses Feld; Fallback auf takeoff-landing
-                            // im Web fuer alte v0.7.5-PIREPs ohne dieses Feld.
-                            actual_trip_burn_kg: actual_burn,
-                            takeoff_weight_kg: stats.takeoff_weight_kg.map(|w| w as f32),
-                            landing_weight_kg: stats.landing_weight_kg.map(|w| w as f32),
-                            planned_tow_kg: stats.planned_tow_kg,
-                            planned_ldw_kg: stats.planned_ldw_kg,
-                            peak_altitude_ft: stats.peak_altitude_ft.map(|v| v.round() as i32),
-                            landing_vs_fpm: body.landing_rate.map(|r| r as i32),
-                            // v0.7.1 P1.3-Fix: gewichteter Aggregate-Score
-                            // (Fuel/Loadsheet/Stability/Rollout fliessen ein),
-                            // mit Fallback auf Touchdown-Klassifikation.
-                            landing_score: payload_landing_score,
-                            go_around_count: Some(stats.go_around_count),
-                            touchdown_count: Some(touchdown_count),
-                            dep_gate: stats.dep_gate.clone(),
-                            arr_gate: stats.arr_gate.clone(),
-                            approach_runway: stats.approach_runway.clone(),
-                            divert: stats.divert_hint.as_ref().map(|_| true),
-                            diverted_to: stats
-                                .divert_hint
-                                .as_ref()
-                                .and_then(|h| h.actual_icao.clone()),
-                            notes: None,
-                            // v0.7.0 — Touchdown-Forensik v2 marker (P2 fix)
-                            forensics_version: touchdown_v2::FORENSICS_VERSION,
-
-                            // ─── v0.7.1 Felder (Spec §5.1) ────────────────
-                            ux_version: 1,
-                            landing_confidence: stats.landing_confidence.clone(),
-                            landing_source: stats.landing_source.clone(),
-                            // F6: Flare-Felder aus dem 50-Hz-Sampler-Buffer
-                            // (landing_analysis ist Option<Value>)
-                            flare_detected: stats
-                                .landing_analysis
-                                .as_ref()
-                                .and_then(|v| v.get("flare_detected"))
-                                .and_then(|v| v.as_bool()),
-                            flare_reduction_fpm: stats
-                                .landing_analysis
-                                .as_ref()
-                                .and_then(|v| v.get("flare_reduction_fpm"))
-                                .and_then(|v| v.as_f64())
-                                .map(|x| x as f32),
-                            flare_quality_score: stats
-                                .landing_analysis
-                                .as_ref()
-                                .and_then(|v| v.get("flare_quality_score"))
-                                .and_then(|v| v.as_i64())
-                                .map(|x| x.clamp(0, 100) as u8),
-                            // F7: Stability-v2-Felder (P2.1-A: bestehende
-                            // Backend-Felder exponieren)
-                            approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
-                            approach_bank_stddev_deg: stats.approach_bank_stddev_deg,
-                            approach_vs_jerk_fpm: stats.approach_vs_jerk_fpm,
-                            approach_ias_stddev_kt: stats.approach_ias_stddev_kt,
-                            approach_stable_config: stats.approach_stable_config,
-                            approach_excessive_sink: Some(stats.approach_excessive_sink),
-                            // v0.7.1 Round-2 P2-Fix: gate_window jetzt
-                            // aus den echten Approach-Samples + TD-
-                            // Timestamp gerechnet (gleiche Formel wie
-                            // build_landing_record). Web/Monitor sehen
-                            // jetzt die echten Window-Boundaries.
-                            gate_window: build_mqtt_gate_window_from_stats(&stats),
-                            // P1.5 + Phase 2 (F1/F2/F3) + P1.3-Fix:
-                            // bereits oben berechnet, hier nur durchreichen.
-                            sub_scores: payload_sub_scores,
-                            // v0.7.6 P1-3: Runway-Geometry-Trust. Pure-
-                            // function Check + reason-string ins Payload.
-                            // Web/Monitor blendet TD-Zone und Float-
-                            // Distance bei trusted=false aus. Spec docs/
-                            // spec/v0.7.6-landing-payload-consistency.md.
-                            runway_geometry_trusted: {
-                                let (trusted, _) = runway_geometry_trust_check(
-                                    stats.runway_match.as_ref()
-                                        .map(|m| m.airport_ident.as_str()),
-                                    &flight.arr_airport,
-                                    stats.divert_hint.as_ref()
-                                        .and_then(|h| h.actual_icao.as_deref()),
-                                    stats.runway_match.as_ref()
-                                        .map(|m| m.centerline_distance_m as f32),
-                                    stats.landing_float_distance_m,
-                                );
-                                Some(trusted)
-                            },
-                            runway_geometry_reason: {
-                                let (_, reason) = runway_geometry_trust_check(
-                                    stats.runway_match.as_ref()
-                                        .map(|m| m.airport_ident.as_str()),
-                                    &flight.arr_airport,
-                                    stats.divert_hint.as_ref()
-                                        .and_then(|h| h.actual_icao.as_deref()),
-                                    stats.runway_match.as_ref()
-                                        .map(|m| m.centerline_distance_m as f32),
-                                    stats.landing_float_distance_m,
-                                );
-                                reason.map(String::from)
-                            },
-                            // v0.7.19 GAF-707 Accident-Detection (QS-R1
-                            // Finding 2): PIREP-Payload bekommt die
-                            // gelatchten Accident-Felder. Sentinel
-                            // (`accident_classifier_version`) wird IMMER
-                            // gesetzt — auch ohne Accident — damit die
-                            // VPS-History v0.7.19+ vs historische PIREPs
-                            // unterscheiden kann.
-                            accident_classifier_version: Some(
-                                accident::ACCIDENT_CLASSIFIER_VERSION.into(),
-                            ),
-                            accident: if stats.accident_detected {
-                                Some(true)
-                            } else {
-                                None
-                            },
-                            accident_kind: stats.accident_kind.clone(),
-                            accident_confidence: stats
-                                .accident_confidence
-                                .clone(),
-                            accident_reasons: if stats
-                                .accident_reasons
-                                .is_empty()
-                            {
-                                None
-                            } else {
-                                Some(stats.accident_reasons.clone())
-                            },
-                            accident_at: stats
-                                .accident_at
-                                .map(|t| t.timestamp_millis()),
-                            // v0.10.0 (#runway-utilization-score): markiert
-                            // dass die sub_scores oben vom LDA-basierten
-                            // Bahn-Auslastungs-Algorithmus stammen. Webapp
-                            // (LandingAnalysis.tsx) gated darauf das
-                            // Rendering der neuen extra-Lines.
-                            score_algorithm_version: Some(3),
-                        }
-                    };
-                    // v0.5.34: PIREP-Forensik ins JSONL — Block/Flight-Time,
-                    // Fuel-Aggregate, Distance, Peak-Altitude, Landing-Score,
-                    // Go-Arounds, Touchdown-Count etc. Damit kann der
-                    // Recovery-Tool Pireps + abhaengige Stats rekonstruieren.
-                    record_event(
-                        &app,
-                        &flight.pirep_id,
-                        &FlightLogEvent::PirepFiled {
-                            timestamp: Utc::now(),
-                            payload: serde_json::to_value(&pirep_payload)
-                                .unwrap_or(serde_json::Value::Null),
-                        },
-                    );
-                    handle.pirep(pirep_payload);
-                }
+                finalize_filed_pirep(
+                    &app,
+                    mqtt.as_ref(),
+                    &flight.pirep_id,
+                    pirep_payload_json,
+                );
             }
             // v0.7.0 — emit landing_finalized mit dem finalen Score
             // (Spec docs/spec/touchdown-forensics-v2.md Sektion 7.2).
-            // Aktuell: nimmt den letzten validated TD-Score (single-shot
-            // bis Multi-TD-Episodes voll integriert sind in v0.7.1+).
-            let (final_vs, final_score_label) = {
-                let s = flight.stats.lock().expect("flight stats");
-                (s.landing_rate_fpm, s.landing_score.map(|sc| format!("{:?}", sc)))
-            };
-            record_event(
-                &app,
-                &flight.pirep_id,
-                &FlightLogEvent::LandingFinalized {
-                    timestamp: Utc::now(),
-                    forensics_version: touchdown_v2::FORENSICS_VERSION,
-                    final_vs_fpm: final_vs,
-                    final_score: final_score_label,
-                },
-            );
+            // v0.12.5 (LE7-QS): in `emit_landing_finalized` ausgelagert —
+            // Divert- und Manual-Pfad rufen denselben Helper.
+            emit_landing_finalized(&app, &flight);
             // v0.5.23 Forensik-Upload: gzip + POST des kompletten JSONL-
             // Logfiles an aeroacars-live damit der VA-Owner ohne den
             // Piloten zu kontaktieren das vollstaendige SimSnapshot-Log
@@ -11458,6 +11698,19 @@ async fn flight_end(
             // Flight in State halten damit der Pilot was korrigieren
             // kann.
             if is_transient_pirep_error(&e) {
+                // v0.12.5 (LE1b): MQTT-PIREP-Payload schon hier bauen und
+                // mit-persistieren — der Queue-Worker publisht es nach
+                // erfolgreichem /file. Normaler /file-Pfad: effective ==
+                // planned == flight.arr_airport.
+                let pirep_payload_json = serde_json::to_value(
+                    build_pirep_payload(
+                        &flight,
+                        &body,
+                        &flight.arr_airport,
+                        &flight.arr_airport,
+                    ),
+                )
+                .unwrap_or(serde_json::Value::Null);
                 let queued = pirep_queue::QueuedPirep {
                     pirep_id: flight.pirep_id.clone(),
                     bid_id: flight.bid_id,
@@ -11475,6 +11728,7 @@ async fn flight_end(
                     // erfolgreichem queued-Filing den flight_id-Fallback
                     // hat. Empty-String fuer pre-v0.7.7-Bids ist okay.
                     flight_id: flight.flight_id.clone(),
+                    pirep_payload_json,
                 };
                 if let Err(qe) = pirep_queue::enqueue(&app, &queued) {
                     // Queue selber kaputt — fallback auf altes Verhalten
@@ -11765,7 +12019,9 @@ async fn flight_end_manual(
     reason: Option<String>,
     flight_time_minutes: Option<i32>,
     block_fuel_kg: Option<f32>,
-    fuel_used_kg: Option<f32>,
+    // v0.12.5 (LE4): Resttreibstoff im Tank in kg — NICHT der Verbrauch.
+    // Das Backend rechnet `fuel_used_kg = block_fuel_kg − remaining_fuel_kg`.
+    remaining_fuel_kg: Option<f32>,
     distance_nm: Option<f64>,
     cruise_level_ft: Option<i32>,
     landing_rate_fpm: Option<f32>,
@@ -11861,16 +12117,27 @@ async fn flight_end_manual(
                     .collect(),
             )
         };
-        // Block→remaining diff in kg, rounded to whole kg before lb
-        // conversion (see flight_end for the cleanup rationale).
-        // Manual override (kg) wins over the FSM-derived diff.
-        let fuel_used = fuel_used_kg
-            .filter(|v| *v > 0.0)
-            .map(|kg| (kg as f64).round() * KG_TO_LB)
-            .or_else(|| match (stats.block_fuel_kg, stats.last_fuel_kg) {
-                (Some(b), Some(c)) if b > c => Some(((b - c) as f64).round() * KG_TO_LB),
+        // v0.12.5 (LE4): Der Pilot gibt die Restmenge im Tank (kg) ein,
+        // nicht den Verbrauch. fuel_used_kg = block_fuel_kg − remaining.
+        // Guard: block_fuel_kg > remaining_fuel_kg >= 0, sonst greift der
+        // FSM-Fallback (block − last_fuel). Gerechnet wird in kg, ERST am
+        // Ende nach lb konvertiert (phpVMS-Site-Unit = lb) — QS-R2-P2.
+        // `stats.block_fuel_kg` trägt hier schon den Manual-Override
+        // (oben gesetzt falls `block_fuel_kg`-Param > 0).
+        let fuel_used = {
+            let from_remaining = match (stats.block_fuel_kg, remaining_fuel_kg) {
+                (Some(block), Some(rem)) if rem >= 0.0 && block > rem => {
+                    Some((block - rem) as f64)
+                }
                 _ => None,
-            });
+            };
+            from_remaining
+                .or_else(|| match (stats.block_fuel_kg, stats.last_fuel_kg) {
+                    (Some(b), Some(c)) if b > c => Some((b - c) as f64),
+                    _ => None,
+                })
+                .map(|kg| kg.round() * KG_TO_LB)
+        };
         let block_fuel = stats
             .block_fuel_kg
             .filter(|kg| *kg > 0.0)
@@ -11922,7 +12189,7 @@ async fn flight_end_manual(
         if block_fuel_kg.is_some() {
             overrides.push("block_fuel");
         }
-        if fuel_used_kg.is_some() {
+        if remaining_fuel_kg.is_some() {
             overrides.push("fuel_used");
         }
         if distance_nm.is_some() {
@@ -12043,6 +12310,51 @@ async fn flight_end_manual(
                     outcome: FlightOutcome::Manual,
                 },
             );
+            // v0.12.5 (Spec v0.12.5-divert-and-manual-pirep.md, Bug B/C):
+            // der manuelle Filing-Pfad publisht jetzt — wie der normale
+            // /file-Pfad — das MQTT-PIREP-Event und lädt das JSONL-
+            // Forensik-Logfile hoch. Vorher tat dieser Pfad keins von
+            // beidem → manuell gefilte Flüge (z.B. Diverts) fehlten
+            // dauerhaft in den VPS-Reports und es gab kein Logfile.
+            // `effective_arr` = das Divert-ICAO falls gesetzt (steht
+            // schon uppercase im `body.arr_airport_id`), sonst das
+            // geplante Ziel.
+            {
+                let effective_arr = body
+                    .arr_airport_id
+                    .as_deref()
+                    .unwrap_or(&flight.arr_airport);
+                let mut pirep_payload = build_pirep_payload(
+                    &flight,
+                    &body,
+                    effective_arr,
+                    &flight.arr_airport,
+                );
+                // v0.12.5 (LE2-QS): die manuelle Begründung auch ins
+                // MQTT-Payload (notes) — konsistent mit dem
+                // `flight_end`-Divert-Pfad, damit Recorder/JSONL den
+                // Grund im Audit haben.
+                pirep_payload.notes = reason
+                    .as_deref()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                let pirep_payload_json =
+                    serde_json::to_value(&pirep_payload)
+                        .unwrap_or(serde_json::Value::Null);
+                // QS-P1: JSONL-PirepFiled IMMER, MQTT nur bei Handle.
+                let mqtt = state.mqtt.lock().await;
+                finalize_filed_pirep(
+                    &app,
+                    mqtt.as_ref(),
+                    &flight.pirep_id,
+                    pirep_payload_json,
+                );
+            }
+            // v0.12.5 (LE7-QS): LandingFinalized-JSONL-Event auch beim
+            // manuellen File — vor dem Upload.
+            emit_landing_finalized(&app, &flight);
+            // v0.12.5 (Bug B): Forensik-Upload auch beim manuellen File.
+            spawn_flight_log_upload(&app, flight.pirep_id.clone());
             // v0.7.19 (QS-R1 Finding 1) + QS-R2 Finding 2 (flight_id fallback).
             consume_bid_best_effort(
                 &app,
@@ -12123,7 +12435,7 @@ async fn flight_cancel(
         //                             Kein Auto-Cancel mehr (R2-1 UX-Fix).
         //                             active_flight bleibt erhalten, Pilot
         //                             entscheidet im Frontend nochmal.
-        match flight_end(app.clone(), state.clone(), None, None).await {
+        match flight_end(app.clone(), state.clone(), None, None, None).await {
             Ok(()) => {
                 // flight_end hat erfolgreich gefilt ODER gequeued. In
                 // beiden Faellen ist active_flight geleert, der PIREP
@@ -12302,15 +12614,96 @@ async fn flight_resume_confirm(
             .cloned()
             .ok_or_else(|| UiError::new("no_active_flight", "no flight to resume"))?
     };
-    // Resume confirmed → clear the banner flag.
-    flight.was_just_resumed.store(false, Ordering::Relaxed);
     let client = current_client(&state)?;
-    // v0.6.0 — neuer phpVMS-Worker, eigenstaendig vom Streamer-Tick.
-    // (Geclonted vor dem move in spawn_position_streamer.)
-    spawn_phpvms_position_worker(app.clone(), Arc::clone(&flight), client.clone());
-    spawn_position_streamer(app.clone(), Arc::clone(&flight), client);
-    spawn_touchdown_sampler(app, flight);
+    // v0.12.5 (Spec docs/spec/v0.12.5-divert-and-manual-pirep.md, LE9):
+    // NICHT mehr bedingungslos scharfschalten. Bisher spawnte
+    // flight_resume_confirm Streamer/phpVMS-Worker/Sampler sofort — nach
+    // einem App-/Mac-Neustart mitten im Flug lief der Flug damit OHNE
+    // Simulator (eingefrorene Stats wurden an phpVMS gepostet). Stattdessen
+    // wartet ein Sim-Gate-Task auf einen FRISCHEN Sim-Snapshot und schaltet
+    // erst dann scharf. `was_just_resumed` bleibt true bis dahin → die UI
+    // zeigt weiter den Resume-/Warte-Zustand statt einen scheinbar laufenden
+    // Flug. Sim-agnostisch (X-Plane + MSFS via `current_snapshot`).
+    spawn_resume_sim_gate(app, Arc::clone(&flight), client);
     Ok(())
+}
+
+/// v0.12.5 (LE9): Resume-Sim-Gate. Wartet nach einem Flight-Resume auf
+/// einen frischen Sim-Snapshot (≤ `SIM_GATE_FRESH_SECS`) und schaltet den
+/// Flug erst dann scharf — Streamer + phpVMS-Worker + Touchdown-Sampler.
+/// Bis dahin: kein Streaming, kein phpVMS-Post. Bricht ab, wenn der Flug
+/// nicht mehr aktiv ist (Cancel/Forget/End) oder `stop` gesetzt wurde.
+fn spawn_resume_sim_gate(app: AppHandle, flight: Arc<ActiveFlight>, client: Client) {
+    tauri::async_runtime::spawn(async move {
+        log_activity_handle(
+            &app,
+            ActivityLevel::Warn,
+            "Warte auf Simulator — Flug wird scharfgeschaltet, sobald der Sim Daten liefert"
+                .to_string(),
+            Some(
+                "Resume nach App-/Sim-Neustart: kein Streaming und kein phpVMS-Post, \
+                 bis ein frischer Sim-Snapshot vorliegt."
+                    .to_string(),
+            ),
+        );
+        loop {
+            // Flug abgebrochen / beendet / vergessen → Gate beenden.
+            if flight.stop.load(Ordering::Relaxed) {
+                tracing::info!(
+                    pirep_id = %flight.pirep_id,
+                    "resume sim-gate: flight stopped — exiting without arming"
+                );
+                return;
+            }
+            let still_active = {
+                let st = app.state::<AppState>();
+                let guard = st.active_flight.lock().expect("active_flight lock");
+                guard
+                    .as_ref()
+                    .map(|f| f.pirep_id == flight.pirep_id)
+                    .unwrap_or(false)
+            };
+            if !still_active {
+                tracing::info!(
+                    pirep_id = %flight.pirep_id,
+                    "resume sim-gate: flight no longer active — exiting"
+                );
+                return;
+            }
+            // Frischer Snapshot vom aktuell gewählten Simulator?
+            if let Some(snap) = current_snapshot(&app) {
+                let age_secs = (Utc::now() - snap.timestamp).num_seconds();
+                if age_secs.abs() <= SIM_GATE_FRESH_SECS {
+                    // Sim liefert frische Daten → jetzt scharfschalten.
+                    flight.was_just_resumed.store(false, Ordering::Relaxed);
+                    spawn_phpvms_position_worker(
+                        app.clone(),
+                        Arc::clone(&flight),
+                        client.clone(),
+                    );
+                    spawn_position_streamer(
+                        app.clone(),
+                        Arc::clone(&flight),
+                        client.clone(),
+                    );
+                    spawn_touchdown_sampler(app.clone(), Arc::clone(&flight));
+                    tracing::info!(
+                        pirep_id = %flight.pirep_id,
+                        age_secs,
+                        "resume sim-gate: fresh sim snapshot — flight armed"
+                    );
+                    log_activity_handle(
+                        &app,
+                        ActivityLevel::Info,
+                        "Simulator verbunden — Flug scharfgeschaltet".to_string(),
+                        None,
+                    );
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
 }
 
 /// Drop local active-flight state without contacting phpVMS. Useful when the
@@ -24556,6 +24949,71 @@ mod sim_pause_tests {
             pilot_state_block_reason(&profile_with_state(Some(99))),
             Some("pilot_state_unknown"),
         );
+    }
+}
+
+/// v0.12.5 (Spec v0.12.5-divert-and-manual-pirep.md, LE2b): die
+/// divert/diverted_to-Marker-Logik aus `build_pirep_payload`.
+#[cfg(test)]
+mod v0_12_5_divert_marker_tests {
+    use super::*;
+
+    fn hint(actual: Option<&str>) -> DivertHint {
+        DivertHint {
+            actual_icao: actual.map(|s| s.to_string()),
+            planned_arr_icao: "EDDF".to_string(),
+            planned_alt_icao: None,
+            distance_to_planned_nmi: 0.0,
+            kind: "nearest",
+        }
+    }
+
+    #[test]
+    fn normal_arrival_no_hint_yields_no_markers() {
+        // effective == planned, kein DivertHint → kein Divert-Marker.
+        let (divert, to) = divert_payload_markers("EDDF", "EDDF", None);
+        assert_eq!(divert, None);
+        assert_eq!(to, None);
+    }
+
+    #[test]
+    fn active_divert_sets_both_markers() {
+        // effective != planned → aktiv geflogener Divert.
+        let (divert, to) = divert_payload_markers("EDDV", "EDDF", None);
+        assert_eq!(divert, Some(true));
+        assert_eq!(to.as_deref(), Some("EDDV"));
+    }
+
+    #[test]
+    fn active_divert_wins_over_stale_hint() {
+        // Aktiver Divert hat Vorrang — diverted_to spiegelt das echte
+        // Ziel, nicht ein evtl. abweichendes Hint-ICAO.
+        let h = hint(Some("EDDH"));
+        let (divert, to) =
+            divert_payload_markers("EDDV", "EDDF", Some(&h));
+        assert_eq!(divert, Some(true));
+        assert_eq!(to.as_deref(), Some("EDDV"));
+    }
+
+    #[test]
+    fn passive_hint_fallback_when_not_filed_as_divert() {
+        // effective == planned, aber die FSM hat ein Ausweichfeld
+        // erkannt → passiver Fallback auf den DivertHint.
+        let h = hint(Some("LOWW"));
+        let (divert, to) =
+            divert_payload_markers("EDDF", "EDDF", Some(&h));
+        assert_eq!(divert, Some(true));
+        assert_eq!(to.as_deref(), Some("LOWW"));
+    }
+
+    #[test]
+    fn passive_hint_without_actual_icao_marks_divert_without_target() {
+        // Hint da, aber kein erkanntes ICAO (Privatpiste/Off-DB).
+        let h = hint(None);
+        let (divert, to) =
+            divert_payload_markers("EDDF", "EDDF", Some(&h));
+        assert_eq!(divert, Some(true));
+        assert_eq!(to, None);
     }
 }
 
