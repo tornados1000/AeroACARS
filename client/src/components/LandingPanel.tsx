@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { useConfirm } from "./ConfirmDialog";
@@ -1061,12 +1062,19 @@ export function RunwayDiagram({
 
 // ---- Wind compass -------------------------------------------------------
 
+// v0.12.8-dev: Wind-Visualisierung — animiertes Stromlinien-Feld. Der Wind
+// "weht" sichtbar über die Karte: Richtung = echte Anströmrichtung relativ
+// zur Landerichtung (Bahn waagerecht, Nase rechts), Tempo + Dichte der
+// Streaks = Windstärke, Farbe = Kritikalität (Seitenwind-/Rückenwind-Limit).
+// Im Vordergrund die Kennzahlen als Hero-Zahl + Chips.
 function WindCompass({
   headwindKt,
   crosswindKt,
+  runwayIdent,
 }: {
   headwindKt: number | null;
   crosswindKt: number | null;
+  runwayIdent?: string | null;
 }) {
   const { t } = useTranslation();
   if (headwindKt == null && crosswindKt == null) return null;
@@ -1074,135 +1082,126 @@ function WindCompass({
   const xw = crosswindKt ?? 0;
 
   const totalKt = Math.sqrt(hw * hw + xw * xw);
-  // atan2(xw, hw) — xw > 0 = from right, hw > 0 = from front. This is
-  // the direction the wind COMES FROM relative to the aircraft nose.
-  const angleRad = Math.atan2(xw, hw);
-  const w = 200;
-  const h = 220;
-  const cx = w / 2;
-  const cy = 90;
-  const r = 60;
+  const isTailwind = hw < -0.5;
+  const xwAbs = Math.abs(xw);
+  const twAbs = Math.abs(hw);
+  const xwFromRight = xw >= 0;
+  const calm = totalKt < 1.5;
 
-  // Pilot convention: wind is described by the direction it comes FROM.
-  // Render as a wind-vane needle pointing AT that source. Tail starts
-  // near the centre (just outside the aircraft silhouette), head sits
-  // on the rim in the direction the wind is coming from.
-  const tailX = cx + Math.sin(angleRad) * 16;
-  const tailY = cy - Math.cos(angleRad) * 16;
-  const headX = cx + Math.sin(angleRad) * (r - 4);
-  const headY = cy - Math.cos(angleRad) * (r - 4);
+  // Kritikalität nach Seitenwind-/Rückenwind-Limit — färbt Streaks + Zahl.
+  const critColor =
+    xwAbs >= 25 || (isTailwind && twAbs >= 10)
+      ? "#f87171"
+      : xwAbs >= 15 || (isTailwind && twAbs >= 5)
+        ? "#fbbf24"
+        : "#38bdf8";
 
-  // Pulled from the labels' "from-quadrant" so the user reads it as
-  // "wind aus 5 Uhr" / "from front".
-  const cardinalLabel = (() => {
-    const deg = ((angleRad * 180) / Math.PI + 360) % 360;
-    if (deg < 22.5 || deg >= 337.5) return t("landing.wind_from_front");
-    if (deg < 67.5) return t("landing.wind_from_front_right");
-    if (deg < 112.5) return t("landing.wind_from_right");
-    if (deg < 157.5) return t("landing.wind_from_rear_right");
-    if (deg < 202.5) return t("landing.wind_from_rear");
-    if (deg < 247.5) return t("landing.wind_from_rear_left");
-    if (deg < 292.5) return t("landing.wind_from_left");
-    return t("landing.wind_from_front_left");
-  })();
+  // Anströmrichtung in Screen-Koordinaten. Wind WEHT von der Quelle weg →
+  // Travel-Vektor (−hw, −xw). +x = mit der Landerichtung, +y = nach unten.
+  const travelDeg = calm ? 0 : (Math.atan2(-xw, -hw) * 180) / Math.PI;
+
+  // Mehr Wind → mehr & schnellere Streaks.
+  const streakCount = calm ? 0 : Math.round(Math.min(34, 8 + totalKt * 0.95));
+  const durationMs = Math.round(
+    Math.min(2400, Math.max(620, 2600 - totalKt * 62)),
+  );
+
+  // Deterministisches Pseudo-Feld — kein Flackern bei Re-Render.
+  const streaks = Array.from({ length: streakCount }, (_, i) => {
+    const rand = ((i * 9301 + 49297) % 233280) / 233280;
+    return {
+      y: -110 + ((i * 81) % 440),
+      len: 26 + rand * 40,
+      delay: -(i / Math.max(1, streakCount)) * durationMs,
+      thickness: 1.4 + rand * 1.7,
+      opacity: 0.3 + rand * 0.42,
+    };
+  });
+
+  const headLabel = isTailwind
+    ? t("landing.wind_tailwind")
+    : t("landing.wind_headwind");
+  const sideLabel = xwFromRight
+    ? t("landing.wind_side_right")
+    : t("landing.wind_side_left");
 
   return (
-    <svg
-      className="landing-wind"
-      viewBox={`0 0 ${w} ${h}`}
-      preserveAspectRatio="xMidYMid meet"
-      role="img"
-      aria-label={t("landing.wind")}
-    >
-      <defs>
-        <marker
-          id="wind-arrow"
-          markerWidth="10"
-          markerHeight="10"
-          refX="5"
-          refY="5"
-          orient="auto"
-        >
-          <path d="M0,0 L10,5 L0,10 z" fill="#38bdf8" />
-        </marker>
-      </defs>
-      {/* Compass face */}
-      <circle
-        cx={cx}
-        cy={cy}
-        r={r + 8}
-        fill="rgba(255,255,255,0.04)"
-        stroke="rgba(255,255,255,0.25)"
-      />
-      {/* Cardinal ticks */}
-      {[0, 90, 180, 270].map((deg) => {
-        const a = (deg * Math.PI) / 180;
-        const x1 = cx + Math.sin(a) * (r + 8);
-        const y1 = cy - Math.cos(a) * (r + 8);
-        const x2 = cx + Math.sin(a) * (r + 2);
-        const y2 = cy - Math.cos(a) * (r + 2);
-        return (
-          <line
-            key={deg}
-            x1={x1}
-            y1={y1}
-            x2={x2}
-            y2={y2}
-            stroke="rgba(255,255,255,0.35)"
-            strokeWidth="1.5"
-          />
-        );
-      })}
-      {/* Aircraft silhouette pointing up (north on dial = nose) */}
-      <polygon
-        points={`${cx},${cy - 14} ${cx - 9},${cy + 12} ${cx + 9},${cy + 12}`}
-        fill="#a3a3a3"
-      />
-      {/* Wind needle — points OUTWARD toward the source (windvane convention). */}
-      <line
-        x1={tailX}
-        y1={tailY}
-        x2={headX}
-        y2={headY}
-        stroke="#38bdf8"
-        strokeWidth="3"
-        markerEnd="url(#wind-arrow)"
-        strokeLinecap="round"
-      />
-      {/* Total speed */}
-      <text
-        x={cx}
-        y={cy + r + 28}
-        textAnchor="middle"
-        fontSize="18"
-        fontWeight="600"
-        fill="currentColor"
+    <div className="windflow">
+      <svg
+        className="windflow__field"
+        viewBox="0 0 360 200"
+        preserveAspectRatio="xMidYMid slice"
+        aria-hidden="true"
       >
-        {totalKt.toFixed(0)} kt
-      </text>
-      {/* "Wind aus vorn", "Wind aus links", … */}
-      <text
-        x={cx}
-        y={cy + r + 46}
-        textAnchor="middle"
-        fontSize="11"
-        fill="var(--text-muted, #888)"
-      >
-        {cardinalLabel}
-      </text>
-      {/* Component breakdown */}
-      <text
-        x={cx}
-        y={cy + r + 60}
-        textAnchor="middle"
-        fontSize="10"
-        fill="var(--text-muted, #888)"
-      >
-        H {hw >= 0 ? "+" : ""}
-        {hw.toFixed(0)} · X {xw >= 0 ? "+" : ""}
-        {xw.toFixed(0)} kt
-      </text>
-    </svg>
+        <g transform={`rotate(${travelDeg.toFixed(1)} 180 100)`}>
+          {streaks.map((s, i) => (
+            <line
+              key={i}
+              className="windflow__streak"
+              x1={-140}
+              y1={s.y}
+              x2={-140 + s.len}
+              y2={s.y}
+              stroke={critColor}
+              strokeWidth={s.thickness}
+              strokeLinecap="round"
+              opacity={s.opacity}
+              style={{
+                animationDuration: `${durationMs}ms`,
+                animationDelay: `${s.delay}ms`,
+              }}
+            />
+          ))}
+        </g>
+      </svg>
+      <div className="windflow__overlay">
+        <div className="windflow__top">
+          <span className="windflow__cap">{t("landing.wind")}</span>
+        </div>
+        {calm ? (
+          <div className="windflow__hero">
+            <span className="windflow__hero-label">
+              {t("landing.wind_calm")}
+            </span>
+          </div>
+        ) : (
+          <div className="windflow__hero">
+            <span
+              className="windflow__hero-num"
+              style={{ color: critColor }}
+            >
+              {xwAbs.toFixed(0)}
+            </span>
+            <div className="windflow__hero-meta">
+              <span className="windflow__hero-unit">kt</span>
+              <span className="windflow__hero-sub">
+                {t("landing.wind_crosswind")} · {sideLabel}
+              </span>
+            </div>
+          </div>
+        )}
+        {/* Landebahn — waagerecht, UNTER der Hero-Zahl. Bleibt fix, damit
+            der Winkel der Streaks die Anströmrichtung relativ zur Bahn
+            zeigt. */}
+        {runwayIdent && (
+          <div className="windflow__runway">
+            <span className="windflow__rwy-keys" />
+            <span className="windflow__rwy-line" />
+            <span className="windflow__rwy-id">{runwayIdent}</span>
+          </div>
+        )}
+        {!calm && (
+          <div className="windflow__chips">
+            <span className="windflow__chip">
+              {headLabel} {twAbs.toFixed(0)} kt
+            </span>
+            <span className="windflow__chip">
+              {t("landing.wind_total")} {totalKt.toFixed(0)} kt
+            </span>
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -2098,6 +2097,646 @@ function FuelComparisonBar({
 
 // ---- Detail view --------------------------------------------------------
 
+// ─── v0.12.8-dev: PDF-Export der Landungs-Analyse ───────────────────────
+//
+// Der Pilot exportiert die Landungs-Analyse als mehrseitigen A4-Report.
+// Mechanik:
+//   1. Button "PDF exportieren" in `.landing-detail__top` setzt
+//      `printing = true`.
+//   2. `<LandingReport>` wird via `createPortal` in einen an `document.body`
+//      gehängten Container gerendert. Auf dem Bildschirm ist der Container
+//      `display:none` — sichtbar wird er NUR im `@media print`.
+//   3. Ein Effect ruft `window.print()` (nach dem ersten Render-Frame) und
+//      registriert einen One-Shot `afterprint`-Listener, der `printing`
+//      zurücksetzt — der Report verschwindet wieder aus dem DOM.
+// Der Report nutzt ALLE lokalen Helper (gradeColor, fmtNumber, computeSub-
+// Scores, ApproachChart, VsCurveChart, RunwayDiagramV2 …), darum lebt er
+// hier in-file statt in einer eigenen Datei.
+
+/** App-Version, die in der Report-Fußzeile erscheint. */
+const REPORT_APP_VERSION = "0.12.8";
+
+/** v0.12.8-dev: Fußzeile — EINMAL am Ende des fließenden Dokuments
+ *  (vorher pro Seite). Generierungs-Datum + App-Version. */
+function ReportFooter() {
+  const { t } = useTranslation();
+  const generated = t("landing.report.generated", {
+    date: new Date().toLocaleDateString(),
+    version: REPORT_APP_VERSION,
+  });
+  return (
+    <div className="report-footer">
+      <span>{generated}</span>
+    </div>
+  );
+}
+
+/** Branding-Kopfzeile (Wortmarke + Untertitel + Akzent-Linie). */
+function ReportHeader() {
+  const { t } = useTranslation();
+  return (
+    <div className="report-head">
+      <div className="report-head__brand">
+        <span className="report-head__mark">{t("landing.report.title")}</span>
+        <span className="report-head__sub">
+          {t("landing.report.subtitle")}
+        </span>
+      </div>
+      <div className="report-head__rule" />
+    </div>
+  );
+}
+
+/** Section-Überschrift mit kurzem Akzent-Strich. v0.12.8-dev: jede
+ *  Section bekommt eine eigene Akzentfarbe (`accent`) — wird als CSS-
+ *  Variable `--report-accent` gesetzt und färbt Titel, Strich und die
+ *  Kachel-Akzente. Bringt Farbe in den sonst sehr weißen Report. */
+function ReportSection({
+  title,
+  accent = "#2563eb",
+  children,
+}: {
+  title: string;
+  accent?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <section
+      className="report-section"
+      style={{ ["--report-accent" as string]: accent } as React.CSSProperties}
+    >
+      <h3 className="report-section__title">
+        {title}
+        <span className="report-section__rule" />
+      </h3>
+      {children}
+    </section>
+  );
+}
+
+/** Dunkle Karte um ein Chart — die Chart-Komponenten zeichnen helle
+ *  Strokes auf transparentem Grund und wären auf weißem Papier
+ *  unsichtbar. Die explizite Breite sorgt für korrektes SVG-Sizing
+ *  im Print. */
+function ReportChartCard({
+  caption,
+  children,
+}: {
+  caption: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="report-chart-card">
+      <div className="report-chart-card__caption">{caption}</div>
+      <div className="report-chart-card__panel">{children}</div>
+    </div>
+  );
+}
+
+/** Eine Touchdown-Kennwert-Kachel: Label + großer Wert. */
+function ReportTile({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="report-tile">
+      <div className="report-tile__label">{label}</div>
+      <div className="report-tile__value">{value}</div>
+    </div>
+  );
+}
+
+/**
+ * v0.12.8-dev: Der A4-Landungs-Report. Hell, luftig, EIN Akzent
+ * (#2563eb). KEIN fixes A4-Box-Paradigma mehr — der Report ist EIN
+ * fließendes Dokument; der Browser paginiert selbst (kein Leerseiten-
+ * Bug). Ausgewählte Section-Gruppen starten via `.report-break-before`
+ * auf einer frischen Seite. Nur sichtbar im `@media print`.
+ */
+function LandingReport({ record }: { record: LandingRecord }) {
+  const { t } = useTranslation();
+
+  const callsign = record.airline_icao
+    ? `${record.airline_icao}${record.flight_number}`
+    : record.flight_number;
+
+  const subs = useMemo(() => computeSubScores(record), [record]);
+  const scored = subs.filter((s) => !s.skipped);
+  const worst = scored.length
+    ? [...scored].sort((a, b) => a.points - b.points)[0]
+    : null;
+
+  // Charts nur rendern, wenn genug Datenpunkte da sind (gleiche
+  // Schwellen wie LandingDetail).
+  const hasApproach = record.approach_samples.length >= 3;
+  const hasCloseup = record.touchdown_profile.length >= 5;
+  const v2Props =
+    record.runway_match && (record.runway_geometry_trusted ?? true)
+      ? mapLandingRecordToV2Props(record)
+      : null;
+  const hasCharts = hasApproach || hasCloseup || v2Props != null;
+
+  // Score-Label: bei Confirmed Accident → "ABSTURZ ERKANNT".
+  const heroLabel =
+    record.accident === true
+      ? t("landing.report.accident_label")
+      : record.score_label.toUpperCase();
+
+  // Sub-Score-Balken: Farbe nach Punkten (grün / amber / rot).
+  const barColor = (pts: number) =>
+    pts >= 80 ? "#22c55e" : pts >= 55 ? "#f59e0b" : "#ef4444";
+
+  const rm = record.runway_match;
+
+  // v0.12.8-dev: Anflug-Stabilität — sichtbar wenn mindestens eines der
+  // 7 Stability-v2-Felder vorhanden ist (alte PIREPs ohne sie zeigen die
+  // "no_data"-Hint). Bools zählen nur als vorhanden wenn != null.
+  const hasStability =
+    record.approach_vs_jerk_fpm != null ||
+    record.approach_bank_stddev_deg != null ||
+    record.approach_ias_stddev_kt != null ||
+    record.approach_vs_deviation_fpm != null ||
+    record.approach_max_vs_deviation_below_500_fpm != null ||
+    record.approach_stable_config != null ||
+    record.approach_excessive_sink != null;
+
+  // v0.12.8-dev: Sprit & Gewicht — sichtbar wenn irgendein Fuel/Weight-
+  // Feld da ist (gleiche Bedingung wie die Loadsheet-Section im
+  // on-screen LandingDetail).
+  const hasFuel =
+    record.planned_burn_kg != null ||
+    record.actual_trip_burn_kg != null ||
+    record.block_fuel_kg != null ||
+    record.takeoff_fuel_kg != null ||
+    record.landing_fuel_kg != null ||
+    record.takeoff_weight_kg != null ||
+    record.landing_weight_kg != null ||
+    record.fuel_efficiency_pct != null;
+
+  return (
+    // v0.12.8-dev: EIN fließendes Dokument — kein <ReportPage>-A4-Box-
+    // Stapel mehr. EIN <ReportHeader> oben, dann fließende Sections,
+    // EINE <ReportFooter> ganz unten. Saubere Seitenanfänge entstehen
+    // durch `.report-break-before` auf den Section-Gruppen.
+    <div className="landing-report report-page">
+      <ReportHeader />
+
+      {/* ── Identität & Score ──────────────────────────────────────── */}
+      <div className="report-identity">
+        <div className="report-identity__callsign">{callsign}</div>
+        <div className="report-identity__route">
+          <span>{record.dpt_airport}</span>
+          <span className="report-identity__arrow">→</span>
+          <span>{record.arr_airport}</span>
+        </div>
+        <div className="report-identity__meta">
+          <div>
+            <span className="report-identity__k">
+              {t("landing.report.aircraft")}
+            </span>
+            <span className="report-identity__v">
+              {record.aircraft_title ?? "—"}
+              {record.aircraft_registration
+                ? ` · ${record.aircraft_registration}`
+                : ""}
+              {record.aircraft_icao ? ` · ${record.aircraft_icao}` : ""}
+            </span>
+          </div>
+          <div>
+            <span className="report-identity__k">
+              {t("landing.report.simulator")}
+            </span>
+            <span className="report-identity__v">
+              {record.sim_kind ?? "—"}
+            </span>
+          </div>
+          <div>
+            <span className="report-identity__k">
+              {t("landing.report.touchdown_time")}
+            </span>
+            <span className="report-identity__v">
+              {fmtDateTime(record.touchdown_at)}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div
+        className="report-hero"
+        style={{
+          borderLeft: `7px solid ${gradeColor(record.grade_letter)}`,
+        }}
+      >
+        <div
+          className="report-hero__badge"
+          style={{ background: gradeColor(record.grade_letter) }}
+        >
+          {record.grade_letter}
+        </div>
+        <div className="report-hero__text">
+          <div className="report-hero__score">
+            {record.score_numeric}
+            <span className="report-hero__of">
+              {" "}
+              {t("landing.report.hero_of")}
+            </span>
+          </div>
+          <div className="report-hero__label">{heroLabel}</div>
+        </div>
+      </div>
+
+      <ReportSection title={t("landing.report.breakdown")}>
+        <div className="report-bars">
+          {subs.map((s) => (
+            <div key={s.key} className="report-bar">
+              <div className="report-bar__head">
+                <span className="report-bar__label">
+                  {t(`landing.sub.${s.key}`)}
+                </span>
+                <span className="report-bar__pts">
+                  {s.skipped
+                    ? t("landing.skipped_label")
+                    : `${s.points} PTS`}
+                </span>
+              </div>
+              <div className="report-bar__track">
+                {!s.skipped && (
+                  <div
+                    className="report-bar__fill"
+                    style={{
+                      width: `${Math.max(0, Math.min(100, s.points))}%`,
+                      background: barColor(s.points),
+                    }}
+                  />
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      </ReportSection>
+
+      {worst && (
+        <ReportSection title={t("landing.report.coach")}>
+          <div className="report-coach">
+            <div className="report-coach__focus">
+              {t(`landing.sub.${worst.key}`)}
+            </div>
+            <p className="report-coach__body">
+              {t(coachTipKey(worst.rationale))}
+            </p>
+          </div>
+        </ReportSection>
+      )}
+
+      {/* ── Touchdown-Kennwerte (frische Seite) ────────────────────── */}
+      <div className="report-break-before">
+        <ReportSection title={t("landing.report.touchdown_section")}>
+          <div className="report-tiles">
+            <ReportTile
+              label={t("landing.landing_rate")}
+              value={fmtNumber(scoreBasisVs(record), 0, "fpm")}
+            />
+            <ReportTile
+              label={t("landing.g_force")}
+              value={fmtNumber(record.landing_g_force, 2, "G")}
+            />
+            <ReportTile
+              label={t("landing.pitch")}
+              value={fmtSigned(record.landing_pitch_deg, 1, "°")}
+            />
+            <ReportTile
+              label={t("landing.bank")}
+              value={fmtSigned(record.landing_bank_deg, 1, "°")}
+            />
+            <ReportTile
+              label={t("landing.speed")}
+              value={fmtNumber(record.landing_speed_kt, 0, "kt")}
+            />
+            <ReportTile
+              label={t("landing.sideslip")}
+              value={fmtSigned(record.touchdown_sideslip_deg, 1, "°")}
+            />
+            <ReportTile
+              label={t("landing.bounces")}
+              value={String(record.bounce_count)}
+            />
+            <ReportTile
+              label={t("landing.heading")}
+              value={fmtNumber(record.landing_heading_deg, 0, "°")}
+            />
+          </div>
+        </ReportSection>
+
+        {/* v0.12.8-dev: NEUE Section — Anflug-Stabilität. Felder +
+            Labels gespiegelt von ApproachStabilityCard für Konsistenz. */}
+        <ReportSection
+          title={t("landing.report.stability_section")}
+          accent="#7c3aed"
+        >
+          {hasStability ? (
+            <div className="report-tiles">
+              {record.approach_vs_jerk_fpm != null && (
+                <ReportTile
+                  label={t(
+                    "landing.approach_stability_card.tiles.vs_jerk.label",
+                  )}
+                  value={fmtNumber(record.approach_vs_jerk_fpm, 0, "fpm")}
+                />
+              )}
+              {record.approach_bank_stddev_deg != null && (
+                <ReportTile
+                  label={t(
+                    "landing.approach_stability_card.tiles.bank_sigma.label",
+                  )}
+                  value={fmtNumber(record.approach_bank_stddev_deg, 1, "°")}
+                />
+              )}
+              {record.approach_ias_stddev_kt != null && (
+                <ReportTile
+                  label={t(
+                    "landing.approach_stability_card.tiles.ias_sigma.label",
+                  )}
+                  value={fmtNumber(record.approach_ias_stddev_kt, 1, "kt")}
+                />
+              )}
+              {record.approach_vs_deviation_fpm != null && (
+                <ReportTile
+                  label={t(
+                    "landing.approach_stability_card.tiles.vs_vs_ils.label",
+                  )}
+                  value={fmtNumber(record.approach_vs_deviation_fpm, 0, "fpm")}
+                />
+              )}
+              {record.approach_max_vs_deviation_below_500_fpm != null && (
+                <ReportTile
+                  label={t(
+                    "landing.approach_stability_card.tiles.max_vs_dev.label",
+                  )}
+                  value={fmtNumber(
+                    record.approach_max_vs_deviation_below_500_fpm,
+                    0,
+                    "fpm",
+                  )}
+                />
+              )}
+              {record.approach_stable_config != null && (
+                <ReportTile
+                  label={t(
+                    "landing.approach_stability_card.tiles.landing_config.label",
+                  )}
+                  value={
+                    record.approach_stable_config
+                      ? t(
+                          "landing.approach_stability_card.tiles.landing_config.value_ok",
+                        )
+                      : t(
+                          "landing.approach_stability_card.tiles.landing_config.value_partial",
+                        )
+                  }
+                />
+              )}
+              {record.approach_excessive_sink != null && (
+                <ReportTile
+                  label={t(
+                    "landing.approach_stability_card.tiles.sink_rate.label",
+                  )}
+                  value={
+                    record.approach_excessive_sink
+                      ? t(
+                          "landing.approach_stability_card.tiles.sink_rate.value_excessive",
+                        )
+                      : t(
+                          "landing.approach_stability_card.tiles.sink_rate.value_ok",
+                        )
+                  }
+                />
+              )}
+            </div>
+          ) : (
+            <div className="report-empty">
+              {t("landing.report.no_data")}
+            </div>
+          )}
+        </ReportSection>
+      </div>
+
+      {/* ── Wind & Bahn (frische Seite) ────────────────────────────── */}
+      <div className="report-break-before">
+        <ReportSection
+          title={t("landing.report.wind_section")}
+          accent="#0891b2"
+        >
+          {(() => {
+            const hw = record.headwind_kt;
+            const xw = record.crosswind_kt;
+            if (hw == null && xw == null) {
+              return (
+                <div className="report-empty">
+                  {t("landing.report.no_data")}
+                </div>
+              );
+            }
+            const hwV = hw ?? 0;
+            const xwV = xw ?? 0;
+            const total = Math.sqrt(hwV * hwV + xwV * xwV);
+            const hwLabel =
+              hwV < -0.5
+                ? t("landing.wind_tailwind")
+                : t("landing.wind_headwind");
+            const xwSide =
+              xwV >= 0
+                ? t("landing.wind_side_right")
+                : t("landing.wind_side_left");
+            return (
+              <div className="report-tiles">
+                <ReportTile
+                  label={hwLabel}
+                  value={fmtNumber(Math.abs(hwV), 0, "kt")}
+                />
+                <ReportTile
+                  label={`${t("landing.wind_crosswind")} · ${xwSide}`}
+                  value={fmtNumber(Math.abs(xwV), 0, "kt")}
+                />
+                <ReportTile
+                  label={t("landing.wind_total")}
+                  value={fmtNumber(total, 0, "kt")}
+                />
+              </div>
+            );
+          })()}
+        </ReportSection>
+
+        <ReportSection
+          title={t("landing.report.runway_section")}
+          accent="#0d9488"
+        >
+          {rm ? (
+            <div className="report-tiles">
+              <ReportTile
+                label={t("landing.runway")}
+                value={`${rm.airport_ident} ${rm.runway_ident}`}
+              />
+              <ReportTile
+                label={t("landing.report.rwy_length")}
+                value={fmtNumber(rm.length_ft * 0.3048, 0, "m")}
+              />
+              <ReportTile
+                label={t("landing.report.rwy_surface")}
+                value={rm.surface || "—"}
+              />
+              {record.td_distance_from_threshold_m != null && (
+                <ReportTile
+                  label={t("landing.report.td_distance")}
+                  value={fmtNumber(
+                    record.td_distance_from_threshold_m,
+                    0,
+                    "m",
+                  )}
+                />
+              )}
+              {record.td_in_tdz != null && (
+                <ReportTile
+                  label={t("landing.report.in_tdz")}
+                  value={
+                    record.td_in_tdz
+                      ? t("landing.report.yes")
+                      : t("landing.report.no")
+                  }
+                />
+              )}
+              {record.aim_delta_m != null && (
+                <ReportTile
+                  label={t("landing.report.aim_delta")}
+                  value={fmtSigned(record.aim_delta_m, 0, "m")}
+                />
+              )}
+              {Number.isFinite(rm.centerline_distance_m) && (
+                <ReportTile
+                  label={t("landing.report.centerline")}
+                  value={fmtNumber(
+                    Math.abs(rm.centerline_distance_m),
+                    1,
+                    "m",
+                  )}
+                />
+              )}
+              {record.rollout_distance_m != null && (
+                <ReportTile
+                  label={t("landing.report.rollout_dist")}
+                  value={fmtNumber(record.rollout_distance_m, 0, "m")}
+                />
+              )}
+            </div>
+          ) : (
+            <div className="report-empty">
+              {t("landing.report.no_data")}
+            </div>
+          )}
+        </ReportSection>
+
+        {/* v0.12.8-dev: NEUE Section — Sprit & Gewicht (Plan vs. Ist).
+            Felder + Labels gespiegelt von der Loadsheet-Section im
+            on-screen LandingDetail. */}
+        <ReportSection
+          title={t("landing.report.fuel_section")}
+          accent="#d97706"
+        >
+          {hasFuel ? (
+            <div className="report-tiles">
+              {(record.planned_burn_kg != null ||
+                record.actual_trip_burn_kg != null) && (
+                <ReportTile
+                  label={`${t("landing.trip_burn")} · ${t(
+                    "landing.actual_burn",
+                  )}`}
+                  value={fmtNumber(record.actual_trip_burn_kg, 0, "kg")}
+                />
+              )}
+              {record.planned_burn_kg != null && (
+                <ReportTile
+                  label={`${t("landing.trip_burn")} · ${t(
+                    "landing.plan_burn",
+                  )}`}
+                  value={fmtNumber(record.planned_burn_kg, 0, "kg")}
+                />
+              )}
+              {record.fuel_efficiency_kg_diff != null && (
+                <ReportTile
+                  label={t("landing.report.fuel_diff")}
+                  value={fmtSigned(record.fuel_efficiency_kg_diff, 0, "kg")}
+                />
+              )}
+              {record.fuel_efficiency_pct != null && (
+                <ReportTile
+                  label={t("landing.report.fuel_efficiency")}
+                  value={fmtSigned(record.fuel_efficiency_pct, 1, "%")}
+                />
+              )}
+              {record.block_fuel_kg != null && (
+                <ReportTile
+                  label={t("landing.block_fuel")}
+                  value={fmtNumber(record.block_fuel_kg, 0, "kg")}
+                />
+              )}
+              {record.landing_fuel_kg != null && (
+                <ReportTile
+                  label={t("landing.landing_fuel")}
+                  value={fmtNumber(record.landing_fuel_kg, 0, "kg")}
+                />
+              )}
+              {record.takeoff_weight_kg != null && (
+                <ReportTile
+                  label={t("landing.tow")}
+                  value={fmtNumber(record.takeoff_weight_kg, 0, "kg")}
+                />
+              )}
+              {record.landing_weight_kg != null && (
+                <ReportTile
+                  label={t("landing.ldw")}
+                  value={fmtNumber(record.landing_weight_kg, 0, "kg")}
+                />
+              )}
+            </div>
+          ) : (
+            <div className="report-empty">
+              {t("landing.report.no_data")}
+            </div>
+          )}
+        </ReportSection>
+      </div>
+
+      {/* ── Profile & Verläufe (frische Seite) ─────────────────────── */}
+      {hasCharts && (
+        <div className="report-break-before">
+          <ReportSection title={t("landing.report.charts_section")}>
+            <div className="report-charts">
+              {hasApproach && (
+                <ReportChartCard
+                  caption={t("landing.report.approach_chart")}
+                >
+                  <ApproachChart samples={record.approach_samples} />
+                </ReportChartCard>
+              )}
+              {hasCloseup && (
+                <ReportChartCard caption={t("landing.report.vs_curve")}>
+                  <VsCurveChart profile={record.touchdown_profile} />
+                </ReportChartCard>
+              )}
+              {v2Props && (
+                <ReportChartCard
+                  caption={t("landing.report.runway_diagram")}
+                >
+                  <RunwayDiagramV2 {...v2Props} />
+                </ReportChartCard>
+              )}
+            </div>
+          </ReportSection>
+        </div>
+      )}
+
+      {/* v0.12.8-dev: EINE Fußzeile am Dokumentende. */}
+      <ReportFooter />
+    </div>
+  );
+}
+
 function LandingDetail({
   record,
   allRecords,
@@ -2136,11 +2775,35 @@ function LandingDetail({
     personalBest != null &&
     Math.abs(record.landing_rate_fpm) < Math.abs(personalBest.landing_rate_fpm);
 
+  // v0.12.8-dev: PDF-Export-State. Sobald `printing` true wird, rendert
+  // der Effect den <LandingReport> ins DOM, ruft `window.print()` und
+  // setzt nach `afterprint` wieder zurück.
+  const [printing, setPrinting] = useState(false);
+  useEffect(() => {
+    if (!printing) return;
+    // Einen Frame warten, damit der Report (inkl. Charts) im DOM ist,
+    // bevor der Druckdialog aufgeht.
+    const raf = requestAnimationFrame(() => {
+      const done = () => setPrinting(false);
+      window.addEventListener("afterprint", done, { once: true });
+      window.print();
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [printing]);
+
   return (
     <div className="landing-detail">
       <div className="landing-detail__top">
         <button type="button" className="landing-back" onClick={onBack}>
           ← {t("landing.back_to_list")}
+        </button>
+        <button
+          type="button"
+          className="landing-export"
+          onClick={() => setPrinting(true)}
+          title={t("landing.report.button")}
+        >
+          🖨 {t("landing.report.button")}
         </button>
         {!isPreview && onDelete && (
           <button
@@ -2153,6 +2816,16 @@ function LandingDetail({
           </button>
         )}
       </div>
+
+      {/* v0.12.8-dev: Druck-Report — per Portal an document.body gehängt,
+          auf dem Bildschirm display:none, nur sichtbar im @media print. */}
+      {printing &&
+        createPortal(
+          <div className="landing-report-print">
+            <LandingReport record={record} />
+          </div>,
+          document.body,
+        )}
 
       <div className="landing-headline">
         <div
@@ -2334,10 +3007,9 @@ function LandingDetail({
               <dt>{t("landing.g_force")}</dt>
               <dd>{fmtNumber(record.landing_g_force, 2, "G")}</dd>
             </div>
-            <div>
-              <dt>{t("landing.peak_g")}</dt>
-              <dd>{fmtNumber(record.landing_peak_g_force, 2, "G")}</dd>
-            </div>
+            {/* v0.12.8-dev: ROH-PEAK G aus der Touchdown-Headline
+                entfernt — war ~immer identisch mit G-Kraft (Doppel-
+                Anzeige). Der rohe Peak bleibt in der G-Force-Forensik. */}
             <div>
               <dt>{t("landing.pitch")}</dt>
               <dd>{fmtSigned(record.landing_pitch_deg, 1, "°")}</dd>
@@ -2366,6 +3038,7 @@ function LandingDetail({
           <WindCompass
             headwindKt={record.headwind_kt}
             crosswindKt={record.crosswind_kt}
+            runwayIdent={record.runway_match?.runway_ident ?? null}
           />
         </div>
       </section>

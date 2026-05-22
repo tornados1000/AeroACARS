@@ -5028,6 +5028,23 @@ input:disabled {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 0.5rem;
+}
+
+/* v0.12.8-dev: PDF-Export-Button — sitzt zwischen Zurück und Löschen. */
+.landing-export {
+  background: transparent;
+  border: 1px solid var(--accent, #2563eb);
+  border-radius: 6px;
+  color: var(--accent, #2563eb);
+  padding: 0.4rem 0.8rem;
+  cursor: pointer;
+  font-size: 0.9rem;
+  margin-left: auto;
+}
+
+.landing-export:hover {
+  background: rgba(37, 99, 235, 0.1);
 }
 
 .landing-back {
@@ -5473,13 +5490,172 @@ input:disabled {
   color: var(--text-muted);
 }
 
-.landing-wind {
+/* v0.12.8-dev: Wind-Visualisierung — animiertes Stromlinien-Feld mit
+   Hero-Zahl. Der Wind "weht" sichtbar über die Karte. */
+.windflow {
+  position: relative;
+  overflow: hidden;
   width: 100%;
-  max-width: 200px;
-  height: auto;
-  color: var(--text-muted);
-  justify-self: center;
-  align-self: center;
+  min-height: 172px;
+  border-radius: 12px;
+  background: radial-gradient(125% 125% at 18% 0%, #1e293b 0%, #0b1120 100%);
+  align-self: start;
+}
+
+.windflow__field {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+@keyframes windflow-streak {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(560px);
+  }
+}
+
+.windflow__streak {
+  animation-name: windflow-streak;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+  will-change: transform;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .windflow__streak {
+    animation: none;
+  }
+}
+
+.windflow__overlay {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 0.6rem;
+  min-height: 172px;
+  box-sizing: border-box;
+  padding: 0.85rem 1rem;
+}
+
+.windflow__top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.windflow__cap {
+  font-size: 0.68rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+/* Landebahn-Streifen — waagerecht, sitzt UNTER der Hero-Zahl. */
+.windflow__runway {
+  position: relative;
+  height: 30px;
+  border-radius: 6px;
+  background: rgba(2, 6, 23, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+}
+
+.windflow__rwy-keys {
+  position: absolute;
+  left: 8px;
+  top: 6px;
+  bottom: 6px;
+  width: 15px;
+  background: repeating-linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.55) 0 3px,
+    transparent 3px 7px
+  );
+}
+
+.windflow__rwy-line {
+  position: absolute;
+  left: 58px;
+  right: 22px;
+  top: 50%;
+  border-top: 2.5px dashed rgba(255, 255, 255, 0.42);
+}
+
+.windflow__rwy-id {
+  position: absolute;
+  left: 32px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 0.8rem;
+  font-weight: 800;
+  letter-spacing: 0.09em;
+  color: rgba(255, 255, 255, 0.72);
+}
+
+.windflow__hero {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.55rem;
+}
+
+.windflow__hero-num {
+  font-size: 3.6rem;
+  font-weight: 800;
+  line-height: 0.82;
+  letter-spacing: -0.03em;
+  font-variant-numeric: tabular-nums;
+  text-shadow: 0 2px 18px rgba(0, 0, 0, 0.55);
+}
+
+.windflow__hero-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding-bottom: 0.3rem;
+}
+
+.windflow__hero-unit {
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: rgba(255, 255, 255, 0.72);
+}
+
+.windflow__hero-sub {
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: rgba(255, 255, 255, 0.62);
+}
+
+.windflow__hero-label {
+  font-size: 1.55rem;
+  font-weight: 700;
+  color: rgba(255, 255, 255, 0.88);
+}
+
+.windflow__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.windflow__chip {
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.82);
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 999px;
+  padding: 0.22rem 0.62rem;
+  font-variant-numeric: tabular-nums;
+  backdrop-filter: blur(2px);
 }
 
 /* ---- Stability ---- */
@@ -5834,8 +6010,8 @@ input:disabled {
 
 .landing-grid--td {
   display: grid;
-  grid-template-columns: minmax(0, 2fr) minmax(0, 1.8fr) minmax(0, 1fr);
-  gap: 1.25rem;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  gap: 1.5rem;
   align-items: start;
 }
 
@@ -5843,9 +6019,8 @@ input:disabled {
   .landing-grid--td {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   }
-  .landing-grid--td > .landing-wind {
+  .landing-grid--td > .windflow {
     grid-column: 1 / -1;
-    justify-self: center;
   }
 }
 
@@ -6904,4 +7079,366 @@ input:disabled {
   border: 1px solid var(--border);
   color: var(--fg-dim);
   font-size: 0.85rem;
+}
+
+/* ─── v0.12.8-dev: PDF-Export der Landungs-Analyse ──────────────────────
+ *
+ * Mehrseitiger A4-Report. Auf dem Bildschirm IMMER display:none — der
+ * Container wird nur im @media-print-Block sichtbar geschaltet. Design:
+ * helles Papier, dunkler Slate-Text, EIN Akzent #2563eb, viel Weißraum.
+ */
+
+.landing-report-print {
+  display: none;
+}
+
+.landing-report {
+  print-color-adjust: exact;
+  -webkit-print-color-adjust: exact;
+  font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  color: #0f172a;
+  background: #ffffff;
+}
+
+/* v0.12.8-dev: KEIN fixes A4-Box-Paradigma mehr. Der Report ist EIN
+   fließendes Dokument — der Browser paginiert selbst, der @page-Rand
+   (siehe @media print) liefert den druckbaren Rahmen. Damit entfallen
+   die leeren Folgeseiten, die `min-height:297mm` + `break-after:page`
+   erzeugt haben. `.report-page` bleibt nur als no-op-Wrapper bestehen. */
+.report-page {
+  background: #ffffff;
+}
+
+/* v0.12.8-dev: KEINE erzwungenen Seitenumbrüche mehr. Die harten
+   break-before-Umbrüche pro Kapitel rissen den Inhalt auseinander und
+   ließen halbe Seiten leer (Coach-Hinweis allein auf Seite 2 usw.).
+   Der Report fließt jetzt dicht — `break-inside:avoid` hält einzelne
+   Sections/Kacheln zusammen, der Browser füllt die Seiten. */
+.report-break-before {
+  /* no-op Wrapper — Umbruch absichtlich entfernt */
+}
+
+/* Branding-Kopf. */
+.report-head {
+  margin-bottom: 12mm;
+}
+.report-head__brand {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.report-head__mark {
+  font-size: 22pt;
+  font-weight: 800;
+  letter-spacing: -0.5px;
+  color: #0f172a;
+}
+.report-head__sub {
+  font-size: 11pt;
+  font-weight: 500;
+  color: #64748b;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+.report-head__rule {
+  margin-top: 6px;
+  height: 3px;
+  width: 100%;
+  background: linear-gradient(90deg, #2563eb 0%, #06b6d4 60%, #10b981 100%);
+  border-radius: 2px;
+}
+
+/* Section + Akzent-Strich unter der Überschrift. */
+/* v0.12.8-dev: break-inside:avoid hält eine Section zusammen, statt sie
+   über eine Seitengrenze zu zerreißen. */
+.report-section {
+  margin-bottom: 9mm;
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+/* v0.12.8-dev: Section-Titel + Strich tragen jetzt die Section-
+   Akzentfarbe (--report-accent), gesetzt von <ReportSection accent>. */
+.report-section__title {
+  font-size: 12pt;
+  font-weight: 700;
+  color: var(--report-accent, #2563eb);
+  margin: 0 0 5mm 0;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.report-section__rule {
+  display: inline-block;
+  height: 2px;
+  flex: 1 1 auto;
+  background: linear-gradient(
+    90deg,
+    var(--report-accent, #2563eb),
+    transparent
+  );
+  border-radius: 2px;
+}
+
+/* Flug-Identität. */
+.report-identity {
+  margin-bottom: 8mm;
+}
+.report-identity__callsign {
+  font-size: 30pt;
+  font-weight: 800;
+  letter-spacing: -1px;
+  color: #0f172a;
+  line-height: 1.05;
+}
+.report-identity__route {
+  font-size: 15pt;
+  font-weight: 600;
+  color: #334155;
+  margin-top: 3mm;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.report-identity__arrow {
+  color: #2563eb;
+  font-weight: 700;
+}
+.report-identity__meta {
+  margin-top: 6mm;
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 4mm;
+}
+.report-identity__meta > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.report-identity__k {
+  font-size: 8pt;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #94a3b8;
+}
+.report-identity__v {
+  font-size: 10pt;
+  font-weight: 500;
+  color: #334155;
+}
+
+/* Hero-Score. */
+.report-hero {
+  display: flex;
+  align-items: center;
+  gap: 8mm;
+  padding: 7mm;
+  margin-bottom: 9mm;
+  background: #f7f8fa;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  /* v0.12.8-dev: Hero-Block nicht über die Seitengrenze splitten. */
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+.report-hero__badge {
+  width: 34mm;
+  height: 34mm;
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 40pt;
+  font-weight: 800;
+  color: #ffffff;
+}
+.report-hero__score {
+  font-size: 38pt;
+  font-weight: 800;
+  color: #0f172a;
+  line-height: 1;
+}
+.report-hero__of {
+  font-size: 13pt;
+  font-weight: 500;
+  color: #94a3b8;
+}
+.report-hero__label {
+  margin-top: 3mm;
+  font-size: 13pt;
+  font-weight: 700;
+  letter-spacing: 1px;
+  color: #2563eb;
+  text-transform: uppercase;
+}
+
+/* Score-Aufschlüsselung — Balken. */
+.report-bars {
+  display: flex;
+  flex-direction: column;
+  gap: 4mm;
+}
+.report-bar__head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 1.5mm;
+}
+.report-bar__label {
+  font-size: 10pt;
+  font-weight: 600;
+  color: #334155;
+}
+.report-bar__pts {
+  font-size: 9pt;
+  font-weight: 700;
+  color: #64748b;
+}
+.report-bar__track {
+  height: 8px;
+  border-radius: 4px;
+  background: #e2e8f0;
+  overflow: hidden;
+}
+.report-bar__fill {
+  height: 100%;
+  border-radius: 4px;
+}
+
+/* Coach-Hinweis. */
+.report-coach {
+  padding: 5mm 6mm;
+  background: #f7f8fa;
+  border-left: 3px solid #2563eb;
+  border-radius: 6px;
+  /* v0.12.8-dev: Coach-Box nicht splitten. */
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+.report-coach__focus {
+  font-size: 9pt;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: #2563eb;
+  margin-bottom: 2mm;
+}
+.report-coach__body {
+  margin: 0;
+  font-size: 10pt;
+  line-height: 1.5;
+  color: #334155;
+}
+
+/* Kennwert-Kacheln. */
+/* v0.12.8-dev: Kachelraster + einzelne Kacheln nicht über die
+   Seitengrenze zerreißen. */
+.report-tiles {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4mm;
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+/* v0.12.8-dev: Kacheln tragen oben einen 3px-Akzentstreifen und einen
+   sehr zarten Farbschleier in der Section-Akzentfarbe — bringt Farbe
+   rein, ohne den hellen, edlen Look zu kippen. */
+.report-tile {
+  padding: 3.4mm 4mm;
+  background: color-mix(in srgb, var(--report-accent, #2563eb) 5%, #ffffff);
+  border: 1px solid #e2e8f0;
+  border-top: 3px solid var(--report-accent, #2563eb);
+  border-radius: 8px;
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+.report-tile__label {
+  font-size: 8pt;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--report-accent, #2563eb);
+  margin-bottom: 2mm;
+}
+.report-tile__value {
+  font-size: 16pt;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+/* Leer-Hinweis. */
+.report-empty {
+  font-size: 10pt;
+  color: #94a3b8;
+  font-style: italic;
+}
+
+/* Charts — dunkle Karte um die hell gezeichneten SVGs. */
+.report-charts {
+  display: flex;
+  flex-direction: column;
+  gap: 6mm;
+}
+.report-chart-card {
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+.report-chart-card__caption {
+  font-size: 9pt;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #334155;
+  margin-bottom: 2mm;
+}
+.report-chart-card__panel {
+  background: #0f172a;
+  border-radius: 10px;
+  padding: 5mm;
+  width: 100%;
+  box-sizing: border-box;
+  color: #cbd5e1;
+}
+.report-chart-card__panel .landing-chart,
+.report-chart-card__panel .landing-runway,
+.report-chart-card__panel svg {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
+/* v0.12.8-dev: EINE Fußzeile am Ende des gesamten Dokuments (nicht
+   mehr pro Seite). */
+.report-footer {
+  margin-top: 8mm;
+  padding-top: 3mm;
+  border-top: 1px solid #e2e8f0;
+  display: flex;
+  justify-content: space-between;
+  font-size: 8pt;
+  color: #94a3b8;
+}
+
+/* Druck: nur den Report zeigen, App ausblenden. */
+@media print {
+  /* v0.12.8-dev: Der @page-Rand liefert jetzt den druckbaren Rahmen
+     (vorher margin:0 + 15mm-Padding pro Box). Der Browser paginiert
+     den fließenden Report selbst — keine erzwungenen Leerseiten mehr. */
+  @page {
+    size: A4;
+    margin: 14mm 15mm;
+  }
+  /* v0.12.8-dev: Die App per `display:none` KOMPLETT aus dem Druck-
+     Layout nehmen. `visibility:hidden` reichte NICHT — das hält das
+     Element im Layout, die lange Landungs-Detail-Ansicht erzeugte so
+     ~8 unsichtbare Leerseiten VOR dem Report. `display:none` entfernt
+     sie ganz, nur der Report fließt dann. */
+  body > #root {
+    display: none !important;
+  }
+  .landing-report-print {
+    display: block !important;
+  }
 }
