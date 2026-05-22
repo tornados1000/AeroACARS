@@ -11,7 +11,7 @@
 //! tail; nothing prior shifts.
 
 use chrono::Utc;
-use sim_core::{AircraftProfile, SimSnapshot, Simulator};
+use sim_core::{clean_atc_model, AircraftProfile, SimSnapshot, Simulator};
 
 const KG_PER_LB: f64 = 0.453_592_37;
 
@@ -1307,8 +1307,13 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
         // (`AircraftProfile::icao_fallback()`), wenn der SimVar nichts
         // liefert. Profile ohne eindeutige Variante (FBW, Default)
         // behalten None und bleiben „?".
-        aircraft_icao: Some(t.atc_model)
-            .filter(|s| !s.is_empty())
+        //
+        // v0.12.10: `clean_atc_model` statt des rohen `t.atc_model` —
+        // sonst landet ein Token wie `ATCCOM.AC_MODEL C208.0.text`
+        // (BlackSquare Caravan) ungereinigt in `aircraft_icao`. Liefert
+        // `clean_atc_model` `None` (leer / nicht decodierbar), greift
+        // weiter der Profile-Fallback.
+        aircraft_icao: clean_atc_model(&t.atc_model)
             .or_else(|| profile.icao_fallback().map(str::to_string)),
         aircraft_registration: Some(t.atc_id).filter(|s| !s.is_empty()),
         simulator,

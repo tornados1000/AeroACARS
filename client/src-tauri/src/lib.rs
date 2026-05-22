@@ -477,53 +477,13 @@ const MAX_START_DISTANCE_NM: f64 = 5.0;
 /// fine — same airport, same check.
 const MAX_FILE_DISTANCE_NM: f64 = 5.0;
 
-/// MSFS often returns SimVar values as localization keys, not plain text.
-/// The ATC MODEL var is one of them — e.g. `TT:ATCCOM.AC_MODEL_A320.0.text`
-/// or `ATCCOM.AC_MODEL A320.0.text`. Pull out the readable code, or return
-/// `None` if the input is an unresolved key we can't decode.
-fn clean_atc_model(raw: &str) -> Option<String> {
-    let s = raw.trim();
-    if s.is_empty() {
-        return None;
-    }
-    if let Some(start) = s.find("AC_MODEL") {
-        let after = &s[start + "AC_MODEL".len()..];
-        let after = after.trim_start_matches(|c: char| c == '_' || c == ' ');
-        if let Some(end) = after.find('.') {
-            let model = &after[..end];
-            if !model.is_empty() {
-                return Some(model.to_uppercase());
-            }
-        }
-    }
-    let upper = s.to_uppercase();
-    if upper.starts_with("TT:") || upper.contains("ATCCOM.") || upper.ends_with(".TEXT") {
-        return None;
-    }
-    // v0.8.1: Vendor-Tag-Prefix-Strip. Einige MSFS-Addons (Flysimware
-    // Citation X, manche Carenado-Pakete) schicken den ICAO mit einem
-    // "$$:"-Prefix als ATC-MODEL — Sim liefert z.B. "$$:C750" statt
-    // "C750". Aircraft-Mismatch-Check verglich dann "C750" (Bid) gegen
-    // "$$:C750" (Sim) und schlug fehl. Live-Bug GSG/Sven M 2026-05-13.
-    // Wir strippen den Prefix wenn er aus 1-4 Zeichen + ":" besteht
-    // und kein Buchstabe enthält (= Sonderzeichen wie "$$:" / "##:"),
-    // damit echte ICAO-Codes wie "TT:..." (= text-token, oben schon
-    // gefiltert) nicht falsch behandelt werden.
-    if let Some(colon_pos) = upper.find(':') {
-        if colon_pos <= 4 {
-            let prefix = &upper[..colon_pos];
-            let is_vendor_tag = !prefix.is_empty()
-                && !prefix.chars().any(|c| c.is_ascii_alphanumeric());
-            if is_vendor_tag {
-                let stripped = upper[colon_pos + 1..].trim().to_string();
-                if !stripped.is_empty() {
-                    return Some(stripped);
-                }
-            }
-        }
-    }
-    Some(upper)
-}
+// v0.12.10: `clean_atc_model` ist nach `sim-core` gezogen, damit der
+// MSFS-Telemetrie-Adapter den `ATC MODEL` schon bei der Erfassung
+// bereinigt (BlackSquare-Caravan-Bug: roher Token `ATCCOM.AC_MODEL
+// C208.0.text` landete ungereinigt in `aircraft_icao` → „Type ?" →
+// kaputtes phpVMS-Filing). Re-Import hier, damit die bestehenden
+// Aufruf-Stellen unverändert weiterlaufen.
+use sim_core::clean_atc_model;
 
 /// Loose check: does the aircraft title from MSFS appear to mention the given
 /// ICAO code? Used as a permissive backup when ATC MODEL parses to one code

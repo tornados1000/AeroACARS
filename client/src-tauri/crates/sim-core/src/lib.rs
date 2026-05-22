@@ -813,6 +813,60 @@ pub enum SimError {
 //   * Add a Phase FSM driven by SimSnapshot streams.
 //   * Add a snapshot ring buffer for downstream consumers.
 
+/// MSFS often returns SimVar values as localization keys, not plain text.
+/// The ATC MODEL var is one of them — e.g. `TT:ATCCOM.AC_MODEL_A320.0.text`
+/// or `ATCCOM.AC_MODEL C208.0.text`. Pull out the readable code, or return
+/// `None` if the input is an unresolved key we can't decode.
+///
+/// v0.12.10: Hierher (sim-core) gezogen, damit der MSFS-Telemetrie-
+/// Adapter den `ATC MODEL` schon bei der Erfassung bereinigt — vorher
+/// landete der rohe Token (z.B. `ATCCOM.AC_MODEL C208.0.text` der
+/// BlackSquare Caravan) ungereinigt in `aircraft_icao`, was „Type ?"
+/// und einen kaputten PIREP zur Folge hatte.
+pub fn clean_atc_model(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(start) = s.find("AC_MODEL") {
+        let after = &s[start + "AC_MODEL".len()..];
+        let after = after.trim_start_matches(|c: char| c == '_' || c == ' ');
+        if let Some(end) = after.find('.') {
+            let model = &after[..end];
+            if !model.is_empty() {
+                return Some(model.to_uppercase());
+            }
+        }
+    }
+    let upper = s.to_uppercase();
+    if upper.starts_with("TT:") || upper.contains("ATCCOM.") || upper.ends_with(".TEXT") {
+        return None;
+    }
+    // v0.8.1: Vendor-Tag-Prefix-Strip. Einige MSFS-Addons (Flysimware
+    // Citation X, manche Carenado-Pakete) schicken den ICAO mit einem
+    // "$$:"-Prefix als ATC-MODEL — Sim liefert z.B. "$$:C750" statt
+    // "C750". Aircraft-Mismatch-Check verglich dann "C750" (Bid) gegen
+    // "$$:C750" (Sim) und schlug fehl. Live-Bug GSG/Sven M 2026-05-13.
+    // Wir strippen den Prefix wenn er aus 1-4 Zeichen + ":" besteht
+    // und kein Buchstabe enthält (= Sonderzeichen wie "$$:" / "##:"),
+    // damit echte ICAO-Codes wie "TT:..." (= text-token, oben schon
+    // gefiltert) nicht falsch behandelt werden.
+    if let Some(colon_pos) = upper.find(':') {
+        if colon_pos <= 4 {
+            let prefix = &upper[..colon_pos];
+            let is_vendor_tag = !prefix.is_empty()
+                && !prefix.chars().any(|c| c.is_ascii_alphanumeric());
+            if is_vendor_tag {
+                let stripped = upper[colon_pos + 1..].trim().to_string();
+                if !stripped.is_empty() {
+                    return Some(stripped);
+                }
+            }
+        }
+    }
+    Some(upper)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -881,5 +935,34 @@ mod tests {
         assert_eq!(AircraftProfile::Default.icao_fallback(), None);
         assert_eq!(AircraftProfile::FbwA32nx.icao_fallback(), None);
         assert_eq!(AircraftProfile::Pmdg737.icao_fallback(), None);
+    }
+
+    #[test]
+    fn clean_atc_model_basic_and_token_forms() {
+        // Plain ICAO codes pass through (uppercased).
+        assert_eq!(clean_atc_model("C208"), Some("C208".to_string()));
+        assert_eq!(clean_atc_model("a320"), Some("A320".to_string()));
+        // Empty / unresolved text tokens → None (caller uses fallback).
+        assert_eq!(clean_atc_model(""), None);
+        assert_eq!(clean_atc_model("TT:CESSNA"), None);
+        // Vendor-tag prefix gets stripped.
+        assert_eq!(clean_atc_model("$$:C750"), Some("C750".to_string()));
+    }
+
+    #[test]
+    fn clean_atc_model_blacksquare_caravan_regression() {
+        // v0.12.10 live-bug: the BlackSquare Caravan reports its ATC MODEL
+        // as the raw token `ATCCOM.AC_MODEL C208.0.text` (note the SPACE
+        // and lowercase `.text`). Must resolve to "C208" — otherwise
+        // `aircraft_icao` carries garbage → "Type ?" → broken PIREP filing.
+        assert_eq!(
+            clean_atc_model("ATCCOM.AC_MODEL C208.0.text"),
+            Some("C208".to_string()),
+        );
+        // Underscore variant must also resolve.
+        assert_eq!(
+            clean_atc_model("ATCCOM.AC_MODEL_C750.0.TEXT"),
+            Some("C750".to_string()),
+        );
     }
 }
