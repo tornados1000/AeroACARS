@@ -7,9 +7,22 @@
     "cockpit": "Cockpit",
     "briefing": "Meine Flüge",
     "landing": "Landung",
+    "news": "Nachrichten",
     "log": "ACARS-Log",
     "settings": "Einstellungen",
     "about": "Über"
+  },
+  "nav": {
+    "news": "Nachrichten"
+  },
+  "news": {
+    "tab": "Nachrichten",
+    "empty": "Keine Nachrichten",
+    "refresh": "Aktualisieren",
+    "new_badge": "Neu",
+    "load_error": "Konnte Nachrichten nicht laden",
+    "relative_just_now": "gerade eben",
+    "mark_all_read": "Alle als gelesen"
   },
   "landing": {
     "off_airport": {
@@ -781,7 +794,12 @@
       "refresh_btn_busy": "Lade…",
       "refresh_btn_done": "✓ OFP aktualisiert",
       "refresh_btn_hint": "Zieht den frischesten OFP von SimBrief und überschreibt die Plan-Werte"
-    }
+    },
+    "weather_briefing": "Wetter-Briefing",
+    "weather_briefing_hint": "Wetter-Briefing auf der GSG-Seite öffnen (zeigt den aktiven Bid)",
+    "notifications": "Nachrichten",
+    "notifications_hint": "phpVMS-Posteingang öffnen",
+    "weather_briefing_load_hint": "Wird im Browser geöffnet — das Laden der Briefing-Seite kann bis zu 30 s dauern (METAR/TAF/NOTAMs/Bahn-Daten werden live geholt)."
   },
   "update": {
     "button_label": "Update verfügbar",
@@ -1441,7 +1459,12 @@
     "refresh_no_result": "Refresh ohne Antwort vom Backend — bitte erneut versuchen",
     "no_active_flight_hint": "Pre-Flight — der SimBrief-OFP wird beim **IFR Start (SimBrief)** mit dem aktuellen Plan geladen. Im Bid-Tab kann der „Aktualisieren\"-Button keinen Pre-Flight-OFP-Refresh machen (kommt in v0.7.11).",
     "preview_loaded": "✓ Frische SimBrief-Werte geladen ({{count}} Bid · direkt von simbrief.com)",
-    "preview_failed_all": "SimBrief-Werte konnten nicht geladen werden — phpVMS-Snapshot wird gezeigt. Settings → SimBrief prüfen."
+    "preview_failed_all": "SimBrief-Werte konnten nicht geladen werden — phpVMS-Snapshot wird gezeigt. Settings → SimBrief prüfen.",
+    "open_weather_briefing": "Wetter-Briefing öffnen",
+    "open_weather_briefing_hint": "GSG-Wetter-Briefing-Seite öffnen (zeigt den aktiven Bid)",
+    "open_notifications": "Nachrichten",
+    "open_notifications_hint": "phpVMS-Posteingang öffnen",
+    "weather_briefing_load_hint": "Wird im Browser geöffnet — das Laden der Briefing-Seite kann bis zu 30 s dauern (METAR/TAF/NOTAMs/Bahn-Daten werden live geholt)."
   },
   "flight": {
     "error": {

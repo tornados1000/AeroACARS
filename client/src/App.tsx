@@ -10,6 +10,7 @@ import { ReleaseNotesModal } from "./components/ReleaseNotesModal";
 import { ActivityLogPanel } from "./components/ActivityLogPanel";
 import { AboutPanel } from "./components/AboutPanel";
 import { LandingPanel } from "./components/LandingPanel";
+import { NewsPanel, useUnreadNewsCount } from "./components/NewsPanel";
 import RunwayDiagramPreview from "./dev/RunwayDiagramPreview";
 import { UpdateButton } from "./components/UpdateButton";
 import { UpdateBanner } from "./components/UpdateBanner";
@@ -27,7 +28,7 @@ type SessionStatus =
   | { kind: "loggedOut"; restoreError?: UiError }
   | { kind: "loggedIn"; session: LoginResult };
 
-type Tab = "cockpit" | "briefing" | "landing" | "log" | "settings" | "about" | "devpreview";
+type Tab = "cockpit" | "briefing" | "landing" | "news" | "log" | "settings" | "about" | "devpreview";
 
 const DEBUG_STORAGE_KEY = "aeroacars.debug";
 const AUTO_FILE_STORAGE_KEY = "aeroacars.autoFile";
@@ -429,6 +430,11 @@ function App() {
     saveAutoDeleteFlightLogs(next);
   }
 
+  // v0.12.12-dev: VA-News-Badge — pollt /api/news + localStorage.
+  // Hook lebt im NewsPanel-Modul; wir lifen den Count nur fuer den
+  // Tab-Badge nach oben.
+  const unreadNews = useUnreadNewsCount(status.kind === "loggedIn");
+
   const phpvmsConnected = status.kind === "loggedIn";
   const simConnected = simState === "connected";
   const simConnecting = simState === "connecting";
@@ -535,6 +541,20 @@ function App() {
           <button
             type="button"
             role="tab"
+            aria-selected={tab === "news"}
+            className={`tab ${tab === "news" ? "tab--active" : ""}`}
+            onClick={() => setTab("news")}
+          >
+            {t("nav.news")}
+            {unreadNews > 0 && (
+              <span className="tab__news-badge" aria-label={t("news.new_badge")}>
+                {unreadNews > 9 ? "9+" : unreadNews}
+              </span>
+            )}
+          </button>
+          <button
+            type="button"
+            role="tab"
             aria-selected={tab === "log"}
             className={`tab ${tab === "log" ? "tab--active" : ""}`}
             onClick={() => setTab("log")}
@@ -635,6 +655,8 @@ function App() {
       )}
 
       {status.kind === "loggedIn" && tab === "landing" && <LandingPanel />}
+
+      {status.kind === "loggedIn" && tab === "news" && <NewsPanel />}
 
       {status.kind === "loggedIn" && tab === "log" && <ActivityLogPanel />}
 

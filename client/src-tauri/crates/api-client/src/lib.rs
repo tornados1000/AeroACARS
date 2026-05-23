@@ -980,6 +980,39 @@ pub struct AircraftDetails {
     pub status: Option<String>,
 }
 
+// v0.12.12-dev: VA-News-Post aus `GET /api/news`. phpVMS liefert je
+// nach Version + Plugin-Config unterschiedliche Felder — wir bleiben
+// permissiv (alle optionalen Felder via `serde(default)`), damit ein
+// fehlendes `updated_at`/`author` nicht die ganze Liste killt.
+// `body` ist HTML — Frontend sanitiziert vor dem Render.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewsItem {
+    #[serde(deserialize_with = "de_int_or_str")]
+    pub id: i64,
+    #[serde(default)]
+    pub subject: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    /// Optional flat author field (manche Installs liefern das so).
+    #[serde(default)]
+    pub author: Option<String>,
+    /// Optional nested user-Objekt — phpVMS-Standard liefert das
+    /// via Resource-Include. Wir nehmen `name` daraus wenn der flat
+    /// `author`-Pfad nicht greift (mapping macht das Frontend).
+    #[serde(default)]
+    pub user: Option<NewsUser>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewsUser {
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
 // phpVMS resource responses are wrapped: `{ "data": {...} }`.
 #[derive(Deserialize)]
 struct DataEnvelope<T> {
@@ -1653,6 +1686,16 @@ impl Client {
             "get_all_aircraft completed"
         );
         Ok(all)
+    }
+
+    /// v0.12.12-dev: `GET /api/news` — VA-News-Posts. phpVMS liefert
+    /// das paginiert mit `{ data: [...], meta: {...} }`. Wir nehmen
+    /// nur `data` und verzichten auf Meta — der Client-Tab zeigt
+    /// Seite 1 mit `per_page` Items (Default 20) und braucht keine
+    /// Pagination.
+    pub async fn get_news(&self, per_page: u32) -> Result<Vec<NewsItem>, ApiError> {
+        let path = format!("/api/news?per_page={}", per_page.max(1).min(100));
+        self.get_data(&path).await
     }
 }
 

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import type {
   ActiveFlightInfo,
   FlightEndOutcome,
@@ -11,6 +12,11 @@ import type {
 import { ResumeFlightBanner } from "./ResumeFlightBanner";
 import { ActiveFlightPanel } from "./ActiveFlightPanel";
 import { StableApproachBanner } from "./StableApproachBanner";
+
+// v0.12.12-dev: GSG-Wetter-Briefing-Seite. Login-basiert — wenn der Pilot
+// in seinem Standard-Browser bei phpVMS eingeloggt ist, zieht die Seite
+// den aktiven Bid automatisch.
+const WEATHER_BRIEFING_URL = "https://german-sky-group.eu/weatherbriefing";
 // v0.3.0: LoadsheetMonitor wird jetzt direkt im ActiveFlightPanel
 // gerendert (zwischen InfoStrip und WeatherBriefing), damit das
 // Loadsheet visuell zum aktiven Flug gehört statt als getrennte
@@ -52,6 +58,9 @@ export function CockpitView({
   // notice for a discard. Replaces the old `filedFlightInfo` which blindly
   // showed "PIREP filed" for cancel/forget/resume too (Bug F).
   const [endNotice, setEndNotice] = useState<FlightEndOutcome | null>(null);
+  /** v0.12.12-dev: Wetter-Briefing-Lade-Hinweis. Erscheint beim Klick auf
+   *  den 🌦-Button (5 s sichtbar) statt als permanenter Schild. */
+  const [weatherLoadHint, setWeatherLoadHint] = useState(false);
   useEffect(() => {
     if (!endNotice) return;
     const id = window.setTimeout(() => setEndNotice(null), 8000);
@@ -163,6 +172,34 @@ export function CockpitView({
     </div>
   );
 
+  // v0.12.12-dev: Wetter-Briefing-Knopf öffnet die GSG-Briefing-Seite im
+  // System-Browser. Login-basiert, die Seite zieht den aktiven Bid auto-
+  // matisch. Der Lade-Hinweis erscheint per Toast beim Klick (5 s sichtbar)
+  // statt als permanenter Schild — der Pilot soll bemerken dass die Seite
+  // ihre Daten live holt (METAR/TAF/NOTAMs/Runway), Ladezeit bis zu 30 s.
+  const quickActionRow = (
+    <div className="cockpit-actions">
+      <button
+        type="button"
+        className="button button--ghost cockpit-actions__weather"
+        onClick={() => {
+          setWeatherLoadHint(true);
+          window.setTimeout(() => setWeatherLoadHint(false), 5000);
+          void openUrl(WEATHER_BRIEFING_URL).catch(() => {});
+        }}
+        title={t("cockpit.weather_briefing_hint")}
+      >
+        🌦 {t("cockpit.weather_briefing")}
+      </button>
+    </div>
+  );
+
+  const weatherLoadToast = weatherLoadHint && (
+    <div className="cockpit-weather-toast" role="status">
+      🌦 {t("cockpit.weather_briefing_load_hint")}
+    </div>
+  );
+
   if (!activeFlight) {
     return (
       <>
@@ -182,6 +219,8 @@ export function CockpitView({
             {t("cockpit.go_briefing")}
           </button>
         </section>
+        {quickActionRow}
+        {weatherLoadToast}
       </>
     );
   }
@@ -189,6 +228,7 @@ export function CockpitView({
   return (
     <>
       {noticeBanner}
+      {quickActionRow}
       <ResumeFlightBanner
         activeFlight={activeFlight}
         onAdopted={setActiveFlight}

@@ -39,8 +39,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use api_client::{
-    Airport, ApiError, Bid, Client, Connection, FareEntry, FileBody, PositionEntry, PrefileBody,
-    Profile, SimBriefDirectError, SimBriefOfp, UpdateBody,
+    Airport, ApiError, Bid, Client, Connection, FareEntry, FileBody, NewsItem, PositionEntry,
+    PrefileBody, Profile, SimBriefDirectError, SimBriefOfp, UpdateBody,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -5565,6 +5565,17 @@ async fn phpvms_get_bids(
             Err(e.into())
         }
     }
+}
+
+/// v0.12.12-dev: `GET /api/news` — VA-News-Posts. Reuse den vorhandenen
+/// phpVMS-Client (gleicher API-Key, gleiches Auth-Handling). Per-page
+/// hardcoded auf 20 — der News-Tab zeigt nur Page 1 ohne Pagination.
+#[tauri::command]
+async fn news_fetch(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<NewsItem>, UiError> {
+    let client = current_client(&state)?;
+    client.get_news(20).await.map_err(Into::into)
 }
 
 /// SimBrief OFP-Preview (v0.3.0) — fetcht das letzte SimBrief XML
@@ -22537,6 +22548,7 @@ pub fn run() {
             phpvms_logout,
             phpvms_load_session,
             phpvms_get_bids,
+            news_fetch,
             fetch_simbrief_preview,
             flight_refresh_simbrief,
             bid_simbrief_preview,

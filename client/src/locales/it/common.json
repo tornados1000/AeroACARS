@@ -7,9 +7,22 @@
     "cockpit": "Cockpit",
     "briefing": "I miei voli",
     "landing": "Atterraggio",
+    "news": "Notizie",
     "log": "Log ACARS",
     "settings": "Impostazioni",
     "about": "Info"
+  },
+  "nav": {
+    "news": "Notizie"
+  },
+  "news": {
+    "tab": "Notizie",
+    "empty": "Nessuna notizia",
+    "refresh": "Aggiorna",
+    "new_badge": "Nuovo",
+    "load_error": "Impossibile caricare le notizie",
+    "relative_just_now": "proprio ora",
+    "mark_all_read": "Segna tutto come letto"
   },
   "landing": {
     "off_airport": {
@@ -781,7 +794,12 @@
       "refresh_btn_busy": "Caricamento…",
       "refresh_btn_done": "✓ OFP aggiornato",
       "refresh_btn_hint": "Recupera l'OFP più recente da SimBrief e sovrascrive i valori del piano"
-    }
+    },
+    "weather_briefing": "Briefing meteo",
+    "weather_briefing_hint": "Apri la pagina meteo GSG (mostra il bid attivo)",
+    "notifications": "Messaggi",
+    "notifications_hint": "Apri la posta in arrivo phpVMS",
+    "weather_briefing_load_hint": "Apertura nel browser — il caricamento della pagina briefing può richiedere fino a 30 s (METAR/TAF/NOTAM/dati pista in tempo reale)."
   },
   "update": {
     "button_label": "Aggiornamento disponibile",
@@ -1441,7 +1459,12 @@
     "refresh_no_result": "Aggiornamento senza risposta dal backend — riprova",
     "no_active_flight_hint": "Pre-volo — l'OFP SimBrief viene caricato con il piano attuale quando clicchi **IFR Start (SimBrief)**. Il pulsante \"Aggiorna\" nel tab dei bid non può fare un refresh OFP pre-volo (in arrivo in v0.7.11).",
     "preview_loaded": "✓ Valori SimBrief aggiornati ({{count}} bid · direttamente da simbrief.com)",
-    "preview_failed_all": "Impossibile caricare i valori SimBrief — mostro snapshot phpVMS. Controlla Impostazioni → SimBrief."
+    "preview_failed_all": "Impossibile caricare i valori SimBrief — mostro snapshot phpVMS. Controlla Impostazioni → SimBrief.",
+    "open_weather_briefing": "Apri briefing meteo",
+    "open_weather_briefing_hint": "Apri la pagina meteo GSG (mostra il bid attivo)",
+    "open_notifications": "Messaggi",
+    "open_notifications_hint": "Apri la posta in arrivo phpVMS",
+    "weather_briefing_load_hint": "Apertura nel browser — il caricamento della pagina briefing può richiedere fino a 30 s (METAR/TAF/NOTAM/dati pista in tempo reale)."
   },
   "flight": {
     "error": {
