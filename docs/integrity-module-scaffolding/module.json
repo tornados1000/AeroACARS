@@ -1,0 +1,12 @@
+{
+  "name": "AeroACARSIntegrityGate",
+  "alias": "aeroacarsintegritygate",
+  "description": "Gates phpVMS PIREP-Filing through AeroACARS-Live integrity validator. Sets PENDING-Hold on review-impacting flags.",
+  "keywords": ["acars", "integrity", "validation", "phpvms-module"],
+  "priority": 0,
+  "providers": [
+    "Modules\\AeroACARSIntegrityGate\\AeroACARSIntegrityGateServiceProvider"
+  ],
+  "files": [],
+  "requires": []
+}
