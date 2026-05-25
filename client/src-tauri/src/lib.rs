@@ -166,12 +166,18 @@ fn position_interval(phase: FlightPhase) -> Duration {
         FlightPhase::Approach | FlightPhase::Final => 8,
         // Climb / descent: moderate change rate.
         FlightPhase::Climb | FlightPhase::Descent => 10,
-        // Cruise: long straight legs, sparse samples are enough — capped
-        // at 30 s so the live map never goes more than half a minute stale.
-        FlightPhase::Cruise => 30,
+        // Cruise: long straight legs, sparse samples are enough.
+        // v0.13.8: 30s -> 60s. Eine halbe Stunde Cruise erzeugte vorher
+        // ~60 Positions, jetzt ~30 — phpVMS-PIREP-Render-Performance
+        // war ein realer Pilot-Befund. Live-Map zeigt jetzt Updates
+        // alle 60s im Cruise; bei 480kt GS sind das ~8 nm zwischen
+        // Punkten, fuer den Strack-Verlauf voellig ausreichend. VPS-
+        // Recorder bekommt weiterhin alle Snapshots (separater MQTT-
+        // Stream), nur phpVMS sieht die ausgedünnte Variante.
+        FlightPhase::Cruise => 60,
         // v0.5.11: Holding — same cadence as Cruise (slow track update,
         // we're circling at constant altitude).
-        FlightPhase::Holding => 30,
+        FlightPhase::Holding => 60,
         // Parked / pre-/post-flight — keep a 30 s heartbeat so phpVMS
         // sees the PIREP is alive while the pilot files.
         FlightPhase::Preflight
@@ -21030,66 +21036,31 @@ fn snapshot_to_position(snap: &SimSnapshot) -> PositionEntry {
     }
 }
 
-/// Pack the telemetry that phpVMS doesn't have first-class columns for
-/// (exterior lights, COM/NAV frequencies, autopilot modes, parking brake,
-/// stall/overspeed warnings) into a compact JSON blob written to the
-/// position's `log` field. The PIREP detail page renders this verbatim,
-/// and Rules-Lua scripts on the server can parse it.
-fn build_position_log(snap: &SimSnapshot) -> Option<String> {
-    let payload = serde_json::json!({
-        "lights": {
-            "landing": snap.light_landing,
-            "beacon": snap.light_beacon,
-            "strobe": snap.light_strobe,
-            "taxi": snap.light_taxi,
-            "nav": snap.light_nav,
-            "logo": snap.light_logo,
-        },
-        "com": {
-            "com1": snap.com1_mhz,
-            "com2": snap.com2_mhz,
-        },
-        "nav": {
-            "nav1": snap.nav1_mhz,
-            "nav2": snap.nav2_mhz,
-        },
-        "ap": {
-            "master": snap.autopilot_master,
-            "hdg": snap.autopilot_heading,
-            "alt": snap.autopilot_altitude,
-            "nav": snap.autopilot_nav,
-            "apr": snap.autopilot_approach,
-        },
-        "state": {
-            "parking_brake": snap.parking_brake,
-            "stall": snap.stall_warning,
-            "overspeed": snap.overspeed_warning,
-            "gear": snap.gear_position,
-            "flaps": snap.flaps_position,
-            "engines_running": snap.engines_running,
-        },
-        "env": {
-            "wind_dir_deg": snap.wind_direction_deg,
-            "wind_kt": snap.wind_speed_kt,
-            "qnh_hpa": snap.qnh_hpa,
-            "oat_c": snap.outside_air_temp_c,
-        },
-        // ATC ground-handling info — current parking stand the aircraft
-        // is on (only filled while still on a named stand, blank during
-        // taxi / cruise / approach) and the ATC-cleared runway. Gives
-        // the live-map "where on the ramp / approach" for free.
-        "atc": {
-            "parking_name": snap.parking_name,
-            "parking_number": snap.parking_number,
-            "runway": snap.selected_runway,
-        },
-        // Aircraft profile that produced this row. Lets the VA admin filter
-        // PIREPs by add-on (FBW vs Fenix vs PMDG) when reviewing data and
-        // know whether the cockpit-state snapshot used standard SimVars or
-        // an LVar mapping (Phase H.4 Stage 2).
-        "profile": snap.aircraft_profile,
-    });
-    serde_json::to_string(&payload).ok()
+/// v0.13.8: log-Blob fuer phpVMS-Positions deaktiviert.
+///
+/// Hintergrund: Bei einem 3.5h-Flug entstanden mit der vorherigen
+/// vollen log-Payload ~400 KB JSON nur fuer das log-Feld (Lights,
+/// COM/NAV, AP-Modi, State-Bits, Env, ATC, Profile) - 99% davon
+/// duplizierten sich zwischen aufeinanderfolgenden Cruise-Samples.
+/// Pilot-Befund: phpVMS-PIREP-Detail-Seite oeffnet sich langsam bei
+/// grossen Fluegen.
+///
+/// Loesung: phpVMS bekommt nur noch die strukturierten Felder
+/// (lat/lon/alt/gs/ias/vs/fuel/heading/transponder/autopilot/distance/
+/// sim_time). Das log-Feld bleibt None.
+///
+/// Die volle Telemetrie (Lights, COM/NAV, AP-Modi, State, Env, ATC,
+/// Profile) geht weiterhin **komplett** an den VPS-Recorder via MQTT
+/// (separater Stream, anderer Code-Pfad). Forensik + Live-Map + Reply
+/// sind unveraendert. Nur phpVMS sieht die schlankere Variante - das
+/// PIREP-Detail-Page rendert dadurch zigfach schneller.
+///
+/// Wenn man jemals wieder ein paar Felder ans phpVMS schicken will
+/// (z. B. nur Lights+State bei Phase-Wechsel) - hier wieder anbauen,
+/// idealerweise mit einem Filter "nur emittieren wenn sich was vs.
+/// last_sent geaendert hat".
+fn build_position_log(_snap: &SimSnapshot) -> Option<String> {
+    None
 }
 
 // ---- Simulator selection + status ----
