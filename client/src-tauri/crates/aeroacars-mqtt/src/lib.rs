@@ -996,12 +996,35 @@ enum Cmd {
     Shutdown,
 }
 
+/// v0.13.0 Stream F (Slice 6) — Integrity-Flag-Event vom Recorder.
+/// Wird live published auf `aeroacars/<va>/<pilot>/integrity_flag` und
+/// vom Client konsumiert für DATA-INTEGRITY-Banner + Resume-Policy.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct IntegrityFlagEvent {
+    pub session_id: i64,
+    pub session_effective_severity: String,
+    pub flag: serde_json::Value,
+}
+
 #[derive(Clone)]
 pub struct Handle {
     tx: mpsc::Sender<Cmd>,
+    /// v0.13.0: optional Broadcast-Receiver für Integrity-Flag-Events.
+    /// Wird per `take_integrity_rx()` einmalig konsumiert.
+    integrity_rx: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedReceiver<IntegrityFlagEvent>>>>,
 }
 
 impl Handle {
+    /// v0.13.0 Slice 6: Konsumiert den einmaligen Receiver für
+    /// Integrity-Flag-Events vom Recorder. Caller (Tauri-Main) ruft
+    /// das genau einmal nach `connect()` und forwarded die Events
+    /// als Tauri-Events an die React-UI.
+    ///
+    /// Returns None wenn der Receiver bereits genommen wurde.
+    pub async fn take_integrity_rx(&self) -> Option<mpsc::UnboundedReceiver<IntegrityFlagEvent>> {
+        self.integrity_rx.lock().await.take()
+    }
+
     pub fn position(&self, snap: &SimSnapshot, meta: &FlightMeta, phase: FlightPhase) {
         let payload = PositionPayload {
             ts: snap.timestamp.timestamp_millis(),
@@ -1276,15 +1299,50 @@ pub fn start(cfg: MqttConfig) -> Result<Handle> {
 
     let (client, mut eventloop) = AsyncClient::new(opts, CMD_BUFFER);
 
+    // v0.13.0 Stream F (Slice 6): Unbounded mpsc für Integrity-Flag-Events
+    // vom Broker. Hat Eigenrate-Begrenzung (Recorder published nur bei
+    // tatsächlichen Flags — < 1/min im normalen Cruise).
+    let (integrity_tx, integrity_rx) = mpsc::unbounded_channel::<IntegrityFlagEvent>();
+    let integrity_topic = format!("aeroacars/{}/{}/integrity_flag", cfg.va_prefix, cfg.pilot_id);
+    let subscribe_client = client.clone();
+    let subscribe_topic = integrity_topic.clone();
+
     let _drive = tokio::spawn(async move {
+        let mut subscribed = false;
         loop {
             match eventloop.poll().await {
                 Ok(Event::Incoming(Packet::ConnAck(_))) => {
                     info!("MQTT CONNACK received");
+                    if !subscribed {
+                        match subscribe_client.subscribe(&subscribe_topic, QoS::AtLeastOnce).await {
+                            Ok(()) => {
+                                info!(topic = %subscribe_topic, "subscribed to integrity_flag topic");
+                                subscribed = true;
+                            }
+                            Err(e) => {
+                                warn!("integrity_flag subscribe failed: {e}");
+                            }
+                        }
+                    }
+                }
+                Ok(Event::Incoming(Packet::Publish(publish))) => {
+                    if publish.topic == subscribe_topic {
+                        match serde_json::from_slice::<IntegrityFlagEvent>(&publish.payload) {
+                            Ok(evt) => {
+                                if integrity_tx.send(evt).is_err() {
+                                    debug!("integrity_flag receiver dropped — discarding");
+                                }
+                            }
+                            Err(e) => {
+                                warn!("integrity_flag JSON decode failed: {e}");
+                            }
+                        }
+                    }
                 }
                 Ok(_) => {}
                 Err(e) => {
                     warn!("MQTT poll error: {e} — backing off 5 s");
+                    subscribed = false;  // re-subscribe on reconnect
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
@@ -1362,7 +1420,10 @@ pub fn start(cfg: MqttConfig) -> Result<Handle> {
         debug!("MQTT cmd loop exiting");
     });
 
-    Ok(Handle { tx })
+    Ok(Handle {
+        tx,
+        integrity_rx: Arc::new(tokio::sync::Mutex::new(Some(integrity_rx))),
+    })
 }
 
 async fn publish_json<T: Serialize>(client: &AsyncClient, topic: &str, payload: &T, qos: QoS, retain: bool) {

@@ -465,6 +465,15 @@ const RESUME_DRIFT_TOAST_NM: f64 = 1.0;
 const RESUME_DRIFT_WARN_NM: f64 = 50.0;
 const RESUME_DRIFT_EXTREME_NM: f64 = 200.0;
 
+/// v0.13.0 Stream F (LE22-LE26): Pilot-getriggerter Re-Check-Workflow.
+/// Wenn `resume_position_suspect=true`, kann der Pilot sich erst manuell im
+/// Sim wieder zur gespeicherten Position bringen und dann via
+/// `flight_resume_check_position`-Command einen Re-Check auslösen. Wenn
+/// die aktuelle Drift kleiner als diese Schwelle ist UND keine
+/// airborne↔on_ground-Inkonsistenz besteht, gilt der Resume als sauber
+/// (kein untrusted-Stempel) und der Flug läuft normal weiter.
+const RESUME_DRIFT_CLEAN_NM: f64 = 5.0;
+
 /// How close (in nautical miles) the aircraft must be to the departure airport
 /// to start the flight. Generous enough to cover taxi positions and remote
 /// stands; tight enough to reject "I'm at EDDF instead of EDDP".
@@ -3131,6 +3140,25 @@ pub struct ActiveFlightInfo {
     /// on-ground, or implausibly large drift). The resume banner then
     /// disables its 10-second auto-confirm and requires an explicit click.
     resume_position_suspect: bool,
+    /// v0.13.0 Stream F (LE22-LE26): wenn `was_just_resumed=true`, hier alle
+    /// gespeicherten State-Werte für die Banner-Anzeige damit der Pilot weiß
+    /// WOHIN er sich im Sim repositionieren muss UND mit welchem Fuel/Weight.
+    /// Sehr wichtig: MSFS setzt Fuel beim Reload oft auf Default zurück —
+    /// der Pilot muss das manuell wieder einstellen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_known_lat: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_known_lon: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_known_alt_ft: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_known_fuel_kg: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_known_zfw_kg: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_known_total_weight_kg: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_known_aircraft_icao: Option<String>,
     /// Departure stand from MSFS `ATC PARKING NAME` (snapshotted at
     /// the start of the flight). Empty until captured.
     dep_gate: Option<String>,
@@ -5035,6 +5063,32 @@ async fn init_mqtt_publisher_via_provisioning(app: AppHandle) {
         }
     };
 
+    // v0.13.0 Slice 6: Take the integrity-flag receiver and forward
+    // each event as a Tauri event "integrity-flag" to the React UI.
+    // Done once per Handle creation — Handle::take_integrity_rx is
+    // protected by Option-Take so subsequent calls return None.
+    if let Some(mut integrity_rx) = handle.take_integrity_rx().await {
+        let emit_app = app.clone();
+        tokio::spawn(async move {
+            while let Some(event) = integrity_rx.recv().await {
+                tracing::debug!(
+                    severity = %event.session_effective_severity,
+                    "integrity_flag received from recorder"
+                );
+                let _ = tauri::Emitter::emit(
+                    &emit_app,
+                    "integrity-flag",
+                    serde_json::json!({
+                        "session_id": event.session_id,
+                        "session_effective_severity": event.session_effective_severity,
+                        "flag": event.flag,
+                    }),
+                );
+            }
+            tracing::debug!("integrity_flag forwarder loop exiting");
+        });
+    }
+
     *state.mqtt.lock().await = Some(handle);
     tracing::info!("live-tracking publisher running");
 }
@@ -6618,6 +6672,26 @@ fn flight_info(flight: &ActiveFlight, resume_position_suspect: bool) -> ActiveFl
         landing_g_force: stats.landing_g_force,
         was_just_resumed,
         resume_position_suspect,
+        // v0.13.0 Stream F: nur befüllen wenn was_just_resumed=true, sonst
+        // werden die Felder via skip_serializing_if weggelassen damit das
+        // Live-Active-Flight-Panel sie nicht sieht.
+        // alt_ft nicht in FlightStats (nur lat/lon) → wir lassen es leer,
+        // die Position allein reicht für die Repositionierung.
+        last_known_lat: if was_just_resumed { stats.last_lat } else { None },
+        last_known_lon: if was_just_resumed { stats.last_lon } else { None },
+        last_known_alt_ft: None,
+        // v0.13.0 Stream F: Fuel/Weight/Aircraft aus dem letzten Sim-Snapshot
+        // (vor dem Disconnect/Crash). MSFS setzt Fuel beim Reload oft auf
+        // Default — der Pilot sieht jetzt den Soll-Wert und kann ihn manuell
+        // nachstellen, BEVOR er auf "Position prüfen + fortsetzen" klickt.
+        last_known_fuel_kg: if was_just_resumed { stats.last_fuel_kg } else { None },
+        last_known_zfw_kg: if was_just_resumed { stats.last_zfw_kg } else { None },
+        last_known_total_weight_kg: if was_just_resumed { stats.last_total_weight_kg } else { None },
+        last_known_aircraft_icao: if was_just_resumed && !flight.aircraft_icao.is_empty() {
+            Some(flight.aircraft_icao.clone())
+        } else {
+            None
+        },
         dep_gate: stats.dep_gate.clone(),
         arr_gate: stats.arr_gate.clone(),
         approach_runway: stats.approach_runway.clone(),
@@ -12358,6 +12432,201 @@ async fn flight_end_manual(
             *guard = Some(flight);
             Err(e.into())
         }
+    }
+}
+
+/// v0.13.0 Stream F (LE22-LE26): Pilot-getriggerter Position-Re-Check.
+///
+/// Workflow:
+///   1. AeroACARS-Client startet nach Sim-Crash neu, ActiveFlight wird
+///      vom Disk restored mit `was_just_resumed=true`.
+///   2. Sim-Position weicht stark ab → `resume_position_suspect=true`.
+///   3. ResumeFlightBanner zeigt drei Optionen, EINE davon ist
+///      "Position prüfen + fortsetzen". Pilot positioniert sich erst
+///      manuell im Sim wieder zur letzten gespeicherten Position, drückt
+///      DANN den Button.
+///   4. Dieser Command holt die aktuelle Sim-Snapshot, vergleicht die
+///      Drift mit `RESUME_DRIFT_CLEAN_NM` und prüft auf airborne↔
+///      on_ground-Inkonsistenz.
+///   5. Wenn alles OK → setzt `was_just_resumed=false` → Frontend ruft
+///      anschließend den normalen Resume-Pfad → kein untrusted-Stempel.
+///   6. Wenn nicht OK → returnt drift_nm + still_suspect=true, Pilot
+///      kann nochmal positionieren und nochmal prüfen.
+///
+/// Tolerant gegen Zeit-Gaps bis ~10min — wir prüfen NUR die Position,
+/// nicht wie lange der Pilot zum Reposition gebraucht hat.
+#[derive(Serialize)]
+struct ResumeCheckPositionOutcome {
+    ok: bool,
+    drift_nm: f64,
+    sim_on_ground_inconsistent: bool,
+    persisted_phase: &'static str,
+    detail: String,
+    // v0.13.0 Stream F: aktuelle Sim-Position damit Frontend einen
+    // Vergleich anzeigen kann (persisted vs current).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_sim_lat: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_sim_lon: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_sim_alt_ft: Option<i32>,
+    current_sim_on_ground: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    persisted_lat: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    persisted_lon: Option<f64>,
+    // v0.13.0 Stream F: Fuel/Weight/Aircraft-Vergleich. Frontend zeigt
+    // damit "Sim hat 5 t weniger Fuel als gespeichert" oder "anderes
+    // Aircraft im Sim geladen" an, sobald der Pilot auf "Position prüfen"
+    // drückt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_sim_fuel_kg: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_sim_zfw_kg: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_sim_total_weight_kg: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_sim_aircraft_icao: Option<String>,
+}
+
+#[tauri::command]
+async fn flight_resume_check_position(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<ResumeCheckPositionOutcome, UiError> {
+    let guard = state.active_flight.lock().expect("active_flight lock");
+    let flight = guard
+        .as_ref()
+        .ok_or_else(|| UiError::new("no_active_flight", "no flight is active"))?;
+
+    if !flight.was_just_resumed.load(Ordering::Relaxed) {
+        // Flight is already live — recheck not applicable
+        return Ok(ResumeCheckPositionOutcome {
+            ok: true,
+            drift_nm: 0.0,
+            sim_on_ground_inconsistent: false,
+            persisted_phase: "Live",
+            detail: "Flight already live, no recheck needed".to_string(),
+            current_sim_lat: None,
+            current_sim_lon: None,
+            current_sim_alt_ft: None,
+            current_sim_on_ground: false,
+            persisted_lat: None,
+            persisted_lon: None,
+            current_sim_fuel_kg: None,
+            current_sim_zfw_kg: None,
+            current_sim_total_weight_kg: None,
+            current_sim_aircraft_icao: None,
+        });
+    }
+
+    let snap = current_snapshot(&app).ok_or_else(|| {
+        UiError::new("sim_disconnected", "Sim ist nicht verbunden — bitte erst den Sim wieder starten und positionieren")
+    })?;
+
+    let (persisted_phase, persisted_pos) = {
+        let stats = flight.stats.lock().expect("flight stats");
+        let pos = match (stats.last_lat, stats.last_lon) {
+            (Some(la), Some(lo)) => Some((la, lo)),
+            _ => None,
+        };
+        (stats.phase, pos)
+    };
+
+    let drift_nm = if let Some((plat, plon)) = persisted_pos {
+        ::geo::distance_m(plat, plon, snap.lat, snap.lon) / 1852.0
+    } else {
+        // No persisted position — can't compute drift, treat as clean
+        0.0
+    };
+
+    let persisted_airborne = matches!(
+        persisted_phase,
+        FlightPhase::Climb
+            | FlightPhase::Cruise
+            | FlightPhase::Holding
+            | FlightPhase::Descent
+            | FlightPhase::Approach
+            | FlightPhase::Final
+    );
+    let sim_on_ground_inconsistent = persisted_airborne && snap.on_ground;
+
+    let ok = drift_nm < RESUME_DRIFT_CLEAN_NM && !sim_on_ground_inconsistent;
+
+    let detail = if ok {
+        format!(
+            "Position OK — Drift {:.2} nm (Limit {:.1} nm). Flug läuft jetzt als sauber weiter.",
+            drift_nm, RESUME_DRIFT_CLEAN_NM
+        )
+    } else if sim_on_ground_inconsistent {
+        format!(
+            "Flugzeug ist im Sim am Boden, gespeicherter Flug war in der Luft (Phase {:?}). Bitte zurück in die Luft positionieren ODER Flug verwerfen.",
+            persisted_phase
+        )
+    } else {
+        format!(
+            "Drift {:.2} nm — zu weit weg von gespeicherter Position (Limit {:.1} nm). Bitte näher positionieren und nochmal prüfen.",
+            drift_nm, RESUME_DRIFT_CLEAN_NM
+        )
+    };
+
+    if ok {
+        // Pilot hat sich erfolgreich repositioniert — Resume gilt als sauber.
+        // was_just_resumed=false → resume_position_suspect wird ebenfalls
+        // false bei nächstem flight_status-Poll → Banner schließt sich.
+        flight.was_just_resumed.store(false, Ordering::Relaxed);
+        tracing::info!(
+            pirep_id = %flight.pirep_id,
+            drift_nm,
+            "flight_resume_check_position: clean — was_just_resumed cleared"
+        );
+    } else {
+        tracing::info!(
+            pirep_id = %flight.pirep_id,
+            drift_nm,
+            sim_on_ground_inconsistent,
+            "flight_resume_check_position: still suspect"
+        );
+    }
+
+    Ok(ResumeCheckPositionOutcome {
+        ok,
+        drift_nm,
+        sim_on_ground_inconsistent,
+        persisted_phase: phase_to_str(persisted_phase),
+        detail,
+        current_sim_lat: Some(snap.lat),
+        current_sim_lon: Some(snap.lon),
+        current_sim_alt_ft: Some(snap.altitude_msl_ft.round() as i32),
+        current_sim_on_ground: snap.on_ground,
+        persisted_lat: persisted_pos.map(|(la, _)| la),
+        persisted_lon: persisted_pos.map(|(_, lo)| lo),
+        current_sim_fuel_kg: Some(snap.fuel_total_kg),
+        current_sim_zfw_kg: snap.zfw_kg,
+        current_sim_total_weight_kg: snap.total_weight_kg,
+        current_sim_aircraft_icao: snap.aircraft_icao.clone(),
+    })
+}
+
+fn phase_to_str(phase: FlightPhase) -> &'static str {
+    match phase {
+        FlightPhase::Preflight => "Preflight",
+        FlightPhase::Boarding => "Boarding",
+        FlightPhase::Pushback => "Pushback",
+        FlightPhase::TaxiOut => "TaxiOut",
+        FlightPhase::TakeoffRoll => "TakeoffRoll",
+        FlightPhase::Takeoff => "Takeoff",
+        FlightPhase::Climb => "Climb",
+        FlightPhase::Cruise => "Cruise",
+        FlightPhase::Holding => "Holding",
+        FlightPhase::Descent => "Descent",
+        FlightPhase::Approach => "Approach",
+        FlightPhase::Final => "Final",
+        FlightPhase::Landing => "Landing",
+        FlightPhase::TaxiIn => "TaxiIn",
+        FlightPhase::BlocksOn => "BlocksOn",
+        FlightPhase::Arrived => "Arrived",
+        FlightPhase::PirepSubmitted => "PirepSubmitted",
     }
 }
 
@@ -22590,6 +22859,7 @@ pub fn run() {
             flight_end,
             flight_end_manual,
             flight_cancel,
+            flight_resume_check_position,
             activity_log_get,
             activity_log_clear,
             activity_log_add,

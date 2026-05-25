@@ -349,6 +349,20 @@ export interface ActiveFlightInfo {
    *  on-ground, or implausibly large drift). The resume banner then
    *  disables its 10-second auto-confirm and waits for an explicit click. */
   resume_position_suspect: boolean;
+  /** v0.13.0 Stream F: nur gesetzt wenn was_just_resumed=true. Die
+   *  letzte gespeicherte Position für die Banner-Anzeige damit der Pilot
+   *  weiß WOHIN er sich im Sim repositionieren muss. */
+  last_known_lat?: number;
+  last_known_lon?: number;
+  last_known_alt_ft?: number;
+  /** v0.13.0 Stream F: zusätzlich Fuel/Weight/Aircraft aus dem letzten
+   *  Sim-Snapshot vor dem Crash/Disconnect. MSFS setzt Fuel beim Reload
+   *  oft auf Default — der Pilot sieht den Soll-Wert + stellt ihn manuell
+   *  nach, BEVOR er auf "Position prüfen + fortsetzen" klickt. */
+  last_known_fuel_kg?: number;
+  last_known_zfw_kg?: number;
+  last_known_total_weight_kg?: number;
+  last_known_aircraft_icao?: string;
   /** Stand the aircraft pushed back from (MSFS ATC PARKING NAME). */
   dep_gate: string | null;
   /** Stand the pilot parked at after arrival. */

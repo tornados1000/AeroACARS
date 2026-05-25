@@ -6432,6 +6432,77 @@ input:disabled {
   font-size: 0.85rem;
 }
 
+/* ──────────────────────────────────────────────────────────────────
+ * v0.13.0 Stream F: Resume-Integrity-Banner — wiederverwendet die
+ * Pause-Banner-Optik (gelber Rahmen, Header, Grid-BG), zeigt aber
+ * einen 3-Spalten-Vergleich (Gespeichert / Sim jetzt / Δ) pro
+ * Parameter statt der 2×2-Pause-Grid.
+ * ────────────────────────────────────────────────────────────────── */
+
+/* Variante mit ROTEM Rahmen für hard-stop (statt orange) */
+.active-flight__paused-banner--hard {
+  background: rgba(239, 68, 68, 0.08);
+  border-color: rgba(239, 68, 68, 0.5);
+}
+.active-flight__paused-banner--hard .active-flight__paused-header strong {
+  color: #ef4444;
+}
+
+/* 3-Spalten-Vergleichstabelle, ersetzt das 2×2-Pause-Grid */
+.resume-compare {
+  display: grid;
+  grid-template-columns: 110px 1fr 1fr 1fr;
+  gap: 0.25rem 1rem;
+  background: rgba(0, 0, 0, 0.18);
+  padding: 0.7rem 0.9rem;
+  border-radius: 7px;
+  align-items: baseline;
+}
+
+.resume-compare__head {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  padding-bottom: 0.3rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.resume-compare__label {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.resume-compare__val {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.88rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.resume-compare__val--missing {
+  color: var(--text-muted);
+  opacity: 0.5;
+}
+
+.resume-compare__delta {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.88rem;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+.resume-compare__delta--ok {
+  color: #34d399; /* grün */
+}
+.resume-compare__delta--bad {
+  color: #fca5a5; /* rot */
+}
+.resume-compare__delta--neutral {
+  color: var(--text-muted);
+}
+
 /* v0.4.2: Hint im Landung-Tab wenn keine SOLL-Werte verfügbar
  * (kein SimBrief-OFP für den Flug). Blauer Info-Banner statt nur
  * stille leere Tabellen-Zellen. */
