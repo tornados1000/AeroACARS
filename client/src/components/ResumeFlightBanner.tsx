@@ -46,10 +46,15 @@ export function ResumeFlightBanner({
   const [mode, setMode] = useState<Mode>({ kind: "idle" });
   const consumedRef = useRef(false);
   const confirmingRef = useRef(false);
-  const positionSuspectRef = useRef(false);
-  useEffect(() => {
-    positionSuspectRef.current = activeFlight?.resume_position_suspect === true;
-  }, [activeFlight]);
+  // v0.13.12 (Michel-Befund): positionSuspect als reactive Value statt Ref.
+  // Vorher: positionSuspectRef wurde via useEffect aktualisiert — React-Refs
+  // triggern KEINEN Re-Render und keine erneute Auswertung von dependent
+  // useEffects. Wenn der Backend-Status flippte (Pilot positioniert nach
+  // Sim-Crash zurueck → on_ground=false → positionSuspect false), blieb der
+  // Countdown-Effect bei positionSuspectRef.current=true haengen und der
+  // Countdown lief nie an. Mit reactive Value triggert der Countdown-Effect
+  // ueber die [mode, positionSuspect] dep automatisch erneut.
+  const positionSuspect = activeFlight?.resume_position_suspect === true;
 
   // v0.13.10 (QS-Round-1 Fix): consumedRef zuruecksetzen sobald
   // was_just_resumed im Backend auf false transitioniert (Pilot hat den
@@ -62,6 +67,24 @@ export function ResumeFlightBanner({
       consumedRef.current = false;
     }
   }, [activeFlight?.was_just_resumed]);
+
+  // v0.13.12 (Michel-Befund): Wenn das Backend was_just_resumed cleared
+  // (z.B. spawn_resume_sim_gate hat einen frischen Sim-Snapshot bekommen
+  // und schaltet den Flug scharf, oder flight_resume_check_position ist
+  // clean durchgelaufen) MUSS das Banner verschwinden. Vorher: mode blieb
+  // in "auto_resumed" haengen, Banner war weiter sichtbar obwohl der
+  // Resume bereits durchgelaufen war. Pilot konnte zwar Resume-Now
+  // druecken, aber das Banner sollte sich selbst schliessen sobald der
+  // Backend-Status sagt "fertig".
+  useEffect(() => {
+    if (
+      mode.kind === "auto_resumed" &&
+      activeFlight &&
+      !activeFlight.was_just_resumed
+    ) {
+      setMode({ kind: "idle" });
+    }
+  }, [activeFlight?.was_just_resumed, mode.kind]);
 
   // Disk-resume Banner
   useEffect(() => {
@@ -111,10 +134,15 @@ export function ResumeFlightBanner({
   }, [activeFlight, mode.kind]);
 
   // Countdown ticker
+  // v0.13.12 (Michel-Befund): positionSuspect zur dep-Liste hinzugefuegt,
+  // damit der Effect erneut laeuft sobald der Backend-Flag flippt (z.B.
+  // Pilot positioniert nach Sim-Crash zurueck — Hard-Stop weicht dem
+  // normalen Countdown). Vorher blieb der Countdown eingefroren weil
+  // positionSuspectRef.current als Ref kein Re-Render ausloest.
   useEffect(() => {
     if (mode.kind !== "auto_resumed" && mode.kind !== "discovered") return;
     if (mode.busy) return;
-    if (mode.kind === "auto_resumed" && positionSuspectRef.current) return;
+    if (mode.kind === "auto_resumed" && positionSuspect) return;
     if (mode.secondsLeft <= 0) {
       if (confirmingRef.current) return;
       confirmingRef.current = true;
@@ -130,7 +158,7 @@ export function ResumeFlightBanner({
     }, 1000);
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode]);
+  }, [mode, positionSuspect]);
 
   async function doConfirm() {
     if (mode.kind === "auto_resumed") {
@@ -199,9 +227,10 @@ export function ResumeFlightBanner({
 
   if (mode.kind === "idle") return null;
 
-  const positionSuspect =
-    mode.kind === "auto_resumed" &&
-    activeFlight?.resume_position_suspect === true;
+  // v0.13.12: lokale JSX-Variable umbenannt — `positionSuspect` ist jetzt
+  // oben als reactive Value definiert. Diese hier kombiniert sie mit dem
+  // Mode-Check fuer die JSX-Variantenwahl (Hard-Stop vs Normal-Countdown).
+  const showHardStop = mode.kind === "auto_resumed" && positionSuspect;
 
   const flight =
     mode.kind === "auto_resumed"
@@ -223,7 +252,7 @@ export function ResumeFlightBanner({
   // Look (rote Variante), Vergleichs-Grid statt Pause-Grid, 3-Button-
   // Recheck-Workflow statt Single-Resume-Button.
   // ─────────────────────────────────────────────────────────────────
-  if (positionSuspect) {
+  if (showHardStop) {
     return (
       <section
         className="active-flight__paused-banner active-flight__paused-banner--hard"
