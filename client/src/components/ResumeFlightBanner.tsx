@@ -51,6 +51,18 @@ export function ResumeFlightBanner({
     positionSuspectRef.current = activeFlight?.resume_position_suspect === true;
   }, [activeFlight]);
 
+  // v0.13.10 (QS-Round-1 Fix): consumedRef zuruecksetzen sobald
+  // was_just_resumed im Backend auf false transitioniert (Pilot hat den
+  // Banner via Re-Check, Force-Resume oder Cancel resolved). Ohne diesen
+  // Reset wuerde ein zweiter Mid-Session-Sim-Crash NICHT erneut den Banner
+  // anzeigen — exakt das Pattern was wir bei Pilot Michel (3x XP12-Crash
+  // pro Flug) beobachtet haben. Mit Reset triggert jeder Crash neu.
+  useEffect(() => {
+    if (activeFlight && !activeFlight.was_just_resumed) {
+      consumedRef.current = false;
+    }
+  }, [activeFlight?.was_just_resumed]);
+
   // Disk-resume Banner
   useEffect(() => {
     if (

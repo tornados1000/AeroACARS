@@ -15049,18 +15049,56 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
 
             // v0.13.9 Stream F (Mid-Session Sim-Crash-Recovery — LE27):
             // Wenn was_just_resumed=true gesetzt ist, pausiert der Streamer
-            // den gesamten Tick — kein FSM-Step, kein Outbox-Push, kein
-            // MQTT-Publish, kein PhpVMS-Worker-Trigger. Der ResumeFlightBanner
-            // (Frontend) zeigt sich via flight_status-Polling und der Pilot
-            // muss aktiv bestaetigen: "Position pruefen + fortsetzen" (clean
-            // via flight_resume_check_position) oder "Trotzdem fortsetzen
-            // (untrusted)" via flight_resume_confirm{force:true}.
+            // den Position-Push (kein FSM-Step, kein Outbox-Push, kein
+            // MQTT-Position-Publish, kein PhpVMS-Worker-Trigger). Der
+            // ResumeFlightBanner (Frontend) zeigt sich via flight_status-
+            // Polling und der Pilot muss aktiv bestaetigen.
             //
-            // Ohne diesen Guard wuerden die fragwuerdigen Recovery-Snapshots
-            // (Sim spawnt am naechsten Airport am Boden mit -30k ft Sprung)
-            // weiterhin in den PIREP-Route gepusht — Replay/Karte zeigen
-            // dann die Phantom-Boden-Beruehrungen.
+            // v0.13.10 (QS-Round-1 Fix): Heartbeat wird WAEHREND der Pause
+            // weiterhin gesendet, sonst killt phpVMS' RemoveExpiredLiveFlights-
+            // Cron den PIREP nach `acars.live_time` (default 2h) — auch
+            // realistisch wenn der Pilot den Banner laengere Zeit ignoriert
+            // (Telefon, Pinkelpause, Pause im Sim). Heartbeat-Body baut sich
+            // aus dem letzten guten Pre-Recovery-Snapshot (last_good_snap
+            // VOR diesem Tick, identisch zum SimPause/SimDisconnect-Pfad).
             if flight.was_just_resumed.load(Ordering::Relaxed) {
+                if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+                    if let Some(hb) = last_good_snap.as_ref() {
+                        let (phase, body) = {
+                            let stats = flight.stats.lock().expect("flight stats");
+                            let p = stats.phase;
+                            (p, build_heartbeat_body(hb, &stats, p))
+                        };
+                        match client.update_pirep(&flight.pirep_id, &body).await {
+                            Ok(()) => {
+                                last_heartbeat = std::time::Instant::now();
+                                {
+                                    let mut stats =
+                                        flight.stats.lock().expect("flight stats");
+                                    stats.last_heartbeat_at = Some(Utc::now());
+                                }
+                                tracing::debug!(
+                                    pirep_id = %flight.pirep_id,
+                                    phase = ?phase,
+                                    "PIREP heartbeat sent during sim-crash-recovery banner"
+                                );
+                            }
+                            Err(ApiError::NotFound) => {
+                                // phpVMS hat den PIREP serverseitig
+                                // entfernt — sauberer Recovery-Pfad
+                                // (gleiches Verhalten wie SimPause).
+                                handle_remote_cancellation(
+                                    &app,
+                                    &flight,
+                                    "POST update (sim-crash-recovery)",
+                                );
+                            }
+                            Err(_) => {
+                                // Transient — retry naechster Tick.
+                            }
+                        }
+                    }
+                }
                 continue;
             }
 
