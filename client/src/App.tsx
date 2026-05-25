@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { applyTheme, getInitialTheme, type Theme } from "./theme";
@@ -6,12 +6,22 @@ import { LoginPage } from "./components/LoginPage";
 import { CockpitView } from "./components/CockpitView";
 import { BriefingView } from "./components/BriefingView";
 import { SettingsPanel } from "./components/SettingsPanel";
-import { ReleaseNotesModal } from "./components/ReleaseNotesModal";
 import { ActivityLogPanel } from "./components/ActivityLogPanel";
 import { AboutPanel } from "./components/AboutPanel";
-import { LandingPanel } from "./components/LandingPanel";
 import { NewsPanel, useUnreadNewsCount } from "./components/NewsPanel";
 import RunwayDiagramPreview from "./dev/RunwayDiagramPreview";
+
+// v0.13.7: LandingPanel + ReleaseNotesModal lazy-loaded. Beide bringen
+// schwere Deps mit (react-markdown + remark-gfm fuer ReleaseNotes; grosse
+// SVG-Builder + scoring-Logik fuer LandingPanel) und werden erst nach dem
+// initialen Login angezeigt. Senkt die Main-Chunk-Size unter 700 KB und
+// beschleunigt den Cold-Start.
+const LandingPanel = lazy(() =>
+  import("./components/LandingPanel").then((m) => ({ default: m.LandingPanel })),
+);
+const ReleaseNotesModal = lazy(() =>
+  import("./components/ReleaseNotesModal").then((m) => ({ default: m.ReleaseNotesModal })),
+);
 import { UpdateButton } from "./components/UpdateButton";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { ErrorReportingFirstRunBanner } from "./components/ErrorReportingFirstRunBanner";
@@ -667,7 +677,11 @@ function App() {
         />
       )}
 
-      {status.kind === "loggedIn" && tab === "landing" && <LandingPanel />}
+      {status.kind === "loggedIn" && tab === "landing" && (
+        <Suspense fallback={<div className="lazy-fallback">…</div>}>
+          <LandingPanel />
+        </Suspense>
+      )}
 
       {status.kind === "loggedIn" && tab === "news" && <NewsPanel />}
 
@@ -709,13 +723,15 @@ function App() {
         tab === "devpreview" && <RunwayDiagramPreview />}
 
       {releaseNotesVersion && (
-        <ReleaseNotesModal
-          version={releaseNotesVersion}
-          onClose={() => {
-            saveLastSeenReleaseNotesVersion(releaseNotesVersion);
-            setReleaseNotesVersion(null);
-          }}
-        />
+        <Suspense fallback={null}>
+          <ReleaseNotesModal
+            version={releaseNotesVersion}
+            onClose={() => {
+              saveLastSeenReleaseNotesVersion(releaseNotesVersion);
+              setReleaseNotesVersion(null);
+            }}
+          />
+        </Suspense>
       )}
     </main>
   );

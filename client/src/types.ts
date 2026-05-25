@@ -476,7 +476,11 @@ export type FlightEndOutcome =
   /** Filing hit a transient error → PIREP sits in the retry queue. */
   | { kind: "queued"; pirep_id: string }
   /** The flight was genuinely discarded — no PIREP. */
-  | { kind: "cancelled" };
+  | { kind: "cancelled" }
+  /** v0.13.7: phpVMS returned 404 for the running PIREP — server-side
+   *  cancellation (inactivity timeout or admin removal). Banner explains
+   *  the situation and prompts a manual file. */
+  | { kind: "cancelled_remotely" };
 
 /** v0.12.5 (LE3): Mirrors the Rust-side `ManualFilingDefaults`. Seeds the
  *  ManualFileDialog so the pilot only corrects deviations. All values

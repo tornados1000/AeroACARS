@@ -769,6 +769,8 @@
     "pirep_filed_dismiss": "Chiudi",
     "cancelled_title": "Volo scartato",
     "cancelled_detail": "Il volo è stato scartato — nessun PIREP è stato inviato.",
+    "cancelled_remotely_title": "PIREP rimosso lato server",
+    "cancelled_remotely_detail": "phpVMS ha rimosso il PIREP in corso (probabile timeout di inattività o azione admin). Lo stato del volo è stato ripulito localmente. Invia il volo come Manual PIREP se necessario.",
     "filed_instead_title": "Volo inviato invece di scartato",
     "filed_instead_detail": "Volevi annullare, ma il volo era già completo — è stato inviato come PIREP {{pirep_id}}.",
     "queued_title": "PIREP in coda",
@@ -1254,6 +1256,14 @@
     "col_value": "Valore",
     "col_actions": "Azioni"
   },
+  "integrity": {
+    "title_critical": "Problema di integrità dei dati rilevato",
+    "title_anomaly": "Anomalia dei dati",
+    "flag_description": "{{type}} in fase {{phase}}",
+    "critical_warning": "Il PIREP sarà probabilmente contrassegnato come 'untrusted' e segnalato per la revisione dell'admin VA.",
+    "flag_count": "{{count}} flag in questa sessione",
+    "dismiss": "Chiudi"
+  },
   "resume": {
     "title": "Volo attivo rilevato",
     "countdown": "Tra {{seconds}}s il volo viene ripreso — fino allora nessun stream di posizioni",
@@ -1264,7 +1274,14 @@
     "confirm_cancel": "Annullare il volo attivo? Il PIREP verrà marcato come „cancellato\" su phpVMS — rimane visibile nella lista PIREP. Eliminazione completa solo dal sito phpVMS.",
     "adopt_failed": "Ripristino fallito",
     "confirm_failed": "Conferma fallita",
-    "cancel_failed": "Impossibile annullare il volo"
+    "cancel_failed": "Impossibile annullare il volo",
+    "hard_stop_title": "Sim crash o reload rilevato",
+    "hard_stop_body": "La posizione attuale del sim non corrisponde al volo salvato. Riposiziona prima nel sim alla posizione precedente (slew mode o ricarica), poi premi \"Verifica posizione ora + riprendi\". Se la posizione è entro 5 nm dal punto salvato, il volo riprende normalmente senza marchio untrusted.",
+    "hard_stop_discard": "Scarta volo + ricomincia",
+    "hard_stop_force_resume": "Continua comunque (PIREP sarà marcato untrusted)",
+    "recheck_check_now": "Verifica posizione ora + riprendi",
+    "recheck_checking": "Verifica posizione…",
+    "recheck_show_force": "Avanzato: continua nonostante il drift"
   },
   "active_flight": {
     "title": "Volo attivo",

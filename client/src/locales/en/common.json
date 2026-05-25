@@ -769,6 +769,8 @@
     "pirep_filed_dismiss": "Dismiss",
     "cancelled_title": "Flight discarded",
     "cancelled_detail": "The flight was discarded — no PIREP was filed.",
+    "cancelled_remotely_title": "PIREP removed server-side",
+    "cancelled_remotely_detail": "phpVMS removed the running PIREP (likely inactivity timeout or admin action). The flight state was cleared locally. File the flight as a Manual PIREP if needed.",
     "filed_instead_title": "Flight filed instead of discarded",
     "filed_instead_detail": "You chose to cancel, but the flight was already complete — it was submitted as PIREP {{pirep_id}} instead.",
     "queued_title": "PIREP queued",
@@ -1253,6 +1255,14 @@
     "col_unit": "Unit",
     "col_value": "Value",
     "col_actions": "Actions"
+  },
+  "integrity": {
+    "title_critical": "Data integrity problem detected",
+    "title_anomaly": "Data anomaly",
+    "flag_description": "{{type}} in phase {{phase}}",
+    "critical_warning": "The PIREP will likely be marked as 'untrusted' and flagged for VA admin review.",
+    "flag_count": "{{count}} flags this session",
+    "dismiss": "Dismiss"
   },
   "resume": {
     "title": "Active flight detected",

@@ -309,7 +309,10 @@ export function BidsList({
           next.set(bids[i]!.id, r.value);
           successCount++;
         } else {
-          console.log("[bid_simbrief_preview]", bids[i]!.id, "failed:", r.reason);
+          // v0.13.7: console.log entfernt — Preview-Failure ist eine
+          // erwartete Bedingung (kein OFP fuer den Bid generiert) und
+          // sollte die DevTools nicht zumuellen. Bei Bedarf kann das
+          // Backend ein log_activity-Entry liefern.
           errorCount++;
         }
       });
@@ -430,8 +433,8 @@ export function BidsList({
     // egal was passiert. Vorher gab es Pfade die `null` zurueckgaben
     // (success+changed=true, unknown-error-code) → Pilot sah gar nichts
     // und wusste nicht ob der Refresh ueberhaupt durchlief.
-    // Plus: Diagnose-Log fuer Backend-Debugging.
-    console.log("[refresh] outcome:", refreshOutcome);
+    // v0.13.7: Diagnose-console.log entfernt — Pilot bekommt die Outcome
+    // bereits ueber das Notice-UI; Devs koennen via Tauri-Logs nachvollziehen.
 
     if (refreshOutcome.error) {
       const formatted = formatRefreshError(refreshOutcome.error, t);

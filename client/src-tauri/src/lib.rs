@@ -4627,27 +4627,10 @@ fn activity_log_clear(state: tauri::State<'_, AppState>) {
     save_activity_log(&log);
 }
 
-/// v0.7.17 (B-006): Append an Activity-Log-Entry from the frontend.
-///
-/// Bisher waren Activity-Log-Eintraege nur backend-seitig moeglich
-/// (`log_activity(...)`). Manche Frontend-State-Wechsel (z.B. Auto-File-
-/// Failure) brauchen einen sichtbaren Eintrag im Log — sonst sieht der
-/// Pilot nicht was schief lief. `level` ist "info" | "warn" | "error".
-#[tauri::command]
-fn activity_log_add(
-    state: tauri::State<'_, AppState>,
-    level: String,
-    message: String,
-    detail: Option<String>,
-) {
-    let parsed_level = match level.as_str() {
-        "info" => ActivityLevel::Info,
-        "warn" => ActivityLevel::Warn,
-        "error" => ActivityLevel::Error,
-        _ => ActivityLevel::Info,
-    };
-    log_activity(&state, parsed_level, message, detail);
-}
+// v0.13.7: activity_log_add Tauri-Command entfernt — wurde von v0.7.17 fuer
+// Frontend-Auto-File-Failure-Logging eingefuehrt, aber nie aus dem Frontend
+// aufgerufen. Backend-Auto-File (v0.12.6+) logged direkt via log_activity().
+// Audit Q4-2026-05.
 
 // ---- Landing-history commands (Landing tab) ----
 
@@ -22862,7 +22845,6 @@ pub fn run() {
             flight_resume_check_position,
             activity_log_get,
             activity_log_clear,
-            activity_log_add,
             landing_list,
             landing_get_current,
             landing_delete,

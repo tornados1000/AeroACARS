@@ -104,6 +104,25 @@ export function CockpitView({
     };
   }, [setActiveFlight]);
 
+  // v0.13.7: Backend emittiert `pirep_cancelled_remotely` wenn phpVMS einen
+  // 404 auf einen laufenden PIREP liefert (= Inaktivitäts-Timeout oder
+  // VA-Admin hat den PIREP entfernt). Activity-Log enthält den Eintrag
+  // bereits durchgehend; hier räumen wir zusätzlich den lokalen
+  // Flugzustand auf, damit der Pilot nicht weiterklickt auf einem PIREP
+  // der serverseitig nicht mehr existiert.
+  useEffect(() => {
+    const unlisten = listen<{ pirep_id: string; source: string }>(
+      "pirep_cancelled_remotely",
+      () => {
+        setEndNotice({ kind: "cancelled_remotely" });
+        setActiveFlight(null);
+      },
+    );
+    return () => {
+      void unlisten.then((f) => f());
+    };
+  }, [setActiveFlight]);
+
   // v0.12.5 (LE7): post-flight notice banner — green ✅ for a real filing,
   // neutral for a discard. Rendered above both the empty state and the
   // active-flight panel so it's visible whichever way the tree resolves.
@@ -158,6 +177,12 @@ export function CockpitView({
           <>
             <strong>{t("cockpit.cancelled_title")}</strong>
             <span>{t("cockpit.cancelled_detail")}</span>
+          </>
+        )}
+        {endNotice.kind === "cancelled_remotely" && (
+          <>
+            <strong>{t("cockpit.cancelled_remotely_title")}</strong>
+            <span>{t("cockpit.cancelled_remotely_detail")}</span>
           </>
         )}
       </div>

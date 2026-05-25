@@ -18,7 +18,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.13.6"
+version = "0.13.7"
 edition = "2021"
 license = "MIT"
 authors = ["Thomas Kant <github@MANFahrer-GF>", "AeroACARS contributors"]
@@ -147,7 +147,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # kommt aus build-time-env AEROACARS_SENTRY_DSN (in CI/Build gesetzt,
 # nicht ins Repo). Wenn leer = kein Init = No-Op.
 # Wir nutzen rustls-tls (kein OpenSSL) konsistent mit reqwest.
-sentry = { version = "0.34", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
+sentry = { version = "0.42", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
 
 # Internal crates — wired up for use as the project grows
 api-client.workspace = true

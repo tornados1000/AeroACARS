@@ -769,6 +769,8 @@
     "pirep_filed_dismiss": "Schließen",
     "cancelled_title": "Flug verworfen",
     "cancelled_detail": "Der Flug wurde verworfen — es wurde kein PIREP eingereicht.",
+    "cancelled_remotely_title": "PIREP serverseitig entfernt",
+    "cancelled_remotely_detail": "phpVMS hat den laufenden PIREP entfernt (vermutlich Inaktivitäts-Timeout oder Admin-Eingriff). Der Flug-State wurde lokal aufgeräumt. Reiche den Flug bei Bedarf als Manual-PIREP nach.",
     "filed_instead_title": "Flug eingereicht statt verworfen",
     "filed_instead_detail": "Du wolltest abbrechen — der Flug war aber bereits abgeschlossen und wurde stattdessen als PIREP {{pirep_id}} eingereicht.",
     "queued_title": "PIREP in Warteschlange",
@@ -1253,6 +1255,14 @@
     "col_unit": "Einheit",
     "col_value": "Wert",
     "col_actions": "Aktionen"
+  },
+  "integrity": {
+    "title_critical": "Data-Integrity-Problem entdeckt",
+    "title_anomaly": "Datenanomalie",
+    "flag_description": "{{type}} in Phase {{phase}}",
+    "critical_warning": "Der PIREP wird wahrscheinlich als 'untrusted' eingestuft und für VA-Admin-Review markiert.",
+    "flag_count": "{{count}} Flags in dieser Session",
+    "dismiss": "Schließen"
   },
   "resume": {
     "title": "Aktiver Flug erkannt",
