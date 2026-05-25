@@ -15160,7 +15160,7 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                         Some(format!(
                             "Vorher: FL{:.0} airborne · jetzt: {:.0} ft am Boden bei LAT {:.3}° LON {:.3}° (Drop: {:.0} ft). \
                             Bitte im ResumeFlightBanner waehlen: zurueck zur Cruise-Position positionieren + Position pruefen, \
-                            oder trotzdem fortsetzen (PIREP wird untrusted markiert).",
+                            oder trotzdem fortsetzen — der Sprung wird im Activity-Log dokumentiert.",
                             prev.altitude_msl_ft / 100.0,
                             curr.altitude_msl_ft,
                             curr.lat,
