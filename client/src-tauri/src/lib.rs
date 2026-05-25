@@ -280,6 +280,54 @@ fn is_resume_position_suspect(
     false
 }
 
+/// v0.13.9 Stream F (LE27): Mid-Session Sim-Crash-Recovery Detection.
+///
+/// Pure Funktion — verglich zwei aufeinanderfolgende Snapshots im Streamer-
+/// Tick und gibt `true` zurueck wenn die Kombination ein Sim-Reload-Artefakt
+/// anzeigt:
+///
+/// 1. Aktuelle FlightPhase ist airborne-Set (Climb/Cruise/Holding/
+///    Descent/Approach/Final).
+/// 2. Vorheriger Snapshot war `on_ground=false`.
+/// 3. Neuer Snapshot ist `on_ground=true`.
+/// 4. |Altitude-Differenz| > Schwelle (default 5000 ft).
+///
+/// Der 5000-ft-Wert ist konservativ: Max realer Descent (Airbus 'Open
+/// Descent' / Boeing 'VS-Mode') liegt bei ~4000 fpm, also ~4000 ft pro
+/// Minute. Im laengsten Tick-Intervall (30 s Cruise) waeren das maximal
+/// 2000 ft realer Drop. Ein 5000-ft-Drop in einem Tick ist physikalisch
+/// unmoeglich = eindeutig Reload-Artefakt.
+///
+/// Position-Distance wird NICHT geprueft weil XP12-Crash-Recovery den
+/// Aircraft am naechstgelegenen Airport spawnt (typisch 10-20 km vom
+/// Cruise-Punkt, < `RESUME_DRIFT_WARN_NM` von 50 nm) — Distance-Trigger
+/// wuerde Faelle wie Michel 2026-05-25 verpassen.
+fn is_mid_session_sim_crash_recovery(
+    current_phase: FlightPhase,
+    prev_on_ground: bool,
+    prev_altitude_msl_ft: f64,
+    curr_on_ground: bool,
+    curr_altitude_msl_ft: f64,
+) -> bool {
+    let was_airborne_phase = matches!(
+        current_phase,
+        FlightPhase::Climb
+            | FlightPhase::Cruise
+            | FlightPhase::Holding
+            | FlightPhase::Descent
+            | FlightPhase::Approach
+            | FlightPhase::Final
+    );
+    if !was_airborne_phase {
+        return false;
+    }
+    if prev_on_ground || !curr_on_ground {
+        return false;
+    }
+    let alt_drop_ft = (prev_altitude_msl_ft - curr_altitude_msl_ft).abs();
+    alt_drop_ft > 5000.0
+}
+
 /// Kilograms → pounds. We collect fuel in kg internally because every
 /// SimConnect adapter normalises to SI, but phpVMS-Core's `acars` table
 /// and the PIREP `file` endpoint expect pounds — convert at the boundary.
@@ -14999,10 +15047,96 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                 break;
             }
 
+            // v0.13.9 Stream F (Mid-Session Sim-Crash-Recovery — LE27):
+            // Wenn was_just_resumed=true gesetzt ist, pausiert der Streamer
+            // den gesamten Tick — kein FSM-Step, kein Outbox-Push, kein
+            // MQTT-Publish, kein PhpVMS-Worker-Trigger. Der ResumeFlightBanner
+            // (Frontend) zeigt sich via flight_status-Polling und der Pilot
+            // muss aktiv bestaetigen: "Position pruefen + fortsetzen" (clean
+            // via flight_resume_check_position) oder "Trotzdem fortsetzen
+            // (untrusted)" via flight_resume_confirm{force:true}.
+            //
+            // Ohne diesen Guard wuerden die fragwuerdigen Recovery-Snapshots
+            // (Sim spawnt am naechsten Airport am Boden mit -30k ft Sprung)
+            // weiterhin in den PIREP-Route gepusht — Replay/Karte zeigen
+            // dann die Phantom-Boden-Beruehrungen.
+            if flight.was_just_resumed.load(Ordering::Relaxed) {
+                continue;
+            }
+
+            // v0.13.9 Stream F: Snapshot VOR Overwrite cachen damit die
+            // Recovery-Detection (airborne -> on_ground mit massivem
+            // Altitude-Drop) den Vergleich machen kann.
+            let previous_snap_for_recovery: Option<SimSnapshot> = last_good_snap.clone();
+
             let snapshot = current_snapshot(&app);
             if let Some(ref s) = snapshot {
                 last_good_snap = Some(s.clone());
                 last_good_snap_at = Some(std::time::Instant::now());
+            }
+
+            // v0.13.9 Stream F (LE27): Mid-Session Sim-Crash-Detection.
+            //
+            // Symptom realer Pilot-Befunde (User Michel, 25.05.2026 ITY 608
+            // KBOS->KJFK, 3x XP12-Reload heute beobachtet):
+            //   - vor Reload: airborne in CRUISE, FL320-FL360
+            //   - nach Reload: on_ground=true am naechstgelegenen Airport,
+            //     Altitude springt -30k ft in einem Sample-Intervall
+            //
+            // Diese Kombination ist physikalisch unmoeglich (max real
+            // achievable descent ~4000 fpm = 4000 ft pro Minute), also
+            // eindeutig ein Sim-Reload-Artefakt.
+            //
+            // Wir setzen `was_just_resumed=true` — der bereits existierende
+            // Stream-F-Workflow (Banner + Re-Check) greift dann automatisch
+            // via flight_status-Polling. Naechster Tick laeuft in den Guard
+            // oben hinein und pausiert den Streamer bis Pilot entschieden hat.
+            //
+            // Schwelle: 5000 ft Altitude-Drop in einem Tick UND on_ground
+            // erst false dann true UND vorherige FlightPhase = airborne-Set.
+            // Position-Distance ist NICHT geprueft weil XP12-Crash-Recovery
+            // am NAECHSTEN Airport (typisch 10-20 km vom Cruise-Punkt) eine
+            // Drift unter Schwellenwert haben kann (RESUME_DRIFT_WARN_NM=50nm).
+            if let (Some(prev), Some(curr)) = (previous_snap_for_recovery.as_ref(), snapshot.as_ref()) {
+                if is_mid_session_sim_crash_recovery(
+                    current_phase,
+                    prev.on_ground,
+                    prev.altitude_msl_ft,
+                    curr.on_ground,
+                    curr.altitude_msl_ft,
+                ) {
+                    let alt_drop_ft = (prev.altitude_msl_ft - curr.altitude_msl_ft).abs();
+                    flight.was_just_resumed.store(true, Ordering::SeqCst);
+                    save_active_flight(&app, &flight);
+                    log_activity_handle(
+                        &app,
+                        ActivityLevel::Error,
+                        "⚠ Sim-Reload erkannt — Aufzeichnung pausiert".to_string(),
+                        Some(format!(
+                            "Vorher: FL{:.0} airborne · jetzt: {:.0} ft am Boden bei LAT {:.3}° LON {:.3}° (Drop: {:.0} ft). \
+                            Bitte im ResumeFlightBanner waehlen: zurueck zur Cruise-Position positionieren + Position pruefen, \
+                            oder trotzdem fortsetzen (PIREP wird untrusted markiert).",
+                            prev.altitude_msl_ft / 100.0,
+                            curr.altitude_msl_ft,
+                            curr.lat,
+                            curr.lon,
+                            alt_drop_ft,
+                        )),
+                    );
+                    tracing::warn!(
+                        pirep_id = %flight.pirep_id,
+                        prev_alt_ft = prev.altitude_msl_ft,
+                        curr_alt_ft = curr.altitude_msl_ft,
+                        alt_drop_ft,
+                        curr_on_ground = curr.on_ground,
+                        prev_on_ground = prev.on_ground,
+                        phase = ?current_phase,
+                        "Stream F mid-session sim-crash-recovery detected — streamer paused"
+                    );
+                    // Skip restlichen Tick — naechster Tick faellt in den
+                    // Guard oben hinein und pausiert bis Pilot bestaetigt.
+                    continue;
+                }
             }
 
             // Spec v0.7.15 F5/F6: Sim-eigene Pause-Detection.
@@ -25067,6 +25201,114 @@ mod sim_pause_tests {
             true,
             52.0,
             10.0,
+        ));
+    }
+
+    // ---- v0.13.9 Stream F (LE27) — Mid-Session Sim-Crash-Recovery ----
+
+    #[test]
+    fn mid_session_recovery_michel_reload_1_cruise_to_edtd_ground() {
+        // Reale Werte ITY 608 / Michel 2026-05-25 12:32:15 UTC:
+        // FL320 (31993 ft) airborne im Cruise → 2117 ft on_ground bei
+        // EDTD Donaueschingen. Alt-Drop: 29876 ft.
+        assert!(is_mid_session_sim_crash_recovery(
+            FlightPhase::Cruise,
+            false, // prev airborne
+            31993.0,
+            true, // curr grounded
+            2117.0,
+        ));
+    }
+
+    #[test]
+    fn mid_session_recovery_michel_reload_2_caen() {
+        // Reale Werte 13:31:06 UTC: FL340 → -6 ft on_ground bei LFRK Caen.
+        assert!(is_mid_session_sim_crash_recovery(
+            FlightPhase::Cruise,
+            false,
+            33999.0,
+            true,
+            -6.0,
+        ));
+    }
+
+    #[test]
+    fn mid_session_recovery_michel_reload_3_newfoundland() {
+        // Reale Werte 18:04:21 UTC: FL360 → 152 ft on_ground bei CYYT.
+        assert!(is_mid_session_sim_crash_recovery(
+            FlightPhase::Cruise,
+            false,
+            36001.0,
+            true,
+            152.0,
+        ));
+    }
+
+    #[test]
+    fn mid_session_recovery_not_triggered_during_normal_descent() {
+        // Realer Descent kann max ~4000 fpm = ~200 ft pro 3-s-Tick. Selbst
+        // ein extrem langer 30-s-Cruise-Tick kann maximal 2000 ft Drop
+        // erzeugen. 1500 ft Drop ist also normaler Sink-Rate.
+        assert!(!is_mid_session_sim_crash_recovery(
+            FlightPhase::Descent,
+            false,
+            10000.0,
+            false,
+            8500.0,
+        ));
+    }
+
+    #[test]
+    fn mid_session_recovery_not_triggered_when_phase_not_airborne() {
+        // Wenn die FSM bereits auf BlocksOn oder TaxiIn ist, ist on_ground
+        // erwartet, nicht alarmierend. Der Trigger soll NUR bei mid-flight
+        // Sim-Crash anschlagen.
+        assert!(!is_mid_session_sim_crash_recovery(
+            FlightPhase::BlocksOn,
+            false,
+            31993.0,
+            true,
+            2117.0,
+        ));
+    }
+
+    #[test]
+    fn mid_session_recovery_not_triggered_on_normal_landing() {
+        // Normaler Touchdown: airborne → grounded, aber Altitude-Drop ist
+        // beim Touchdown nur wenige Hundert Fuss (AGL). 50 ft Drop in
+        // einem Tick = normaler Flare, kein Crash.
+        assert!(!is_mid_session_sim_crash_recovery(
+            FlightPhase::Final,
+            false,
+            150.0,
+            true,
+            100.0,
+        ));
+    }
+
+    #[test]
+    fn mid_session_recovery_not_triggered_when_already_grounded() {
+        // Wenn prev bereits on_ground=true war, kann das kein Sim-Reload-
+        // Recovery sein — wir waren bereits am Boden.
+        assert!(!is_mid_session_sim_crash_recovery(
+            FlightPhase::Cruise, // hypothetisch
+            true,                // prev grounded
+            2000.0,
+            true,
+            2000.0,
+        ));
+    }
+
+    #[test]
+    fn mid_session_recovery_not_triggered_when_still_airborne_after() {
+        // Wenn curr noch airborne ist, ist's kein Reload (Recovery setzt
+        // den Aircraft am Boden ab).
+        assert!(!is_mid_session_sim_crash_recovery(
+            FlightPhase::Cruise,
+            false,
+            36000.0,
+            false, // still airborne
+            10000.0,
         ));
     }
 
