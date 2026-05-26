@@ -598,6 +598,18 @@ pub enum AircraftProfile {
     IniA350,
     /// INIBuilds A340-600 Pro.
     IniA346Pro,
+    /// v0.13.13: FSReborn Phenom 300E (MSFS 2024 release). Verwendet die
+    /// FSR-eigenen Engine-Knob-LVars statt `GENERAL ENG COMBUSTION:N`.
+    /// Hintergrund (Pilot-Befund Michael 2026-05-26): Standard-SimVar
+    /// liefert in Cold&Dark vor Engine-Start `engines_running > 0` obwohl
+    /// Engines aus → Auto-Start scheitert mit "Triebwerke sind an". FSR
+    /// nutzt eigene LVars fuer Switch-State (siehe HubHop-Reference
+    /// docs/dev/lvar-discovery-hubhop.md):
+    ///   L:FSR_300E_ENGINE1_KNOB_POS  Number  0=STOP 1=RUN 2=START
+    ///   L:FSR_300E_ENGINE2_KNOB_POS  Number  0=STOP 1=RUN 2=START
+    /// Rest der Telemetrie (N1/N2/Fuel/Gear/Flaps) kommt sauber via
+    /// Standard-SimVars — kein voller Profile-Override noetig.
+    FsrPhenom300e,
 }
 
 impl AircraftProfile {
@@ -651,6 +663,13 @@ impl AircraftProfile {
         if t.contains("inibuilds") && t.contains("a340") {
             return Self::IniA340;
         }
+        // v0.13.13: FSReborn Phenom 300E. Title aus dem Sim heisst typisch
+        // "FSReborn Phenom 300E Tristan Interior" (oder mit anderen
+        // Interior-Varianten). Wir matchen tolerant auf fsreborn + phenom +
+        // 300 — fängt auch Edge-Cases ab wie "FSR Phenom300" ohne Space.
+        if t.contains("fsreborn") && t.contains("phenom") && t.contains("300") {
+            return Self::FsrPhenom300e;
+        }
         Self::Default
     }
 
@@ -674,6 +693,9 @@ impl AircraftProfile {
             Self::FenixA319 => Some("A319"),
             Self::FenixA320 => Some("A320"),
             Self::FenixA321 => Some("A321"),
+            // v0.13.13: FSR Phenom 300E hat ICAO E55P (Embraer Phenom 300
+            // Standard-Designator).
+            Self::FsrPhenom300e => Some("E55P"),
             _ => None,
         }
     }
@@ -691,6 +713,7 @@ impl AircraftProfile {
             Self::IniA340 => "INIBuilds A340",
             Self::IniA350 => "INIBuilds A350",
             Self::IniA346Pro => "INIBuilds A340-600 Pro",
+            Self::FsrPhenom300e => "FSReborn Phenom 300E",
         }
     }
 }
@@ -935,6 +958,62 @@ mod tests {
         assert_eq!(AircraftProfile::Default.icao_fallback(), None);
         assert_eq!(AircraftProfile::FbwA32nx.icao_fallback(), None);
         assert_eq!(AircraftProfile::Pmdg737.icao_fallback(), None);
+    }
+
+    // ---- v0.13.13 FsrPhenom300e Profile ----
+
+    #[test]
+    fn detect_fsr_phenom_300e_from_full_title() {
+        // Realer Title aus Michael's Telemetrie (NJE 245 LEMH->LEBL 26.05.2026):
+        let p = AircraftProfile::detect("FSReborn Phenom 300E Tristan Interior", "E55P");
+        assert_eq!(p, AircraftProfile::FsrPhenom300e);
+    }
+
+    #[test]
+    fn detect_fsr_phenom_300e_case_insensitive() {
+        let p = AircraftProfile::detect("fsreborn phenom 300e", "E55P");
+        assert_eq!(p, AircraftProfile::FsrPhenom300e);
+    }
+
+    #[test]
+    fn detect_fsr_phenom_300e_with_variant_suffix() {
+        // FSR liefert verschiedene Interior-Optionen, z.B. "Tristan", "Default".
+        let p = AircraftProfile::detect("FSReborn Phenom 300E Default Interior", "E55P");
+        assert_eq!(p, AircraftProfile::FsrPhenom300e);
+    }
+
+    #[test]
+    fn detect_phenom_without_fsreborn_marker_stays_default() {
+        // Asobo Default-Phenom oder andere Studios sollen NICHT auf das
+        // FSR-Profile fallen — die haben das Knob-LVar nicht.
+        let p = AircraftProfile::detect("Asobo Phenom 300", "E55P");
+        assert_eq!(p, AircraftProfile::Default);
+    }
+
+    #[test]
+    fn detect_fsreborn_lear_75_does_not_match_phenom() {
+        // FSReborn hat auch andere Aircraft (FSR500, Sting S4, evtl. spaeter
+        // Lear). Diese sollen nicht versehentlich als Phenom 300E erkannt
+        // werden — Detection prueft auf alle drei Marker.
+        let p = AircraftProfile::detect("FSReborn Lear 75", "LJ75");
+        assert_eq!(p, AircraftProfile::Default);
+    }
+
+    #[test]
+    fn icao_fallback_fsr_phenom_300e_is_e55p() {
+        assert_eq!(AircraftProfile::FsrPhenom300e.icao_fallback(), Some("E55P"));
+    }
+
+    #[test]
+    fn label_fsr_phenom_300e_is_human_readable() {
+        assert_eq!(AircraftProfile::FsrPhenom300e.label(), "FSReborn Phenom 300E");
+    }
+
+    #[test]
+    fn fsr_phenom_300e_is_not_fenix() {
+        // Sanity: das Profile darf NICHT als Fenix klassifiziert werden
+        // (sonst wuerde der Fenix-LVar-Mapping-Block falsch greifen).
+        assert!(!AircraftProfile::FsrPhenom300e.is_fenix());
     }
 
     #[test]

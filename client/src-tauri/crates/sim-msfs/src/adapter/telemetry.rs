@@ -301,6 +301,24 @@ pub const TELEMETRY_FIELDS: &[TelemetryField] = &[
     // adds the lever *detent* as a cross-check value the activity log
     // can pin against (e.g. "Lever 1+F" vs the percentage).
     F::f64("L:S_FC_FLAPS", "Number"),
+
+    // ---- FSReborn Phenom 300E LVars (v0.13.13) ----
+    // Pilot-Befund Michael 2026-05-26: AeroACARS Auto-Start scheiterte mit
+    // "Triebwerke sind an" obwohl FSR Phenom 300E Cold&Dark stand. Standard
+    // SimVar GENERAL ENG COMBUSTION:N liefert beim FSReborn vor erstem
+    // Engine-Start unzuverlaessige Werte. Loesung: FSR-eigene Engine-Knob-
+    // LVars lesen, die den Pilot-Befehl direkt reflektieren.
+    //
+    // LVar-Werte (aus HubHop-Dump verifiziert):
+    //   0 = STOP   (engine commanded off)
+    //   1 = RUN    (engine commanded running)
+    //   2 = START  (engine in start sequence)
+    //
+    // Andere Telemetrie-Felder (N1/N2/Fuel/Gear/Flaps) kommen sauber
+    // ueber Standard-SimVars — kein Override noetig. Siehe HubHop-Audit
+    // docs/dev/lvar-discovery-hubhop.md fuer den vollen LVar-Katalog.
+    F::f64("L:FSR_300E_ENGINE1_KNOB_POS", "Number"),
+    F::f64("L:FSR_300E_ENGINE2_KNOB_POS", "Number"),
 ];
 
 // Helper builders so the table above stays compact.
@@ -474,6 +492,14 @@ pub struct Telemetry {
     pub fnx_ext_lt_landing_both: f64,
     pub fnx_ext_lt_nose: f64,
     pub fnx_fc_flaps_lever: f64,
+
+    // v0.13.13: FSReborn Phenom 300E Engine-Knob-State (0=STOP, 1=RUN,
+    // 2=START). Wird in `telemetry_to_snapshot` als Quelle fuer
+    // engines_running genutzt wenn AircraftProfile::FsrPhenom300e
+    // detected ist — Standard SimVar GENERAL ENG COMBUSTION:N ist beim
+    // FSR in Cold&Dark unzuverlaessig (Pilot-Befund Michael 2026-05-26).
+    pub fsr_phenom_eng1_knob: f64,
+    pub fsr_phenom_eng2_knob: f64,
 }
 
 // ---- Touchdown sample (separate data definition #2) ----
@@ -832,6 +858,14 @@ impl Telemetry {
         pull_f64!(t.fnx_ext_lt_nose);
         pull_f64!(t.fnx_fc_flaps_lever);
 
+        // v0.13.13: FSR Phenom 300E Engine-Knob LVars — gleiche
+        // TELEMETRY_FIELDS-Reihenfolge wie oben registriert. Werte:
+        //   0 = STOP   (engine commanded off)
+        //   1 = RUN    (engine commanded running)
+        //   2 = START  (engine in start sequence)
+        pull_f64!(t.fsr_phenom_eng1_knob);
+        pull_f64!(t.fsr_phenom_eng2_knob);
+
         // Silence the unused-assignment warning the last `pull_*!`
         // emits (the macro always advances `off`, but the very last
         // call doesn't read it again).
@@ -894,10 +928,24 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
     // site; semantically it's now just "is a Fenix profile".
     let fenix_beta = is_fenix;
 
-    let engines_running = (t.eng1_firing as u8)
-        + (t.eng2_firing as u8)
-        + (t.eng3_firing as u8)
-        + (t.eng4_firing as u8);
+    // v0.13.13: FSR Phenom 300E nutzt den Engine-Knob-LVar statt
+    // `GENERAL ENG COMBUSTION:N`. Hintergrund: der Standard-SimVar liefert
+    // beim FSR-Phenom in Cold&Dark > 0 obwohl Engines aus — Auto-Start
+    // scheiterte mit "Triebwerke sind an" (Pilot-Befund Michael 26.05.2026).
+    // Knob-Werte: 0 = STOP, 1 = RUN, 2 = START. Beides >0 = Engine commanded
+    // on. Real airborne Phase laeuft sowieso ueber knob=1 (RUN), also
+    // konsistent mit dem GENERAL ENG COMBUSTION-Verhalten ueber den
+    // ganzen Flug — nur Cold&Dark wird korrekt.
+    let is_fsr_phenom = matches!(profile, AircraftProfile::FsrPhenom300e);
+    let engines_running = if is_fsr_phenom {
+        (if t.fsr_phenom_eng1_knob > 0.5 { 1u8 } else { 0 })
+            + (if t.fsr_phenom_eng2_knob > 0.5 { 1u8 } else { 0 })
+    } else {
+        (t.eng1_firing as u8)
+            + (t.eng2_firing as u8)
+            + (t.eng3_firing as u8)
+            + (t.eng4_firing as u8)
+    };
 
     // Fuel pick order: FBW LVar (already in kg) > EX1 SimVar (SU2+,
     // works for modern fuel system) > legacy WEIGHT SimVar.
