@@ -8056,6 +8056,12 @@ input:disabled {
 .aa-livemap__log .activity-log__list {
   max-height: none;
   flex: 1;
+  /* v0.15.8: min-height:0 ist der entscheidende Flexbox-Fix — ohne ihn schrumpft
+     die Liste NICHT unter ihren Inhalt, die lange Log-Liste drückt die ganze
+     Seite auf (Map wird elend lang, Zoom-Buttons verschwinden). Mit min-height:0
+     scrollt die Liste intern, und die Karte bleibt auf Fenster-/Bildschirmhöhe. */
+  min-height: 0;
+  overflow-y: auto;
 }
 .aa-livemap__log .activity-log__title {
   font-size: 14px;
