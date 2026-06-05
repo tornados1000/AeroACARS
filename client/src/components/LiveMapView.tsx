@@ -18,6 +18,8 @@ import { invoke } from "@tauri-apps/api/core";
 import type { ActiveFlightInfo, SimSnapshot } from "../types";
 import { ActivityLogPanel } from "./ActivityLogPanel";
 import { getTrack } from "../lib/trackStore";
+import { aircraftSvg } from "../lib/aircraftIcon";
+import { phaseColor, phaseLabel as formatPhase } from "../lib/phaseColors";
 
 const BASEMAP_DARK = "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json";
 const BASEMAP_LIGHT = "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json";
@@ -51,7 +53,6 @@ interface VaFlight {
     vs?: number;
   } | null;
 }
-type View = "own" | "va";
 interface Aircraft {
   lon: number;
   lat: number;
@@ -64,6 +65,17 @@ function readTheme(): "dark" | "light" {
 function cssVar(name: string, fallback: string): string {
   const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
   return v || fallback;
+}
+/** Great-circle-Distanz in nautischen Meilen zwischen [lon,lat]-Paaren. */
+function distNm(a: [number, number], b: [number, number]): number {
+  const R = 3440.065; // Erdradius in nm
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const dLat = toRad(b[1] - a[1]);
+  const dLon = toRad(b[0] - a[0]);
+  const la1 = toRad(a[1]);
+  const la2 = toRad(b[1]);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(la1) * Math.cos(la2) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
 }
 
 // Phasenabhängiger Folge-Zoom: am Boden nah dran, im Reiseflug weit.
@@ -130,9 +142,11 @@ function vaPopupHtml(f: VaFlight): string {
 const SRC_ROUTE = "aa-planned-route";
 const SRC_WPTS = "aa-planned-wpts";
 const SRC_TRACK = "aa-flown-track";
+const SRC_TRACK_DOTS = "aa-flown-track-dots";
 const LYR_ROUTE = "aa-planned-route-line";
 const LYR_WPTS = "aa-planned-wpts-circles";
 const LYR_TRACK = "aa-flown-track-line";
+const LYR_TRACK_DOTS = "aa-flown-track-dots-circles";
 
 interface Props {
   activeFlight: ActiveFlightInfo | null;
@@ -149,22 +163,29 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
   const vaFittedRef = useRef(false);
   const zoomTargetRef = useRef<number | null>(null);
   const zoomingRef = useRef(false);
+  const acCatRef = useRef<string | null>(null); // zuletzt gerendertes Eigen-Flieger-Icon (ICAO)
   const dataRef = useRef<{
     fixes: RouteFix[];
     track: [number, number][];
     dep?: [number, number];
     arr?: [number, number];
+    nextIdent?: string;
   }>({ fixes: [], track: [] });
 
   const [mapReady, setMapReady] = useState(false);
-  const [view, setView] = useState<View>("own");
   const [follow, setFollow] = useState(true);
+  const [showVa, setShowVa] = useState(true); // VA-Verkehr ein-/ausblenden
   const [theme, setTheme] = useState<"dark" | "light">(readTheme());
   const [routeFixes, setRouteFixes] = useState<RouteFix[]>([]);
   const [depArr, setDepArr] = useState<{ dep?: [number, number]; arr?: [number, number] }>({});
   const [vaFlights, setVaFlights] = useState<VaFlight[]>([]);
 
   const pirepId = activeFlight?.pirep_id ?? null;
+  // VA-Flieger ohne den eigenen Flug (steckt auch in /api/acars).
+  const vaVisible = useMemo(
+    () => (showVa ? vaFlights.filter((f) => !activeFlight || String(f.id ?? "") !== activeFlight.pirep_id) : []),
+    [showVa, vaFlights, activeFlight],
+  );
 
   // ---- effektive Daten (aktiver Flug) ----
   const effFixes = routeFixes;
@@ -182,10 +203,39 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
   const effDepIcao = activeFlight?.dpt_airport;
   const effArrIcao = activeFlight?.arr_airport;
 
-  const phaseLabel = activeFlight?.phase ?? "—";
+  const phaseLabel = formatPhase(activeFlight?.phase);
+
+  // ---- Nächster Wegpunkt + ETA ----
+  const nav = useMemo(() => {
+    if (!effAircraft) return { nextIdent: undefined as string | undefined, nextLabel: "—", eta: "—" };
+    const ac: [number, number] = [effAircraft.lon, effAircraft.lat];
+    const acToArr = effArr ? distNm(ac, effArr) : Infinity;
+    let next: RouteFix | null = null;
+    let bestD = Infinity;
+    for (const f of effFixes) {
+      const fp: [number, number] = [f.lon, f.lat];
+      // nur Fixe, die näher am Ziel sind als wir (= voraus), und nicht das Ziel selbst.
+      if (effArr && distNm(fp, effArr) >= acToArr - 1) continue;
+      const d = distNm(ac, fp);
+      if (d < bestD) {
+        bestD = d;
+        next = f;
+      }
+    }
+    const nextLabel = next ? `${next.ident} · ${Math.round(bestD)} nm` : "—";
+    const dtg = activeFlight?.distance_nm;
+    const gs = simSnapshot?.groundspeed_kt;
+    let eta = "—";
+    if (dtg != null && gs != null && gs > 30) {
+      const mins = Math.round((dtg / gs) * 60);
+      eta = mins >= 60 ? `${Math.floor(mins / 60)}h ${String(mins % 60).padStart(2, "0")}m` : `${mins}m`;
+    }
+    return { nextIdent: next?.ident, nextLabel, eta };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [effFixes, effAircraft, effArr, activeFlight?.distance_nm, simSnapshot?.groundspeed_kt]);
 
   // dataRef für die styledata-Re-Adds aktuell halten
-  dataRef.current = { fixes: effFixes, track: effTrack, dep: effDep, arr: effArr };
+  dataRef.current = { fixes: effFixes, track: effTrack, dep: effDep, arr: effArr, nextIdent: nav.nextIdent };
 
   // ---- Map einmalig erstellen ----
   useEffect(() => {
@@ -230,17 +280,22 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
   // ---- Overlays anlegen (idempotent) + aus dataRef füllen ----
   function addOverlays(map: maplibregl.Map) {
     const accent = cssVar("--accent", "#0a84ff");
-    const trackColor = cssVar("--success", "#30d158");
+    const trackColor = cssVar("--map-track", "#e8e8e8"); // theme-aware (hell/dunkel)
+    const surface = cssVar("--surface", "#ffffff");
+    const warning = cssVar("--warning", "#ff9f0a");
     const empty: GeoJSON.FeatureCollection = { type: "FeatureCollection", features: [] };
     if (!map.getSource(SRC_ROUTE)) map.addSource(SRC_ROUTE, { type: "geojson", data: empty });
     if (!map.getSource(SRC_WPTS)) map.addSource(SRC_WPTS, { type: "geojson", data: empty });
     if (!map.getSource(SRC_TRACK)) map.addSource(SRC_TRACK, { type: "geojson", data: empty });
+    if (!map.getSource(SRC_TRACK_DOTS)) map.addSource(SRC_TRACK_DOTS, { type: "geojson", data: empty });
     if (!map.getLayer(LYR_ROUTE)) {
       map.addLayer({
         id: LYR_ROUTE,
         type: "line",
         source: SRC_ROUTE,
-        paint: { "line-color": accent, "line-width": 2, "line-opacity": 0.6, "line-dasharray": [2, 2] },
+        layout: { "line-cap": "round", "line-join": "round" },
+        // Stratos-Look: durchgezogene geplante Route.
+        paint: { "line-color": accent, "line-width": 2.5, "line-opacity": 0.55 },
       });
     }
     if (!map.getLayer(LYR_TRACK)) {
@@ -252,21 +307,41 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
         paint: { "line-color": trackColor, "line-width": 3 },
       });
     }
+    // Breadcrumb-Punkte entlang des geflogenen Tracks (wie Stratos).
+    if (!map.getLayer(LYR_TRACK_DOTS)) {
+      map.addLayer({
+        id: LYR_TRACK_DOTS,
+        type: "circle",
+        source: SRC_TRACK_DOTS,
+        paint: {
+          "circle-radius": 2.4,
+          "circle-color": trackColor,
+          "circle-stroke-width": 1,
+          "circle-stroke-color": surface,
+        },
+      });
+    }
     if (!map.getLayer(LYR_WPTS)) {
       map.addLayer({
         id: LYR_WPTS,
         type: "circle",
         source: SRC_WPTS,
         paint: {
-          "circle-radius": ["case", ["in", ["get", "kind"], ["literal", ["TOC", "TOD"]]], 5, 3],
+          // nächster Wegpunkt größer hervorgehoben (Stratos-Look).
+          "circle-radius": [
+            "case",
+            ["==", ["get", "isNext"], true], 6,
+            ["in", ["get", "kind"], ["literal", ["TOC", "TOD"]]], 5,
+            3,
+          ],
           "circle-color": [
             "case",
-            ["in", ["get", "kind"], ["literal", ["TOC", "TOD"]]],
-            cssVar("--warning", "#ff9f0a"),
+            ["==", ["get", "isNext"], true], accent,
+            ["in", ["get", "kind"], ["literal", ["TOC", "TOD"]]], warning,
             accent,
           ],
-          "circle-stroke-width": 1,
-          "circle-stroke-color": cssVar("--surface", "#ffffff"),
+          "circle-stroke-width": ["case", ["==", ["get", "isNext"], true], 2, 1],
+          "circle-stroke-color": surface,
         },
       });
     }
@@ -275,12 +350,13 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
 
   function pushSources(
     map: maplibregl.Map,
-    d: { fixes: RouteFix[]; track: [number, number][]; dep?: [number, number]; arr?: [number, number] },
+    d: { fixes: RouteFix[]; track: [number, number][]; dep?: [number, number]; arr?: [number, number]; nextIdent?: string },
   ) {
     const routeSrc = map.getSource(SRC_ROUTE) as maplibregl.GeoJSONSource | undefined;
     const wptSrc = map.getSource(SRC_WPTS) as maplibregl.GeoJSONSource | undefined;
     const trackSrc = map.getSource(SRC_TRACK) as maplibregl.GeoJSONSource | undefined;
-    if (!routeSrc || !wptSrc || !trackSrc) return;
+    const dotsSrc = map.getSource(SRC_TRACK_DOTS) as maplibregl.GeoJSONSource | undefined;
+    if (!routeSrc || !wptSrc || !trackSrc || !dotsSrc) return;
     let line: [number, number][] = d.fixes.map((f) => [f.lon, f.lat]);
     if (line.length < 2 && d.dep && d.arr) line = [d.dep, d.arr];
     routeSrc.setData({
@@ -291,13 +367,23 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
       type: "FeatureCollection",
       features: d.fixes.map((f) => ({
         type: "Feature",
-        properties: { ident: f.ident, kind: f.ident === "TOC" || f.ident === "TOD" ? f.ident : f.kind },
+        properties: {
+          ident: f.ident,
+          kind: f.ident === "TOC" || f.ident === "TOD" ? f.ident : f.kind,
+          isNext: !!d.nextIdent && f.ident === d.nextIdent,
+        },
         geometry: { type: "Point", coordinates: [f.lon, f.lat] },
       })),
     });
     trackSrc.setData({
       type: "FeatureCollection",
       features: d.track.length >= 2 ? [{ type: "Feature", properties: {}, geometry: { type: "LineString", coordinates: d.track } }] : [],
+    });
+    // Breadcrumbs: jeden 8. Track-Punkt als Dot (sonst zu dicht).
+    const dots = d.track.filter((_, i) => i % 8 === 0);
+    dotsSrc.setData({
+      type: "FeatureCollection",
+      features: dots.map((p) => ({ type: "Feature", properties: {}, geometry: { type: "Point", coordinates: p } })),
     });
   }
 
@@ -341,35 +427,30 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
     };
   }, [activeFlight?.dpt_airport, activeFlight?.arr_airport, activeFlight]);
 
-  // ---- Redraw: Quellen + Flugzeug-Marker + Pins ----
+  // ---- Redraw: eigener Flug (Quellen + Flugzeug-Marker + Pins) ----
+  // Läuft immer; VA-Flieger liegen als zusätzliche Marker mit drauf (eigene Effekte).
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapReady) return;
-    if (view !== "own") {
-      // Eigen-Flug-Layer leeren, damit Route/Track/Marker nicht unter der VA-Übersicht durchscheinen.
-      const empty: GeoJSON.FeatureCollection = { type: "FeatureCollection", features: [] };
-      (map.getSource(SRC_ROUTE) as maplibregl.GeoJSONSource | undefined)?.setData(empty);
-      (map.getSource(SRC_WPTS) as maplibregl.GeoJSONSource | undefined)?.setData(empty);
-      (map.getSource(SRC_TRACK) as maplibregl.GeoJSONSource | undefined)?.setData(empty);
-      acMarkerRef.current?.remove();
-      acMarkerRef.current = null;
-      pinMarkersRef.current.forEach((m) => m.remove());
-      pinMarkersRef.current = [];
-      zoomTargetRef.current = null; // beim Zurückkehren Zoom neu setzen
-      zoomingRef.current = false;
-      return;
-    }
-    pushSources(map, { fixes: effFixes, track: effTrack, dep: effDep, arr: effArr });
+    pushSources(map, { fixes: effFixes, track: effTrack, dep: effDep, arr: effArr, nextIdent: nav.nextIdent });
 
-    // Flugzeug-Marker
+    // Flugzeug-Marker (kategorieabhängiges Icon wie VPS/Stratos)
     if (effAircraft) {
       const lngLat: [number, number] = [effAircraft.lon, effAircraft.lat];
+      const icao = simSnapshot?.aircraft_icao ?? null;
       if (!acMarkerRef.current) {
         const el = document.createElement("div");
         el.className = "aa-ac-marker";
-        el.innerHTML = planeSvg();
+        el.innerHTML = aircraftSvg(icao);
+        acCatRef.current = icao;
         acMarkerRef.current = new maplibregl.Marker({ element: el, rotationAlignment: "map" }).setLngLat(lngLat).addTo(map);
+      } else if (acCatRef.current !== icao) {
+        // Muster wurde (nach-)geladen → Icon aktualisieren.
+        acMarkerRef.current.getElement().innerHTML = aircraftSvg(icao);
+        acCatRef.current = icao;
       }
+      // Phasenabhängige Farbe (Fill + Glow + Pulse) wie auf dem VPS.
+      acMarkerRef.current.getElement().style.setProperty("--ac-color", phaseColor(activeFlight?.phase));
       acMarkerRef.current.setLngLat(lngLat).setRotation(effAircraft.hdg);
       if (follow) {
         // Phasenabhängiger Zoom (Boden nah, Reiseflug weit).
@@ -418,13 +499,13 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
     if (effDep && effDepIcao) mk(effDep, effDepIcao, "dep");
     if (effArr && effArrIcao) mk(effArr, effArrIcao, "arr");
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mapReady, view, follow, simSnapshot, routeFixes, depArr.dep, depArr.arr]);
+  }, [mapReady, follow, simSnapshot, routeFixes, depArr.dep, depArr.arr]);
 
-  // einmal auf die Route fitten, wenn nicht Follow
+  // einmal auf die eigene Route fitten, wenn Follow aus (und ein Flug aktiv ist)
   const fittedRef = useRef<string | null>(null);
   useEffect(() => {
     const map = mapRef.current;
-    if (!map || !mapReady || view !== "own" || follow) return;
+    if (!map || !mapReady || !activeFlight || follow) return;
     const pts: [number, number][] = [
       ...effFixes.map((f) => [f.lon, f.lat] as [number, number]),
       ...(effDep ? [effDep] : []),
@@ -437,16 +518,12 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
       map.fitBounds(b, { padding: 80, duration: 600, maxZoom: 8 });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mapReady, view, follow, effFixes, effDepIcao, effArrIcao]);
+  }, [mapReady, follow, effFixes, effDepIcao, effArrIcao, activeFlight]);
 
-  // ---- VA-Übersicht ----
+  // ---- VA-Verkehr: pollt /api/acars (wenn eingeblendet) ----
   useEffect(() => {
-    if (view !== "va") {
-      vaMarkersRef.current.forEach((m) => m.remove());
-      vaMarkersRef.current = [];
-      vaPopupRef.current?.remove();
-      vaPopupRef.current = null;
-      vaFittedRef.current = false;
+    if (!showVa) {
+      setVaFlights([]);
       return;
     }
     let cancelled = false;
@@ -466,22 +543,29 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
       cancelled = true;
       clearInterval(id);
     };
-  }, [view]);
+  }, [showVa]);
 
+  // ---- VA-Marker rendern (liegen mit auf der einen Karte) ----
   useEffect(() => {
     const map = mapRef.current;
-    if (!map || !mapReady || view !== "va") return;
+    if (!map || !mapReady) return;
     vaMarkersRef.current.forEach((m) => m.remove());
     vaMarkersRef.current = [];
+    if (vaVisible.length === 0) {
+      vaPopupRef.current?.remove();
+      vaPopupRef.current = null;
+      vaFittedRef.current = false;
+    }
     const pts: [number, number][] = [];
-    for (const f of vaFlights) {
+    for (const f of vaVisible) {
       const lat = f.position?.lat;
       const lon = f.position?.lon;
       if (typeof lat !== "number" || typeof lon !== "number") continue;
       const lngLat: [number, number] = [lon, lat];
       const el = document.createElement("div");
       el.className = "aa-ac-marker aa-ac-marker--va";
-      el.innerHTML = planeSvg();
+      el.innerHTML = aircraftSvg(f.aircraft?.icao);
+      el.style.setProperty("--ac-color", phaseColor(f.status_text ?? (f.phase != null ? String(f.phase) : null)));
       el.title = `${f.ident ?? f.flight_number ?? "?"} · ${f.aircraft?.icao ?? ""} · ${f.dpt_airport_id ?? ""}→${f.arr_airport_id ?? ""}`;
       // Klick → Popup mit Flugdaten (ersetzt ein evtl. offenes Popup).
       el.addEventListener("click", (ev) => {
@@ -497,13 +581,14 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
       );
       pts.push(lngLat);
     }
-    // Nur einmal je VA-Sitzung einpassen, sonst zuckt die Karte alle 12 s.
-    if (pts.length >= 1 && !vaFittedRef.current) {
+    // Nur auf die VA-Flieger einpassen, wenn KEIN eigener Flug die Kamera führt
+    // (sonst würde es dich vom eigenen Flug wegziehen). Und nur einmal.
+    if (pts.length >= 1 && !vaFittedRef.current && !activeFlight) {
       vaFittedRef.current = true;
       const b = pts.reduce((acc, p) => acc.extend(p), new maplibregl.LngLatBounds(pts[0], pts[0]));
       map.fitBounds(b, { padding: 60, duration: 600, maxZoom: 6 });
     }
-  }, [vaFlights, view, mapReady]);
+  }, [vaVisible, mapReady, activeFlight]);
 
   // ---- Stats ----
   const stats = useMemo(() => {
@@ -525,22 +610,15 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
     };
   }, [simSnapshot, activeFlight]);
 
-  const showOwnContent = view === "own" && !!activeFlight;
+  const showOwnContent = !!activeFlight;
 
   return (
     <section className="aa-livemap">
       <div className="aa-livemap__topbar">
-        <div className="aa-livemap__viewtoggle">
-          <button type="button" className={`aa-seg ${view === "own" ? "aa-seg--active" : ""}`} onClick={() => setView("own")}>
-            Mein Flug
-          </button>
-          <button
-            type="button"
-            className={`aa-seg ${view === "va" ? "aa-seg--active" : ""}`}
-            onClick={() => setView("va")}
-          >
-            VA-Übersicht
-          </button>
+        <div className="aa-livemap__title">
+          {activeFlight
+            ? `${activeFlight.airline_icao}${activeFlight.flight_number} · ${activeFlight.dpt_airport}→${activeFlight.arr_airport}`
+            : "Live-Karte"}
         </div>
 
         {showOwnContent && (
@@ -550,25 +628,33 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
             <Stat label="HDG" value={stats.hdg} />
             <Stat label="GS" value={stats.gs} />
             <Stat label="DTG" value={stats.dtg} />
+            <Stat label="NEXT" value={nav.nextLabel} />
+            <Stat label="ETA" value={nav.eta} />
             <Stat label="PHASE" value={phaseLabel} />
           </div>
         )}
 
         <div className="aa-livemap__right">
-          {view === "own" && (
+          {activeFlight && (
             <label className="aa-livemap__follow">
               <input type="checkbox" checked={follow} onChange={(e) => setFollow(e.target.checked)} />
               Follow
             </label>
           )}
+          <label className="aa-livemap__follow">
+            <input type="checkbox" checked={showVa} onChange={(e) => setShowVa(e.target.checked)} />
+            VA-Verkehr
+          </label>
         </div>
       </div>
 
       <div className="aa-livemap__body">
         <div className="aa-livemap__map" ref={containerRef}>
-          {view === "own" && !activeFlight && (
+          {!effAircraft && vaVisible.length === 0 && (
             <div className="aa-livemap__empty">
-              Kein aktiver Flug — starte einen Flug, um ihn live zu verfolgen.
+              {showVa
+                ? "Kein aktiver Flug und gerade kein VA-Verkehr."
+                : "Kein aktiver Flug — starte einen Flug, um ihn live zu verfolgen."}
             </div>
           )}
         </div>
@@ -589,8 +675,3 @@ function Stat({ label, value }: { label: string; value: string }) {
   );
 }
 
-function planeSvg(): string {
-  return `<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
-    <path fill="currentColor" d="M12 2l1.5 7.5L22 13v2l-8.5-2.2L13 21l2 1.5V24l-3-1-3 1v-1.5L11 21l-.5-8.2L2 15v-2l8.5-3.5L12 2z"/>
-  </svg>`;
-}

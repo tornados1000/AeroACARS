@@ -10,6 +10,8 @@
   --warning: #ff9f0a;
   --danger: #ff453a;
   --offline: #8e8e93;
+  /* Live-Map: geflogener Track / Breadcrumbs — kontrastreich auf heller Basemap */
+  --map-track: #334155;
 
   /* v0.3.0: Akzent-Farb-Tokens für Bid-Card Chips + Plan-Cards.
      Light-Theme-Werte hier — gesättigter & dunkler damit sie auf
@@ -45,6 +47,8 @@
   --accent: #0a84ff;
   --border: #3a3a3c;
   --offline: #636366;
+  /* Live-Map: Track / Breadcrumbs — hell auf dunkler Basemap (Stratos-Look) */
+  --map-track: #e8edf2;
 
   /* Dark-Theme: hellere/blassere Akzent-Tokens — auf dunkler Surface
      wirken zu satte Farben hart. */
@@ -7952,23 +7956,12 @@ input:disabled {
   flex-wrap: wrap;
   padding: 4px 2px;
 }
-.aa-livemap__viewtoggle {
-  display: inline-flex;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  overflow: hidden;
-}
-.aa-seg {
-  background: var(--surface);
-  color: var(--text-muted);
-  border: none;
-  padding: 6px 14px;
+.aa-livemap__title {
   font-size: 13px;
-  cursor: pointer;
-}
-.aa-seg--active {
-  background: var(--accent);
-  color: #fff;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: 0.01em;
+  white-space: nowrap;
 }
 .aa-livemap__stats {
   display: flex;
@@ -8061,13 +8054,54 @@ input:disabled {
   background: color-mix(in srgb, var(--bg) 70%, transparent);
 }
 .aa-ac-marker {
-  color: var(--accent);
-  filter: drop-shadow(0 0 3px rgba(0, 0, 0, 0.5));
+  width: 38px;
+  height: 38px;
   display: flex;
+  align-items: center;
+  justify-content: center;
+  /* phasenabhängige Farbe (vom VPS); heli-Rotor nutzt currentColor */
+  color: var(--ac-color, var(--accent));
+}
+/* Kategorie-Silhouette (portiert vom VPS) — Heading-Rotation macht der maplibre-Marker. */
+.aa-ac-marker .aircraft-svg {
+  width: 32px;
+  height: 32px;
+  display: block;
+  fill: var(--ac-color, var(--accent));
+  filter:
+    drop-shadow(0 0 1px rgba(0, 0, 0, 1))
+    drop-shadow(0 0 3px rgba(0, 0, 0, 0.85))
+    drop-shadow(0 0 6px var(--ac-color, var(--accent)));
 }
 .aa-ac-marker--va {
-  color: var(--warning);
   cursor: pointer;
+}
+/* Radar-Pulse-Ring um den Flieger (vom VPS) */
+.aa-ac-marker::before {
+  content: "";
+  position: absolute;
+  inset: 3px;
+  border-radius: 50%;
+  border: 1.5px solid var(--ac-color, var(--accent));
+  opacity: 0.55;
+  pointer-events: none;
+  animation: aa-ac-pulse 2.4s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+@keyframes aa-ac-pulse {
+  0% {
+    transform: scale(0.5);
+    opacity: 0.7;
+  }
+  100% {
+    transform: scale(1.9);
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .aa-ac-marker::before {
+    animation: none;
+    opacity: 0.4;
+  }
 }
 .aa-pin {
   font-size: 11px;
