@@ -17672,6 +17672,18 @@ fn engines_effectively_running(stats: &FlightStats, snap: &SimSnapshot, now: Dat
 /// Semantik exakt wie die bisherigen Inline-Blöcke (Overwrite, Sampler-
 /// bevorzugte Attitude, TOTAL-WEIGHT-Fallback auf ZFW+Fuel) — nur extrahiert,
 /// damit Latch-Logik nie wieder pro Call-Site driftet.
+/// Gross weight at this snapshot: prefer TOTAL WEIGHT (fuel + payload +
+/// empty); fall back to ZFW + fuel only when the SimVar isn't wired.
+/// Shared by both takeoff-latch variants so the fallback can never drift.
+fn takeoff_weight_from_snapshot(snap: &SimSnapshot) -> Option<f64> {
+    if let Some(tw) = snap.total_weight_kg {
+        return Some(tw as f64);
+    }
+    let zfw = snap.zfw_kg.unwrap_or(0.0);
+    let weight = zfw as f64 + snap.fuel_total_kg as f64;
+    (weight > 0.0).then_some(weight)
+}
+
 fn latch_takeoff_stats(stats: &mut FlightStats, snap: &SimSnapshot, now: DateTime<Utc>) {
     stats.takeoff_at = Some(now);
     stats.takeoff_fuel_kg = Some(snap.fuel_total_kg);
@@ -17684,16 +17696,8 @@ fn latch_takeoff_stats(stats: &mut FlightStats, snap: &SimSnapshot, now: DateTim
     // 3-30s-spaeter-Tick.
     stats.takeoff_pitch_deg = stats.sampler_takeoff_pitch_deg.or(Some(snap.pitch_deg));
     stats.takeoff_bank_deg = stats.sampler_takeoff_bank_deg.or(Some(snap.bank_deg));
-    // Prefer TOTAL WEIGHT (fuel + payload + empty); fall back to
-    // ZFW + fuel only when the SimVar isn't wired.
-    if let Some(tw) = snap.total_weight_kg {
-        stats.takeoff_weight_kg = Some(tw as f64);
-    } else {
-        let zfw = snap.zfw_kg.unwrap_or(0.0);
-        let weight = zfw as f64 + snap.fuel_total_kg as f64;
-        if weight > 0.0 {
-            stats.takeoff_weight_kg = Some(weight);
-        }
+    if let Some(weight) = takeoff_weight_from_snapshot(snap) {
+        stats.takeoff_weight_kg = Some(weight);
     }
 }
 
@@ -17732,15 +17736,7 @@ fn latch_takeoff_stats_if_missing(
         stats.takeoff_bank_deg = stats.sampler_takeoff_bank_deg;
     }
     if stats.takeoff_weight_kg.is_none() {
-        if let Some(tw) = snap.total_weight_kg {
-            stats.takeoff_weight_kg = Some(tw as f64);
-        } else {
-            let zfw = snap.zfw_kg.unwrap_or(0.0);
-            let weight = zfw as f64 + snap.fuel_total_kg as f64;
-            if weight > 0.0 {
-                stats.takeoff_weight_kg = Some(weight);
-            }
-        }
+        stats.takeoff_weight_kg = takeoff_weight_from_snapshot(snap);
     }
 }
 

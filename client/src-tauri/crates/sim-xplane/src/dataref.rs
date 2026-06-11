@@ -893,9 +893,9 @@ impl XPlaneState {
             _ => None,
         };
 
-        // (forward_fps, right_fps) in the body frame, derived from the
-        // world-frame velocity + true heading — see `body_velocity_fps`.
-        let body_velocity = body_velocity_fps(
+        // Body frame, derived from the world-frame velocity + true
+        // heading — see `body_velocity_fps`.
+        let (body_forward_fps, body_right_fps) = body_velocity_fps(
             self.local_vx_ms,
             self.local_vz_ms,
             self.heading_true_deg,
@@ -922,8 +922,8 @@ impl XPlaneState {
             // Raw local_vy → the responsive touchdown signal (kept separate so
             // the curvature bias never reaches display/FSM/stability).
             vertical_speed_raw_fpm: Some(self.vertical_speed_raw_fpm),
-            velocity_body_x_fps: body_velocity.1,
-            velocity_body_z_fps: body_velocity.0,
+            velocity_body_x_fps: body_right_fps,
+            velocity_body_z_fps: body_forward_fps,
             groundspeed_kt: self.groundspeed_ms * KT_PER_MS,
             // X-Plane's pitot simulation produces small negative IAS/TAS
             // readings when the aircraft is stationary on the ground
