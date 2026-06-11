@@ -297,7 +297,7 @@
     "skipped_label": "nicht bewertet",
     "skipped_reason": {
       "no_planned_burn": "Kein OFP-Trip-Burn geplant — wird nicht bewertet (kein Penalty).",
-      "no_actual_burn": "Tatsächlicher Trip-Burn nicht messbar (Tank-Daten fehlen).",
+      "no_actual_burn": "Takeoff-Daten nicht erfasst (Takeoff-Phase übersprungen) — tatsächlicher Trip-Burn nicht ermittelbar (kein Penalty).",
       "no_planned_zfw": "Kein ZFW eingetragen — VFR/Manual ohne Loadsheet-Wertung (kein Penalty).",
       "no_planned_tow": "Kein TOW geplant — Loadsheet-Wertung übersprungen (kein Penalty).",
       "missing_length": "Bahnlänge nicht verfügbar — Bahn-Auslastung kann nicht berechnet werden.",

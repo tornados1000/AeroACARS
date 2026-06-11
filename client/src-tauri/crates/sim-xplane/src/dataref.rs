@@ -64,9 +64,22 @@ pub enum FieldId {
     FuelTotalKg,
     EmptyWeightKg,
     TotalWeightKg,
-    /// Body-frame X velocity (m/s), positive right. Used for sideslip.
+    /// WORLD-frame (OpenGL) X velocity (m/s), positive EAST — from
+    /// `sim/flightmodel/position/local_vx`. Rotated by true heading into
+    /// the body frame at snapshot time (see `body_velocity_fps`).
+    ///
+    /// v0.16.9: was `sim/flightmodel/forces/local_vx` (body frame). The
+    /// `forces/` family is written by X-Plane's OWN flight model and reads
+    /// a constant 0.0 on addons with an external FM (FlightFactor/LevelUp
+    /// 767 — live flight BCS8: 0.0 through a 256-kt takeoff roll), which
+    /// froze the Pushback→TaxiOut forward-motion gate for the whole
+    /// flight. The `position/` family is maintained by the sim core from
+    /// the kinematic state and is alive on every addon (the same family
+    /// already powers `VerticalSpeedRawFpm` and `GroundspeedKt`).
     LocalVxMs,
-    /// Body-frame Z velocity (m/s), positive forward. Used for sideslip.
+    /// WORLD-frame (OpenGL) Z velocity (m/s), positive SOUTH — from
+    /// `sim/flightmodel/position/local_vz`. See `LocalVxMs` for why the
+    /// `position/` family replaced `forces/` in v0.16.9.
     LocalVzMs,
     /// Wind X relative to airframe (m/s).
     WindXMs,
@@ -324,13 +337,16 @@ pub const CATALOG: &[DatarefEntry] = &[
         name: "sim/flightmodel/weight/m_total",
         field: FieldId::TotalWeightKg,
     },
-    // --- Body velocity (m/s) — for native sideslip ---
+    // --- World-frame velocity (m/s) — rotated to body frame at snapshot
+    // time (`body_velocity_fps`). `position/` (sim-core kinematics, alive
+    // on every addon), NOT `forces/` (own-FM only; constant 0.0 on
+    // external-FM addons like the FF/LevelUp 767 — v0.16.9).
     DatarefEntry {
-        name: "sim/flightmodel/forces/local_vx",
+        name: "sim/flightmodel/position/local_vx",
         field: FieldId::LocalVxMs,
     },
     DatarefEntry {
-        name: "sim/flightmodel/forces/local_vz",
+        name: "sim/flightmodel/position/local_vz",
         field: FieldId::LocalVzMs,
     },
     // ---- Phase 2 DataRefs ----
@@ -563,6 +579,69 @@ pub const CATALOG: &[DatarefEntry] = &[
         field: FieldId::TolissAthrMode,
     },
 ];
+
+/// v0.16.9: body-frame horizontal velocity, derived from the WORLD-frame
+/// (OpenGL) velocity + true heading instead of trusting an FM-dependent
+/// body-frame DataRef.
+///
+/// Background (live flight BCS8, FF/LevelUp 767): `sim/flightmodel/forces/
+/// local_vz` is written by X-Plane's own flight model only — on addons with
+/// an external FM it reads a CONSTANT 0.0 (verified: 0.0 through a 256-kt
+/// takeoff roll). `moving_forward(Some(0.0))` then hard-blocks the
+/// Pushback→TaxiOut transition for the whole flight (only `None` activates
+/// the documented no-signal fallback), the v0.13.17 airborne-rescue forces
+/// Pushback→Climb past the Takeoff phase, and every Takeoff-latched stat
+/// (takeoff_fuel_kg → OFP fuel sub-score) is lost.
+///
+/// The `position/local_vx|vz` family used here is maintained by the SIM
+/// CORE from the kinematic state and is alive on every addon — the proof
+/// is in the same BCS8 log: `position/local_vy` (touchdown V/S) and
+/// `position/groundspeed` worked fine while `forces/` was dead.
+///
+/// Frame math (OpenGL: +X east, +Z south; psi = true heading):
+///   north = −vz, east = vx
+///   forward =  north·cos(psi) + east·sin(psi)   (positive forward)
+///   right   =  east·cos(psi)  − north·sin(psi)  (positive right)
+/// For ground movement this is exactly the body longitudinal/lateral
+/// velocity (verified semantics match the old `forces/` source on ToLiss:
+/// tug push negative, forward taxi positive, |fwd| ≈ groundspeed). In the
+/// air a crosswind crab shifts a few fps into the lateral component — all
+/// FSM consumers (`powered_taxi_move`, `moving_backward`) are ground-only,
+/// so that is irrelevant. The OpenGL curvature bias that affects the
+/// vertical axis at cruise (see `VerticalSpeedRawFpm`) is negligible for
+/// the horizontal sign test near the ground (< 1° rotation per 100 km from
+/// the local origin).
+///
+/// Plausibility guard (the sustainable part): if the sim reports genuine
+/// ground movement (> ~3 kt) but the world velocity carries none of it,
+/// the source contradicts itself — emit `None` so the FSM uses its
+/// documented no-signal fallback instead of a frozen `Some(0.0)`. Any
+/// future variant of this bug class degrades to pre-v0.15.13 behaviour
+/// (pushback phase may end early) instead of eating the Takeoff phase.
+///
+/// Returns `(forward_fps, right_fps)`.
+fn body_velocity_fps(
+    local_vx_ms: f32,
+    local_vz_ms: f32,
+    heading_true_deg: f32,
+    groundspeed_ms: f32,
+) -> (Option<f32>, Option<f32>) {
+    const M_PER_FT: f32 = 0.3048;
+    /// ~3 kt — below this no consumer needs a direction and noise dominates.
+    const GUARD_MIN_GS_MS: f32 = 1.5;
+
+    let north = -local_vz_ms;
+    let east = local_vx_ms;
+    let horizontal = (north * north + east * east).sqrt();
+    if groundspeed_ms > GUARD_MIN_GS_MS && horizontal < 0.25 * groundspeed_ms {
+        return (None, None);
+    }
+
+    let psi = heading_true_deg.to_radians();
+    let forward_ms = north * psi.cos() + east * psi.sin();
+    let right_ms = east * psi.cos() - north * psi.sin();
+    (Some(forward_ms / M_PER_FT), Some(right_ms / M_PER_FT))
+}
 
 /// Mutable parsed state — populated as RREF responses arrive. Held
 /// behind a Mutex by the adapter; on every snapshot request we copy
@@ -814,6 +893,15 @@ impl XPlaneState {
             _ => None,
         };
 
+        // (forward_fps, right_fps) in the body frame, derived from the
+        // world-frame velocity + true heading — see `body_velocity_fps`.
+        let body_velocity = body_velocity_fps(
+            self.local_vx_ms,
+            self.local_vz_ms,
+            self.heading_true_deg,
+            self.groundspeed_ms,
+        );
+
         SimSnapshot {
             timestamp: chrono::Utc::now(),
             lat: self.lat,
@@ -834,8 +922,8 @@ impl XPlaneState {
             // Raw local_vy → the responsive touchdown signal (kept separate so
             // the curvature bias never reaches display/FSM/stability).
             vertical_speed_raw_fpm: Some(self.vertical_speed_raw_fpm),
-            velocity_body_x_fps: Some((self.local_vx_ms / 0.3048) as f32),
-            velocity_body_z_fps: Some((self.local_vz_ms / 0.3048) as f32),
+            velocity_body_x_fps: body_velocity.1,
+            velocity_body_z_fps: body_velocity.0,
             groundspeed_kt: self.groundspeed_ms * KT_PER_MS,
             // X-Plane's pitot simulation produces small negative IAS/TAS
             // readings when the aircraft is stationary on the ground
@@ -1061,6 +1149,93 @@ mod vs_dual_source_tests {
         // The two are independent: the display VVI is NOT scaled by the m/s
         // factor and is not overwritten by the raw read.
         assert!((s.vertical_speed_fpm - (-277.0)).abs() < 0.001);
+    }
+}
+
+// ---- v0.16.9 — body velocity derived from world frame (BCS8/FF767) ----
+#[cfg(test)]
+mod body_velocity_tests {
+    use super::*;
+
+    const FPS_PER_MS: f32 = 1.0 / 0.3048;
+
+    /// Heading north, moving north (OpenGL: −Z) → forward positive,
+    /// |forward| = groundspeed, lateral ≈ 0.
+    #[test]
+    fn forward_taxi_north() {
+        let (fwd, right) = body_velocity_fps(0.0, -5.0, 0.0, 5.0);
+        assert!((fwd.unwrap() - 5.0 * FPS_PER_MS).abs() < 0.01);
+        assert!(right.unwrap().abs() < 0.01);
+    }
+
+    /// Heading north, tug pushing SOUTH (+Z) → forward negative — the
+    /// pushback signal `moving_backward` keys on.
+    #[test]
+    fn tug_push_reads_backward() {
+        let (fwd, _) = body_velocity_fps(0.0, 2.0, 0.0, 2.0);
+        assert!(fwd.unwrap() < -1.0, "tug push must read backward, got {fwd:?}");
+    }
+
+    /// The sign test must hold at EVERY heading (the world→body rotation is
+    /// the whole point — a raw world component flips sign with heading).
+    #[test]
+    fn forward_taxi_any_heading() {
+        for hdg in [0.0_f32, 47.3, 90.0, 135.0, 226.7, 270.0, 333.0] {
+            let psi = hdg.to_radians();
+            // World velocity for "moving straight ahead at 10 m/s".
+            let east = 10.0 * psi.sin();
+            let north = 10.0 * psi.cos();
+            let (fwd, right) = body_velocity_fps(east, -north, hdg, 10.0);
+            assert!(
+                (fwd.unwrap() - 10.0 * FPS_PER_MS).abs() < 0.05,
+                "heading {hdg}: forward expected ~{}, got {fwd:?}",
+                10.0 * FPS_PER_MS
+            );
+            assert!(right.unwrap().abs() < 0.05, "heading {hdg}: lateral ≈ 0");
+        }
+    }
+
+    /// Heading east, drifting south → positive lateral (south is to the
+    /// right of east), forward ≈ 0.
+    #[test]
+    fn lateral_sign() {
+        let (fwd, right) = body_velocity_fps(0.0, 4.0, 90.0, 4.0);
+        assert!(fwd.unwrap().abs() < 0.01);
+        assert!((right.unwrap() - 4.0 * FPS_PER_MS).abs() < 0.01);
+    }
+
+    /// THE BCS8 regression: sim reports 30 kt of ground movement but the
+    /// velocity source is dead (constant 0). Must emit None (→ FSM
+    /// no-signal fallback), NEVER a frozen Some(0.0) that hard-blocks
+    /// Pushback→TaxiOut.
+    #[test]
+    fn dead_source_with_real_movement_is_none() {
+        let (fwd, right) = body_velocity_fps(0.0, 0.0, 48.0, 15.4);
+        assert_eq!(fwd, None);
+        assert_eq!(right, None);
+    }
+
+    /// Parked: groundspeed ~0 and world velocity ~0 is CONSISTENT —
+    /// emit Some(0.0) (standstill is real, not a dead source).
+    #[test]
+    fn parked_is_some_zero() {
+        let (fwd, right) = body_velocity_fps(0.0, 0.0, 243.0, 0.0001);
+        assert!(fwd.unwrap().abs() < 0.01);
+        assert!(right.unwrap().abs() < 0.01);
+    }
+
+    /// End-to-end through the snapshot: a dead world-velocity source at
+    /// taxi speed yields None on the snapshot fields.
+    #[test]
+    fn snapshot_emits_none_for_dead_source() {
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::HeadingDegTrue, 48.0);
+        s.apply_field(FieldId::GroundspeedKt, 15.4); // m/s native
+        s.apply_field(FieldId::LocalVxMs, 0.0);
+        s.apply_field(FieldId::LocalVzMs, 0.0);
+        let snap = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(snap.velocity_body_z_fps, None);
+        assert_eq!(snap.velocity_body_x_fps, None);
     }
 }
 

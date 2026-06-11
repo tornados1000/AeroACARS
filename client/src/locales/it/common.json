@@ -297,7 +297,7 @@
     "skipped_label": "non valutato",
     "skipped_reason": {
       "no_planned_burn": "Nessun trip-burn OFP pianificato — non valutato (nessuna penalità).",
-      "no_actual_burn": "Trip-burn reale non misurabile (dati carburante mancanti).",
+      "no_actual_burn": "Dati di decollo non registrati (fase di decollo saltata) — trip-burn reale non determinabile (nessuna penalità).",
       "no_planned_zfw": "Nessun ZFW inserito — VFR/manuale senza valutazione del loadsheet (nessuna penalità).",
       "no_planned_tow": "Nessun TOW pianificato — valutazione loadsheet saltata (nessuna penalità).",
       "missing_length": "Lunghezza pista non disponibile — utilizzo pista non calcolabile.",
