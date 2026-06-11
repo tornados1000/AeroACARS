@@ -17668,6 +17668,78 @@ fn engines_effectively_running(stats: &FlightStats, snap: &SimSnapshot, now: Dat
         .unwrap_or(false)
 }
 
+/// v0.16.9: der Takeoff-Latch der drei →Takeoff-Übergänge, an EINER Stelle.
+/// Semantik exakt wie die bisherigen Inline-Blöcke (Overwrite, Sampler-
+/// bevorzugte Attitude, TOTAL-WEIGHT-Fallback auf ZFW+Fuel) — nur extrahiert,
+/// damit Latch-Logik nie wieder pro Call-Site driftet.
+/// Gross weight at this snapshot: prefer TOTAL WEIGHT (fuel + payload +
+/// empty); fall back to ZFW + fuel only when the SimVar isn't wired.
+/// Shared by both takeoff-latch variants so the fallback can never drift.
+fn takeoff_weight_from_snapshot(snap: &SimSnapshot) -> Option<f64> {
+    if let Some(tw) = snap.total_weight_kg {
+        return Some(tw as f64);
+    }
+    let zfw = snap.zfw_kg.unwrap_or(0.0);
+    let weight = zfw as f64 + snap.fuel_total_kg as f64;
+    (weight > 0.0).then_some(weight)
+}
+
+fn latch_takeoff_stats(stats: &mut FlightStats, snap: &SimSnapshot, now: DateTime<Utc>) {
+    stats.takeoff_at = Some(now);
+    stats.takeoff_fuel_kg = Some(snap.fuel_total_kg);
+    // v0.5.16: capture pitch + bank for tail-strike / wing-strike
+    // maintenance detection (DisposableSpecial dmaintenance reads these
+    // as numeric custom fields).
+    // v0.5.24: prefer the 50Hz-sampler value (Wheels-Up-frame-genau)
+    // ueber den Streamer-Tick-Snapshot. Bei tail-strike-empfindlichen
+    // Aircraft wie A321 spart das 2-3° Pitch-Drift gegen den
+    // 3-30s-spaeter-Tick.
+    stats.takeoff_pitch_deg = stats.sampler_takeoff_pitch_deg.or(Some(snap.pitch_deg));
+    stats.takeoff_bank_deg = stats.sampler_takeoff_bank_deg.or(Some(snap.bank_deg));
+    if let Some(weight) = takeoff_weight_from_snapshot(snap) {
+        stats.takeoff_weight_kg = Some(weight);
+    }
+}
+
+/// v0.16.9: Takeoff-Latch-Sicherheitsnetz für Pfade, die airborne werden,
+/// OHNE durch `FlightPhase::Takeoff` zu gehen — heute genau das
+/// v0.13.17-Airborne-Rescue (Live-Flug BCS8: totes vbz-Signal → Pushback nie
+/// verlassen → Rescue forcte Pushback→Climb → `takeoff_fuel_kg` blieb None →
+/// OFP-Fuel-Sub-Score „no_actual_burn"-skipped).
+///
+/// Unterschiede zum echten Takeoff-Latch — bewusst:
+/// * `get_or_insert`-Semantik: überschreibt NIE bereits gelatchte Werte.
+/// * `takeoff_at`: bevorzugt den frame-genauen 50Hz-Sampler-Edge
+///   (`sampler_takeoff_at`, falls der Sampler den Wheels-up sah), sonst jetzt.
+/// * Pitch/Bank NUR vom Sampler (echter Wheels-up-Frame): der Rescue-Snapshot
+///   steckt schon tief im Climb — dessen ~15° Pitch würde der Tail-Strike-
+///   Maintenance-Erkennung einen falschen „Takeoff-Pitch" füttern. Lieber
+///   leer als falsch.
+/// * Fuel/Weight vom Rescue-Snapshot (≤ 500 ft AGL): Burn seit Rotation ist
+///   < 1 % des Trip-Burns — für die OFP-Treue-Bewertung präzise genug, und
+///   unendlich besser als „nicht bewertbar".
+fn latch_takeoff_stats_if_missing(
+    stats: &mut FlightStats,
+    snap: &SimSnapshot,
+    now: DateTime<Utc>,
+) {
+    if stats.takeoff_at.is_none() {
+        stats.takeoff_at = Some(stats.sampler_takeoff_at.unwrap_or(now));
+    }
+    if stats.takeoff_fuel_kg.is_none() {
+        stats.takeoff_fuel_kg = Some(snap.fuel_total_kg);
+    }
+    if stats.takeoff_pitch_deg.is_none() {
+        stats.takeoff_pitch_deg = stats.sampler_takeoff_pitch_deg;
+    }
+    if stats.takeoff_bank_deg.is_none() {
+        stats.takeoff_bank_deg = stats.sampler_takeoff_bank_deg;
+    }
+    if stats.takeoff_weight_kg.is_none() {
+        stats.takeoff_weight_kg = takeoff_weight_from_snapshot(snap);
+    }
+}
+
 /// v0.13.17 Airborne-Rescue-Bedingung (rein, testbar). True, wenn die FSM in
 /// einer Boden-/Pre-Takeoff-Phase steht, das Flugzeug aber klar in der Luft
 /// ist (nicht am Boden + AGL > 500 ft) und der Tick kein Reload-/Slew-Glitch
@@ -18476,6 +18548,11 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
             gs_kt = snap.groundspeed_kt,
             "v0.13.17 airborne-rescue: phase stuck on ground while airborne — forcing Climb"
         );
+        // v0.16.9: das Rescue überspringt die Takeoff-Phase — ohne dieses
+        // Netz blieben alle Takeoff-Latches leer (BCS8: takeoff_fuel_kg
+        // None → OFP-Fuel-Sub-Score unbewertbar). get_or_insert-Semantik,
+        // Attitude nur vom Sampler — Details am Helper.
+        latch_takeoff_stats_if_missing(&mut stats, snap, now);
         // Commit identisch zum normalen Ende von step_flight (siehe unten).
         if should_reset_holding_pending(prev_phase, FlightPhase::Climb) {
             stats.holding_pending_since = None;
@@ -18661,28 +18738,7 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                 && snap.vertical_speed_fpm > 100.0
             {
                 next_phase = FlightPhase::Takeoff;
-                stats.takeoff_at = Some(now);
-                stats.takeoff_fuel_kg = Some(snap.fuel_total_kg);
-                // v0.5.16: capture pitch + bank for tail-strike /
-                // wing-strike maintenance detection (DisposableSpecial
-                // dmaintenance reads these as numeric custom fields).
-                // v0.5.24: prefer the 50Hz-sampler value (Wheels-Up-
-                // frame-genau) ueber den Streamer-Tick-Snapshot.
-                stats.takeoff_pitch_deg = stats
-                    .sampler_takeoff_pitch_deg
-                    .or(Some(snap.pitch_deg));
-                stats.takeoff_bank_deg = stats
-                    .sampler_takeoff_bank_deg
-                    .or(Some(snap.bank_deg));
-                if let Some(tw) = snap.total_weight_kg {
-                    stats.takeoff_weight_kg = Some(tw as f64);
-                } else {
-                    let zfw = snap.zfw_kg.unwrap_or(0.0);
-                    let weight = zfw as f64 + snap.fuel_total_kg as f64;
-                    if weight > 0.0 {
-                        stats.takeoff_weight_kg = Some(weight);
-                    }
-                }
+                latch_takeoff_stats(&mut stats, snap, now);
                 tracing::info!(
                     pirep_id = %flight.pirep_id,
                     "vertical takeoff from boarding (helicopter pure-hover) — Boarding → Takeoff"
@@ -18814,28 +18870,7 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                     && !snap.paused)
             {
                 next_phase = FlightPhase::Takeoff;
-                stats.takeoff_at = Some(now);
-                stats.takeoff_fuel_kg = Some(snap.fuel_total_kg);
-                // v0.5.16: capture pitch + bank for tail-strike /
-                // wing-strike maintenance detection (DisposableSpecial
-                // dmaintenance reads these as numeric custom fields).
-                // v0.5.24: prefer the 50Hz-sampler value (Wheels-Up-
-                // frame-genau) ueber den Streamer-Tick-Snapshot.
-                stats.takeoff_pitch_deg = stats
-                    .sampler_takeoff_pitch_deg
-                    .or(Some(snap.pitch_deg));
-                stats.takeoff_bank_deg = stats
-                    .sampler_takeoff_bank_deg
-                    .or(Some(snap.bank_deg));
-                if let Some(tw) = snap.total_weight_kg {
-                    stats.takeoff_weight_kg = Some(tw as f64);
-                } else {
-                    let zfw = snap.zfw_kg.unwrap_or(0.0);
-                    let weight = zfw as f64 + snap.fuel_total_kg as f64;
-                    if weight > 0.0 {
-                        stats.takeoff_weight_kg = Some(weight);
-                    }
-                }
+                latch_takeoff_stats(&mut stats, snap, now);
                 tracing::info!(
                     pirep_id = %flight.pirep_id,
                     "non-conventional takeoff detected (heli / glider / seaplane) — TaxiOut → Takeoff"
@@ -18874,32 +18909,7 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
 
             if was_on_ground && !snap.on_ground {
                 next_phase = FlightPhase::Takeoff;
-                stats.takeoff_at = Some(now);
-                stats.takeoff_fuel_kg = Some(snap.fuel_total_kg);
-                // v0.5.16: capture pitch + bank for tail-strike /
-                // wing-strike maintenance detection (DisposableSpecial
-                // dmaintenance reads these as numeric custom fields).
-                // v0.5.24: prefer the 50Hz-sampler value (Wheels-Up-
-                // frame-genau) ueber den Streamer-Tick-Snapshot. Bei
-                // tail-strike-empfindlichen Aircraft wie A321 spart das
-                // 2-3° Pitch-Drift gegen den 3-30s-spaeter-Tick.
-                stats.takeoff_pitch_deg = stats
-                    .sampler_takeoff_pitch_deg
-                    .or(Some(snap.pitch_deg));
-                stats.takeoff_bank_deg = stats
-                    .sampler_takeoff_bank_deg
-                    .or(Some(snap.bank_deg));
-                // Prefer TOTAL WEIGHT (fuel + payload + empty); fall
-                // back to ZFW + fuel only when the SimVar isn't wired.
-                if let Some(tw) = snap.total_weight_kg {
-                    stats.takeoff_weight_kg = Some(tw as f64);
-                } else {
-                    let zfw = snap.zfw_kg.unwrap_or(0.0);
-                    let weight = zfw as f64 + snap.fuel_total_kg as f64;
-                    if weight > 0.0 {
-                        stats.takeoff_weight_kg = Some(weight);
-                    }
-                }
+                latch_takeoff_stats(&mut stats, snap, now);
             }
         }
         FlightPhase::Takeoff => {
@@ -26008,6 +26018,106 @@ mod aircraft_alias_tests {
         assert!(!rescue(P::Climb, false, 5000.0, false));
         assert!(!rescue(P::Cruise, false, 38000.0, false));
         assert!(!rescue(P::Approach, false, 2000.0, false));
+    }
+
+    /// v0.16.9 (BCS8/FF767): das Rescue-Latch-Sicherheitsnetz füllt die
+    /// Takeoff-Stats nach, wenn der echte →Takeoff-Übergang übersprungen
+    /// wurde — sonst bleibt der OFP-Fuel-Sub-Score „no_actual_burn"-skipped.
+    #[test]
+    fn rescue_latch_fills_missing_takeoff_stats() {
+        use super::{latch_takeoff_stats_if_missing, FlightStats};
+        use chrono::Utc;
+        let mut stats = FlightStats::default();
+        let mut snap = sim_core::SimSnapshot::default();
+        snap.fuel_total_kg = 15_930.5;
+        snap.total_weight_kg = Some(105_741.0);
+        snap.pitch_deg = 14.8; // Climb-Pitch — darf NICHT als Takeoff-Pitch landen
+        let now = Utc::now();
+
+        latch_takeoff_stats_if_missing(&mut stats, &snap, now);
+
+        assert_eq!(stats.takeoff_at, Some(now));
+        assert_eq!(stats.takeoff_fuel_kg, Some(15_930.5));
+        assert_eq!(stats.takeoff_weight_kg, Some(105_741.0));
+        // Attitude NUR vom Sampler — der Rescue-Snapshot steckt im Climb,
+        // sein Pitch würde die Tail-Strike-Erkennung falsch füttern.
+        assert_eq!(stats.takeoff_pitch_deg, None);
+        assert_eq!(stats.takeoff_bank_deg, None);
+    }
+
+    /// Sampler-Werte (frame-genauer Wheels-up) werden bevorzugt, wenn der
+    /// 50Hz-Sampler den Edge trotz festhängender Phase gesehen hat.
+    #[test]
+    fn rescue_latch_prefers_sampler_edge() {
+        use super::{latch_takeoff_stats_if_missing, FlightStats};
+        use chrono::Utc;
+        let mut stats = FlightStats::default();
+        let edge_at = Utc::now() - chrono::Duration::seconds(42);
+        stats.sampler_takeoff_at = Some(edge_at);
+        stats.sampler_takeoff_pitch_deg = Some(8.2);
+        stats.sampler_takeoff_bank_deg = Some(-0.6);
+        let mut snap = sim_core::SimSnapshot::default();
+        snap.fuel_total_kg = 9_000.0;
+        let now = Utc::now();
+
+        latch_takeoff_stats_if_missing(&mut stats, &snap, now);
+
+        assert_eq!(stats.takeoff_at, Some(edge_at));
+        assert_eq!(stats.takeoff_pitch_deg, Some(8.2));
+        assert_eq!(stats.takeoff_bank_deg, Some(-0.6));
+    }
+
+    /// get_or_insert-Semantik: bereits gelatchte Werte (echter Takeoff,
+    /// Resume-Restore) werden NIE überschrieben.
+    #[test]
+    fn rescue_latch_never_overwrites() {
+        use super::{latch_takeoff_stats_if_missing, FlightStats};
+        use chrono::Utc;
+        let mut stats = FlightStats::default();
+        let real_takeoff = Utc::now() - chrono::Duration::seconds(90);
+        stats.takeoff_at = Some(real_takeoff);
+        stats.takeoff_fuel_kg = Some(17_146.1);
+        stats.takeoff_weight_kg = Some(138_305.0);
+        stats.takeoff_pitch_deg = Some(7.5);
+        stats.takeoff_bank_deg = Some(0.1);
+        let mut snap = sim_core::SimSnapshot::default();
+        snap.fuel_total_kg = 15_000.0;
+        snap.total_weight_kg = Some(100_000.0);
+
+        latch_takeoff_stats_if_missing(&mut stats, &snap, Utc::now());
+
+        assert_eq!(stats.takeoff_at, Some(real_takeoff));
+        assert_eq!(stats.takeoff_fuel_kg, Some(17_146.1));
+        assert_eq!(stats.takeoff_weight_kg, Some(138_305.0));
+        assert_eq!(stats.takeoff_pitch_deg, Some(7.5));
+        assert_eq!(stats.takeoff_bank_deg, Some(0.1));
+    }
+
+    /// Der echte Takeoff-Latch (extrahiert, Overwrite-Semantik) — Verhalten
+    /// byte-identisch zu den drei früheren Inline-Blöcken: Snapshot-Fallback
+    /// für Pitch/Bank, ZFW+Fuel-Fallback fürs Gewicht.
+    #[test]
+    fn real_takeoff_latch_keeps_legacy_semantics() {
+        use super::{latch_takeoff_stats, FlightStats};
+        use chrono::Utc;
+        let mut stats = FlightStats::default();
+        let mut snap = sim_core::SimSnapshot::default();
+        snap.fuel_total_kg = 6_000.0;
+        snap.pitch_deg = 9.1;
+        snap.bank_deg = -0.3;
+        snap.total_weight_kg = None;
+        snap.zfw_kg = Some(50_000.0);
+        let now = Utc::now();
+
+        latch_takeoff_stats(&mut stats, &snap, now);
+
+        assert_eq!(stats.takeoff_at, Some(now));
+        assert_eq!(stats.takeoff_fuel_kg, Some(6_000.0));
+        // Ohne Sampler-Werte: Snapshot-Fallback (wie bisher).
+        assert_eq!(stats.takeoff_pitch_deg, Some(9.1));
+        assert_eq!(stats.takeoff_bank_deg, Some(-0.3));
+        // total_weight fehlt → ZFW + Fuel.
+        assert_eq!(stats.takeoff_weight_kg, Some(56_000.0));
     }
 
     /// v0.13.18: FOB-abgeleiteter Fuel-Flow-Fallback (Aerosoft/iniBuilds

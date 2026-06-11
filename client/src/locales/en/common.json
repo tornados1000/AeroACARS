@@ -297,7 +297,7 @@
     "skipped_label": "not scored",
     "skipped_reason": {
       "no_planned_burn": "No OFP trip burn planned — not scored (no penalty).",
-      "no_actual_burn": "Actual trip burn not measurable (fuel data missing).",
+      "no_actual_burn": "Takeoff data not captured (takeoff phase skipped) — actual trip burn cannot be derived (no penalty).",
       "no_planned_zfw": "No ZFW entered — VFR/manual without loadsheet scoring (no penalty).",
       "no_planned_tow": "No TOW planned — loadsheet scoring skipped (no penalty).",
       "missing_length": "Runway length unavailable — runway utilization cannot be computed.",
