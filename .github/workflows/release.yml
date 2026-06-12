@@ -242,7 +242,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: windows-latest
+          # windows-2022 gepinnt (2026-06-12): GitHubs windows-latest-Rollout
+          # auf das 2025er-Image liefert VMs ohne Visual-Studio-Instanz —
+          # "could not find any instance of Visual Studio" beim CMake-Configure
+          # (v0.16.12-Run 27403478349, 2x reproduziert). Zurueck auf latest,
+          # sobald das Image stabil VS traegt.
+          - platform: windows-2022
             generator: 'Visual Studio 17 2022'
             cmake_args: '-A x64'
             xpl_name: 'win.xpl'
