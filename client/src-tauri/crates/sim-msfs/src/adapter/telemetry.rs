@@ -617,9 +617,63 @@ pub const TELEMETRY_FIELDS: &[TelemetryField] = &[
     F::f64("L:FSL_FCU_ALT_MANAGED", "Number"),
     F::f64("L:FSL_FCU_SPD_DASHED", "Number"),
     F::f64("L:FSL_FCU_HDG_DASHED", "Number"),
-    F::f64("L:VC_MIP_BRAKES_AUTOBRK_LO_BUTTON_BOT", "Number"),
-    F::f64("L:VC_MIP_BRAKES_AUTOBRK_MED_BUTTON_BOT", "Number"),
-    F::f64("L:VC_MIP_BRAKES_AUTOBRK_MAX_BUTTON_BOT", "Number"),
+    // v0.16.20: Casing-Fix. Die echte FSLabs-Variable heisst "_Button_"
+    // (gemischt, vgl. WinWing-Profil /tmp/fsl_all_lvars.txt), NICHT
+    // "_BUTTON_". Mit der falschen Schreibweise loesten die LVars nie auf
+    // (Peters Log las Autobrake ueber den ganzen Flug None) — LVar-Namen
+    // sind in MSFS case-sensitiv.
+    F::f64("L:VC_MIP_BRAKES_AUTOBRK_LO_Button_BOT", "Number"),
+    F::f64("L:VC_MIP_BRAKES_AUTOBRK_MED_Button_BOT", "Number"),
+    F::f64("L:VC_MIP_BRAKES_AUTOBRK_MAX_Button_BOT", "Number"),
+
+    // ---- FSLabs A321 PREMIUM (v0.16.20) — echte LVars aus dem
+    //      WinWing/StreamDeck-Forum-Profil (FSLabsA3x_Scripts.xml) ----
+    // Quelle: /tmp/fsl_all_lvars.txt (202 Vars) + die Read-Kontexte der
+    // Skripte (z.B. `(L:VC_PED_PARK_BRAKE_Switch, Number) 0 ==`). Alle
+    // Namen WOERTLICH (case-sensitiv) uebernommen. Nur bei
+    // AircraftProfile::FsLabsA321 konsultiert. Hintergrund (Peters Log,
+    // 0.16.18): FSL FAELSCHT die Standard-SimVars — am Gate mit echt
+    // ausgeschalteten Triebwerken + gesetzter Parkbremse lasen wir
+    // engines_running=2 (gefaelschte COMBUSTION), parking_brake=False
+    // (toter SimVar). Die echten FSL-Schalter unten liefern die wahren
+    // Signale, damit die Auto-End-FSM (TaxiIn→BlocksOn→Arrived) feuert.
+    //
+    // KRITISCH (Flug-Ende):
+    //   PARK_BRAKE_Switch: Skript `0 == if{ released }` → !=0 = gesetzt.
+    //   ENG_x_MSTR_Switch: Skript-Schwellen `20 >=`=ON, `10 <=`=OFF →
+    //     Position, kein 0/1. Wir werten >= 15 (Mitte) = Master ON.
+    //   FSLA320_WHEEL_CHOCKS: Bool-Toggle (`! (>L:...)`), Bonus-Signal.
+    F::f64("L:VC_PED_PARK_BRAKE_Switch", "Number"),
+    F::f64("L:VC_PED_ENG_1_MSTR_Switch", "Number"),
+    F::f64("L:VC_PED_ENG_2_MSTR_Switch", "Number"),
+    F::f64("L:FSLA320_WHEEL_CHOCKS", "Bool"),
+    // PREMIUM (Mapping auf bestehende SimSnapshot-Felder):
+    //   EFIS_CPT_BARO_STD: !=0 = STD-Fenster (baro_std).
+    //   Caution/Warning_Button_BOT: Skript `0 != if{ MSTR ... }` → !=0
+    //     = Master-Lampe gedrueckt/aktiv.
+    //   SPD_BRK_LEVER: Skript `0 ==`=eingefahren, `10 ==`=armed →
+    //     diskrete Stellung, NICHT 0..1. Auf 0..1 normalisiert
+    //     (Annahme Range 0..~50; "Range beim naechsten Flug verifizieren").
+    //   ENGFIRE_x_LT_TOP: rote Feuer-Lampe → hebt master_warning.
+    //   AI_Eng_x_Anti_Ice_Button: Skript `0 !=`=an → engine_anti_ice.
+    //   ATCXPDR_MODE_SWITCH: Skript `/10` → 0=STBY,1=TA,2=TARA.
+    F::f64("L:FSL_EFIS_CPT_BARO_STD", "Number"),
+    F::f64("L:VC_GSLD_CP_Caution_Button_BOT", "Number"),
+    F::f64("L:VC_GSLD_CP_Warning_Button_BOT", "Number"),
+    F::f64("L:VC_PED_SPD_BRK_LEVER", "Number"),
+    F::f64("L:VC_PED_ENGFIRE_1_LT_TOP", "Number"),
+    F::f64("L:VC_PED_ENGFIRE_2_LT_TOP", "Number"),
+    F::f64("L:VC_OVHD_AI_Eng_1_Anti_Ice_Button", "Number"),
+    F::f64("L:VC_OVHD_AI_Eng_2_Anti_Ice_Button", "Number"),
+    F::f64("L:VC_PED_ATCXPDR_MODE_SWITCH", "Number"),
+    // v0.16.20 (Review-Fund): Transponder ON/OFF-Schalter. Skript
+    // (FSLabsA3x_Scripts.xml) liest ihn `/10` → 0=OFF, 1=AUTO, 2=ON
+    // (Rohwert 0/10/20). Wird genutzt, um `xpdr_mode_label` zu
+    // unterdruecken (None), wenn der Transponder AUS ist — der
+    // MODE-Switch labelt sonst auch bei abgeschaltetem XPDR. LOCKSTEP:
+    // append-only am Tabellen-Ende, gleiche Reihenfolge im
+    // pull_f64!-Block + Telemetry-Struct.
+    F::f64("L:VC_PED_ATCXPDR_ON_OFF_Switch", "Number"),
 ];
 
 // Helper builders so the table above stays compact.
@@ -988,6 +1042,23 @@ pub struct Telemetry {
     pub fsl_autobrake_lo_light: f64,
     pub fsl_autobrake_med_light: f64,
     pub fsl_autobrake_max_light: f64,
+    // ---- FSLabs A321 PREMIUM (v0.16.20) ----
+    pub fsl_park_brake_switch: f64,
+    pub fsl_eng1_mstr_switch: f64,
+    pub fsl_eng2_mstr_switch: f64,
+    pub fsl_wheel_chocks: f64,
+    pub fsl_baro_std: f64,
+    pub fsl_master_caution: f64,
+    pub fsl_master_warning: f64,
+    pub fsl_spd_brk_lever: f64,
+    pub fsl_engfire1_lt: f64,
+    pub fsl_engfire2_lt: f64,
+    pub fsl_eng1_anti_ice: f64,
+    pub fsl_eng2_anti_ice: f64,
+    pub fsl_xpdr_mode_switch: f64,
+    // v0.16.20 (Review-Fund): XPDR ON/OFF-Schalter (0=OFF, 10=AUTO,
+    // 20=ON per Skript-`/10`). Gated `xpdr_mode_label` auf OFF.
+    pub fsl_xpdr_on_off_switch: f64,
 }
 
 // ---- Touchdown sample (separate data definition #2) ----
@@ -1517,6 +1588,22 @@ impl Telemetry {
         pull_f64!(t.fsl_autobrake_lo_light);
         pull_f64!(t.fsl_autobrake_med_light);
         pull_f64!(t.fsl_autobrake_max_light);
+        // ---- FSLabs A321 PREMIUM (v0.16.20) ----
+        pull_f64!(t.fsl_park_brake_switch);
+        pull_f64!(t.fsl_eng1_mstr_switch);
+        pull_f64!(t.fsl_eng2_mstr_switch);
+        pull_f64!(t.fsl_wheel_chocks);
+        pull_f64!(t.fsl_baro_std);
+        pull_f64!(t.fsl_master_caution);
+        pull_f64!(t.fsl_master_warning);
+        pull_f64!(t.fsl_spd_brk_lever);
+        pull_f64!(t.fsl_engfire1_lt);
+        pull_f64!(t.fsl_engfire2_lt);
+        pull_f64!(t.fsl_eng1_anti_ice);
+        pull_f64!(t.fsl_eng2_anti_ice);
+        pull_f64!(t.fsl_xpdr_mode_switch);
+        // v0.16.20 (Review-Fund): XPDR ON/OFF — neuer outermost-Slot.
+        pull_f64!(t.fsl_xpdr_on_off_switch);
 
         // Silence the unused-assignment warning the last `pull_*!`
         // emits (the macro always advances `off`, but the very last
@@ -1759,7 +1846,17 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
     // konsistent mit dem GENERAL ENG COMBUSTION-Verhalten ueber den
     // ganzen Flug — nur Cold&Dark wird korrekt.
     let is_fsr_phenom = matches!(profile, AircraftProfile::FsrPhenom300e);
-    let engines_running = if is_fsr_phenom {
+    // v0.16.20: FSLabs FAELSCHT `GENERAL ENG COMBUSTION` → der Standard-
+    // Pfad las am Gate (Triebwerke aus) konstant 2 (Peters Log, 0.16.18).
+    // Die echten Engine-Master-Schalter sind die wahre On/Off-Quelle.
+    // Skript-Schwellen: `20 >=` = ON, `10 <=` = OFF → Stellung, kein 0/1;
+    // Mitte (>= 15) trennt sauber. Master AUS = Shutdown = das echte
+    // Ankunftssignal, das die Auto-End-FSM braucht.
+    const FSL_MSTR_ON: f64 = 15.0;
+    let engines_running = if is_fsl {
+        (if t.fsl_eng1_mstr_switch >= FSL_MSTR_ON { 1u8 } else { 0 })
+            + (if t.fsl_eng2_mstr_switch >= FSL_MSTR_ON { 1u8 } else { 0 })
+    } else if is_fsr_phenom {
         (if t.fsr_phenom_eng1_knob > 0.5 { 1u8 } else { 0 })
             + (if t.fsr_phenom_eng2_knob > 0.5 { 1u8 } else { 0 })
     } else {
@@ -2125,6 +2222,11 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
     // standard SimVar on that aircraft.
     let parking_brake = if is_fenix {
         t.fnx_park_brake as i32 != 0
+    } else if is_fsl {
+        // v0.16.20: FSL faelscht den Standard-Parkbremsen-SimVar (Peters
+        // Log: parking_brake=False bei real gesetzter Bremse). Skript
+        // `(L:VC_PED_PARK_BRAKE_Switch) 0 == if{ released }` → !=0 = SET.
+        t.fsl_park_brake_switch != 0.0
     } else {
         t.parking_brake
     };
@@ -2175,6 +2277,10 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
     };
     let engine_anti_ice = if is_fenix {
         t.fnx_eng1_anti_ice as i32 != 0 || t.fnx_eng2_anti_ice as i32 != 0
+    } else if is_fsl {
+        // v0.16.20: `VC_OVHD_AI_Eng_{1,2}_Anti_Ice_Button` — Skript
+        // `0 !=`=an. Kombiniertes "irgendein Triebwerk Anti-Ice an".
+        t.fsl_eng1_anti_ice != 0.0 || t.fsl_eng2_anti_ice != 0.0
     } else if is_a346 {
         // 4 Engine-Anti-Ice-Schalter (L1/L2/R1/R2). Der Snapshot
         // fuehrt nur das kombinierte "any engine anti-ice on" — wie
@@ -2381,20 +2487,22 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
         // RTO/OFF/1/2/3/MAX).
         raw_enum_label(t.ifly_autobrake_sw)
     } else if is_fsl {
-        // FSLabs A321 (v0.16.14): die drei AUTO-BRK-Tasten-Lampen
-        // (`L:VC_MIP_BRAKES_AUTOBRK_{LO,MED,MAX}_BUTTON_BOT`,
-        // BOT = untere Lampenhaelfte = Mode selected). HubHop-Button-
-        // Presets pruefen ">50" — gleiche Schwelle hier (Helligkeits-
-        // LVar wie die FCU-LEDs, nur mit dem Preset-Idiom belegt).
+        // FSLabs A321: die drei AUTO-BRK-Tasten-LVars
+        // (`L:VC_MIP_BRAKES_AUTOBRK_{LO,MED,MAX}_Button_BOT`,
+        // BOT = untere Tastenhaelfte = Mode selected). Review-Fund
+        // v0.16.20: das FSLabsA3x_Scripts.xml behandelt sie als STATE
+        // (`(L:...) 0 != if{ ... selected }`), NICHT als Helligkeit —
+        // also `!= 0` statt der frueheren `>50`-Schwelle (gleiches
+        // Idiom wie Parkbremse / Anti-Ice / Master-Caution beim FSL).
         // Real leuchtet genau eine; sollten (theoretisch) mehrere
         // gleichzeitig lesen, gewinnt die erste (LO → MED → MAX).
-        // Keine leuchtet → None ("wissen wir nicht"), kein erfundenes
+        // Keine selektiert → None ("wissen wir nicht"), kein erfundenes
         // OFF-Label.
-        if t.fsl_autobrake_lo_light > 50.0 {
+        if t.fsl_autobrake_lo_light != 0.0 {
             Some("LO".to_string())
-        } else if t.fsl_autobrake_med_light > 50.0 {
+        } else if t.fsl_autobrake_med_light != 0.0 {
             Some("MED".to_string())
-        } else if t.fsl_autobrake_max_light > 50.0 {
+        } else if t.fsl_autobrake_max_light != 0.0 {
             Some("MAX".to_string())
         } else {
             None
@@ -2620,6 +2728,9 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
     } else if is_ifly {
         // v0.16.11: iFly `L:VC_Master_Caution_Light_1_VAL` (Capt-Seite).
         Some(t.ifly_master_caution_light != 0.0)
+    } else if is_fsl {
+        // v0.16.20: `VC_GSLD_CP_Caution_Button_BOT` — Skript `0 !=`=aktiv.
+        Some(t.fsl_master_caution != 0.0)
     } else {
         None
     };
@@ -2635,6 +2746,16 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
         // Light_1_VAL`, Capt-Seite). Gleiche Konvention wie der
         // PMDG-Mapper (dort speist fire_warn → master_warning).
         Some(t.ifly_fire_warning_light != 0.0)
+    } else if is_fsl {
+        // v0.16.20: `VC_GSLD_CP_Warning_Button_BOT` (rote Master-Lampe,
+        // Skript `0 !=`=aktiv) ODER eine Triebwerks-Feuer-Lampe
+        // (`VC_PED_ENGFIRE_{1,2}_LT_TOP` — Feuer ist eine rote
+        // Master-Klasse-Bedingung).
+        Some(
+            t.fsl_master_warning != 0.0
+                || t.fsl_engfire1_lt != 0.0
+                || t.fsl_engfire2_lt != 0.0,
+        )
     } else {
         None
     };
@@ -2724,6 +2845,16 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
         None
     };
 
+    // Spoilers HANDLE: KEIN FSL-Override (Review-Fund v0.16.20).
+    // Frueher ueberschrieb das FSL-Profil `spoilers_handle_position`
+    // mit einer aus `VC_PED_SPD_BRK_LEVER` erfundenen `/50`-Skala. Das
+    // war FALSCH und ein Rollout-Scoring-Regress: FSL TREIBT die
+    // Standard-SimVar `SPOILERS HANDLE POSITION` KORREKT (Peters Log:
+    // 0.0 im Final → 1.0 beim Touchdown-Rollout). Der LVar kennt nur
+    // 0=eingefahren / 10=armed (KEINEN deployed-Bereich), taugt also
+    // nicht als Handle-Quelle. Also: Standard-SimVar unveraendert
+    // durchreichen wie bei jedem anderen Aircraft.
+    let spoilers_handle_position = t.spoilers_handle_position as f32;
     // Spoilers ARMED: Standard-SimVar ODER Profil-LVar — jede Quelle
     // genuegt, kein Regress fuer Aircraft mit funktionierendem
     // Standard.
@@ -2731,13 +2862,49 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
         t.spoilers_armed || t.fbw_spoilers_armed != 0.0
     } else if is_a346 {
         t.spoilers_armed || t.a346_spoiler_lever_armed != 0.0
+    } else if is_fsl {
+        // v0.16.20: NUR der armed-Detent kommt aus `VC_PED_SPD_BRK_LEVER`
+        // — Skript prueft exakt `10 ==` (10 = armed). Wir tolerieren ein
+        // Fenster (>= 5 und <= 15), falls der Live-Wert leicht abweicht.
+        // Der physische Handle bleibt bewusst auf der Standard-SimVar.
+        t.spoilers_armed || (t.fsl_spd_brk_lever >= 5.0 && t.fsl_spd_brk_lever <= 15.0)
     } else {
         t.spoilers_armed
     };
 
-    // Baro STD (nur Fenix: EFIS1-Schalterstellung).
+    // v0.16.20: FSL-Transponder-Modus. `VC_PED_ATCXPDR_MODE_SWITCH` —
+    // Skript `/10` → 0=STBY, 1=TA, 2=TARA (Rohwert 0/10/20). Auf das
+    // Panel-Label gemappt (None, wenn kein FSL-Profil).
+    // Review-Fund v0.16.20: gegated auf den XPDR-ON/OFF-Schalter
+    // (`VC_PED_ATCXPDR_ON_OFF_Switch`, Skript `/10` → 0=OFF, 1=AUTO,
+    // 2=ON). Bei OFF (Rohwert 0) liefert der MODE-Switch kein
+    // sinnvolles Label → None statt eines erfundenen STBY.
+    let xpdr_mode_label = if is_fsl {
+        let on_off = (t.fsl_xpdr_on_off_switch / 10.0).round() as i32;
+        if on_off == 0 {
+            None // Transponder AUS → kein Modus-Label
+        } else {
+            let mode = (t.fsl_xpdr_mode_switch / 10.0).round() as i32;
+            Some(
+                match mode {
+                    0 => "STBY",
+                    1 => "TA",
+                    2 => "TA-RA",
+                    _ => "STBY",
+                }
+                .to_string(),
+            )
+        }
+    } else {
+        None
+    };
+
+    // Baro STD (Fenix: EFIS1-Schalterstellung; FSL v0.16.20:
+    // `FSL_EFIS_CPT_BARO_STD` !=0 = STD-Fenster gewaehlt).
     let baro_std = if is_fenix {
         Some(t.fnx_baro_std != 0.0)
+    } else if is_fsl {
+        Some(t.fsl_baro_std != 0.0)
     } else {
         None
     };
@@ -2936,11 +3103,14 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
         autopilot_approach: Some(ap_appr),
         autothrottle_on,
         fuel_flow_kg_per_h,
-        // Spoilers-Handle: bleibt die analoge Standard-SimVar — auch
-        // beim Fenix (dessen `L:A_FC_SPEEDBRAKE` ist nur als Override-
-        // Kandidat subscribed, s. Tabellen-Kommentar Gruppe A).
-        spoilers_handle_position: Some(t.spoilers_handle_position as f32),
-        // v0.16.10 (#Premium): Standard ODER Profil-LVar (FBW/A346).
+        // Spoilers-Handle: bleibt fuer ALLE Profile die analoge
+        // Standard-SimVar — auch beim Fenix (dessen `L:A_FC_SPEEDBRAKE`
+        // ist nur als Override-Kandidat subscribed, s. Tabellen-
+        // Kommentar Gruppe A) und beim FSL (Review-Fund v0.16.20: FSL
+        // treibt die Standard-SimVar korrekt, 0→1 beim Rollout — der
+        // SPD_BRK_LEVER-Override war ein Rollout-Scoring-Regress).
+        spoilers_handle_position: Some(spoilers_handle_position),
+        // v0.16.10 (#Premium): Standard ODER Profil-LVar (FBW/A346/FSL).
         spoilers_armed: Some(spoilers_armed),
         pushback_state,
         apu_switch: Some(apu_switch),
@@ -2956,7 +3126,9 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
         // `None` for non-PMDG / non-Fenix-beta aircraft.
         light_wing: fenix_beta_light_wing,
         light_wheel_well: None,
-        xpdr_mode_label: None,
+        // v0.16.20: FSL liefert den XPDR-Modus ueber den MODE-Switch
+        // (STBY/TA/TA-RA); sonst None.
+        xpdr_mode_label,
         takeoff_config_warning: None,
         seatbelts_sign,
         no_smoking_sign,
@@ -3525,7 +3697,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(buf.len(), 2668, "total block size");
+        assert_eq!(buf.len(), 2780, "total block size");
         let t = Telemetry::from_block(&buf);
 
         // Identity / head sentinels.
@@ -3704,6 +3876,22 @@ mod tests {
         assert_eq!(t.fsl_autobrake_lo_light, 1254.0); // idx 254
         assert_eq!(t.fsl_autobrake_med_light, 1255.0); // idx 255
         assert_eq!(t.fsl_autobrake_max_light, 1256.0); // idx 256
+
+        // ---- v0.16.20: FSLabs A321 PREMIUM tail (idx 257..269) ----
+        assert_eq!(t.fsl_park_brake_switch, 1257.0); // idx 257
+        assert_eq!(t.fsl_eng1_mstr_switch, 1258.0); // idx 258
+        assert_eq!(t.fsl_eng2_mstr_switch, 1259.0); // idx 259
+        assert_eq!(t.fsl_wheel_chocks, 1260.0); // idx 260
+        assert_eq!(t.fsl_baro_std, 1261.0); // idx 261
+        assert_eq!(t.fsl_master_caution, 1262.0); // idx 262
+        assert_eq!(t.fsl_master_warning, 1263.0); // idx 263
+        assert_eq!(t.fsl_spd_brk_lever, 1264.0); // idx 264
+        assert_eq!(t.fsl_engfire1_lt, 1265.0); // idx 265
+        assert_eq!(t.fsl_engfire2_lt, 1266.0); // idx 266
+        assert_eq!(t.fsl_eng1_anti_ice, 1267.0); // idx 267
+        assert_eq!(t.fsl_eng2_anti_ice, 1268.0); // idx 268
+        assert_eq!(t.fsl_xpdr_mode_switch, 1269.0); // idx 269
+        assert_eq!(t.fsl_xpdr_on_off_switch, 1270.0); // idx 270 (Review-Fund)
     }
 
     /// Truncated block (e.g. all 12 new tail LVars rejected by an older
@@ -3719,9 +3907,20 @@ mod tests {
                 FieldKind::String256 => buf.extend_from_slice(&[0u8; 256]),
             }
         }
-        // v0.16.14: drop the 17 FSLabs tail fields (17*8) — the new
-        // outermost layer. Everything up to the iFly group stays
-        // intact, the FSL slots parse to safe defaults.
+        // v0.16.20: drop the 14 FSLabs PREMIUM tail fields (14*8) — the
+        // new outermost layer (13 original + the XPDR ON/OFF Review-Fund
+        // field). Everything up to the v0.16.14 FSL group stays intact,
+        // the new premium slots parse to safe defaults.
+        buf.truncate(buf.len() - 112);
+        let t = Telemetry::from_block(&buf);
+        assert_eq!(t.fsl_autobrake_max_light, 1256.0); // last v0.16.14 field intact
+        assert_eq!(t.ifly_autobrake_sw, 1239.0); // v0.16.11 layer intact
+        assert_eq!(t.fsl_park_brake_switch, 0.0); // premium tail = safe defaults
+        assert_eq!(t.fsl_eng1_mstr_switch, 0.0);
+        assert_eq!(t.fsl_xpdr_mode_switch, 0.0);
+        assert_eq!(t.fsl_xpdr_on_off_switch, 0.0);
+
+        // v0.16.14: drop the 17 FSLabs tail fields (17*8).
         buf.truncate(buf.len() - 136);
         let t = Telemetry::from_block(&buf);
         assert_eq!(t.ifly_autobrake_sw, 1239.0); // last v0.16.11 field intact
@@ -4775,6 +4974,24 @@ mod tests {
         t.fsl_autobrake_lo_light = 80.0;
         t.fsl_autobrake_med_light = 80.0;
         t.fsl_autobrake_max_light = 80.0;
+        // v0.16.20: alle 13 neuen FSL-PREMIUM-Slots beheizt — der
+        // kritischste Phantom-Schutz: parking_brake/engines_running
+        // duerfen NICHT vom FSL-Pfad uebernommen werden, wenn das Profil
+        // ein C172 ist.
+        t.fsl_park_brake_switch = 1.0; // wuerde parking_brake=true erzwingen
+        t.fsl_eng1_mstr_switch = 20.0; // wuerde engines_running=2 erzwingen
+        t.fsl_eng2_mstr_switch = 20.0;
+        t.fsl_wheel_chocks = 1.0;
+        t.fsl_baro_std = 1.0; // wuerde baro_std=Some leaken
+        t.fsl_master_caution = 1.0; // wuerde master_caution=Some leaken
+        t.fsl_master_warning = 1.0; // wuerde master_warning=Some leaken
+        t.fsl_spd_brk_lever = 10.0; // wuerde spoilers_armed/handle leaken
+        t.fsl_engfire1_lt = 1.0; // wuerde master_warning leaken
+        t.fsl_engfire2_lt = 1.0;
+        t.fsl_eng1_anti_ice = 1.0; // wuerde engine_anti_ice leaken
+        t.fsl_eng2_anti_ice = 1.0;
+        t.fsl_xpdr_mode_switch = 20.0; // wuerde xpdr_mode_label leaken
+        t.fsl_xpdr_on_off_switch = 20.0; // ON — wuerde das Gate beheizen (Review-Fund)
 
         let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
 
@@ -4816,6 +5033,16 @@ mod tests {
         assert_eq!(snap.fcu_selected_altitude_ft, None);
         assert_eq!(snap.fcu_selected_heading_deg, None);
         assert_eq!(snap.fcu_selected_vs_fpm, None);
+
+        // v0.16.20: die kritischen FSL-PREMIUM-Override-Felder bleiben
+        // auf dem Standard-Pfad — KEIN Leak in ein C172.
+        assert!(!snap.parking_brake); // FSL-PARK_BRAKE_Switch leakt nicht
+        assert_eq!(snap.engines_running, 0); // FSL-ENG_MSTR leakt nicht
+        assert_eq!(snap.engine_anti_ice, Some(false)); // FSL-Anti-Ice leakt nicht
+        assert_eq!(snap.spoilers_armed, Some(false)); // FSL-SPD_BRK leakt nicht
+        assert_eq!(snap.xpdr_mode_label, None); // FSL-XPDR-Modus leakt nicht
+        // master_caution/master_warning/baro_std bereits oben als None
+        // geprueft — die FSL-Slots duerfen sie nicht auf Some heben.
     }
 
     // ---- v0.16.11: iFly 737 MAX 8 Premium-Mappings ----
@@ -5104,12 +5331,15 @@ mod tests {
     }
 
     #[test]
-    fn fsl_autobrake_from_button_lights_with_priority() {
-        // Genau eine Lampe > 50 → ihr Label.
+    fn fsl_autobrake_from_button_state_with_priority() {
+        // Review-Fund v0.16.20: die AUTO-BRK-LVars sind STATE, nicht
+        // Helligkeit — `!= 0` = selektiert (Skript-Idiom `0 != if{ ... }`).
+        // Genau ein State != 0 → sein Label. Auch ein kleiner Wert (1)
+        // zaehlt jetzt (frueher unter der >50-Schwelle verworfen).
         for (lo, med, max, want) in [
-            (80.0, 0.0, 0.0, "LO"),
-            (0.0, 80.0, 0.0, "MED"),
-            (0.0, 0.0, 80.0, "MAX"),
+            (1.0, 0.0, 0.0, "LO"),
+            (0.0, 1.0, 0.0, "MED"),
+            (0.0, 0.0, 1.0, "MAX"),
         ] {
             let mut t = fsl_telemetry();
             t.fsl_autobrake_lo_light = lo;
@@ -5122,30 +5352,221 @@ mod tests {
         // (Theoretisch) mehrere gleichzeitig → die erste gewinnt
         // (LO → MED → MAX).
         let mut t = fsl_telemetry();
-        t.fsl_autobrake_lo_light = 80.0;
-        t.fsl_autobrake_max_light = 80.0;
+        t.fsl_autobrake_lo_light = 1.0;
+        t.fsl_autobrake_max_light = 1.0;
         let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
         assert_eq!(snap.autobrake, Some("LO".to_string()));
 
-        // Unter der >50-Preset-Schwelle bzw. alles aus → None
-        // (kein erfundenes OFF-Label).
-        let mut t = fsl_telemetry();
-        t.fsl_autobrake_med_light = 30.0;
-        let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
+        // Alles 0 (keine Stufe selektiert) → None (kein erfundenes
+        // OFF-Label).
+        let snap = telemetry_to_snapshot(fsl_telemetry(), Simulator::Msfs2024);
         assert_eq!(snap.autobrake, None);
     }
 
     #[test]
     fn fsl_undocumented_warning_fields_stay_none() {
-        // Master Caution/Warning, Reverser, Ground-Spoiler und
-        // Cabin-Alt sind fuer FSL extern + nicht katalogisiert —
-        // bleiben ehrlich None (Standard-SimVars + Kaskaden greifen
-        // an anderer Stelle, kein erfundenes Some(false)).
+        // Reverser, Ground-Spoiler und Cabin-Alt sind fuer FSL extern +
+        // nicht katalogisiert — bleiben ehrlich None (kein erfundenes
+        // Some(false)). Master Caution/Warning werden ab v0.16.20 ueber
+        // die echten Lampen-LVars gemappt → sind nun Some (s. eigene
+        // Tests), nicht mehr None.
         let snap = telemetry_to_snapshot(fsl_telemetry(), Simulator::Msfs2024);
-        assert_eq!(snap.master_caution, None);
-        assert_eq!(snap.master_warning, None);
         assert_eq!(snap.reverser_deployed, None);
         assert_eq!(snap.ground_spoilers_active, None);
         assert_eq!(snap.cabin_altitude_warning, None);
+    }
+
+    // ---- v0.16.20: FSLabs A321 PREMIUM-Mappings (echte LVars) ----
+
+    #[test]
+    fn fsl_parking_brake_from_real_switch_overrides_faked_simvar() {
+        // FSL faelscht den Standard-SimVar; der echte Schalter gewinnt.
+        // Skript: `0 ==` = released → !=0 = SET.
+        let mut t = fsl_telemetry();
+        t.fsl_park_brake_switch = 0.0;
+        let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
+        assert!(!snap.parking_brake); // 0 → released
+
+        let mut t = fsl_telemetry();
+        t.fsl_park_brake_switch = 1.0;
+        let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
+        assert!(snap.parking_brake); // !=0 → set
+
+        // Selbst wenn der gefaelschte Standard-SimVar False liefert
+        // (parking_brake-Default), gewinnt der echte Schalter.
+        let mut t = fsl_telemetry();
+        t.parking_brake = false; // FSL-Fake
+        t.fsl_park_brake_switch = 1.0; // Realitaet: gesetzt
+        let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
+        assert!(snap.parking_brake);
+    }
+
+    #[test]
+    fn fsl_engines_running_from_masters_overrides_faked_combustion() {
+        // FSL faelscht COMBUSTION → Standard-Pfad las am Gate konstant 2.
+        // Master-Schalter: Skript-Schwellen 20>=ON, 10<=OFF → >= 15 = ON.
+        // Beide Master an → 2.
+        let mut t = fsl_telemetry();
+        t.fsl_eng1_mstr_switch = 20.0;
+        t.fsl_eng2_mstr_switch = 20.0;
+        // gefaelschte COMBUSTION wie in Peters Log:
+        t.eng1_firing = true;
+        t.eng2_firing = true;
+        let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
+        assert_eq!(snap.engines_running, 2);
+
+        // Nur Engine 1 an → 1.
+        let mut t = fsl_telemetry();
+        t.fsl_eng1_mstr_switch = 20.0;
+        t.fsl_eng2_mstr_switch = 0.0;
+        let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
+        assert_eq!(snap.engines_running, 1);
+
+        // Beide Master AUS (am Gate) → 0, OBWOHL COMBUSTION faked 2 meldet.
+        // Das ist das echte Ankunftssignal fuer die Auto-End-FSM.
+        let mut t = fsl_telemetry();
+        t.fsl_eng1_mstr_switch = 0.0;
+        t.fsl_eng2_mstr_switch = 0.0;
+        t.eng1_firing = true; // FSL-Fake
+        t.eng2_firing = true; // FSL-Fake
+        let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
+        assert_eq!(snap.engines_running, 0);
+
+        // OFF-Stellung als Restwert <= 10 zaehlt NICHT als laufend.
+        let mut t = fsl_telemetry();
+        t.fsl_eng1_mstr_switch = 10.0;
+        t.fsl_eng2_mstr_switch = 10.0;
+        let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
+        assert_eq!(snap.engines_running, 0);
+    }
+
+    #[test]
+    fn fsl_baro_std_from_efis_lvar() {
+        let mut t = fsl_telemetry();
+        t.fsl_baro_std = 1.0;
+        let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
+        assert_eq!(snap.baro_std, Some(true));
+
+        let t = fsl_telemetry(); // 0 → QNH/QFE
+        let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
+        assert_eq!(snap.baro_std, Some(false));
+    }
+
+    #[test]
+    fn fsl_master_caution_and_warning_from_buttons() {
+        let mut t = fsl_telemetry();
+        t.fsl_master_caution = 1.0;
+        let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
+        assert_eq!(snap.master_caution, Some(true));
+        assert_eq!(snap.master_warning, Some(false));
+
+        let mut t = fsl_telemetry();
+        t.fsl_master_warning = 1.0;
+        let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
+        assert_eq!(snap.master_caution, Some(false));
+        assert_eq!(snap.master_warning, Some(true));
+
+        // Beide aus → ehrliches Some(false), nicht None.
+        let snap = telemetry_to_snapshot(fsl_telemetry(), Simulator::Msfs2024);
+        assert_eq!(snap.master_caution, Some(false));
+        assert_eq!(snap.master_warning, Some(false));
+    }
+
+    #[test]
+    fn fsl_engine_fire_lamp_raises_master_warning() {
+        // Triebwerks-Feuer ist eine rote Master-Klasse-Bedingung →
+        // hebt master_warning, auch ohne die Warning-Button-Lampe.
+        let mut t = fsl_telemetry();
+        t.fsl_engfire1_lt = 1.0;
+        let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
+        assert_eq!(snap.master_warning, Some(true));
+
+        let mut t = fsl_telemetry();
+        t.fsl_engfire2_lt = 1.0;
+        let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
+        assert_eq!(snap.master_warning, Some(true));
+    }
+
+    #[test]
+    fn fsl_engine_anti_ice_from_buttons() {
+        let mut t = fsl_telemetry();
+        t.fsl_eng1_anti_ice = 1.0;
+        let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
+        assert_eq!(snap.engine_anti_ice, Some(true));
+
+        let mut t = fsl_telemetry();
+        t.fsl_eng2_anti_ice = 1.0;
+        let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
+        assert_eq!(snap.engine_anti_ice, Some(true));
+
+        // Beide aus → Some(false).
+        let snap = telemetry_to_snapshot(fsl_telemetry(), Simulator::Msfs2024);
+        assert_eq!(snap.engine_anti_ice, Some(false));
+    }
+
+    #[test]
+    fn fsl_speedbrake_handle_uses_standard_simvar_lever_only_arms() {
+        // Review-Fund v0.16.20: das FSL-Profil ueberschreibt
+        // `spoilers_handle_position` NICHT mehr — FSL treibt die
+        // Standard-SimVar `SPOILERS HANDLE POSITION` korrekt (Peters
+        // Log: 0→1 beim Rollout). Nur `spoilers_armed` kommt aus dem
+        // SPD_BRK_LEVER-Detent (== 10).
+
+        // Lever eingefahren (0), Standard-Handle 0 → Handle 0, nicht armed.
+        let snap = telemetry_to_snapshot(fsl_telemetry(), Simulator::Msfs2024);
+        assert_eq!(snap.spoilers_handle_position, Some(0.0));
+        assert_eq!(snap.spoilers_armed, Some(false));
+
+        // Armed-Detent (Skript: == 10) → armed. Der Handle bleibt auf
+        // der Standard-SimVar (hier Default 0.0) — NICHT vom Lever
+        // ueberschrieben (frueher faelschlich 10/50 = 0.2).
+        let mut t = fsl_telemetry();
+        t.fsl_spd_brk_lever = 10.0;
+        let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
+        assert_eq!(snap.spoilers_armed, Some(true));
+        assert_eq!(snap.spoilers_handle_position, Some(0.0)); // Standard, NICHT 0.2
+
+        // Standard-Handle deployed (z.B. 1.0 beim Rollout) fliesst
+        // unveraendert durch — der Lever-Wert aendert daran nichts.
+        let mut t = fsl_telemetry();
+        t.spoilers_handle_position = 1.0; // FSL treibt das korrekt
+        t.fsl_spd_brk_lever = 0.0;
+        let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
+        assert_eq!(snap.spoilers_handle_position, Some(1.0));
+    }
+
+    #[test]
+    fn fsl_xpdr_mode_from_switch_enum() {
+        // Skript: Rohwert /10 → 0=STBY, 1=TA, 2=TA-RA. Der XPDR muss
+        // dazu eingeschaltet sein (ON/OFF-Switch != OFF) — sonst gated
+        // das Label auf None (s. eigener Test).
+        for (raw, want) in [(0.0, "STBY"), (10.0, "TA"), (20.0, "TA-RA")] {
+            let mut t = fsl_telemetry();
+            t.fsl_xpdr_on_off_switch = 20.0; // ON
+            t.fsl_xpdr_mode_switch = raw;
+            let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
+            assert_eq!(snap.xpdr_mode_label, Some(want.to_string()));
+        }
+    }
+
+    #[test]
+    fn fsl_xpdr_label_gated_off_when_transponder_off() {
+        // Review-Fund v0.16.20: bei XPDR OFF (ON/OFF-Switch Rohwert 0)
+        // liefert das Label None, auch wenn der MODE-Switch eine
+        // Stellung haelt.
+        let mut t = fsl_telemetry();
+        t.fsl_xpdr_on_off_switch = 0.0; // OFF
+        t.fsl_xpdr_mode_switch = 20.0; // MODE = TA-RA, aber XPDR aus
+        let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
+        assert_eq!(snap.xpdr_mode_label, None);
+
+        // AUTO (10) und ON (20) labeln beide.
+        for on_off in [10.0, 20.0] {
+            let mut t = fsl_telemetry();
+            t.fsl_xpdr_on_off_switch = on_off;
+            t.fsl_xpdr_mode_switch = 0.0; // STBY
+            let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
+            assert_eq!(snap.xpdr_mode_label, Some("STBY".to_string()));
+        }
     }
 }
