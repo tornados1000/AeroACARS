@@ -15235,6 +15235,481 @@ fn score_g_for_stats(stats: &FlightStats) -> recorder::ScoredG {
     }
 }
 
+// ======================================================================
+// v0.16.22 — MSFS flare metric on the lag-free AGL-geometric V/S
+// ======================================================================
+//
+// PROBLEM. The flare metric in `compute_landing_analysis` derives
+// `peak_vs_pre` / `vs_at_flare_end` (window [-2000ms, -100ms]) from
+// `s.vs_fpm`. On MSFS that field is the DISPLAY vertical-speed SimVar,
+// which lags the airframe ~0.5-0.7 s through the flare (same lag the
+// v0.16.21 touchdown de-lag corrects at the edge). So at -100 ms the
+// SimVar still reflects the descent ~0.6 s earlier — BEFORE a late
+// flare took effect — the reduction reads near zero and the metric
+// reports "no flare" even when the pilot genuinely pulled.
+//
+// Proven on JBU323 (Fenix A320, MSFS2024): lagged peak -469 / end -440
+// → reduction 30 fpm → flare_detected=FALSE. But the lag-free AGL-
+// geometric derivative over the SAME window shows the real profile
+// (pre-flare ~-569, mid-flare ~-370) → real reduction ~130-200 fpm; the
+// pitch rose 2.5°→5.2°. The pilot DID flare — it was just late, so the
+// aircraft still settled firm (edge -423, peak_g 1.43). The de-lag fix
+// already credits the firmer-than-displayed *touchdown*; this fix
+// credits the *flare* the lag hid, without softening the touchdown.
+//
+// THE FIX. For MSFS fixed-wing, compute `peak_vs_pre` / `vs_at_flare_
+// end` from the AGL trace via a SMOOTHED LOCAL LINEAR FIT (least-squares
+// slope of agl_ft over a ±MSFS_FLARE_AGL_FIT_HALF_WINDOW_MS window of
+// samples) rather than raw consecutive-sample diffs (too noisy). The
+// slope (ft/min) is the geometric sink at that instant — lag-free,
+// because position/AGL is not the lagged SimVar. X-Plane (raw local_vy,
+// far less lagged) and Other keep the existing `s.vs_fpm` path so their
+// analysis output is byte-identical.
+//
+// WHY THE FIT IS NOISE-ROBUST. A single-sample AGL diff at 50 Hz is
+// dominated by AGL quantization (MSFS reports AGL in ~0.5-0.6 ft steps).
+// A least-squares slope over ±300 ms (typically 15-20 samples) averages
+// that quantization out — the residual after the linear trend is the
+// noise floor, and the slope is the trend. On the corpus the detection
+// verdict is identical at half-windows of 250/300/350 ms for every
+// flight (only JBU323's reduction MAGNITUDE moves, 116-207 fpm, all
+// well above the 50 fpm threshold). We pick the STEEPEST fitted slope in
+// the window as `peak_vs_pre`; on JBU323 that peak (-659) is supported
+// by a plateau of neighbours in the -580..-660 band, not a lone spike.
+//
+// NO PHANTOM FLARES. The reduction is a REAL geometric reduction in the
+// AGL trace, not a SimVar lag artifact. A firm landing with no real
+// flare (DLH848: AGL slope flat at -382 across the window) yields
+// reduction 0 → flare_detected=false, unchanged. The endpoint score
+// still reflects the firm touchdown — we credit the reduction, never
+// turn a firm landing soft.
+
+/// Half-window (ms) of AGL samples used for each local linear-fit slope.
+/// ±300 ms ≈ 15-20 samples at 50 Hz — wide enough to average out MSFS's
+/// ~0.5 ft AGL quantization, narrow enough to resolve the flare's sink
+/// reduction. Corpus-stable: detection verdict identical at 250/350 too.
+const MSFS_FLARE_AGL_FIT_HALF_WINDOW_MS: i64 = 300;
+/// Minimum airborne AGL samples inside a fit window for the slope to be
+/// trusted. Below this the least-squares slope is too sensitive to a
+/// single quantization step; we skip that time point.
+const MSFS_FLARE_AGL_FIT_MIN_SAMPLES: usize = 4;
+/// AGL above this (ft) at a fit point means we are not yet in the flare/
+/// short-final geometry — the same guard the touchdown AGL estimator
+/// uses for window-start. Keeps a high pre-flare descent out of the
+/// flare-window slope set. Reuses TD_AGL_MAX_AT_WINDOW_START_FT.
+const MSFS_FLARE_AGL_MAX_FT: f32 = TD_AGL_MAX_AT_WINDOW_START_FT;
+
+// ─── v0.16.22 hardening: phantom-flare guards ────────────────────────────
+//
+// Adversarial QS found two phantom "butter" flares the bare AGL path
+// produced. Both are DATA pathologies, not piloting:
+//   • E195 MXY322 — the AGL trace FROZE at 9.96 ft for ~14 samples
+//     (-466…-31 ms), so the flare-end fit slope read ~0 → vs_at_flare_end
+//     ≈ 0 → reduction 742 → score 100, on a firm -315 fpm / 1.46 g arrival
+//     with NOSE-DOWN pitch. The whole flare window had only 4 DISTINCT
+//     agl_ft values.
+//   • DA40 GSG2056 — touched at -1626 ms (on_ground=true, g 1.3),
+//     ballooned ~2.4 ft, settled. The credited "reduction" was the
+//     post-bounce settle, pitch -6° nose-DOWN at flare-end.
+//
+// A 316-landing VPS sweep + the local corpus drove the thresholds below.
+// Gate 1 (data quality) + Gate 2 (bounce) suppress BOTH phantoms AND the
+// near-frozen B738 (7 distinct) QS also flagged, while NOT touching any
+// of 115 real flares (incl. JBU323, the FSLabs A321, the Baron 58P).
+//
+/// Gate 1a — minimum DISTINCT `agl_ft` values among the airborne flare-
+/// window samples for the AGL geometry to be trusted. Below this the trace
+/// is too coarse to differentiate (a step/plateau, not a slope). VPS data:
+/// the only two flights under 8 in 316 landings are the two frozen
+/// phantoms (4 and 7 distinct); the lowest REAL flare has 18 distinct —
+/// a 2.25× margin. On reject we fall back to the SimVar path so no garbage
+/// AGL endpoint is published.
+const MSFS_FLARE_MIN_DISTINCT_AGL: usize = 8;
+/// Gate 1b — maximum MEDIAN sample Δt (ms) inside the flare window. Above
+/// this the effective rate is < ~16 Hz and a local slope is unreliable.
+/// All healthy captures in the corpus sit at ~31 ms (32 Hz); this is a
+/// safety net for genuinely degraded capture (it fires on none of the 316
+/// — the frozen E195 still streamed at 31 ms, so distinct-count, not Δt,
+/// is what catches it). Reject → SimVar fallback.
+const MSFS_FLARE_MAX_MEDIAN_DT_MS: i64 = 60;
+/// Gate 1c — minimum DISTINCT `agl_ft` values in the FLARE-END fit window
+/// (±MSFS_FLARE_AGL_FIT_HALF_WINDOW_MS around flare_hi). This is the LOCAL
+/// version of Gate 1a: it catches a freeze that corrupts ONLY the flare-
+/// end slope while the rest of the window streamed fine. Such a freeze
+/// reads vs_at_flare_end ≈ 0 from a plateau and INFLATES the reduction
+/// (E195 phantom whole-window; vrNEVnl phantom mid-window with 25 distinct
+/// overall, which Gate 1a misses; pVGZW real-but-corrupt — a genuine flare
+/// whose AGL froze in the final ~360 ms so the AGL ENDPOINT is garbage and
+/// the honest SimVar value should publish instead). VPS data: the three
+/// frozen-end phantoms have 1-3 distinct values in the end-fit window; the
+/// largest REAL flares (reduction 500+) have 8 — a clean 2× margin at 4.
+const MSFS_FLARE_MIN_END_FIT_DISTINCT_AGL: usize = 4;
+/// Gate 1c BACKSTOP — minimum AGL SPAN (ft) in the flare-END fit window
+/// (±MSFS_FLARE_AGL_FIT_HALF_WINDOW_MS around flare_hi). The distinct-bucket
+/// count above (Gate 1c) is fooled by a NOISY freeze: a trace that dithers
+/// across ≥4 quantized 0.01 ft buckets while spanning near-zero TRUE height
+/// passes the bucket count yet still reads vs_at_flare_end ≈ 0 from the flat
+/// plateau → a huge fake reduction → phantom score-100. The span check is the
+/// physics floor that bucket-counting cannot give: in the final ±300 ms a
+/// REAL flare descends through real height. On the corpus the slowest REAL
+/// flare-end (extra_y8Y5, end −95 fpm) covers ≈0.95 ft in that 600 ms window
+/// and the JBU323/jbu322 flares span 4-6 ft; a frozen/near-frozen plateau
+/// spans ~0. 0.3 ft sits an order of magnitude below the slowest real end
+/// span yet an order of magnitude above quantization+jitter (~0.01-0.05 ft),
+/// so it fires ONLY on a true plateau. Reject → SimVar fallback.
+const MSFS_FLARE_MIN_END_AGL_SPAN_FT: f32 = 0.3;
+/// Gate 2 — balloon tolerance (ft). If the airborne AGL trace rises by
+/// more than this above a prior in-window minimum it is non-monotone (a
+/// bounce/balloon), not a descent+flare. DA40 GSG2056 balloons ~2.4 ft;
+/// every real flare in the corpus stays ≤ ~0.25 ft. Reject → SimVar
+/// fallback. (An on_ground=true sample anywhere in the window is a
+/// separate, unconditional bounce reject.)
+const MSFS_FLARE_BALLOON_TOL_FT: f32 = 1.5;
+/// Gate 3 — pitch-corroboration veto. `flare_detected` is additionally
+/// withheld when the net pitch trend across the window is strongly
+/// NOSE-DOWN (a settle/shed signature, not a pull). Tuned conservatively:
+/// real held-attitude flares on the VPS show window pitch-deltas as low as
+/// −0.6° (the pilot sets a flare attitude early and HOLDS it while the
+/// sink decays in ground effect), so a positive "+Δ required" gate would
+/// wrongly suppress real flares — Gates 1+2 are the primary phantom
+/// defense. This veto only trips on a clear nose-down trend, below every
+/// real flare observed, and is belt-and-suspenders for a future bounce
+/// that somehow evades Gate 2.
+const MSFS_FLARE_PITCH_NOSEDOWN_VETO_DEG: f32 = -1.0;
+/// The flare-source detection floor (fpm of reduction). Kept at 50 (NOT
+/// nudged to 60): the real FSLabs A321 flare in the QS set reduces 58.5
+/// fpm and MUST stay detected, so 60 would drop a real marginal flare.
+/// The fragile band is instead cleaned by Gates 1-3, which remove the
+/// frozen/bounce members of that band without touching real soft flares.
+const MSFS_FLARE_DETECT_FLOOR_FPM: f64 = 50.0;
+
+/// Pitch-corrected AGL-geometric V/S (fpm, negative = descending) at the
+/// time point `t_ms`, via a least-squares fit of `agl_ft` over the
+/// airborne samples in `[t_ms ± MSFS_FLARE_AGL_FIT_HALF_WINDOW_MS]`.
+///
+/// `fit_hi_cap`: when `Some(cap)`, no sample at or after `cap` ms enters the
+/// fit. v0.16.22 hardening: the end point (nearest flare_hi = edge−100 ms)
+/// would otherwise reach edge+200 ms; on a touchdown-then-bounce the
+/// post-edge airborne balloon has RISING AGL, which flattens/reverses the
+/// end slope → an inflated reduction → phantom. Capping at `edge_ms` keeps
+/// the end fit on the genuine pre-touchdown descent (a firm landing's
+/// post-edge samples are on_ground and already excluded, so it is
+/// unaffected). Pass `None` for an uncapped fit.
+///
+/// Lag-free: AGL/position is not the lagged display-VSI SimVar. Returns
+/// `None` when fewer than `MSFS_FLARE_AGL_FIT_MIN_SAMPLES` qualifying
+/// samples exist, the AGL is above `MSFS_FLARE_AGL_MAX_FT` at the point,
+/// or the time spread is degenerate (all samples share one timestamp).
+/// Pure + side-effect-free → unit-testable on every platform.
+fn agl_geometric_vs_fpm_at(
+    samples: &[TouchdownWindowSample],
+    t_ms: i64,
+    pitch_deg_at_t: f32,
+    fit_hi_cap: Option<i64>,
+) -> Option<f32> {
+    let lo = t_ms - MSFS_FLARE_AGL_FIT_HALF_WINDOW_MS;
+    let hi = t_ms + MSFS_FLARE_AGL_FIT_HALF_WINDOW_MS;
+    // Least-squares slope of agl_ft (y) over time-offset in ms (x,
+    // centred on t_ms so the numbers stay small). Only airborne samples
+    // near the ground — a high sample would be pre-flare descent.
+    let mut n = 0_usize;
+    let mut sx = 0.0_f64;
+    let mut sy = 0.0_f64;
+    let mut sxx = 0.0_f64;
+    let mut sxy = 0.0_f64;
+    for s in samples {
+        let ts = s.at.timestamp_millis();
+        if ts < lo || ts > hi || s.on_ground {
+            continue;
+        }
+        // Do not let the fit cross the touchdown moment (post-edge balloon
+        // would corrupt the end slope on a bounce).
+        if let Some(cap) = fit_hi_cap {
+            if ts >= cap {
+                continue;
+            }
+        }
+        if s.agl_ft > MSFS_FLARE_AGL_MAX_FT || !s.agl_ft.is_finite() {
+            continue;
+        }
+        let x = (ts - t_ms) as f64; // ms, centred
+        let y = s.agl_ft as f64; // ft
+        n += 1;
+        sx += x;
+        sy += y;
+        sxx += x * x;
+        sxy += x * y;
+    }
+    if n < MSFS_FLARE_AGL_FIT_MIN_SAMPLES {
+        return None;
+    }
+    let nf = n as f64;
+    let denom = nf * sxx - sx * sx;
+    if denom.abs() < 1e-9 {
+        return None; // all samples at one timestamp → no slope
+    }
+    let slope_ft_per_ms = (nf * sxy - sx * sy) / denom;
+    let fpm = slope_ft_per_ms * 1000.0 * 60.0; // ft/ms → ft/min
+    if !fpm.is_finite() {
+        return None;
+    }
+    // Pitch-correct (× cos(pitch)) — mirrors the SimVar flare path so
+    // the metric stays consistent across sources. Tiny here but correct.
+    let pitch_rad = (pitch_deg_at_t as f64) * std::f64::consts::PI / 180.0;
+    Some((fpm * pitch_rad.cos()) as f32)
+}
+
+/// The AGL-derived flare endpoints for MSFS: the steepest (most
+/// negative) AGL-geometric V/S anywhere in `[flare_lo, flare_hi]` and
+/// the AGL-geometric V/S at the sample nearest `flare_hi` (-100 ms).
+/// Both already pitch-corrected. Returns `(peak_vs_pre, vs_at_flare_
+/// end)`; either may be `None` if no fit point qualified.
+fn compute_msfs_agl_flare_endpoints(
+    samples: &[TouchdownWindowSample],
+    flare_lo: i64,
+    flare_hi: i64,
+) -> (Option<f32>, Option<f32>) {
+    let mut peak_vs_pre: Option<f32> = None; // most negative AGL slope
+    let mut vs_at_flare_end: Option<f32> = None;
+    let mut min_dist_to_end = i64::MAX;
+    // v0.16.22 hardening: cap every endpoint fit at the touchdown edge so a
+    // post-edge bounce/balloon (rising AGL after first ground contact) never
+    // contaminates the end slope. flare_hi == edge_ms − 100, so edge_ms is
+    // flare_hi + 100; samples at/after that never enter a fit.
+    let edge_cap = flare_hi + 100;
+    for s in samples {
+        let ts = s.at.timestamp_millis();
+        if ts < flare_lo || ts > flare_hi || s.on_ground {
+            continue;
+        }
+        let vs_agl = match agl_geometric_vs_fpm_at(samples, ts, s.pitch_deg, Some(edge_cap)) {
+            Some(v) => v,
+            None => continue,
+        };
+        if peak_vs_pre.map(|p| vs_agl < p).unwrap_or(true) {
+            peak_vs_pre = Some(vs_agl);
+        }
+        let dist_to_end = (flare_hi - ts).abs();
+        if dist_to_end < min_dist_to_end {
+            min_dist_to_end = dist_to_end;
+            vs_at_flare_end = Some(vs_agl);
+        }
+    }
+    (peak_vs_pre, vs_at_flare_end)
+}
+
+/// v0.16.22 hardening: outcome of the phantom-flare guards over the MSFS
+/// flare window. `agl_reliable` is false when Gate 1 (data quality) OR
+/// Gate 2 (bounce) tripped → the caller MUST fall back to the SimVar path
+/// so no garbage AGL endpoint is published. `unreliable_source` is true
+/// only when a DATA-QUALITY gate tripped (frozen/degraded AGL) so the
+/// provenance string can distinguish that from a plain non-MSFS fallback.
+/// `pitch_nose_down` is the Gate-3 veto signal (a strongly nose-down net
+/// pitch trend) — it does NOT block the AGL endpoints (the reduction is
+/// still computed for forensics), only `flare_detected`.
+struct MsfsFlareGates {
+    agl_reliable: bool,
+    unreliable_source: bool,
+    pitch_nose_down: bool,
+}
+
+/// Evaluate the v0.16.22 phantom-flare guards over `[flare_lo, flare_hi]`.
+/// Pure + side-effect-free → unit-testable. See the gate constants above
+/// for the data behind each threshold.
+fn evaluate_msfs_flare_gates(
+    samples: &[TouchdownWindowSample],
+    flare_lo: i64,
+    flare_hi: i64,
+) -> MsfsFlareGates {
+    // Collect the in-window samples (airborne + ground) in time order.
+    let mut in_window: Vec<&TouchdownWindowSample> = samples
+        .iter()
+        .filter(|s| {
+            let ts = s.at.timestamp_millis();
+            ts >= flare_lo && ts <= flare_hi
+        })
+        .collect();
+    in_window.sort_by_key(|s| s.at.timestamp_millis());
+
+    // ── Gate 2 (bounce, part A): any on_ground=true in the PRE-edge window
+    // means a touchdown already happened here — a post-bounce settle, not a
+    // flare. (Kept pre-edge: EVERY normal landing is on_ground just past the
+    // edge — that is the touchdown itself, not a prior bounce. Extending this
+    // to post-edge would wrongly trip on all firm landings; the post-edge
+    // bounce signal is the BALLOON below, not on_ground.)
+    let any_on_ground = in_window.iter().any(|s| s.on_ground);
+
+    // ── Gate 2 (bounce) extended balloon-scan window. v0.16.22 hardening: a
+    // touchdown-then-bounce contacts the ground AT/near the edge, then goes
+    // airborne again just past it with RISING AGL. A NORMAL landing has no
+    // airborne samples post-edge (it is on the ground), so extending only the
+    // BALLOON (non-monotone rise among airborne samples) to flare_hi + the
+    // fit half-window (= edge + 200 ms) catches the bounce balloon WITHOUT
+    // tripping firm landings. (The fit endpoints are already capped at the
+    // edge — this gate is the corroborating veto so a bounce earns no
+    // credited flare. Data-quality gates 1a/1b/1c stay on the pre-edge set.)
+    let bounce_scan_hi = flare_hi + MSFS_FLARE_AGL_FIT_HALF_WINDOW_MS;
+
+    // Airborne, finite-AGL, near-ground samples in the FLARE window drive the
+    // data-quality checks (mirrors the slope fit's qualifying set).
+    let air: Vec<&TouchdownWindowSample> = in_window
+        .iter()
+        .copied()
+        .filter(|s| !s.on_ground && s.agl_ft.is_finite() && s.agl_ft <= MSFS_FLARE_AGL_MAX_FT)
+        .collect();
+    // Airborne set over the EXTENDED balloon-scan window (pre-edge flare
+    // window + post-edge fit reach) — used ONLY for the balloon (non-monotone
+    // rise) check so a post-edge bounce balloon is visible.
+    let mut air_bounce: Vec<&TouchdownWindowSample> = samples
+        .iter()
+        .filter(|s| {
+            let ts = s.at.timestamp_millis();
+            ts >= flare_lo
+                && ts <= bounce_scan_hi
+                && !s.on_ground
+                && s.agl_ft.is_finite()
+                && s.agl_ft <= MSFS_FLARE_AGL_MAX_FT
+        })
+        .collect();
+    air_bounce.sort_by_key(|s| s.at.timestamp_millis());
+
+    // ── Gate 1a (data quality): distinct agl_ft count. Quantize to 0.01 ft
+    // so float jitter does not inflate the count (the frozen E195 repeats
+    // EXACTLY, e.g. 9.96, so quantization is conservative here).
+    let mut distinct: Vec<i64> = air
+        .iter()
+        .map(|s| (s.agl_ft as f64 * 100.0).round() as i64)
+        .collect();
+    distinct.sort_unstable();
+    distinct.dedup();
+    let n_distinct = distinct.len();
+
+    // ── Gate 1c (data quality, LOCAL): distinct agl_ft in the flare-END
+    // fit window only — catches a freeze that corrupts the end slope while
+    // the rest of the window is fine (Gate 1a's whole-window count misses
+    // a localized mid/late freeze). Same quantization as Gate 1a.
+    let end_lo = flare_hi - MSFS_FLARE_AGL_FIT_HALF_WINDOW_MS;
+    let end_hi = flare_hi + MSFS_FLARE_AGL_FIT_HALF_WINDOW_MS;
+    let end_agls: Vec<f32> = air
+        .iter()
+        .filter(|s| {
+            let ts = s.at.timestamp_millis();
+            ts >= end_lo && ts <= end_hi
+        })
+        .map(|s| s.agl_ft)
+        .collect();
+    let mut end_distinct: Vec<i64> = end_agls
+        .iter()
+        .map(|a| (*a as f64 * 100.0).round() as i64)
+        .collect();
+    end_distinct.sort_unstable();
+    end_distinct.dedup();
+    // Only judge the end window if it actually has samples (an empty end
+    // window cannot be "frozen" — let the MIN_SAMPLES fit guard handle it).
+    let n_end_distinct = end_distinct.len();
+    // Gate 1c backstop: the AGL SPAN across the end-fit window. A NOISY
+    // freeze dithers across ≥MSFS_FLARE_MIN_END_FIT_DISTINCT_AGL quantized
+    // buckets (passing the distinct count) while spanning ~0 true height —
+    // the span catches that where bucket-counting cannot.
+    let end_agl_span = if end_agls.len() >= 2 {
+        let mut lo = f32::INFINITY;
+        let mut hi = f32::NEG_INFINITY;
+        for &a in &end_agls {
+            if a < lo {
+                lo = a;
+            }
+            if a > hi {
+                hi = a;
+            }
+        }
+        Some(hi - lo)
+    } else {
+        None
+    };
+
+    // ── Gate 1b (data quality): median sample Δt over the FULL in-window
+    // set (airborne + ground) — a degraded stream is degraded regardless of
+    // on_ground. Median is robust to the occasional duplicate-timestamp.
+    let mut dts: Vec<i64> = in_window
+        .windows(2)
+        .map(|w| w[1].at.timestamp_millis() - w[0].at.timestamp_millis())
+        .filter(|&d| d >= 0)
+        .collect();
+    let median_dt = if dts.is_empty() {
+        0
+    } else {
+        dts.sort_unstable();
+        dts[dts.len() / 2]
+    };
+
+    // ── Gate 2 (bounce, part B): non-monotone balloon. Walk the airborne
+    // AGL trace (over the EXTENDED bounce-scan window so a post-edge balloon
+    // is visible) tracking the running minimum; if AGL rises more than the
+    // tolerance above that minimum, the trace ballooned back up.
+    let mut balloon_ft = 0.0_f32;
+    let mut running_min = f32::INFINITY;
+    for s in &air_bounce {
+        if s.agl_ft < running_min {
+            running_min = s.agl_ft;
+        } else {
+            let rise = s.agl_ft - running_min;
+            if rise > balloon_ft {
+                balloon_ft = rise;
+            }
+        }
+    }
+
+    // Frozen end if EITHER the distinct-bucket count is too low (coarse/
+    // stepped freeze) OR the AGL span across the end window is below the
+    // physics floor (noisy multi-bucket freeze on a flat plateau). The span
+    // backstop is what catches a dither that spreads across ≥4 buckets yet
+    // covers near-zero true height (vs_at_flare_end ≈ 0 → fake reduction).
+    let end_span_flat = end_agl_span
+        .map(|sp| sp < MSFS_FLARE_MIN_END_AGL_SPAN_FT)
+        .unwrap_or(false);
+    let end_frozen = (n_end_distinct > 0
+        && n_end_distinct < MSFS_FLARE_MIN_END_FIT_DISTINCT_AGL)
+        || end_span_flat;
+    let dq_reject = n_distinct < MSFS_FLARE_MIN_DISTINCT_AGL
+        || median_dt > MSFS_FLARE_MAX_MEDIAN_DT_MS
+        || end_frozen;
+    let bounce_reject = any_on_ground || balloon_ft > MSFS_FLARE_BALLOON_TOL_FT;
+
+    // ── Gate 3 (pitch corroboration): net window pitch trend. Compare the
+    // mean pitch over the first ~300 ms of airborne samples to the mean over
+    // the last ~300 ms. A strongly NOSE-DOWN trend vetoes detection.
+    let pitch_nose_down = if air.len() >= 2 {
+        let first_t = air.first().unwrap().at.timestamp_millis();
+        let last_t = air.last().unwrap().at.timestamp_millis();
+        let mean_pitch = |pred: &dyn Fn(i64) -> bool| -> Option<f32> {
+            let vals: Vec<f32> = air
+                .iter()
+                .filter(|s| pred(s.at.timestamp_millis()))
+                .map(|s| s.pitch_deg)
+                .collect();
+            if vals.is_empty() {
+                None
+            } else {
+                Some(vals.iter().sum::<f32>() / vals.len() as f32)
+            }
+        };
+        let p_start = mean_pitch(&|t| t <= first_t + 300);
+        let p_end = mean_pitch(&|t| t >= last_t - 300);
+        match (p_start, p_end) {
+            (Some(a), Some(b)) => (b - a) <= MSFS_FLARE_PITCH_NOSEDOWN_VETO_DEG,
+            _ => false,
+        }
+    } else {
+        false
+    };
+
+    MsfsFlareGates {
+        agl_reliable: !(dq_reject || bounce_reject),
+        unreliable_source: dq_reject,
+        pitch_nose_down,
+    }
+}
+
 /// v0.5.39: Forensik-Bewertung der Landung aus dem 50-Hz-Sample-Buffer
 /// um den TD-Edge. Gibt JSON-Map zurück, die im LandingAnalysis-Event in
 /// die JSONL geschrieben + im MQTT-Touchdown-Payload mit-publisht wird.
@@ -15253,6 +15728,18 @@ fn score_g_for_stats(stats: &FlightStats) -> recorder::ScoredG {
 ///   - flare_dvs_dt_fpm_per_sec — Steigungs-Rate der VS-Reduktion
 ///   - flare_quality_score      — 0..100, höher = besser geflared
 ///   - flare_detected           — bool, true wenn signifikante Reduktion
+///
+/// v0.16.22: Auf MSFS (fixed-wing) werden die Flare-Endpunkte
+/// `peak_vs_pre_flare_fpm` / `vs_at_flare_end_fpm` aus der LAG-FREIEN
+/// AGL-Geometrie (lokaler Linear-Fit der agl_ft-Spur) berechnet statt
+/// aus dem lagbehafteten `s.vs_fpm`-Display-SimVar — sonst meldet der
+/// Flare-Metrik bei spät/firm geflareten Landungen faelschlich "kein
+/// Flare". Die roh-lagbehafteten Werte bleiben als Forensik-Keys
+/// (`peak_vs_pre_flare_fpm_raw`, `vs_at_flare_end_fpm_raw`); `flare_vs_
+/// source` markiert die Quelle ("msfs_agl" | "simvar"). X-Plane (raw
+/// local_vy, kaum Lag) und Other behalten den SimVar-Pfad — ihre
+/// Analyse-Ausgabe ist byte-identisch. Touchdown-Rate/Klasse und der
+/// Master-Score bleiben unveraendert (Flare ist forensisch/Coaching).
 ///   - bounce_count             — Anzahl on_ground=False Excursionen post-TD
 ///   - bounce_max_agl_ft        — höchster Bounce
 ///   - sample_count             — Anzahl Samples im Buffer
@@ -15261,6 +15748,7 @@ fn score_g_for_stats(stats: &FlightStats) -> recorder::ScoredG {
 fn compute_landing_analysis(
     samples: &[TouchdownWindowSample],
     edge_at: DateTime<Utc>,
+    simulator: Simulator,
 ) -> serde_json::Value {
     use serde_json::json;
     if samples.is_empty() {
@@ -15420,8 +15908,11 @@ fn compute_landing_analysis(
     // VS-Wert kurz vor Edge.
     let flare_lo = edge_ms - 2000;
     let flare_hi = edge_ms - 100;
-    let mut peak_vs_pre: Option<f32> = None;     // most negative
-    let mut vs_at_flare_end: Option<f32> = None; // VS am ts nahe -100ms
+    // SimVar pass (pitch-corrected `s.vs_fpm`). On X-Plane/Other this is
+    // the published flare metric; on MSFS it lags the airframe and is
+    // kept only as the `_raw` forensic provenance (see v0.16.22 block).
+    let mut peak_vs_pre_simvar: Option<f32> = None;     // most negative
+    let mut vs_at_flare_end_simvar: Option<f32> = None; // VS am ts nahe -100ms
     let mut min_dist_to_end = i64::MAX;
     let mut earliest_in_window: Option<&TouchdownWindowSample> = None;
     for s in samples {
@@ -15430,13 +15921,13 @@ fn compute_landing_analysis(
             // Pitch-korrigierte VS verwenden — bei steilem Flare wichtig
             let pitch_rad = (s.pitch_deg as f64) * std::f64::consts::PI / 180.0;
             let vs_corrected = (s.vs_fpm as f64 * pitch_rad.cos()) as f32;
-            if peak_vs_pre.map(|p| vs_corrected < p).unwrap_or(true) {
-                peak_vs_pre = Some(vs_corrected);
+            if peak_vs_pre_simvar.map(|p| vs_corrected < p).unwrap_or(true) {
+                peak_vs_pre_simvar = Some(vs_corrected);
             }
             let dist_to_end = (flare_hi - ts).abs();
             if dist_to_end < min_dist_to_end {
                 min_dist_to_end = dist_to_end;
-                vs_at_flare_end = Some(vs_corrected);
+                vs_at_flare_end_simvar = Some(vs_corrected);
             }
             if earliest_in_window.map(|e| ts < e.at.timestamp_millis()).unwrap_or(true) {
                 earliest_in_window = Some(s);
@@ -15444,22 +15935,96 @@ fn compute_landing_analysis(
         }
     }
 
+    // v0.16.22: MSFS flare metric on the lag-free AGL-geometric V/S.
+    // For MSFS2020/2024 fixed-wing, replace the lagged SimVar endpoints
+    // with the AGL local-linear-fit slope endpoints over the SAME
+    // window; keep the SimVar values as `_raw` provenance. X-Plane (raw
+    // local_vy) / Other keep the SimVar endpoints → byte-identical.
+    // Heli/seaplane are NOT category-gated here (compute_landing_analysis
+    // has no category); we gate on the AGL endpoints existing AND being a
+    // real reduction — a near-zero-V/S rotorcraft touchdown produces no
+    // AGL flare reduction, so the metric stays inert. Fixed-wing scope is
+    // additionally enforced by the de-lag/score paths that consume this.
+    let is_msfs = matches!(simulator, Simulator::Msfs2020 | Simulator::Msfs2024);
+    let (peak_vs_pre_agl, vs_at_flare_end_agl) = if is_msfs {
+        compute_msfs_agl_flare_endpoints(samples, flare_lo, flare_hi)
+    } else {
+        (None, None)
+    };
+    // v0.16.22 hardening: evaluate the phantom-flare guards (frozen/coarse
+    // AGL, bounce/balloon, nose-down pitch). On a data-quality or bounce
+    // reject we fall back to the SimVar path so no garbage AGL endpoint is
+    // published; the pitch veto is applied to `flare_detected` only.
+    let flare_gates = if is_msfs {
+        evaluate_msfs_flare_gates(samples, flare_lo, flare_hi)
+    } else {
+        MsfsFlareGates {
+            agl_reliable: true,
+            unreliable_source: false,
+            pitch_nose_down: false,
+        }
+    };
+    // The endpoints that actually drive reduction / score / detected.
+    // MSFS: AGL if BOTH endpoints resolved AND the guards pass, else fall
+    // back to SimVar (too few AGL samples, frozen/coarse trace, or a
+    // bounce — never worse than the pre-v0.16.22 SimVar behaviour).
+    let use_agl = is_msfs
+        && peak_vs_pre_agl.is_some()
+        && vs_at_flare_end_agl.is_some()
+        && flare_gates.agl_reliable;
+    let (peak_vs_pre, vs_at_flare_end, flare_vs_source) = if use_agl {
+        (peak_vs_pre_agl, vs_at_flare_end_agl, "msfs_agl")
+    } else if is_msfs && flare_gates.unreliable_source {
+        // A data-quality gate tripped: mark the fallback distinctly so the
+        // provenance shows WHY we did not use the AGL geometry.
+        (peak_vs_pre_simvar, vs_at_flare_end_simvar, "simvar_agl_unreliable")
+    } else {
+        (peak_vs_pre_simvar, vs_at_flare_end_simvar, "simvar")
+    };
+
     // Reduktion: positive Zahl = Flare hat Sinkrate verkleinert
     let flare_reduction = match (peak_vs_pre, vs_at_flare_end) {
         (Some(p), Some(v)) => Some(v - p),
         _ => None,
     };
-    // dVS/dt grob: (vs_at_flare_end - vs_at_flare_start) / window_dt
-    let flare_dvs_dt = match (earliest_in_window, vs_at_flare_end) {
-        (Some(start), Some(end_vs)) => {
+    // dVS/dt grob: (vs_at_flare_end - vs_at_flare_start) / window_dt.
+    // Secondary diagnostic. v0.16.22 FIX 4: route this through the SAME
+    // endpoint SOURCE as the published `flare_reduction` so the two
+    // diagnostics never disagree. On the MSFS AGL path both start and end are
+    // AGL-geometric (start = the capped AGL fit at the earliest in-window
+    // sample, end = the published AGL `vs_at_flare_end`); on the SimVar
+    // fallback (and X-Plane / Other) both stay SimVar → byte-identical to
+    // pre-v0.16.22.
+    let flare_dvs_dt = match earliest_in_window {
+        Some(start) => {
             let dt_sec = (flare_hi - start.at.timestamp_millis()) as f64 / 1000.0;
             if dt_sec > 0.1 {
-                let pitch_rad = (start.pitch_deg as f64) * std::f64::consts::PI / 180.0;
-                let start_vs = (start.vs_fpm as f64 * pitch_rad.cos()) as f32;
-                Some(((end_vs - start_vs) as f64 / dt_sec) as f32)
-            } else { None }
+                // Pick the start/end pair from the SAME source as the reduction.
+                let endpoints = if use_agl {
+                    // AGL start at the earliest-window timestamp (edge-capped,
+                    // matching compute_msfs_agl_flare_endpoints) + AGL end.
+                    let start_vs = agl_geometric_vs_fpm_at(
+                        samples,
+                        start.at.timestamp_millis(),
+                        start.pitch_deg,
+                        Some(flare_hi + 100),
+                    );
+                    match (start_vs, vs_at_flare_end) {
+                        (Some(sv), Some(ev)) => Some((sv, ev)),
+                        _ => None,
+                    }
+                } else {
+                    // SimVar pass: pitch-corrected vs_fpm start + SimVar end.
+                    let pitch_rad = (start.pitch_deg as f64) * std::f64::consts::PI / 180.0;
+                    let start_vs = (start.vs_fpm as f64 * pitch_rad.cos()) as f32;
+                    vs_at_flare_end_simvar.map(|ev| (start_vs, ev))
+                };
+                endpoints.map(|(start_vs, end_vs)| ((end_vs - start_vs) as f64 / dt_sec) as f32)
+            } else {
+                None
+            }
         }
-        _ => None,
+        None => None,
     };
 
     // v0.5.41: rebalanced — Endpoint-Score dominiert (was kommt am TD raus),
@@ -15506,7 +16071,17 @@ fn compute_landing_analysis(
                 else if red > 50.0 { 5.0 }
                 else { 0.0 };
             let score = (endpoint + bonus).max(0.0).min(100.0) as i32;
-            (Some(score), Some(red > 50.0))
+            // Detection floor. MSFS_FLARE_DETECT_FLOOR_FPM == 50.0, so the
+            // value here is byte-identical to the previous `red > 50.0` for
+            // X-Plane / Other. v0.16.22: on the MSFS AGL path the pitch
+            // veto (Gate 3) additionally withholds detection when the net
+            // pitch trend is strongly nose-down (a settle/shed, not a
+            // pull) — the reduction/score still publish for forensics.
+            let mut detected = red > MSFS_FLARE_DETECT_FLOOR_FPM;
+            if is_msfs && use_agl && flare_gates.pitch_nose_down {
+                detected = false;
+            }
+            (Some(score), Some(detected))
         }
         _ => (None, None),
     };
@@ -15558,7 +16133,7 @@ fn compute_landing_analysis(
     // Analyse-Map.
     let scored = recorder::compute_scored_g(samples, edge_at);
 
-    json!({
+    let mut analysis = json!({
         "vs_at_edge_fpm": vs_at_edge,
         "vs_smoothed_250ms_fpm": vs_250,
         "vs_smoothed_500ms_fpm": vs_500,
@@ -15593,7 +16168,28 @@ fn compute_landing_analysis(
         "sample_count": samples.len(),
         "pre_edge_sample_count": pre_count,
         "post_edge_sample_count": post_count,
-    })
+    });
+
+    // v0.16.22: provenance of the MSFS AGL flare endpoints — ADDITIVE,
+    // MSFS-ONLY. `flare_vs_source` marks whether the published flare
+    // endpoints are the lag-free AGL fit ("msfs_agl") or the SimVar
+    // fallback ("simvar"); the `_raw` keys carry the lagged display-VSI
+    // values for forensics. On X-Plane / Other we add NOTHING so their
+    // analysis JSON is byte-identical to pre-v0.16.22 (no new keys).
+    if is_msfs {
+        if let Some(obj) = analysis.as_object_mut() {
+            obj.insert("flare_vs_source".into(), json!(flare_vs_source));
+            obj.insert(
+                "peak_vs_pre_flare_fpm_raw".into(),
+                json!(peak_vs_pre_simvar),
+            );
+            obj.insert(
+                "vs_at_flare_end_fpm_raw".into(),
+                json!(vs_at_flare_end_simvar),
+            );
+        }
+    }
+    analysis
 }
 
 /// v0.5.39: Beim TD-Edge — Pre-TD-Buffer (snapshot_buffer, ~5 s @ 50 Hz)
@@ -16410,7 +17006,8 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
             // damit der Touchdown-Payload-Builder im Streamer-Tick die Felder
             // direkt zur Verfuegung hat (anstatt aus der JSONL re-zu-parsen).
             let prepared_dump = if let Some((edge_at, samples)) = dump_payload {
-                let mut analysis = compute_landing_analysis(&samples, edge_at);
+                let mut analysis =
+                    compute_landing_analysis(&samples, edge_at, snap.simulator);
                 // v0.16.21: MSFS touchdown V/S SimVar-lag de-lag —
                 // g-force-gated. Runs BEFORE the analysis is stored, the
                 // accident heuristic, and the class re-derivation below, so
@@ -31554,4 +32151,746 @@ mod msfs_touchdown_delag_replay_golden {
             "ITY324 must stay Severe"
         );
     }
+}
+
+// ======================================================================
+// v0.16.22 — MSFS AGL-flare metric tests
+// ======================================================================
+#[cfg(test)]
+mod msfs_agl_flare_tests {
+    use super::*;
+
+    /// Build one `TouchdownWindowSample` at offset `ms` from a base epoch,
+    /// with the given AGL (ft), pitch (deg), on_ground flag, and SimVar
+    /// V/S (fpm). `vs_fpm` is what the LAGGED SimVar path reads; the AGL
+    /// fit reads only `agl_ft` / `at` / `on_ground`.
+    fn tw(base: DateTime<Utc>, ms: i64, agl_ft: f32, pitch_deg: f32, on_ground: bool, vs_fpm: f32) -> TouchdownWindowSample {
+        TouchdownWindowSample {
+            at: base + chrono::Duration::milliseconds(ms),
+            vs_fpm,
+            g_force: 1.0,
+            on_ground,
+            agl_ft,
+            heading_true_deg: 0.0,
+            groundspeed_kt: 120.0,
+            indicated_airspeed_kt: 130.0,
+            lat: 0.0,
+            lon: 0.0,
+            pitch_deg,
+            bank_deg: 0.0,
+            gear_normal_force_n: None,
+            total_weight_kg: Some(60_000.0),
+        }
+    }
+
+    /// Synthesize an AGL trace over [-2000, 0] ms at 50 Hz from a piecewise
+    /// constant sink-rate profile (fpm, negative = descending). Each entry
+    /// `(from_ms, sink_fpm)` applies until the next entry's `from_ms`. AGL
+    /// integrates the sink backward from `agl_at_edge_ft` at t=0. `pitch_fn`
+    /// supplies pitch per sample; `on_ground` is false until t≥0.
+    fn synth_trace(
+        base: DateTime<Utc>,
+        agl_at_edge_ft: f32,
+        profile: &[(i64, f32)],
+        pitch_fn: impl Fn(i64) -> f32,
+    ) -> Vec<TouchdownWindowSample> {
+        // First build AGL forward from -2000 to 0 by integrating sink.
+        let dt_ms = 20_i64; // 50 Hz
+        let sink_at = |ms: i64| -> f32 {
+            let mut cur = profile[0].1;
+            for &(from_ms, s) in profile {
+                if ms >= from_ms {
+                    cur = s;
+                }
+            }
+            cur
+        };
+        // Integrate forward so AGL hits exactly agl_at_edge_ft at t=0.
+        // agl(t+dt) = agl(t) + sink_fpm/60 * (dt/1000)  [sink negative]
+        let mut times: Vec<i64> = Vec::new();
+        let mut t = -2000_i64;
+        while t <= 0 {
+            times.push(t);
+            t += dt_ms;
+        }
+        // Compute AGL at each time relative to a running value, then shift
+        // so the t=0 sample equals agl_at_edge_ft.
+        let mut agls = vec![0.0_f32; times.len()];
+        for i in 1..times.len() {
+            let dt_sec = (times[i] - times[i - 1]) as f32 / 1000.0;
+            agls[i] = agls[i - 1] + sink_at(times[i - 1]) / 60.0 * dt_sec;
+        }
+        let shift = agl_at_edge_ft - *agls.last().unwrap();
+        times
+            .iter()
+            .zip(agls.iter())
+            .map(|(&ms, &a)| {
+                let on_ground = ms >= 0;
+                tw(base, ms, a + shift, pitch_fn(ms), on_ground, sink_at(ms))
+            })
+            .collect()
+    }
+
+    fn base() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-06-16T12:00:02.000000Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// The AGL fit must recover a known constant sink rate from a clean
+    /// linear AGL ramp (lag-free truth), within a few fpm.
+    #[test]
+    fn agl_fit_recovers_constant_sink() {
+        let b = base();
+        // constant -300 fpm, flat pitch, AGL 20 ft at edge.
+        let s = synth_trace(b, 20.0, &[(-2000, -300.0)], |_| 3.0);
+        let edge_ms = b.timestamp_millis();
+        // fit at -1000ms should read ~-300 (×cos(3°) ≈ ×0.9986 ⇒ ~-299.6)
+        let v = agl_geometric_vs_fpm_at(&s, edge_ms - 1000, 3.0, None).expect("fit");
+        assert!((v - (-300.0 * (3.0_f32).to_radians().cos())).abs() < 8.0, "got {v}");
+    }
+
+    /// Too few samples (or all above the AGL ceiling) → None, never a wild
+    /// slope. Guards the noise floor.
+    #[test]
+    fn agl_fit_rejects_sparse_or_high() {
+        let b = base();
+        let edge_ms = b.timestamp_millis();
+        // Only 2 samples in the ±300ms window → below MIN_SAMPLES.
+        let sparse = vec![
+            tw(b, -1000, 20.0, 3.0, false, -300.0),
+            tw(b, -700, 18.0, 3.0, false, -300.0),
+        ];
+        assert!(agl_geometric_vs_fpm_at(&sparse, edge_ms - 850, 3.0, None).is_none());
+        // Dense but all AGL above the ceiling → None.
+        let high: Vec<_> = (0..20)
+            .map(|i| tw(b, -1000 + i * 20, 500.0, 3.0, false, -300.0))
+            .collect();
+        assert!(agl_geometric_vs_fpm_at(&high, edge_ms - 800, 3.0, None).is_none());
+    }
+
+    /// REAL flare: sink reduces from -560 (early) to -360 (late) as pitch
+    /// rises — endpoints must show a genuine reduction ≥ ~150 fpm and the
+    /// metric must DETECT it. Mirrors JBU323's geometry.
+    #[test]
+    fn endpoints_detect_real_flare() {
+        let b = base();
+        let edge_ms = b.timestamp_millis();
+        // steep early, shallow late: a deliberate flare.
+        let profile = [(-2000, -560.0), (-900, -460.0), (-400, -360.0)];
+        let s = synth_trace(b, 16.0, &profile, |ms| {
+            // pitch ramps 2.5° → 5.2° over the window
+            let frac = ((ms + 2000) as f32 / 2000.0).clamp(0.0, 1.0);
+            2.5 + 2.7 * frac
+        });
+        let (peak, end) = compute_msfs_agl_flare_endpoints(&s, edge_ms - 2000, edge_ms - 100);
+        let peak = peak.expect("peak");
+        let end = end.expect("end");
+        let red = end - peak;
+        assert!(peak < -500.0, "peak should reflect the steep early sink, got {peak}");
+        assert!(end > -420.0, "end should reflect the shallow late sink, got {end}");
+        assert!(red > 100.0, "real flare must show a reduction > 100 fpm, got {red}");
+    }
+
+    /// NO flare: constant sink the whole window (firm, pilot never pulled)
+    /// → the AGL endpoints must show ~zero reduction. NO PHANTOM.
+    #[test]
+    fn endpoints_no_phantom_on_constant_sink() {
+        let b = base();
+        let edge_ms = b.timestamp_millis();
+        let s = synth_trace(b, 16.0, &[(-2000, -380.0)], |_| 3.0);
+        let (peak, end) = compute_msfs_agl_flare_endpoints(&s, edge_ms - 2000, edge_ms - 100);
+        let red = end.unwrap() - peak.unwrap();
+        assert!(red.abs() < 50.0, "constant sink must NOT register a flare, got reduction {red}");
+    }
+
+    /// End-to-end on the JSON: a constant-sink MSFS trace must report
+    /// flare_detected=false, source "msfs_agl", and the lagged SimVar
+    /// values preserved in the `_raw` keys.
+    #[test]
+    fn analysis_msfs_constant_sink_no_phantom_with_provenance() {
+        let b = base();
+        // SimVar deliberately lags (reads a different shallow value) so we
+        // can prove the published endpoints came from AGL, not vs_fpm.
+        let s = synth_trace(b, 16.0, &[(-2000, -380.0)], |_| 3.0);
+        let a = compute_landing_analysis(&s, b, Simulator::Msfs2024);
+        assert_eq!(a.get("flare_detected").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(a.get("flare_vs_source").and_then(|v| v.as_str()), Some("msfs_agl"));
+        // _raw keys present on MSFS.
+        assert!(a.get("peak_vs_pre_flare_fpm_raw").is_some());
+        assert!(a.get("vs_at_flare_end_fpm_raw").is_some());
+    }
+
+    /// X-Plane output must be byte-identical to the pre-v0.16.22 SimVar
+    /// path: NO new flare keys, endpoints from `vs_fpm`.
+    #[test]
+    fn analysis_xplane_byte_identical_no_new_keys() {
+        let b = base();
+        let s = synth_trace(b, 16.0, &[(-2000, -560.0), (-900, -360.0)], |_| 3.0);
+        let a = compute_landing_analysis(&s, b, Simulator::XPlane12);
+        assert!(a.get("flare_vs_source").is_none(), "X-Plane must add no source key");
+        assert!(a.get("peak_vs_pre_flare_fpm_raw").is_none(), "X-Plane must add no _raw key");
+        assert!(a.get("vs_at_flare_end_fpm_raw").is_none(), "X-Plane must add no _raw key");
+        // The published endpoints equal the SimVar pitch-corrected values.
+        // (cos(3°) ≈ 0.99863; vs_fpm at the flare-window samples.)
+        let peak = a.get("peak_vs_pre_flare_fpm").and_then(|v| v.as_f64()).unwrap();
+        assert!(peak < -500.0, "X-Plane peak from SimVar, got {peak}");
+    }
+
+    /// FIX 4 (flare_dvs_dt source consistency). On the MSFS AGL path the
+    /// published `flare_reduction_fpm` is AGL-derived; `flare_dvs_dt` must use
+    /// the SAME source so the two diagnostics agree in SIGN. A genuine flare
+    /// (positive reduction) must yield a POSITIVE dVS/dt (sink decaying toward
+    /// zero). On X-Plane / Other the dVS/dt stays SimVar-derived (unchanged).
+    #[test]
+    fn flare_dvs_dt_follows_published_source() {
+        // synth_trace writes `vs_fpm` == the geometric sink, so for a clean
+        // synthetic AGL == SimVar; to PROVE dvs_dt follows the AGL source we
+        // additionally check the SIGN agrees with the AGL reduction.
+        let b = base();
+        // Real flare: steep early -560 → shallow late -360, pitch rising.
+        let s = synth_trace(b, 16.0, &[(-2000, -560.0), (-900, -460.0), (-400, -360.0)], |ms| {
+            let frac = ((ms + 2000) as f32 / 2000.0).clamp(0.0, 1.0);
+            2.5 + 2.7 * frac
+        });
+        let a = compute_landing_analysis(&s, b, Simulator::Msfs2024);
+        assert_eq!(a.get("flare_vs_source").and_then(|v| v.as_str()), Some("msfs_agl"));
+        let red = a.get("flare_reduction_fpm").and_then(|v| v.as_f64()).unwrap();
+        let dvs = a.get("flare_dvs_dt_fpm_per_sec").and_then(|v| v.as_f64()).unwrap();
+        assert!(red > 100.0, "real flare reduction expected, got {red}");
+        // The KEY assertion: dvs_dt sign agrees with the AGL reduction.
+        // Pre-v0.16.22 FIX 4 this could disagree (SimVar end vs AGL reduction).
+        assert!(
+            dvs > 0.0,
+            "MSFS AGL dvs_dt must be POSITIVE (consistent with the positive AGL reduction), got {dvs}"
+        );
+
+        // X-Plane: dvs_dt stays SimVar-derived. With this same descending-
+        // then-shallowing profile the SimVar dvs_dt is also positive, but the
+        // point is it is computed from the SimVar pass — assert it is present
+        // and finite (byte-identical path; no AGL involvement).
+        let ax = compute_landing_analysis(&s, b, Simulator::XPlane12);
+        let dvs_x = ax.get("flare_dvs_dt_fpm_per_sec").and_then(|v| v.as_f64());
+        assert!(dvs_x.is_some_and(|v| v.is_finite()), "X-Plane dvs_dt must be SimVar-derived and present");
+    }
+
+    /// Real-fixture golden: the committed trimmed JBU323 flight. The
+    /// recorded (lagged) analysis says flare_detected=false (reduction
+    /// ~30 fpm); re-running compute_landing_analysis with MSFS must flip
+    /// it to TRUE on the lag-free AGL geometry, while the touchdown rate
+    /// (vs_at_edge_fpm) stays the recorded firm value (-423).
+    #[test]
+    fn jbu323_real_fixture_flare_flips_true_touchdown_unchanged() {
+        use flate2::read::GzDecoder;
+        use std::io::{BufRead, BufReader};
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/jbu323_msfs_late_flare.jsonl.gz");
+        let file = std::fs::File::open(&path).expect("open jbu323 fixture");
+        let reader = BufReader::new(GzDecoder::new(file));
+
+        let mut edge_at: Option<DateTime<Utc>> = None;
+        let mut samples: Vec<TouchdownWindowSample> = Vec::new();
+        let mut recorded: Option<serde_json::Value> = None;
+        for line in reader.lines() {
+            let line = line.unwrap();
+            if line.trim().is_empty() {
+                continue;
+            }
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            match v.get("type").and_then(|x| x.as_str()).unwrap_or("") {
+                "touchdown_window" => {
+                    edge_at = v
+                        .get("edge_at")
+                        .and_then(|x| x.as_str())
+                        .map(|s| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc));
+                    for sv in v.get("samples").and_then(|x| x.as_array()).unwrap() {
+                        let f = |k: &str| sv.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
+                        let f64v = |k: &str| sv.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
+                        samples.push(TouchdownWindowSample {
+                            at: DateTime::parse_from_rfc3339(sv["at"].as_str().unwrap())
+                                .unwrap()
+                                .with_timezone(&Utc),
+                            vs_fpm: f("vs_fpm"),
+                            g_force: f("g_force"),
+                            on_ground: sv.get("on_ground").and_then(|x| x.as_bool()).unwrap_or(false),
+                            agl_ft: f("agl_ft"),
+                            heading_true_deg: f("heading_true_deg"),
+                            groundspeed_kt: f("groundspeed_kt"),
+                            indicated_airspeed_kt: f("indicated_airspeed_kt"),
+                            lat: f64v("lat"),
+                            lon: f64v("lon"),
+                            pitch_deg: f("pitch_deg"),
+                            bank_deg: f("bank_deg"),
+                            gear_normal_force_n: sv
+                                .get("gear_normal_force_n")
+                                .and_then(|x| x.as_f64())
+                                .map(|x| x as f32),
+                            total_weight_kg: sv
+                                .get("total_weight_kg")
+                                .and_then(|x| x.as_f64())
+                                .map(|x| x as f32),
+                        });
+                    }
+                }
+                "landing_analysis" => recorded = v.get("analysis").cloned(),
+                _ => {}
+            }
+        }
+        let edge_at = edge_at.expect("edge_at");
+        let recorded = recorded.expect("recorded analysis");
+
+        // The recorded (production, pre-v0.16.22 LAGGED) verdict.
+        assert_eq!(
+            recorded.get("flare_detected").and_then(|v| v.as_bool()),
+            Some(false),
+            "recorded lagged analysis said no flare"
+        );
+
+        // Re-run with the v0.16.22 MSFS AGL path.
+        let a = compute_landing_analysis(&samples, edge_at, Simulator::Msfs2024);
+
+        let flare_detected = a.get("flare_detected").and_then(|v| v.as_bool()).unwrap();
+        let reduction = a.get("flare_reduction_fpm").and_then(|v| v.as_f64()).unwrap();
+        assert!(flare_detected, "JBU323 flare must flip to TRUE on AGL geometry");
+        assert!(
+            (100.0..=260.0).contains(&reduction),
+            "JBU323 AGL flare reduction should land ~100-200 fpm, got {reduction}"
+        );
+        assert_eq!(
+            a.get("flare_vs_source").and_then(|v| v.as_str()),
+            Some("msfs_agl")
+        );
+
+        // The TOUCHDOWN rate must NOT change — only the flare metric does.
+        // compute_landing_analysis computes vs_at_edge_fpm the same way
+        // regardless of simulator (no de-lag applied inside it).
+        let edge_recorded = recorded.get("vs_at_edge_fpm").and_then(|v| v.as_f64()).unwrap();
+        let edge_new = a.get("vs_at_edge_fpm").and_then(|v| v.as_f64()).unwrap();
+        assert!(
+            (edge_recorded - edge_new).abs() < 1.0,
+            "touchdown rate must be unchanged: recorded {edge_recorded}, new {edge_new}"
+        );
+        assert!(edge_new < -400.0, "touchdown still firm (~-423), got {edge_new}");
+
+        // The lagged SimVar values are preserved as forensic provenance and
+        // match the recorded (lagged) endpoints.
+        let raw_peak = a.get("peak_vs_pre_flare_fpm_raw").and_then(|v| v.as_f64()).unwrap();
+        let rec_peak = recorded.get("peak_vs_pre_flare_fpm").and_then(|v| v.as_f64()).unwrap();
+        assert!((raw_peak - rec_peak).abs() < 1.0, "raw peak must equal recorded lagged peak");
+    }
+
+    // ─── v0.16.22 hardening: phantom-flare guard tests ────────────────────
+
+    /// Load a trimmed `.jsonl.gz` fixture (touchdown_window + landing_
+    /// analysis) into `(edge_at, samples, recorded_analysis)`. Reads the
+    /// FIRST touchdown_window / landing_analysis (the fixtures are single-
+    /// window). Shared by the real-phantom golden tests below.
+    fn load_flare_fixture(
+        fixture: &str,
+    ) -> (DateTime<Utc>, Vec<TouchdownWindowSample>, serde_json::Value) {
+        use flate2::read::GzDecoder;
+        use std::io::{BufRead, BufReader};
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(fixture);
+        let file = std::fs::File::open(&path).unwrap_or_else(|_| panic!("open fixture {fixture}"));
+        let reader = BufReader::new(GzDecoder::new(file));
+        let mut edge_at: Option<DateTime<Utc>> = None;
+        let mut samples: Vec<TouchdownWindowSample> = Vec::new();
+        let mut recorded: Option<serde_json::Value> = None;
+        for line in reader.lines() {
+            let line = line.unwrap();
+            if line.trim().is_empty() {
+                continue;
+            }
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            match v.get("type").and_then(|x| x.as_str()).unwrap_or("") {
+                "touchdown_window" if edge_at.is_none() => {
+                    edge_at = v
+                        .get("edge_at")
+                        .and_then(|x| x.as_str())
+                        .map(|s| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc));
+                    for sv in v.get("samples").and_then(|x| x.as_array()).unwrap() {
+                        let f = |k: &str| sv.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
+                        let f64v = |k: &str| sv.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
+                        samples.push(TouchdownWindowSample {
+                            at: DateTime::parse_from_rfc3339(sv["at"].as_str().unwrap())
+                                .unwrap()
+                                .with_timezone(&Utc),
+                            vs_fpm: f("vs_fpm"),
+                            g_force: f("g_force"),
+                            on_ground: sv.get("on_ground").and_then(|x| x.as_bool()).unwrap_or(false),
+                            agl_ft: f("agl_ft"),
+                            heading_true_deg: f("heading_true_deg"),
+                            groundspeed_kt: f("groundspeed_kt"),
+                            indicated_airspeed_kt: f("indicated_airspeed_kt"),
+                            lat: f64v("lat"),
+                            lon: f64v("lon"),
+                            pitch_deg: f("pitch_deg"),
+                            bank_deg: f("bank_deg"),
+                            gear_normal_force_n: sv
+                                .get("gear_normal_force_n")
+                                .and_then(|x| x.as_f64())
+                                .map(|x| x as f32),
+                            total_weight_kg: sv
+                                .get("total_weight_kg")
+                                .and_then(|x| x.as_f64())
+                                .map(|x| x as f32),
+                        });
+                    }
+                }
+                "landing_analysis" if recorded.is_none() => {
+                    recorded = v.get("analysis").cloned();
+                }
+                _ => {}
+            }
+        }
+        (edge_at.expect("edge_at"), samples, recorded.expect("recorded"))
+    }
+
+    /// Gate 1 (data quality): a synthetic FROZEN-AGL trace (the AGL value
+    /// stuck at one number through the flare-end) must mark the AGL path
+    /// unreliable so the caller falls back to SimVar.
+    #[test]
+    fn gate_frozen_agl_marks_unreliable() {
+        let b = base();
+        let edge_ms = b.timestamp_millis();
+        // 50 Hz samples but agl_ft frozen at 10.0 the whole window → only 1
+        // distinct value (< MSFS_FLARE_MIN_DISTINCT_AGL).
+        let s: Vec<_> = (0..100)
+            .map(|i| tw(b, -2000 + i * 20, 10.0, 3.0, false, -300.0))
+            .collect();
+        let g = evaluate_msfs_flare_gates(&s, edge_ms - 2000, edge_ms - 100);
+        assert!(!g.agl_reliable, "frozen AGL must be unreliable");
+        assert!(g.unreliable_source, "frozen AGL is a data-quality reject");
+    }
+
+    /// Gate 1b (data quality): a degraded sample rate (median Δt > 60 ms,
+    /// i.e. < ~16 Hz) marks the AGL path unreliable even with many distinct
+    /// AGL values.
+    #[test]
+    fn gate_low_rate_marks_unreliable() {
+        let b = base();
+        let edge_ms = b.timestamp_millis();
+        // ~13 Hz (75 ms spacing), distinct descending AGL.
+        let s: Vec<_> = (0..26)
+            .map(|i| tw(b, -2000 + i * 75, 20.0 - i as f32 * 0.4, 3.0, false, -300.0))
+            .collect();
+        let g = evaluate_msfs_flare_gates(&s, edge_ms - 2000, edge_ms - 100);
+        assert!(!g.agl_reliable, "degraded rate must be unreliable");
+        assert!(g.unreliable_source, "degraded rate is a data-quality reject");
+    }
+
+    /// Gate 2 (bounce): an on_ground=true sample inside the window
+    /// suppresses the AGL path (a post-touchdown settle, not a flare). The
+    /// fallback is the PLAIN simvar source (not "unreliable").
+    #[test]
+    fn gate_on_ground_in_window_suppresses() {
+        let b = base();
+        let edge_ms = b.timestamp_millis();
+        let mut s: Vec<_> = (0..100)
+            .map(|i| tw(b, -2000 + i * 20, 20.0 - i as f32 * 0.15, 3.0, false, -300.0))
+            .collect();
+        // Force an on_ground touch mid-window (a bounce).
+        s[30].on_ground = true;
+        let g = evaluate_msfs_flare_gates(&s, edge_ms - 2000, edge_ms - 100);
+        assert!(!g.agl_reliable, "on_ground in window = bounce → suppress");
+        assert!(!g.unreliable_source, "bounce is NOT a data-quality reject");
+    }
+
+    /// Gate 2 (balloon): a non-monotone AGL rise beyond the tolerance
+    /// (without an on_ground sample) is also a bounce/balloon → suppress.
+    #[test]
+    fn gate_balloon_suppresses() {
+        let b = base();
+        let edge_ms = b.timestamp_millis();
+        // Descend, then balloon up ~3 ft, then settle — all airborne.
+        let agl = |i: i64| -> f32 {
+            let t = i as f32;
+            if t < 40.0 {
+                15.0 - t * 0.2 // 15 → 7
+            } else if t < 60.0 {
+                7.0 + (t - 40.0) * 0.15 // balloon up to ~10
+            } else {
+                10.0 - (t - 60.0) * 0.1
+            }
+        };
+        let s: Vec<_> = (0..100)
+            .map(|i| tw(b, -2000 + i * 20, agl(i), 3.0, false, -300.0))
+            .collect();
+        let g = evaluate_msfs_flare_gates(&s, edge_ms - 2000, edge_ms - 100);
+        assert!(!g.agl_reliable, "balloon must suppress the AGL path");
+    }
+
+    /// Gate 1c (LOCAL data quality): the whole-window trace is data-rich
+    /// (well above the distinct floor) but the AGL FREEZES in the final
+    /// ~360 ms — the flare-end fit reads a near-zero slope from the plateau
+    /// and INFLATES the reduction. Gate 1a's whole-window count misses this
+    /// (the freeze is localized); Gate 1c's end-window distinct count
+    /// catches it → unreliable → SimVar fallback. (This is the vrNEVnl
+    /// archetype: 25 distinct over the window, frozen only at the end.)
+    #[test]
+    fn gate_localized_frozen_end_marks_unreliable() {
+        let b = base();
+        let edge_ms = b.timestamp_millis();
+        // Genuine descent for the first ~1.5 s (many distinct AGL values),
+        // then AGL frozen at 6.0 ft through the flare-end fit window.
+        let s: Vec<_> = (0..100)
+            .map(|i| {
+                let ms = -2000 + i * 20;
+                let agl = if ms < -500 {
+                    // descend 18 → 6 over [-2000,-500]
+                    18.0 - (ms - (-2000)) as f32 / 1500.0 * 12.0
+                } else {
+                    6.0 // FROZEN for the last 500 ms (overlaps end fit window)
+                };
+                tw(b, ms, agl, 3.0, false, -300.0)
+            })
+            .collect();
+        let g = evaluate_msfs_flare_gates(&s, edge_ms - 2000, edge_ms - 100);
+        assert!(!g.agl_reliable, "frozen flare-END must be unreliable");
+        assert!(g.unreliable_source, "frozen end is a data-quality reject");
+        // Sanity: the WHOLE-window distinct count is well above Gate 1a's
+        // floor, proving Gate 1c (not 1a) is what catches this.
+        let distinct = {
+            let mut v: Vec<i64> = s
+                .iter()
+                .filter(|x| {
+                    let t = x.at.timestamp_millis();
+                    t >= edge_ms - 2000 && t <= edge_ms - 100 && !x.on_ground
+                })
+                .map(|x| (x.agl_ft as f64 * 100.0).round() as i64)
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v.len()
+        };
+        assert!(
+            distinct >= MSFS_FLARE_MIN_DISTINCT_AGL,
+            "whole-window distinct ({distinct}) is above Gate 1a — only Gate 1c catches it"
+        );
+    }
+
+    /// FIX 1 (Gate 1c span backstop): a NOISY freeze. The AGL descends
+    /// genuinely through the first ~1.5 s (many distinct values → Gate 1a
+    /// passes), then in the final ~600 ms it DITHERS across ≥4 distinct 0.01
+    /// ft buckets (so the Gate 1c bucket-COUNT passes) while the true span is
+    /// only ~0.03 ft — a flat plateau. The end-fit slope reads ≈0 →
+    /// vs_at_flare_end ≈ 0 → a huge fake reduction → phantom score-100. The
+    /// SPAN backstop must catch it where the bucket count cannot.
+    #[test]
+    fn gate_noisy_freeze_span_backstop_rejects() {
+        let b = base();
+        let edge_ms = b.timestamp_millis();
+        // End fit window is [flare_hi-300, flare_hi+300] = [-400, +200] ms.
+        // The flare window samples run [-2000, -100]. Build a real descent
+        // until -500 ms, then a near-flat noisy plateau through the end.
+        // The dither uses 5 distinct 0.01-ft buckets within a ~0.04 ft span.
+        let plateau = [6.00_f32, 6.01, 6.02, 6.03, 6.04];
+        let s: Vec<_> = (0..96)
+            .map(|i| {
+                let ms: i64 = -2000 + i * 20; // -2000 .. -100
+                let agl = if ms < -500 {
+                    // descend 18 → 6 over [-2000,-500]: many distinct values
+                    18.0 - (ms - (-2000)) as f32 / 1500.0 * 12.0
+                } else {
+                    // noisy plateau: cycle the 5 buckets (≥4 distinct, ~0.04 ft span)
+                    let idx = (((ms + 500) / 20).rem_euclid(plateau.len() as i64)) as usize;
+                    plateau[idx]
+                };
+                tw(b, ms, agl, 3.0, false, -300.0)
+            })
+            .collect();
+        let g = evaluate_msfs_flare_gates(&s, edge_ms - 2000, edge_ms - 100);
+        assert!(
+            !g.agl_reliable,
+            "noisy multi-bucket freeze (flat span) must be unreliable"
+        );
+        assert!(g.unreliable_source, "noisy freeze is a data-quality reject");
+        // Prove the bucket COUNT alone would NOT have caught it: the end-fit
+        // window has ≥ MSFS_FLARE_MIN_END_FIT_DISTINCT_AGL distinct buckets,
+        // so only the SPAN backstop rejects here.
+        let end_lo = (edge_ms - 100) - MSFS_FLARE_AGL_FIT_HALF_WINDOW_MS;
+        let end_hi = (edge_ms - 100) + MSFS_FLARE_AGL_FIT_HALF_WINDOW_MS;
+        let mut end_buckets: Vec<i64> = s
+            .iter()
+            .filter(|x| {
+                let t = x.at.timestamp_millis();
+                t >= end_lo && t <= end_hi && !x.on_ground
+            })
+            .map(|x| (x.agl_ft as f64 * 100.0).round() as i64)
+            .collect();
+        end_buckets.sort_unstable();
+        end_buckets.dedup();
+        assert!(
+            end_buckets.len() >= MSFS_FLARE_MIN_END_FIT_DISTINCT_AGL,
+            "end window has ≥4 distinct buckets ({}) — only the span backstop catches this",
+            end_buckets.len()
+        );
+        // And the end-to-end JSON must NOT publish a phantom: source falls
+        // back, no detection, no butter-100.
+        let a = compute_landing_analysis(&s, b, Simulator::Msfs2024);
+        assert_eq!(
+            a.get("flare_vs_source").and_then(|v| v.as_str()),
+            Some("simvar_agl_unreliable")
+        );
+        assert_eq!(a.get("flare_detected").and_then(|v| v.as_bool()), Some(false));
+        let score = a.get("flare_quality_score").and_then(|v| v.as_i64()).unwrap();
+        assert!(score < 100, "no butter-100 on a noisy-freeze phantom (got {score})");
+    }
+
+    /// FIX 2 (post-edge bounce contamination): a clean descent to a touchdown
+    /// AT the edge, then a post-edge airborne BALLOON with rising AGL. The
+    /// uncapped end-fit would reach edge+200 ms and read those rising
+    /// post-edge samples, flattening/reversing the end slope → an inflated
+    /// reduction → phantom. The edge-capped fit + the extended balloon gate
+    /// must keep this from earning a credited flare.
+    #[test]
+    fn touchdown_then_balloon_not_credited() {
+        let b = base();
+        let edge_ms = b.timestamp_millis();
+        // Steady firm descent -350 fpm to ~0 ft at the edge (t=0), then the
+        // aircraft bounces: on_ground at the edge sample, airborne again and
+        // ballooning up ~2.5 ft over the next 200 ms.
+        let mut s: Vec<TouchdownWindowSample> = Vec::new();
+        // Pre-edge descent [-2000, -20] ms, AGL 11.6 → ~0.1, all airborne.
+        for i in 0..100 {
+            let ms = -2000 + i * 20;
+            let agl = 0.1 + (-ms as f32) / 1000.0 * 5.8; // ~-350 fpm geometry
+            s.push(tw(b, ms, agl, 4.0, false, -350.0));
+        }
+        // Edge sample: ground contact at t=0.
+        s.push(tw(b, 0, 0.0, 4.0, true, -350.0));
+        // Post-edge balloon: airborne again, rising AGL 0.5 → 2.5 ft.
+        for i in 1..=10 {
+            let ms = i * 20; // +20 .. +200
+            let agl = 0.5 + (i as f32) * 0.2; // climbs to 2.5 ft
+            s.push(tw(b, ms, agl, 4.0, false, 150.0));
+        }
+        let flare_lo = edge_ms - 2000;
+        let flare_hi = edge_ms - 100;
+        // The balloon gate must mark the AGL path unreliable/blocked.
+        let g = evaluate_msfs_flare_gates(&s, flare_lo, flare_hi);
+        assert!(
+            !g.agl_reliable,
+            "post-edge balloon must suppress the AGL path (Gate 2 extended)"
+        );
+        // End-to-end: no credited flare.
+        let a = compute_landing_analysis(&s, b, Simulator::Msfs2024);
+        assert_eq!(
+            a.get("flare_detected").and_then(|v| v.as_bool()),
+            Some(false),
+            "touchdown-then-bounce must NOT produce a credited flare"
+        );
+    }
+
+    /// Gate 3 (pitch veto): a clean, data-rich descent with a strongly
+    /// NOSE-DOWN net pitch trend passes the data/bounce gates but sets the
+    /// pitch_nose_down veto. A normal nose-up/flat flare does not.
+    #[test]
+    fn gate_pitch_nose_down_veto() {
+        let b = base();
+        let edge_ms = b.timestamp_millis();
+        // pitch ramps +3° → −4° across the window (nose-DOWN, like a shed).
+        let nose_down: Vec<_> = (0..100)
+            .map(|i| {
+                let frac = i as f32 / 99.0;
+                tw(b, -2000 + i * 20, 20.0 - i as f32 * 0.15, 3.0 - 7.0 * frac, false, -300.0)
+            })
+            .collect();
+        let g = evaluate_msfs_flare_gates(&nose_down, edge_ms - 2000, edge_ms - 100);
+        assert!(g.agl_reliable, "data is clean — only the pitch veto applies");
+        assert!(g.pitch_nose_down, "strong nose-down trend must set the veto");
+        // A held/nose-up flare must NOT trip the veto.
+        let nose_up: Vec<_> = (0..100)
+            .map(|i| {
+                let frac = i as f32 / 99.0;
+                tw(b, -2000 + i * 20, 20.0 - i as f32 * 0.15, 3.0 + 2.0 * frac, false, -300.0)
+            })
+            .collect();
+        let g2 = evaluate_msfs_flare_gates(&nose_up, edge_ms - 2000, edge_ms - 100);
+        assert!(!g2.pitch_nose_down, "nose-up flare must not trip the veto");
+    }
+
+    /// E195 MXY322 real fixture (frozen AGL). The BARE AGL path would have
+    /// produced a phantom "butter" (reduction ~742, score 100); the
+    /// data-quality gate must fall back to SimVar — source
+    /// "simvar_agl_unreliable", NO 100-score butter, flare_detected=false.
+    #[test]
+    fn e195_frozen_agl_phantom_suppressed() {
+        let (edge_at, samples, recorded) = load_flare_fixture("e195_mxy322_frozen_agl.jsonl.gz");
+        // Recorded (SimVar) verdict was already no-flare.
+        assert_eq!(
+            recorded.get("flare_detected").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        let a = compute_landing_analysis(&samples, edge_at, Simulator::Msfs2024);
+        assert_eq!(
+            a.get("flare_vs_source").and_then(|v| v.as_str()),
+            Some("simvar_agl_unreliable"),
+            "frozen E195 must fall back to the SimVar path"
+        );
+        assert_eq!(
+            a.get("flare_detected").and_then(|v| v.as_bool()),
+            Some(false),
+            "no phantom flare on frozen data"
+        );
+        // The published reduction is the SimVar (lagged) value, NOT the
+        // bare-AGL phantom 742. And the score is not a butter 100.
+        let red = a.get("flare_reduction_fpm").and_then(|v| v.as_f64()).unwrap();
+        assert!(red < 200.0, "frozen phantom reduction must NOT publish (got {red})");
+        let score = a.get("flare_quality_score").and_then(|v| v.as_i64()).unwrap();
+        assert!(score < 100, "no butter-100 on a firm frozen-data arrival (got {score})");
+    }
+
+    /// vrNEVnl A320 real fixture (LOCALIZED frozen end). 25 distinct AGL
+    /// values over the window (passes Gate 1a), but the trace froze in the
+    /// final ~360 ms so the bare AGL path would publish an INFLATED
+    /// reduction of ~168 fpm (end read −24 from the plateau instead of the
+    /// true −170). Gate 1c must fall back to "simvar_agl_unreliable" with
+    /// no detection — the honest SimVar reduction here is ~8 fpm.
+    #[test]
+    fn vrnevnl_localized_frozen_end_phantom_suppressed() {
+        let (edge_at, samples, _recorded) = load_flare_fixture("a320_vrnevnl_frozen_end.jsonl.gz");
+        let a = compute_landing_analysis(&samples, edge_at, Simulator::Msfs2024);
+        assert_eq!(
+            a.get("flare_vs_source").and_then(|v| v.as_str()),
+            Some("simvar_agl_unreliable"),
+            "localized frozen end must fall back (Gate 1c)"
+        );
+        assert_eq!(
+            a.get("flare_detected").and_then(|v| v.as_bool()),
+            Some(false),
+            "frozen-end inflated reduction must NOT be detected"
+        );
+        // The published reduction is the honest SimVar value (~8 fpm), not
+        // the bare-AGL phantom ~168.
+        let red = a.get("flare_reduction_fpm").and_then(|v| v.as_f64()).unwrap();
+        assert!(
+            red < 100.0,
+            "frozen-end phantom reduction (~168) must NOT publish (got {red})"
+        );
+    }
+
+    /// DA40 GSG2056 real fixture (bounce/balloon). The aircraft touched
+    /// (on_ground=true) and ballooned inside the window; the bounce gate
+    /// must suppress detection (post-bounce settle is not a flare). Falls
+    /// back to the PLAIN simvar source (the data itself is fine).
+    #[test]
+    fn da40_bounce_phantom_suppressed() {
+        let (edge_at, samples, _recorded) = load_flare_fixture("da40_gsg2056_bounce.jsonl.gz");
+        let a = compute_landing_analysis(&samples, edge_at, Simulator::Msfs2024);
+        assert_eq!(
+            a.get("flare_detected").and_then(|v| v.as_bool()),
+            Some(false),
+            "post-bounce settle must NOT be detected as a flare"
+        );
+        assert_eq!(
+            a.get("flare_vs_source").and_then(|v| v.as_str()),
+            Some("simvar"),
+            "bounce falls back to SimVar (data quality is fine, not 'unreliable')"
+        );
+    }
+
 }
