@@ -243,6 +243,26 @@ impl Connection {
                 url.scheme()
             )));
         }
+        // SECURITY: plaintext `http://` is only allowed to loopback. The API key
+        // travels in the X-API-Key / bearer headers, so over http to a routable
+        // host it would be sent in cleartext. Production hard-locks the phpVMS URL
+        // to https anyway; this stops the dev/localhost path from being aimed at a
+        // remote http host (LAN or public).
+        if url.scheme() == "http" {
+            let host = url.host_str().unwrap_or("");
+            // host_str() keeps brackets for IPv6 (e.g. "[::1]") — strip them.
+            let host_ip = host.trim_start_matches('[').trim_end_matches(']');
+            let is_loopback = host.eq_ignore_ascii_case("localhost")
+                || host_ip
+                    .parse::<std::net::IpAddr>()
+                    .map(|ip| ip.is_loopback())
+                    .unwrap_or(false);
+            if !is_loopback {
+                return Err(ApiError::InvalidUrl(format!(
+                    "plaintext http:// is only allowed for localhost, got '{host}'"
+                )));
+            }
+        }
         Ok(Self {
             base_url: url,
             api_key: api_key.into(),
@@ -2082,6 +2102,27 @@ mod tests {
     #[test]
     fn accepts_http_localhost() {
         Connection::new("http://localhost:8000", "k").unwrap();
+        // loopback IPs (v4 + v6) must also pass
+        Connection::new("http://127.0.0.1:8000", "k").unwrap();
+        Connection::new("http://[::1]:8000", "k").unwrap();
+    }
+
+    #[test]
+    fn rejects_http_to_routable_host() {
+        // C2c: plaintext http to a routable host would leak the API key.
+        for url in [
+            "http://german-sky-group.eu",
+            "http://example.com:8000",
+            "http://192.168.1.5:8000", // even a LAN host: only loopback is exempt
+        ] {
+            let err = Connection::new(url, "k").unwrap_err();
+            assert!(
+                matches!(err, ApiError::InvalidUrl(_)),
+                "expected InvalidUrl for {url}, got {err:?}"
+            );
+        }
+        // https to the same hosts stays fine.
+        Connection::new("https://german-sky-group.eu", "k").unwrap();
     }
 
     #[test]
