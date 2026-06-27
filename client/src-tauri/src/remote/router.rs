@@ -22,8 +22,9 @@ use std::sync::Arc;
 
 use axum::{
     body::Bytes,
-    extract::{ws::WebSocketUpgrade, ConnectInfo, Path as AxumPath, Query, State},
+    extract::{ws::WebSocketUpgrade, ConnectInfo, Path as AxumPath, Query, Request, State},
     http::{header, HeaderMap, StatusCode, Uri},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -238,6 +239,12 @@ pub fn build_router(ctx: RemoteContext, spa_dir: PathBuf) -> Router {
         // `/api/cmd` + `/ws` request) plus the private-LAN peer check. The
         // CorsLayer is just belt-and-suspenders for the same-origin SPA.
         .layer(CorsLayer::new())
+        // SECURITY: global LAN-only guard, applied to EVERY route — including
+        // the SPA fallback. Without this the static app bundle (index.html/JS)
+        // is served to any peer that can reach the socket (the server binds
+        // 0.0.0.0); only `/api` + `/ws` carried the private-peer check before.
+        // The per-handler `reject_non_private` calls stay as belt-and-suspenders.
+        .layer(middleware::from_fn(lan_only))
         .with_state(ctx)
 }
 
@@ -254,6 +261,17 @@ fn reject_non_private(peer: SocketAddr) -> Option<Response> {
         tracing::warn!(%peer, "remote: rejected non-private peer");
         Some((StatusCode::FORBIDDEN, "forbidden: LAN only").into_response())
     }
+}
+
+/// Global middleware: reject any non-private/loopback peer on EVERY route
+/// (including the SPA fallback), so the static bundle isn't reachable from a
+/// forwarded/public port. Runs before the route handlers; the per-handler
+/// `reject_non_private` checks remain as redundant defense-in-depth.
+async fn lan_only(ConnectInfo(peer): ConnectInfo<SocketAddr>, req: Request, next: Next) -> Response {
+    if let Some(r) = reject_non_private(peer) {
+        return r;
+    }
+    next.run(req).await
 }
 
 /// Extract + verify the bearer token from the `X-AeroACARS-Token` header.
