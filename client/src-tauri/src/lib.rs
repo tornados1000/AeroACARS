@@ -6220,12 +6220,18 @@ async fn init_mqtt_publisher_via_provisioning(app: AppHandle) {
         };
 
         // Cache for next launch. Failures here are non-fatal —
-        // we'll just provision again next time.
-        let _ = secrets::store_api_key(MQTT_KEYRING_USERNAME, &resp.username);
-        let _ = secrets::store_api_key(MQTT_KEYRING_PASSWORD, &resp.password);
-        let _ = secrets::store_api_key(MQTT_KEYRING_VA, &resp.va_prefix);
-        let _ = secrets::store_api_key(MQTT_KEYRING_PILOT_ID, &resp.pilot_id);
-        let _ = secrets::store_api_key(MQTT_KEYRING_BROKER, &resp.broker_url);
+        // we'll just provision again next time. Log (key NAME + error only;
+        // never the secret value) so a silently-failing keyring is diagnosable.
+        let store = |k: &str, v: &str| {
+            if let Err(e) = secrets::store_api_key(k, v) {
+                tracing::warn!(key = k, error = %e, "live-tracking: caching MQTT credential failed (non-fatal, will re-provision)");
+            }
+        };
+        store(MQTT_KEYRING_USERNAME, &resp.username);
+        store(MQTT_KEYRING_PASSWORD, &resp.password);
+        store(MQTT_KEYRING_VA, &resp.va_prefix);
+        store(MQTT_KEYRING_PILOT_ID, &resp.pilot_id);
+        store(MQTT_KEYRING_BROKER, &resp.broker_url);
         tracing::info!(
             pilot_id = %resp.pilot_id,
             va = %resp.va_prefix,
@@ -10001,7 +10007,9 @@ async fn flight_start_manual(
         source_name: Some(format!("AeroACARS/{}", env!("CARGO_PKG_VERSION"))),
         ..Default::default()
     };
-    let _ = client.update_pirep(&pirep.id, &update_body).await;
+    if let Err(e) = client.update_pirep(&pirep.id, &update_body).await {
+        tracing::warn!(pirep_id = %pirep.id, error = %e, "update_pirep (set BST/state 0) failed (non-fatal)");
+    }
 
     // Aircraft-Daten + Airline-Logo holen
     let aircraft_details = client.get_aircraft(aircraft_id).await.ok();
@@ -10523,7 +10531,9 @@ fn spawn_pirep_queue_worker(app: AppHandle) {
                         }
                         q.last_error = Some(friendly_net_error(&e));
                         // Update das File mit dem neuen attempt-count + Error
-                        let _ = pirep_queue::enqueue(&app, &q);
+                        if let Err(e) = pirep_queue::enqueue(&app, &q) {
+                            tracing::warn!(pirep_id = %q.pirep_id, error = %e, "pirep_queue: persisting retry state failed — attempt-count/last_error may be lost");
+                        }
                         tracing::warn!(
                             pirep_id = %q.pirep_id,
                             attempt = q.attempt_count,
