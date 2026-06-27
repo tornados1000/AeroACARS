@@ -22554,6 +22554,19 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                                 sub_bounces: stats.bounce_count,
                             };
                             stats.touchdown_events.push(event.clone());
+                            // JBU327-Fix: ein Touch-and-Go / Balked-Landing IST
+                            // ein Go-Around — der Anflug wurde abgebrochen und neu
+                            // angesetzt. `check_go_around` (nur Approach/Final)
+                            // erfasst ausschliesslich den Go-Around OHNE
+                            // Bodenberuehrung; der balked-landing-Fall (Raeder
+                            // beruehrten kurz, dann Wegstieg) lief bisher NUR durch
+                            // diesen T&G-Pfad und blieb in `go_around_count`
+                            // ungezaehlt — fehlte damit im PIREP (phpVMS) + auf der
+                            // Live-Map. Hier mitzaehlen. Reporting-only, KEIN
+                            // Score-Einfluss (`go_around_count` fliesst nicht in
+                            // `landing_scoring`).
+                            stats.go_around_count = stats.go_around_count.saturating_add(1);
+                            let ga_count = stats.go_around_count;
                             let tg_count = stats
                                 .touchdown_events
                                 .iter()
@@ -22561,14 +22574,15 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                                 .count();
                             tracing::info!(
                                 count = tg_count,
+                                go_around_count = ga_count,
                                 peak_vs = event.peak_vs_fpm,
                                 peak_g = event.peak_g,
                                 sub_bounces = event.sub_bounces,
-                                "touch-and-go classified — resetting landing window"
+                                "touch-and-go classified (counts as go-around) — resetting landing window"
                             );
                             stats.pending_acars_logs.push(format!(
-                                "Touch-and-go #{} — V/S {:.0} fpm, G {:.2}",
-                                tg_count, event.peak_vs_fpm, event.peak_g
+                                "Go-around #{} (touch-and-go) — V/S {:.0} fpm, G {:.2}",
+                                ga_count, event.peak_vs_fpm, event.peak_g
                             ));
                             // Reset landing window so the NEXT touchdown
                             // gets a fresh score window. Bounce count
