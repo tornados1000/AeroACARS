@@ -193,6 +193,11 @@ function subStability(
   return { key: "stability", points, value, band: band(points), rationale };
 }
 
+// FROZEN legacy fallback (Q2, Audit 2026-06-27): the live source of truth is
+// the Rust crate's sub_rollout (LDA-/weight-class-based since v0.10.0). These
+// absolute-metre thresholds exist ONLY to re-score pre-v0.7.1 PIREPs as they
+// were originally scored — do NOT "align" them with the current Rust algorithm
+// (that would re-grade old landings). Pinned by landingScoring.golden.test.ts.
 function subRollout(rolloutM: number | null | undefined): SubScore | null {
   if (rolloutM == null) return null;
   const m = rolloutM;
