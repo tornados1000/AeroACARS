@@ -15,8 +15,9 @@
 //! switch because no runtime was available on the calling thread.
 //! `std::thread` works from any context.
 
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -157,17 +158,17 @@ impl XPlaneAdapter {
         self.stop();
         self.kind = kind;
         // Reset state for a fresh run.
-        *self.shared.state.lock().unwrap() = ConnectionState::Connecting;
-        *self.shared.last_error.lock().unwrap() = None;
-        *self.shared.parsed.lock().unwrap() = XPlaneState::default();
-        *self.shared.aircraft.lock().unwrap() = AircraftInfo::default();
+        *self.shared.state.lock() = ConnectionState::Connecting;
+        *self.shared.last_error.lock() = None;
+        *self.shared.parsed.lock() = XPlaneState::default();
+        *self.shared.aircraft.lock() = AircraftInfo::default();
         // v0.12.2: a fresh run starts on the base catalog — profile
         // detection re-runs from scratch against the new sim session.
-        *self.shared.active_catalog.lock().unwrap() = build_active_catalog(None);
-        for v in self.shared.seen.lock().unwrap().iter_mut() {
+        *self.shared.active_catalog.lock() = build_active_catalog(None);
+        for v in self.shared.seen.lock().iter_mut() {
             *v = false;
         }
-        for v in self.shared.last_values.lock().unwrap().iter_mut() {
+        for v in self.shared.last_values.lock().iter_mut() {
             *v = 0.0;
         }
         self.shared.stop.store(false, Ordering::SeqCst);
@@ -208,7 +209,7 @@ impl XPlaneAdapter {
         // Tear down the premium listener last so it can drain any
         // in-flight packet before close. Idempotent.
         self.premium.stop();
-        *self.shared.state.lock().unwrap() = ConnectionState::Disconnected;
+        *self.shared.state.lock() = ConnectionState::Disconnected;
     }
 
     /// Status of the AeroACARS X-Plane Plugin connection (v0.5.0+).
@@ -235,7 +236,7 @@ impl XPlaneAdapter {
     }
 
     pub fn state(&self) -> ConnectionState {
-        *self.shared.state.lock().unwrap()
+        *self.shared.state.lock()
     }
 
     /// Force-clear the parsed RREF state so `snapshot()` returns
@@ -247,19 +248,19 @@ impl XPlaneAdapter {
     /// state is downgraded to Connecting so the UI shows "waiting
     /// for sim position …" until the next real packet lands.
     pub fn clear_snapshot(&self) {
-        *self.shared.parsed.lock().unwrap() = XPlaneState::default();
-        for v in self.shared.seen.lock().unwrap().iter_mut() {
+        *self.shared.parsed.lock() = XPlaneState::default();
+        for v in self.shared.seen.lock().iter_mut() {
             *v = false;
         }
-        for v in self.shared.last_values.lock().unwrap().iter_mut() {
+        for v in self.shared.last_values.lock().iter_mut() {
             *v = 0.0;
         }
-        *self.shared.state.lock().unwrap() = ConnectionState::Connecting;
+        *self.shared.state.lock() = ConnectionState::Connecting;
         tracing::info!("X-Plane snapshot cleared by user (force-resync)");
     }
 
     pub fn snapshot(&self) -> Option<SimSnapshot> {
-        let parsed = self.shared.parsed.lock().unwrap();
+        let parsed = self.shared.parsed.lock();
         if !parsed.got_first_packet {
             return None;
         }
@@ -274,7 +275,7 @@ impl XPlaneAdapter {
         // reachable (X-Plane <12.1, or pilot didn't enable it). The
         // SimSnapshot fields default to None in that path so the
         // existing "(unknown)" UI label still shows.
-        let aircraft = self.shared.aircraft.lock().unwrap();
+        let aircraft = self.shared.aircraft.lock();
         if aircraft.descrip.is_some() {
             snap.aircraft_title = aircraft.descrip.clone();
         }
@@ -288,7 +289,7 @@ impl XPlaneAdapter {
     }
 
     pub fn last_error(&self) -> Option<String> {
-        self.shared.last_error.lock().unwrap().clone()
+        self.shared.last_error.lock().clone()
     }
 
     /// Return the catalog with each DataRef's most recent received
@@ -299,9 +300,9 @@ impl XPlaneAdapter {
     /// dataref names actually in use — including a detected aircraft
     /// profile's overrides (e.g. the CL650 flaps dataref).
     pub fn subscribed_datarefs(&self) -> Vec<DatarefSample> {
-        let seen = self.shared.seen.lock().unwrap();
-        let last = self.shared.last_values.lock().unwrap();
-        let active = self.shared.active_catalog.lock().unwrap();
+        let seen = self.shared.seen.lock();
+        let last = self.shared.last_values.lock();
+        let active = self.shared.active_catalog.lock();
         active
             .iter()
             .enumerate()
@@ -366,8 +367,8 @@ fn run_listener(shared: Arc<AdapterShared>) {
     let socket = match UdpSocket::bind("127.0.0.1:0") {
         Ok(s) => s,
         Err(e) => {
-            *shared.last_error.lock().unwrap() = Some(format!("bind failed: {e}"));
-            *shared.state.lock().unwrap() = ConnectionState::Disconnected;
+            *shared.last_error.lock() = Some(format!("bind failed: {e}"));
+            *shared.state.lock() = ConnectionState::Disconnected;
             tracing::error!(error = %e, "could not bind XPlane UDP socket");
             return;
         }
@@ -440,7 +441,7 @@ fn run_listener(shared: Arc<AdapterShared>) {
     // Initial subscribe — base catalog + profile probes.
     subscribe_catalog(&socket, &active);
     subscribe_probes(&socket);
-    *shared.active_catalog.lock().unwrap() = active.clone();
+    *shared.active_catalog.lock() = active.clone();
 
     // Listen.
     let mut buf = vec![0u8; 8192];
@@ -465,9 +466,9 @@ fn run_listener(shared: Arc<AdapterShared>) {
                     continue;
                 }
                 last_packet_at = Some(Instant::now());
-                let mut parsed = shared.parsed.lock().unwrap();
-                let mut seen = shared.seen.lock().unwrap();
-                let mut last = shared.last_values.lock().unwrap();
+                let mut parsed = shared.parsed.lock();
+                let mut seen = shared.seen.lock();
+                let mut last = shared.last_values.lock();
                 for p in pairs {
                     // v0.12.2 (LE1): discovery-index packets are PROBE
                     // responses — they only prove a profile's dataref
@@ -496,7 +497,7 @@ fn run_listener(shared: Arc<AdapterShared>) {
                     }
                 }
                 if parsed.got_first_packet {
-                    let mut s = shared.state.lock().unwrap();
+                    let mut s = shared.state.lock();
                     if *s != ConnectionState::Connected {
                         *s = ConnectionState::Connected;
                         tracing::info!("X-Plane: first RREF packet received → Connected");
@@ -526,7 +527,7 @@ fn run_listener(shared: Arc<AdapterShared>) {
         // stale — `desired` is None and the adapter falls back to the
         // base catalog. This is the runtime aircraft-swap path (LE6) and
         // (QS-R4/P1) now works even with no Web API title.
-        let current_title = shared.aircraft.lock().unwrap().descrip.clone();
+        let current_title = shared.aircraft.lock().descrip.clone();
         let probe_fresh: Vec<bool> = probe_last_seen
             .iter()
             .map(|t| t.is_some_and(|seen| seen.elapsed() < PROBE_STALE_AFTER))
@@ -554,7 +555,7 @@ fn run_listener(shared: Arc<AdapterShared>) {
             // fresh indices. The probes keep running regardless, so a
             // later aircraft swap is always detected.
             active = build_active_catalog(desired.map(|pi| &PROFILES[pi]));
-            *shared.active_catalog.lock().unwrap() = active.clone();
+            *shared.active_catalog.lock() = active.clone();
             subscribe_catalog(&socket, &active);
         }
 
@@ -566,22 +567,22 @@ fn run_listener(shared: Arc<AdapterShared>) {
         // to Connected without intervention.
         if let Some(at) = last_packet_at {
             if at.elapsed() > STALE_TIMEOUT {
-                let mut parsed = shared.parsed.lock().unwrap();
+                let mut parsed = shared.parsed.lock();
                 if parsed.got_first_packet {
                     tracing::warn!(
                         "X-Plane: no RREF packets for {:?} — clearing snapshot, marking connecting",
                         STALE_TIMEOUT
                     );
                     *parsed = XPlaneState::default();
-                    let mut seen = shared.seen.lock().unwrap();
+                    let mut seen = shared.seen.lock();
                     for v in seen.iter_mut() {
                         *v = false;
                     }
-                    let mut last = shared.last_values.lock().unwrap();
+                    let mut last = shared.last_values.lock();
                     for v in last.iter_mut() {
                         *v = 0.0;
                     }
-                    *shared.state.lock().unwrap() = ConnectionState::Connecting;
+                    *shared.state.lock() = ConnectionState::Connecting;
                 }
                 // Reset so we don't fire the warning every tick.
                 last_packet_at = None;
@@ -592,7 +593,7 @@ fn run_listener(shared: Arc<AdapterShared>) {
         // Whenever we're not Connected, periodically resend the full
         // subscription set (active catalog + probes) so the connection
         // recovers from a cold start or an X-Plane restart on its own.
-        let state_now = *shared.state.lock().unwrap();
+        let state_now = *shared.state.lock();
         if state_now != ConnectionState::Connected
             && last_resubscribe_at.elapsed() >= RESUBSCRIBE_INTERVAL
         {
@@ -663,7 +664,7 @@ fn run_web_api_poller(shared: Arc<AdapterShared>) {
                         last_logged_path = path;
                     }
                 }
-                *shared.aircraft.lock().unwrap() = info;
+                *shared.aircraft.lock() = info;
             }
             Err(e) => {
                 consecutive_failures += 1;

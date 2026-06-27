@@ -4543,6 +4543,7 @@ version = "0.16.27"
 dependencies = [
  "bindgen",
  "chrono",
+ "parking_lot",
  "serde",
  "sim-core",
  "thiserror 2.0.18",
@@ -4556,6 +4557,7 @@ version = "0.16.27"
 dependencies = [
  "base64 0.22.1",
  "chrono",
+ "parking_lot",
  "serde",
  "serde_json",
  "sim-core",

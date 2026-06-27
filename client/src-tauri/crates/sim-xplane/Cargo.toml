@@ -17,6 +17,9 @@ serde_json.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# parking_lot: poison-free Mutex for the UDP-ingest worker threads — a panic
+# in one ingest thread must not cascade-poison every subsequent lock.
+parking_lot = "0.12"
 # ureq for the X-Plane 12.1+ Web API client (string DataRefs that
 # the UDP RREF protocol can't read — aircraft type / registration /
 # author etc.). Sync, single-purpose, no tokio runtime. The localhost

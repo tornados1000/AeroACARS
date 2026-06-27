@@ -49,9 +49,10 @@
 //! `std::net::UdpSocket` with a 200 ms read timeout so it can re-check
 //! the shared `stop` flag and exit promptly on adapter shutdown.
 
+use parking_lot::Mutex;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -222,9 +223,9 @@ impl PremiumListener {
         // `ever_seen` sticky across stop/start so toggling the
         // adapter doesn't make the UI badge flicker; it only
         // resets to false when the whole process exits.
-        *self.shared.last_packet_at.lock().unwrap() = None;
-        *self.shared.pending_touchdown.lock().unwrap() = None;
-        *self.shared.last_error.lock().unwrap() = None;
+        *self.shared.last_packet_at.lock() = None;
+        *self.shared.pending_touchdown.lock() = None;
+        *self.shared.last_error.lock() = None;
         self.shared.stop.store(false, Ordering::SeqCst);
         let shared = Arc::clone(&self.shared);
         let handle = std::thread::Builder::new()
@@ -250,7 +251,7 @@ impl PremiumListener {
     }
 
     pub fn status(&self) -> PremiumStatus {
-        let active = match *self.shared.last_packet_at.lock().unwrap() {
+        let active = match *self.shared.last_packet_at.lock() {
             Some(t) => t.elapsed() < ACTIVE_TIMEOUT,
             None => false,
         };
@@ -271,12 +272,11 @@ impl PremiumListener {
         self.shared
             .pending_touchdown
             .lock()
-            .unwrap()
             .take()
     }
 
     pub fn last_error(&self) -> Option<String> {
-        self.shared.last_error.lock().unwrap().clone()
+        self.shared.last_error.lock().clone()
     }
 }
 
@@ -303,7 +303,7 @@ fn run_listener(shared: Arc<PremiumShared>) {
                  (plugin telemetry will not be received this session)"
             );
             tracing::warn!("{msg}");
-            *shared.last_error.lock().unwrap() = Some(msg);
+            *shared.last_error.lock() = Some(msg);
             return;
         }
     };
@@ -378,7 +378,7 @@ fn handle_packet(bytes: &[u8], shared: &Arc<PremiumShared>) {
     }
 
     // ---- Heartbeat (any valid packet counts) ----
-    *shared.last_packet_at.lock().unwrap() = Some(Instant::now());
+    *shared.last_packet_at.lock() = Some(Instant::now());
     shared.ever_seen.store(true, Ordering::Relaxed);
     shared
         .packet_count
@@ -401,7 +401,7 @@ fn handle_packet(bytes: &[u8], shared: &Arc<PremiumShared>) {
                         pitch_deg = td.captured_pitch_deg,
                         "premium: touchdown event received from plugin"
                     );
-                    *shared.pending_touchdown.lock().unwrap() = Some(td);
+                    *shared.pending_touchdown.lock() = Some(td);
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -466,7 +466,7 @@ mod tests {
             &shared,
         );
         assert_eq!(shared.packet_count.load(Ordering::Relaxed), 1);
-        assert!(shared.pending_touchdown.lock().unwrap().is_none());
+        assert!(shared.pending_touchdown.lock().is_none());
     }
 
     #[test]
@@ -477,10 +477,10 @@ mod tests {
             &shared,
         );
         // First pickup returns Some, second returns None.
-        let td = shared.pending_touchdown.lock().unwrap().take();
+        let td = shared.pending_touchdown.lock().take();
         assert!(td.is_some());
         assert_eq!(td.unwrap().captured_vs_fpm as i32, -300);
-        let td2 = shared.pending_touchdown.lock().unwrap().take();
+        let td2 = shared.pending_touchdown.lock().take();
         assert!(td2.is_none());
     }
 

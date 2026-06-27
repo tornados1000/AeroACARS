@@ -6,8 +6,9 @@
 //! [`MsfsAdapter`] API is the same as the legacy adapter so the rest
 //! of the application doesn't need to change.
 
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -585,14 +586,14 @@ impl MsfsAdapter {
             return;
         }
         if !kind.is_msfs() {
-            *self.shared.state.lock().unwrap() = ConnectionState::Disconnected;
+            *self.shared.state.lock() = ConnectionState::Disconnected;
             return;
         }
         self.stop = Arc::new(AtomicBool::new(false));
         let shared = Arc::clone(&self.shared);
         let stop = Arc::clone(&self.stop);
-        *shared.state.lock().unwrap() = ConnectionState::Connecting;
-        *shared.last_error.lock().unwrap() = None;
+        *shared.state.lock() = ConnectionState::Connecting;
+        *shared.last_error.lock() = None;
         tracing::info!(?kind, "MSFS raw adapter started");
         let handle = thread::Builder::new()
             .name("sim-msfs-worker".into())
@@ -609,16 +610,16 @@ impl MsfsAdapter {
             // can hang if MSFS itself is gone.
             let _ = h.join();
         }
-        *self.shared.state.lock().unwrap() = ConnectionState::Disconnected;
+        *self.shared.state.lock() = ConnectionState::Disconnected;
         tracing::info!("MSFS raw adapter stopped");
     }
 
     pub fn state(&self) -> ConnectionState {
-        *self.shared.state.lock().unwrap()
+        *self.shared.state.lock()
     }
 
     pub fn snapshot(&self) -> Option<SimSnapshot> {
-        let mut snap = self.shared.snapshot.lock().unwrap().clone()?;
+        let mut snap = self.shared.snapshot.lock().clone()?;
         // Merge PMDG SDK data when available (Phase 5.4 + 5.4b).
         // The standard SimVar telemetry fills the SimSnapshot's
         // main body; PMDG fills the optional `pmdg` field with
@@ -717,7 +718,7 @@ impl MsfsAdapter {
     /// AND the SDK is enabled in `777X_Options.ini`. Same on-
     /// demand decoding semantics as the NG3 variant.
     pub fn pmdg_x777_snapshot(&self) -> Option<crate::pmdg::x777::Pmdg777XSnapshot> {
-        let g = self.shared.pmdg.lock().unwrap();
+        let g = self.shared.pmdg.lock();
         g.x777_raw
             .as_ref()
             .map(|raw| crate::pmdg::x777::Pmdg777XSnapshot::from_raw(raw))
@@ -729,7 +730,7 @@ impl MsfsAdapter {
     /// byte struct — so callers don't have to know about layout.
     /// `None` when no PMDG NG3 is loaded or no data has arrived yet.
     pub fn pmdg_ng3_snapshot(&self) -> Option<crate::pmdg::ng3::Pmdg738Snapshot> {
-        let g = self.shared.pmdg.lock().unwrap();
+        let g = self.shared.pmdg.lock();
         g.ng3_raw
             .as_ref()
             .map(|raw| crate::pmdg::ng3::Pmdg738Snapshot::from_raw(raw))
@@ -739,7 +740,7 @@ impl MsfsAdapter {
     /// whether we've subscribed, and how stale the most recent
     /// data is. Drives the Settings-tab "SDK enabled?" hint.
     pub fn pmdg_status(&self) -> PmdgStatus {
-        let g = self.shared.pmdg.lock().unwrap();
+        let g = self.shared.pmdg.lock();
         let stale_secs = g
             .last_packet_at
             .map(|t| t.elapsed().as_secs())
@@ -761,26 +762,26 @@ impl MsfsAdapter {
     /// Connecting so the UI shows "waiting for sim position …" until
     /// the next real packet lands.
     pub fn clear_snapshot(&self) {
-        *self.shared.snapshot.lock().unwrap() = None;
-        *self.shared.touchdown.lock().unwrap() = None;
+        *self.shared.snapshot.lock() = None;
+        *self.shared.touchdown.lock() = None;
         // PMDG raw data is part of the same "stale snapshot"
         // problem — clear it on manual re-sync too. Variant
         // stays (we still know what aircraft is loaded), but
         // we clear `subscribed=false` so the next dispatch
         // re-subscribes and gets a fresh data block.
         {
-            let mut g = self.shared.pmdg.lock().unwrap();
+            let mut g = self.shared.pmdg.lock();
             g.ng3_raw = None;
             g.x777_raw = None;
             g.subscribed = false;
             g.last_packet_at = None;
         }
-        *self.shared.state.lock().unwrap() = ConnectionState::Connecting;
+        *self.shared.state.lock() = ConnectionState::Connecting;
         tracing::info!("MSFS snapshot cleared by user (force-resync)");
     }
 
     pub fn last_error(&self) -> Option<String> {
-        self.shared.last_error.lock().unwrap().clone()
+        self.shared.last_error.lock().clone()
     }
 
     // ---- Inspector (Phase B) ----
@@ -790,12 +791,12 @@ impl MsfsAdapter {
     /// Re-registration of SimConnect data definition #3 happens on the
     /// next worker tick (asynchronous, sub-second).
     pub fn add_watch(&self, name: String, unit: String, kind: WatchKind) -> u32 {
-        let mut g = self.shared.inspector.lock().unwrap();
+        let mut g = self.shared.inspector.lock();
         g.add(name, unit, kind)
     }
 
     pub fn remove_watch(&self, id: u32) {
-        let mut g = self.shared.inspector.lock().unwrap();
+        let mut g = self.shared.inspector.lock();
         g.remove(id);
     }
 
@@ -803,7 +804,7 @@ impl MsfsAdapter {
     /// hold the inspector mutex). Each entry carries its latest value
     /// — `value: None` means we haven't received a tick yet.
     pub fn watches(&self) -> Vec<InspectorWatch> {
-        self.shared.inspector.lock().unwrap().watches.clone()
+        self.shared.inspector.lock().watches.clone()
     }
 }
 
@@ -871,26 +872,26 @@ fn worker_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>, kind: SimKind) {
                 // the old KSEA position from before the load. Live
                 // bug 2026-05-03. State stays "Disconnected" until
                 // the next snapshot lands.
-                *shared.snapshot.lock().unwrap() = None;
-                *shared.touchdown.lock().unwrap() = None;
+                *shared.snapshot.lock() = None;
+                *shared.touchdown.lock() = None;
                 // PMDG state too — variant + raw + subscribed flag
                 // all reset so the next dispatch session re-detects
                 // and re-subscribes from scratch.
-                *shared.pmdg.lock().unwrap() = PmdgSharedState::default();
-                *shared.state.lock().unwrap() = ConnectionState::Connecting;
+                *shared.pmdg.lock() = PmdgSharedState::default();
+                *shared.state.lock() = ConnectionState::Connecting;
             }
             Err(e) => {
                 let msg = format!("SimConnect_Open failed: {e}");
                 set_error(&shared, msg);
-                *shared.state.lock().unwrap() = ConnectionState::Connecting;
+                *shared.state.lock() = ConnectionState::Connecting;
             }
         }
         sleep_or_stop(&stop, Duration::from_secs(2));
     }
-    *shared.state.lock().unwrap() = ConnectionState::Disconnected;
-    *shared.snapshot.lock().unwrap() = None;
-    *shared.touchdown.lock().unwrap() = None;
-    *shared.pmdg.lock().unwrap() = PmdgSharedState::default();
+    *shared.state.lock() = ConnectionState::Disconnected;
+    *shared.snapshot.lock() = None;
+    *shared.touchdown.lock() = None;
+    *shared.pmdg.lock() = PmdgSharedState::default();
 }
 
 fn run_dispatch(
@@ -905,8 +906,8 @@ fn run_dispatch(
     // Force inspector re-registration after a reconnect — the new
     // SimConnect handle starts with an empty definition table even
     // if the user already populated the watchlist before the drop.
-    if !shared.inspector.lock().unwrap().watches.is_empty() {
-        shared.inspector.lock().unwrap().dirty = true;
+    if !shared.inspector.lock().watches.is_empty() {
+        shared.inspector.lock().dirty = true;
     }
 
     while !stop.load(Ordering::Relaxed) {
@@ -914,11 +915,11 @@ fn run_dispatch(
         // mutated it. The dirty flag avoids hot-looping the
         // SimConnect call in the steady state.
         let needs_inspector_register = {
-            let g = shared.inspector.lock().unwrap();
+            let g = shared.inspector.lock();
             g.dirty
         };
         if needs_inspector_register {
-            let watches = shared.inspector.lock().unwrap().watches.clone();
+            let watches = shared.inspector.lock().watches.clone();
             match conn.register_inspector(&watches) {
                 Ok(()) => {
                     if !watches.is_empty() {
@@ -926,7 +927,7 @@ fn run_dispatch(
                             tracing::warn!(error = %e, "request_inspector failed");
                         }
                     }
-                    shared.inspector.lock().unwrap().dirty = false;
+                    shared.inspector.lock().dirty = false;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "register_inspector failed; will retry");
@@ -990,7 +991,7 @@ fn run_dispatch(
                             };
                             // Merge in the most recent touchdown sample
                             // so consumers see a unified snapshot.
-                            if let Some(td) = *shared.touchdown.lock().unwrap() {
+                            if let Some(td) = *shared.touchdown.lock() {
                                 if !td.is_uninitialised() {
                                     // PLANE TOUCHDOWN NORMAL VELOCITY in MSFS
                                     // returns the touchdown impact velocity as
@@ -1046,19 +1047,19 @@ fn run_dispatch(
                             // Mirrors how the X-Plane listener handles
                             // this exact case.
                             {
-                                let mut s = shared.state.lock().unwrap();
+                                let mut s = shared.state.lock();
                                 if *s != ConnectionState::Connected {
                                     *s = ConnectionState::Connected;
                                 }
                             }
-                            *shared.snapshot.lock().unwrap() = Some(snap);
+                            *shared.snapshot.lock() = Some(snap);
                         }
                         TOUCHDOWN_REQUEST_ID => {
                             let td = Touchdown::from_block(&bytes);
-                            *shared.touchdown.lock().unwrap() = Some(td);
+                            *shared.touchdown.lock() = Some(td);
                         }
                         INSPECTOR_REQUEST_ID => {
-                            shared.inspector.lock().unwrap().ingest(&bytes);
+                            shared.inspector.lock().ingest(&bytes);
                         }
                         other => {
                             tracing::trace!(request_id = other, "unknown SimObjectData request_id");
@@ -1099,7 +1100,7 @@ fn run_dispatch(
                                     );
                                     Box::from_raw(Box::into_raw(b) as *mut crate::pmdg::ng3::Pmdg738RawData)
                                 };
-                                let mut g = shared.pmdg.lock().unwrap();
+                                let mut g = shared.pmdg.lock();
                                 g.ng3_raw = Some(raw);
                                 g.last_packet_at = Some(Instant::now());
                             }
@@ -1126,7 +1127,7 @@ fn run_dispatch(
                                         Box::into_raw(b) as *mut crate::pmdg::x777::Pmdg777XRawData,
                                     )
                                 };
-                                let mut g = shared.pmdg.lock().unwrap();
+                                let mut g = shared.pmdg.lock();
                                 g.x777_raw = Some(raw);
                                 g.last_packet_at = Some(Instant::now());
                             }
@@ -1143,7 +1144,7 @@ fn run_dispatch(
                     if request_id == AIRCRAFT_LOADED_REQUEST_ID {
                         let detected =
                             crate::pmdg::PmdgVariant::detect_from_air_path(&air_path);
-                        let mut g = shared.pmdg.lock().unwrap();
+                        let mut g = shared.pmdg.lock();
                         if g.variant != detected {
                             tracing::info!(
                                 ?detected,
@@ -1219,7 +1220,7 @@ fn run_dispatch(
         // dispatch loop. Subscribed flag prevents redundant
         // re-subscriptions on every iteration.
         let pmdg_action = {
-            let g = shared.pmdg.lock().unwrap();
+            let g = shared.pmdg.lock();
             if !g.subscribed {
                 g.variant
             } else {
@@ -1236,7 +1237,7 @@ fn run_dispatch(
                         );
                     } else {
                         tracing::info!("PMDG NG3 ClientData subscription registered");
-                        shared.pmdg.lock().unwrap().subscribed = true;
+                        shared.pmdg.lock().subscribed = true;
                     }
                 }
                 crate::pmdg::PmdgVariant::X777 => {
@@ -1247,7 +1248,7 @@ fn run_dispatch(
                         );
                     } else {
                         tracing::info!("PMDG 777X ClientData subscription registered");
-                        shared.pmdg.lock().unwrap().subscribed = true;
+                        shared.pmdg.lock().subscribed = true;
                     }
                 }
             }
@@ -1276,7 +1277,7 @@ fn log_first_snapshot_diagnostics(snap: &SimSnapshot) {
 }
 
 fn set_error(shared: &Arc<Shared>, msg: String) {
-    *shared.last_error.lock().unwrap() = Some(msg);
+    *shared.last_error.lock() = Some(msg);
 }
 
 fn sleep_or_stop(stop: &Arc<AtomicBool>, dur: Duration) {

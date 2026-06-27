@@ -18,6 +18,9 @@ serde.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# parking_lot: poison-free Mutex for the SimConnect ingest threads — a panic in
+# one ingest thread must not cascade-poison every subsequent lock.
+parking_lot = "0.12"
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
 
 [target.'cfg(target_os = "windows")'.build-dependencies]
