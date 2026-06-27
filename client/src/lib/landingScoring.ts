@@ -125,15 +125,18 @@ export function coachTip(subs: SubScore[]): { sub: SubScore; tip: string } | nul
 
 // ─── Sub-Score-Berechnung ─────────────────────────────────────────
 
-const T_VS_SMOOTH_FPM = 200;
-const T_VS_FIRM_FPM   = 400;
-const T_VS_HARD_FPM   = 600;
-const T_VS_SEVERE_FPM = 1000;
+// Exported single source of truth for the V/S- and G-tone bands. The
+// forensik components (SinkrateForensik / GForceForensik) import these instead
+// of shadowing the literals (Q4, Audit 2026-06-27).
+export const T_VS_SMOOTH_FPM = 200;
+export const T_VS_FIRM_FPM = 400;
+export const T_VS_HARD_FPM = 600;
+export const T_VS_SEVERE_FPM = 1000;
 
-const T_G_SMOOTH = 1.20;
-const T_G_FIRM   = 1.40;
-const T_G_HARD   = 1.70;
-const T_G_SEVERE = 2.10;
+export const T_G_SMOOTH = 1.2;
+export const T_G_FIRM = 1.4;
+export const T_G_HARD = 1.7;
+export const T_G_SEVERE = 2.1;
 
 export function band(points: number): Band {
   if (points >= 75) return "good";

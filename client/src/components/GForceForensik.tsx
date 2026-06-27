@@ -19,6 +19,14 @@
 
 import { useTranslation } from "react-i18next";
 import type { LandingRecord } from "./LandingPanel";
+import {
+  T_G_SMOOTH,
+  T_G_FIRM,
+  T_G_HARD,
+  T_G_SEVERE,
+  T_VS_SMOOTH_FPM,
+  T_VS_FIRM_FPM,
+} from "../lib/landingScoring";
 
 // ───────────────────────────────────────────────────────────────────────────
 // Pure functions — testbar isoliert
@@ -49,10 +57,10 @@ export type Tone = "good" | "neutral" | "warn" | "err" | "err-severe";
 
 export function gTone(g: number | null | undefined): Tone | null {
   if (g == null) return null;
-  if (g < 1.20) return "good";
-  if (g < 1.40) return "neutral";
-  if (g < 1.70) return "warn";
-  if (g < 2.10) return "err";
+  if (g < T_G_SMOOTH) return "good";
+  if (g < T_G_FIRM) return "neutral";
+  if (g < T_G_HARD) return "warn";
+  if (g < T_G_SEVERE) return "err";
   return "err-severe";
 }
 
@@ -78,12 +86,12 @@ export function pickGCoachingTip(args: {
   const force = args.maxGearForceN;
 
   // 1. real_impact: V/S Hard (< -400 fpm) + G high
-  if (vs != null && Math.abs(vs) > 400 && peak != null && peak >= 1.40) {
+  if (vs != null && Math.abs(vs) > T_VS_FIRM_FPM && peak != null && peak >= T_G_FIRM) {
     return "real_impact";
   }
   // 2. sim_strut: V/S smooth (>= -200 fpm) but G high + Strut-Force-Anstieg
   //    → klassische Sim-Strut-Compression-Spike
-  if (vs != null && Math.abs(vs) < 200 && peak != null && peak >= 1.70
+  if (vs != null && Math.abs(vs) < T_VS_SMOOTH_FPM && peak != null && peak >= T_G_HARD
       && force != null && force > 5000) {
     return "sim_strut";
   }
@@ -94,9 +102,9 @@ export function pickGCoachingTip(args: {
   }
   // 4. airborne_spike: G hoch aber Strut-Force unauffaellig
   //    → Frame-Stutter oder Sample-Noise, kein echter Impact
-  if (peak != null && peak >= 1.70
+  if (peak != null && peak >= T_G_HARD
       && (force == null || force < 2000)
-      && median != null && median < 1.20) {
+      && median != null && median < T_G_SMOOTH) {
     return "airborne_spike";
   }
   // 5. clean: alles smooth

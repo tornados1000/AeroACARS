@@ -18,6 +18,12 @@
 
 import { useTranslation } from "react-i18next";
 import type { LandingRecord, LandingProfilePoint } from "./LandingPanel";
+import {
+  T_VS_SMOOTH_FPM,
+  T_VS_FIRM_FPM,
+  T_VS_HARD_FPM,
+  T_VS_SEVERE_FPM,
+} from "../lib/landingScoring";
 
 // ───────────────────────────────────────────────────────────────────────────
 // Pure functions — gut testbar isoliert von React
@@ -136,17 +142,18 @@ export function pickCoachingTip(args: {
   return "clean";
 }
 
-/// Tone-Bands aus landingScoring.ts:128-131 (T_VS_*-Konstanten).
-/// Spec §4.4. Niemals diese Schwellen verschieben — sind SoT fuer Sub-Score.
+/// Tone-Bands = die exportierten T_VS_*-Konstanten aus landingScoring (SoT für
+/// den Sub-Score). Spec §4.4 — niemals divergieren lassen (Q4: ehemals
+/// hartcodierte 200/400/600/1000 hier, jetzt importiert).
 export type Tone = "good" | "neutral" | "warn" | "err" | "err-severe";
 
 export function vsTone(vs: number | null | undefined): Tone | null {
   if (vs == null) return null;
   const abs = Math.abs(vs);
-  if (abs < 200) return "good";
-  if (abs < 400) return "neutral";
-  if (abs < 600) return "warn";
-  if (abs < 1000) return "err";
+  if (abs < T_VS_SMOOTH_FPM) return "good";
+  if (abs < T_VS_FIRM_FPM) return "neutral";
+  if (abs < T_VS_HARD_FPM) return "warn";
+  if (abs < T_VS_SEVERE_FPM) return "err";
   return "err-severe";
 }
 
