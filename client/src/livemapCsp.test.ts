@@ -50,11 +50,21 @@ describe("Live-Map CSP (paketierte App)", () => {
     expect(workerSources()).toContain("blob:");
   });
 
-  it("connect-src erlaubt die CARTO-Basemap (https:)", () => {
-    expect(directive("connect-src")).toContain("https:");
+  // C3c (Audit 2026-06-27): bare `https:` wurde durch eine explizite Host-
+  // Allowlist ersetzt (XSS-Exfil-Fläche). Der Guard prüft jetzt, dass die
+  // Karten-Hosts konkret erlaubt BLEIBEN — und dass das Wildcard NICHT
+  // zurückkommt.
+  it("connect-src erlaubt CARTO-Basemap + Esri-Satellit (explizite Allowlist)", () => {
+    const src = directive("connect-src");
+    expect(src).toContain("https://*.cartocdn.com");
+    expect(src).toContain("https://server.arcgisonline.com");
+    expect(src).not.toContain("https:");
   });
 
-  it("img-src erlaubt Raster-Kacheln/Sprites (https:)", () => {
-    expect(directive("img-src")).toContain("https:");
+  it("img-src erlaubt Raster-Kacheln/Sprites (CARTO + Esri, kein Wildcard)", () => {
+    const src = directive("img-src");
+    expect(src).toContain("https://*.cartocdn.com");
+    expect(src).toContain("https://server.arcgisonline.com");
+    expect(src).not.toContain("https:");
   });
 });
