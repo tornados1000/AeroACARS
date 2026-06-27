@@ -5075,7 +5075,10 @@ fn compute_approach_stability_v2(
     // 6) Stable-Config: Gear+Flaps am 1000-ft-Sample (= aeltester
     //    Sample im Gate, = der mit hoechster Hoehe).
     if let Some(gate_entry) = gate_samples.iter()
-        .max_by(|a, b| height_for(a).partial_cmp(&height_for(b)).unwrap())
+        // NaN-safe: a missing/unreadable SimVar height yields NaN, and
+        // `partial_cmp` returns None on NaN — `.unwrap()` would PANIC mid-scoring.
+        // Treat NaN as Equal (no reorder) instead, like the sort at the IAS path.
+        .max_by(|a, b| height_for(a).partial_cmp(&height_for(b)).unwrap_or(std::cmp::Ordering::Equal))
     {
         let gear_ok = gate_entry.gear_position >= 0.99;
         // v0.12.1 (Stream C LE11): detect an unreadable flaps dataref.
