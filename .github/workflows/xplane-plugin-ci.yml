@@ -30,7 +30,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: windows-latest
+          # v0.18.x: gepinnt auf windows-2022 (statt windows-latest) — GitHub
+          # hat den windows-latest-Runner auf ein neueres Image umgestellt,
+          # auf dem CMake die Generator-Instanz "Visual Studio 17 2022"
+          # nicht mehr findet ("could not find any instance of Visual
+          # Studio", jeder Push seit 05.07.2026 rot). windows-2022 ist das
+          # feste Image mit garantiert VS 2022 — kein schwimmender Alias,
+          # den GitHub uns unter den Fuessen wegziehen kann.
+          - platform: windows-2022
             generator: 'Visual Studio 17 2022'
             cmake_args: '-A x64'
             xpl_name: 'win.xpl'
@@ -75,7 +82,7 @@ jobs:
       # Sanity check: the .xpl must be non-empty and (on platforms where
       # `file` is available) must report as a shared library / DLL.
       - name: Inspect .xpl
-        if: matrix.platform != 'windows-latest'
+        if: matrix.platform != 'windows-2022'
         working-directory: xplane-plugin
         shell: bash
         run: |
