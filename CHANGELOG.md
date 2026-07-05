@@ -4,6 +4,12 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.18.2] — 2026-07-05 · Aircraft-Scan-Nachbesserungen
+
+Vier Fixes direkt aus Pilotenbefunden (Thomas K.): (1) ZIP64-Sentinel-Bug — `.large_file(true)` beim ZIP-Bau ließ den Server (Node/fflate) JEDE Datei fälschlich als ~4 GB lesen, wodurch der komplette Client-Upload-Pfad seit v0.18.0 für JEDE Einreichung fehlschlug (Web-Uploader nicht betroffen); Fix + Byte-Level-Regressionstest gegen den Local-File-Header. (2) X-Plane-Flugzeuge in Kategorie-Ordnern (z. B. "Aircraft/Extra Aircraft/…") wurden von der Ein-Ebenen-Suche nicht gefunden — jetzt eine Ebene tiefer nachgesehen, wenn eine Ebene nicht selbst ein Paket ist. (3) Kein Schutz gegen einen zweiten AeroACARS-Prozess (Minimize-to-Tray + Neustart nach Schlaf/Wach-Zyklus) → doppelte Phase-/Touchdown-Zeilen im PIREP; `tauri-plugin-single-instance` ergänzt. (4) AGL-/Gelände-Linie im Logbuch-Höhenprofil von der MSL-Linie verdeckt (Zeichenreihenfolge, kein Datenproblem) — behoben. Neu: nativer Ordner-Auswahl-Dialog im Aircraft-Scan-Panel. Details: `docs/release-notes/v0.18.2.md`.
+
+---
+
 ## [v0.18.1] — 2026-07-05 · Aircraft-Scan, Falcon 50 & Zibo 737 (X-Plane)
 
 Neues Aircraft-Scan-Werkzeug (Settings → Aircraft-Scan): geladenes Flugzeug-Add-on direkt einreichen statt den kompletten Community-Ordner hochzuladen, für schnellere Premium-Profil-Entwicklung. Zwei neue Profile: Contrail Falcon 50 (FMA, Autothrottle, Master-/Feuerwarnung) und Zibo/Laminar 737-800 (X-Plane, AP-Modi über `laminar/B738`-Datarefs). Fix: Stillstands-Fallback für Auto-File beim Falcon 50 (klemmender Triebwerkszähler) — bewusst NUR für Flugzeuge mit per Aircraft-Scan bestätigtem Fehler gegatet (`AircraftProfile::engine_count_unreliable`), Dwell 5 min, Parkbremse bleibt Pflicht; kein Fleet-weiter Fallback, damit ein Rollhalt beim Warten auf Rollfreigabe an großen Flughäfen bei keinem anderen Flugzeug fälschlich als Ankunft gilt (QS-Einwand Thomas, v0.18.0 intern verworfen ohne Veröffentlichung). Fix: TakeoffRoll-Rückkante nach Startabbruch. Fix: ICAO-Typ-Ableitung gehärtet (42 % Datenmüll in der internen Erfassung behoben). Neu: GitHub-Actions-CI baut/testet bei jedem Push. Details: `docs/release-notes/v0.18.1.md`.
