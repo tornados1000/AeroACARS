@@ -6,6 +6,7 @@ import type { ActiveFlightInfo, SimKind, SimStatus } from "../types";
 import type { Theme } from "../theme";
 import { SimDebugPanel } from "./SimDebugPanel";
 import { PmdgPremiumPanel } from "./PmdgPremiumPanel";
+import { AircraftScanPanel } from "./AircraftScanPanel";
 import { XPlanePremiumPanel } from "./XPlanePremiumPanel";
 import { OrphanFlightsPanel } from "./OrphanFlightsPanel";
 import { useConfirm } from "./ConfirmDialog";
@@ -534,6 +535,7 @@ export function SettingsPanel({
           <XPlanePremiumPanel
             simState={simStatus?.state ?? "disconnected"}
           />
+          <AircraftScanPanel />
         </>
       )}
 

@@ -1714,5 +1714,27 @@
     "surface_grs": "Erba",
     "surface_dirt": "Terra",
     "surface_turf": "Manto erboso"
+  },
+  "ascan": {
+    "title": "🔬 Invia aereo per l'analisi (Aircraft Scan)",
+    "hint": "Un nuovo add-on che AeroACARS non riconosce ancora bene? Inviaci i file di configurazione e codice dell'aereo (solo cfg/json/xml/js/wasm — mai texture, modelli o suoni). Prima dell'invio vedi l'elenco esatto dei file; puoi consultare ed eliminare il tuo invio su live.kant.ovh/aircraft in qualsiasi momento.",
+    "find_button": "Cerca aerei nella cartella Community",
+    "searching": "Ricerca…",
+    "manual_dir_label": "Opzionale: percorso Community/add-on personalizzato",
+    "none_found": "Nessun add-on aereo trovato. MSFS è installato? Altrimenti inserisci il percorso manualmente.",
+    "pick_hint": "Trovati {{count}} aerei — quale analizzare?",
+    "back": "Indietro",
+    "collecting": "Scansione di {{title}}…",
+    "files": "file",
+    "transparency": "Esattamente questi file — e nessun altro — verranno trasferiti.",
+    "skipped_large": "Saltati (troppo grandi)",
+    "send_button": "D'accordo — invia e analizza",
+    "cancel": "Annulla",
+    "sending": "Invio di {{title}} a live.kant.ovh…",
+    "done": "{{title}} è stato analizzato",
+    "done_stats": "{{lvars}} candidati LVar trovati · {{size}} trasferiti",
+    "stub_warning": "Nota: i sistemi di questo add-on girano probabilmente in un processo esterno — l'analisi statica trova solo una parte. Al resto pensiamo noi.",
+    "see_web": "I tuoi invii (incl. elenco file ed eliminazione):",
+    "again": "Invia un altro aereo"
   }
 }

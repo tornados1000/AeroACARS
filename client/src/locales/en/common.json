@@ -1714,5 +1714,27 @@
     "surface_grs": "Grass",
     "surface_dirt": "Dirt",
     "surface_turf": "Turf"
+  },
+  "ascan": {
+    "title": "🔬 Submit aircraft for analysis (Aircraft Scan)",
+    "hint": "Got a new add-on AeroACARS doesn't recognise properly yet? Send us the aircraft's configuration and code files (cfg/json/xml/js/wasm only — never textures, models or sounds). You'll see the exact file list before sending; you can review and delete your submission at live.kant.ovh/aircraft at any time.",
+    "find_button": "Search Community folder for aircraft",
+    "searching": "Searching…",
+    "manual_dir_label": "Optional: custom Community/add-on path (e.g. addon linker)",
+    "none_found": "No aircraft add-ons found. Is MSFS installed? Otherwise enter the path manually below.",
+    "pick_hint": "Found {{count}} aircraft — which one should be analysed?",
+    "back": "Back",
+    "collecting": "Scanning {{title}} for analysable files…",
+    "files": "files",
+    "transparency": "Exactly these files — and no others — will be transferred.",
+    "skipped_large": "Skipped (too large)",
+    "send_button": "Agree — send & analyse",
+    "cancel": "Cancel",
+    "sending": "Sending {{title}} to live.kant.ovh…",
+    "done": "{{title}} has been analysed",
+    "done_stats": "{{lvars}} LVar candidates found · {{size}} transferred",
+    "stub_warning": "Note: this add-on's systems likely run in an external process — static analysis only finds part of the data. We'll take care of the rest.",
+    "see_web": "Your submissions (incl. file list and deletion):",
+    "again": "Submit another aircraft"
   }
 }

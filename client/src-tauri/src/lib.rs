@@ -49,6 +49,7 @@ pub mod phase_v2;
 // React SPA + bridges every safe Tauri command over HTTP/WS to a tablet or
 // second PC on the local network, PIN-gated. Lives entirely in `src/remote/`.
 mod remote;
+mod aircraft_scan;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -78,6 +79,12 @@ use tracing_subscriber::EnvFilter;
 use sim_msfs::MsfsAdapter;
 
 const KEYRING_ACCOUNT: &str = "primary";
+
+/// Aircraft-Scan (aircraft_scan.rs): phpVMS-API-Key aus dem Keyring —
+/// derselbe Trust-Anker wie Login/Provisioning.
+pub(crate) fn secrets_load_phpvms_key() -> Option<String> {
+    secrets::load_api_key(KEYRING_ACCOUNT).ok().flatten()
+}
 const SITE_CONFIG_FILE: &str = "site.json";
 const SIM_CONFIG_FILE: &str = "sim.json";
 /// File holding the current in-progress flight, written on flight_start and
@@ -27626,6 +27633,7 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
         .manage(app_state)
+        .manage(aircraft_scan::AircraftScanState::default())
         .on_window_event(|window, event| {
             // CloseRequested fires when the user clicks the red X
             // (Mac) or the title-bar X (Win). When the
@@ -27867,6 +27875,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             app_info,
+            aircraft_scan::ascan_list_aircraft,
+            aircraft_scan::ascan_collect,
+            aircraft_scan::ascan_submit,
             phpvms_login,
             phpvms_logout,
             phpvms_load_session,
