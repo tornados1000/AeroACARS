@@ -1300,6 +1300,19 @@ struct ActiveFlight {
     /// streamer_spawned). Wird im worker-loop selbst gesetzt damit
     /// nicht mehrere parallele Worker laufen.
     phpvms_worker_spawned: AtomicBool,
+    /// v0.18.x: Guard fuer `spawn_touchdown_sampler` (analog zu
+    /// streamer_spawned/phpvms_worker_spawned). Fehlte bisher — `flight_
+    /// resume_confirm` ist ueber die LAN-Fernbedienung (remote/bridge.rs)
+    /// erreichbar, und der Frontend-Doppelklick-Schutz (`confirmingRef` in
+    /// ResumeFlightBanner.tsx) lebt nur im Hauptfenster, NICHT im separaten
+    /// React-Baum der Remote-Weboberflaeche auf einem Tablet/2. PC. Ein
+    /// Pilot mit aktivierter Fernbedienung (Thomas K., 05.07.2026) haette
+    /// so zwei parallele Touchdown-Sampler fuer denselben Flug bekommen
+    /// koennen — jeder mit eigenem lokalem `prev_in_air`-Zustand, beide
+    /// schreiben unkoordiniert in dieselben `stats`-Felder (peak_vs_fpm,
+    /// sampler_touchdown_at, …). Ohne diesen Guard waere das der einzige
+    /// der drei Resume-Spawns ohne Schutz geblieben.
+    touchdown_sampler_spawned: AtomicBool,
     /// v0.6.2 — Connection-Health-State zum phpVMS-Server. Vom phpVMS-
     /// Worker gesetzt nach jedem POST:
     ///   - 0 = Live (letzter POST war Erfolg)
@@ -8763,6 +8776,7 @@ async fn flight_adopt(
         cancelled_remotely: AtomicBool::new(false),
         position_outbox: Mutex::new(std::collections::VecDeque::new()),
         phpvms_worker_spawned: AtomicBool::new(false),
+        touchdown_sampler_spawned: AtomicBool::new(false),
         connection_state: std::sync::atomic::AtomicU8::new(CONN_STATE_LIVE),
         // v0.8.0: Navdata-Cache startet leer — wird von
         // `fetch_navdata_for_flight` (Slice B) parallel beim Flugstart
@@ -9422,6 +9436,7 @@ async fn flight_start(
         cancelled_remotely: AtomicBool::new(false),
         position_outbox: Mutex::new(std::collections::VecDeque::new()),
         phpvms_worker_spawned: AtomicBool::new(false),
+        touchdown_sampler_spawned: AtomicBool::new(false),
         connection_state: std::sync::atomic::AtomicU8::new(CONN_STATE_LIVE),
         // v0.8.0: Navdata-Cache startet leer — wird von
         // `fetch_navdata_for_flight` (Slice B) parallel beim Flugstart
@@ -10105,6 +10120,7 @@ async fn flight_start_manual(
         cancelled_remotely: AtomicBool::new(false),
         position_outbox: Mutex::new(std::collections::VecDeque::new()),
         phpvms_worker_spawned: AtomicBool::new(false),
+        touchdown_sampler_spawned: AtomicBool::new(false),
         connection_state: std::sync::atomic::AtomicU8::new(CONN_STATE_LIVE),
         // v0.8.0: Navdata-Cache startet leer — wird von
         // `fetch_navdata_for_flight` (Slice B) parallel beim Flugstart
@@ -16877,6 +16893,14 @@ fn open_touchdown_capture_window(stats: &mut FlightStats, now: DateTime<Utc>) {
 }
 
 fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
+    // Guard gegen Doppel-Spawn (mehrere flight_resume etc.) — analog zu
+    // streamer_spawned/phpvms_worker_spawned. Ohne dies koennen zwei
+    // unabhaengige Aufrufer von flight_resume_confirm (z. B. das
+    // Hauptfenster UND ein via LAN-Fernbedienung verbundenes Tablet, siehe
+    // remote/bridge.rs) zwei parallele Sampler fuer denselben Flug starten.
+    if flight.touchdown_sampler_spawned.swap(true, Ordering::SeqCst) {
+        return;
+    }
     tauri::async_runtime::spawn(async move {
         tracing::info!(pirep_id = %flight.pirep_id, "touchdown sampler started");
         // v0.4.4: lokale Edge-Tracking-State.
@@ -26752,6 +26776,7 @@ async fn try_resume_flight(
         cancelled_remotely: AtomicBool::new(false),
         position_outbox: Mutex::new(std::collections::VecDeque::new()),
         phpvms_worker_spawned: AtomicBool::new(false),
+        touchdown_sampler_spawned: AtomicBool::new(false),
         connection_state: std::sync::atomic::AtomicU8::new(CONN_STATE_LIVE),
         // v0.8.0: Navdata-Cache startet leer — wird von
         // `fetch_navdata_for_flight` (Slice B) parallel beim Flugstart
@@ -31997,6 +32022,7 @@ mod touchdown_metadata_stamp_tests {
             cancelled_remotely: AtomicBool::new(false),
             position_outbox: Mutex::new(std::collections::VecDeque::new()),
             phpvms_worker_spawned: AtomicBool::new(false),
+            touchdown_sampler_spawned: AtomicBool::new(false),
             connection_state: std::sync::atomic::AtomicU8::new(CONN_STATE_LIVE),
             navdata: Mutex::new(NavdataCache::default()),
         }
