@@ -451,6 +451,17 @@ const KG_TO_LB: f64 = 2.20462262;
 /// hasn't started yet).
 const ARRIVED_FALLBACK_RADIUS_NM: f64 = 2.0;
 const ARRIVED_FALLBACK_DWELL_SECS: i64 = 30;
+/// v0.17.x (#Premium, Aircraft-Scan): längerer Dwell für den engines-
+/// UNABHÄNGIGEN Stillstands-Fallback (Groundspeed < 1 kt + Parkbremse am
+/// Ziel). Fängt Addons ab, deren `engines_running`-SimVar nach dem Shutdown
+/// klemmt: der Contrail-FA50-Trijet meldet dauerhaft 3 laufende Triebwerke,
+/// sodass der engines-off-Pfad NIE feuert und Auto-File hängt (Michel D.,
+/// D-BETI). Bewusst 4× länger als die 30 s des engines-off-Pfads — ein
+/// kurzer Halt mit laufenden Triebwerken (Warten vor dem Gate) darf nicht als
+/// Ankunft durchgehen; 2 Minuten voll gestanden MIT gesetzter Parkbremse am
+/// Zielflughafen ist dagegen eindeutig eine Ankunft. Addon-agnostisch: hilft
+/// jedem Flieger mit klemmendem Triebwerkszähler, unabhängig von LVars.
+const ARRIVED_STANDSTILL_DWELL_SECS: i64 = 120;
 
 // ---- Touch-and-Go / Go-Around detection (Stage 3) ----
 //
@@ -10612,6 +10623,62 @@ pub fn arrived_fallback_conditions_basic(
     groundspeed_kt: f32,
 ) -> bool {
     on_ground && engines_running == 0 && groundspeed_kt < 1.0
+}
+
+/// v0.17.x (#Premium, Aircraft-Scan): reine Bedingung für den engines-
+/// UNABHÄNGIGEN Stillstands-Fallback (siehe [`ARRIVED_STANDSTILL_DWELL_SECS`]).
+/// Anders als [`arrived_fallback_conditions_basic`] verlangt sie NICHT
+/// `engines_running == 0` — genau dafür ist sie da: Addons, deren
+/// Triebwerkszähler nach dem Shutdown klemmt (Contrail FA50 Trijet bleibt
+/// bei 3), würden sonst nie Auto-File auslösen. Stattdessen: am geplanten
+/// Ziel (`near_planned`), voll gestanden (< 1 kt), Parkbremse gesetzt. Der
+/// Aufrufer koppelt das an den längeren Dwell, damit ein kurzer Halt mit
+/// laufenden Triebwerken (Warten vor dem Gate) nicht als Ankunft durchgeht.
+pub fn arrived_standstill_condition(
+    near_planned: bool,
+    on_ground: bool,
+    groundspeed_kt: f32,
+    parking_brake: bool,
+) -> bool {
+    near_planned && on_ground && groundspeed_kt < 1.0 && parking_brake
+}
+
+#[cfg(test)]
+mod arrived_standstill_tests {
+    use super::arrived_standstill_condition as cond;
+
+    #[test]
+    fn fa50_stuck_engine_count_still_arrives() {
+        // Contrail FA50: am Ziel voll gestanden, Parkbremse gesetzt — der
+        // Stillstands-Pfad greift, obwohl engines_running (hier irrelevant)
+        // klemmen würde. Das ist der Kern des Auto-File-Fixes.
+        assert!(cond(true, true, 0.0, true));
+    }
+
+    #[test]
+    fn requires_parking_brake() {
+        // Ohne Parkbremse NICHT — verhindert Fehlauslösung beim kurzen
+        // Rollhalt am Feld.
+        assert!(!cond(true, true, 0.0, false));
+    }
+
+    #[test]
+    fn requires_stationary() {
+        // Noch in Bewegung (Taxi) → nein.
+        assert!(!cond(true, true, 5.0, true));
+    }
+
+    #[test]
+    fn requires_on_ground() {
+        assert!(!cond(true, false, 0.0, true));
+    }
+
+    #[test]
+    fn requires_near_planned_destination() {
+        // Fernab vom geplanten Ziel läuft der Stillstands-Pfad NICHT — dort
+        // greift stattdessen der strikte engines-off-Divert-Pfad.
+        assert!(!cond(false, true, 0.0, true));
+    }
 }
 
 /// v0.7.5 Phase-Safety Hotfix (Spec §13.9):
@@ -22826,7 +22893,10 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
         // with the same on-ground + stationary + 30 s dwell guards, so a
         // rotors-running intermediate stop can never be mis-filed as a divert
         // (the divert path keeps the strict engines-off requirement).
-        let conditions_basic = if category.is_rotorcraft() && near_planned {
+        // Original engines-off-Pfad (30 s Dwell) inkl. Rotorcraft-Relaxation
+        // (Rotoren laufen oft nach dem Aufsetzen weiter → nur Stillstand am
+        // Ziel gefordert).
+        let engines_off_path = if category.is_rotorcraft() && near_planned {
             snap.on_ground && snap.groundspeed_kt < 1.0
         } else {
             arrived_fallback_conditions_basic(
@@ -22835,10 +22905,32 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                 snap.groundspeed_kt,
             )
         };
+        // v0.17.x (#Premium, Aircraft-Scan): addon-agnostischer Stillstands-
+        // Fallback. Manche Addons klemmen `engines_running` nach dem Shutdown
+        // (Contrail FA50 Trijet: bleibt bei 3 → der engines-off-Pfad feuert
+        // NIE, Auto-File hängt). Ein Flieger, der am Zielflughafen voll steht
+        // (< 1 kt) MIT gesetzter Parkbremse, ist angekommen — unabhängig vom
+        // (falschen) Triebwerkszähler. NUR `near_planned` (der Divert-Pfad
+        // unten behält die strikte engines-off-Bedingung, damit ein
+        // Zwischenstopp mit laufenden Triebwerken nie als Divert fehl-filed
+        // wird); längerer Dwell als Schutz gegen kurzes Parken.
+        let standstill_path = arrived_standstill_condition(
+            near_planned,
+            snap.on_ground,
+            snap.groundspeed_kt,
+            snap.parking_brake,
+        );
+        let conditions_basic = engines_off_path || standstill_path;
         if conditions_basic {
             let pending_at = stats.arrived_fallback_pending_since.get_or_insert(now);
             let elapsed = (now - *pending_at).num_seconds();
-            if elapsed >= ARRIVED_FALLBACK_DWELL_SECS {
+            // engines-off/Rotor: 30 s; reiner Stillstands-Pfad: längerer Dwell.
+            let dwell_needed = if engines_off_path {
+                ARRIVED_FALLBACK_DWELL_SECS
+            } else {
+                ARRIVED_STANDSTILL_DWELL_SECS
+            };
+            if elapsed >= dwell_needed {
                 // Two paths to Arrived from here:
                 //
                 //   1. near_planned    → normal arrival, original fallback behaviour
