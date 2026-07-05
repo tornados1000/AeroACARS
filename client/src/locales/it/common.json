@@ -1717,7 +1717,7 @@
   },
   "ascan": {
     "title": "🔬 Invia aereo per l'analisi (Aircraft Scan)",
-    "hint": "Un nuovo add-on che AeroACARS non riconosce ancora bene? Inviaci i file di configurazione e codice dell'aereo (solo cfg/json/xml/js/wasm — mai texture, modelli o suoni). Prima dell'invio vedi l'elenco esatto dei file. Puoi eliminare i tuoi dati (upload, elenco file, riferimento personale) su live.kant.ovh/aircraft in qualsiasi momento — resta solo il report tecnico anonimizzato.",
+    "hint": "Un nuovo add-on che AeroACARS non riconosce ancora bene? Inviaci i file di configurazione e codice dell'aereo (MSFS: cfg/json/xml/js/wasm · X-Plane: acf/lua/xpl — mai texture, modelli o suoni). Prima dell'invio vedi l'elenco esatto dei file. Puoi eliminare i tuoi dati (upload, elenco file, riferimento personale) su live.kant.ovh/aircraft in qualsiasi momento — resta solo il report tecnico anonimizzato.",
     "find_button": "Cerca aerei nella cartella Community",
     "searching": "Ricerca…",
     "manual_dir_label": "Opzionale: percorso Community/add-on personalizzato",
