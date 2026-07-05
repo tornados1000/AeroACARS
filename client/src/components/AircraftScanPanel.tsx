@@ -1,11 +1,12 @@
 // Aircraft-Scan — "Flugzeug zur Analyse einreichen" (Settings → Plugins).
 //
 // Gegenstueck zum Web-Tool auf https://live.kant.ovh/aircraft/: der Client
-// findet die MSFS-Community-Ordner selbst (UserCfg.opt), listet die
-// Flugzeug-Pakete, zeigt VOR dem Senden die exakte Dateiliste (DSGVO-
-// Transparenz — nur cfg/json/xml/js + panel-WASM, nie Texturen/Modelle/
-// Sounds) und schickt den gefilterten Auszug an live.kant.ovh. Die
-// Einreichung erscheint dort unter "Meine Einreichungen".
+// findet MSFS-Community-Ordner (UserCfg.opt) UND X-Plane-Aircraft-Ordner
+// (x-plane_install_*.txt) selbst, listet die Flugzeug-Pakete, zeigt VOR dem
+// Senden die exakte Dateiliste (DSGVO-Transparenz — nur cfg/json/xml/js/wasm
+// bzw. acf/lua/xpl, nie Texturen/Modelle/Sounds) und schickt den gefilterten
+// Auszug an live.kant.ovh. Die Einreichung erscheint dort unter "Meine
+// Einreichungen".
 
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -126,7 +127,7 @@ export function AircraftScanPanel() {
             <input
               type="text"
               value={manualDir}
-              placeholder="D:\\MSFS\\Community"
+              placeholder={t("ascan.manual_dir_placeholder")}
               onChange={(e) => setManualDir(e.target.value)}
             />
           </label>

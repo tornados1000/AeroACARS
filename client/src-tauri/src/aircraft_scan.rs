@@ -431,38 +431,46 @@ pub async fn ascan_list_aircraft(
         roots
     };
 
-    let scanned = tauri::async_runtime::spawn_blocking(move || {
-        let mut packages: Vec<ScanPackage> = Vec::new();
-        let mut found: Vec<FoundAircraft> = Vec::new();
-        for (root, label) in &roots {
-            let Ok(entries) = std::fs::read_dir(root) else { continue };
-            let mut dirs: Vec<_> = entries
-                .filter_map(|e| e.ok())
-                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-                .collect();
-            dirs.sort_by_key(|e| e.file_name());
-            for d in dirs {
-                let pkg_dir = d.path();
-                // Unterordner als Paket? MSFS-manifest.json ODER X-Plane-.acf.
-                if let Some((title, creator)) = detect_aircraft(&pkg_dir) {
-                    let folder = d.file_name().to_string_lossy().to_string();
-                    found.push(FoundAircraft {
-                        index: packages.len(),
-                        folder: folder.clone(),
-                        title,
-                        creator,
-                        source_dir: format!("{} — {}", label, root.display()),
-                    });
-                    packages.push(ScanPackage { dir: pkg_dir, folder });
-                }
-            }
-            // Root selbst als Paket (manual_dir zeigt direkt auf EIN Flugzeug,
-            // egal wo — MSFS-manifest.json ODER X-Plane-.acf).
-            if let Some((title, creator)) = detect_aircraft(root) {
-                let folder = root
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "package".to_string());
+    let (packages, found) = tauri::async_runtime::spawn_blocking(move || scan_roots(&roots))
+        .await
+        .map_err(|e| format!("Scan-Task abgebrochen: {e}"))?;
+
+    *state.packages.lock().map_err(|_| "state poisoned".to_string())? = packages;
+    Ok(found)
+}
+
+/// Sortierte, direkte Unterordner von `dir` (best-effort — Lesefehler ergeben
+/// eine leere Liste statt eines Absturzes).
+fn sorted_subdirs(dir: &Path) -> Vec<std::fs::DirEntry> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut dirs: Vec<_> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .collect();
+    dirs.sort_by_key(|e| e.file_name());
+    dirs
+}
+
+/// Kern der Flugzeug-Suche — bewusst reine Funktion (kein Tauri-State/async),
+/// damit sie mit echten Tempdir-Fixtures testbar ist statt nur "sieht richtig
+/// aus". Prüft für jede Wurzel: die Wurzel selbst als Paket (manual_dir zeigt
+/// direkt auf EIN Flugzeug), jeden direkten Unterordner als Paket (MSFS-
+/// Community: flach), und — wenn ein Unterordner selbst KEIN Paket ist — eine
+/// Ebene tiefer (X-Plane gruppiert Flugzeuge in Kategorie-Ordnern, z. B.
+/// "Aircraft/Laminar Research/Cessna 172SP/*.acf",
+/// "Aircraft/Extra Aircraft/Zibo B738/*.acf" — der Kategorie-Ordner selbst hat
+/// keine .acf, das eigentliche Flugzeug sonst nie gefunden; Live-Befund
+/// Thomas K., 05.07.2026: "mein X-Plane-Ordner wird nicht gefunden"). MSFS-
+/// Community-Ordner sind flach — für sie ist der zweite Blick ein billiges,
+/// folgenloses Read-Dir auf Ordner, die ohnehin schon kein Paket waren.
+fn scan_roots(roots: &[(PathBuf, String)]) -> (Vec<ScanPackage>, Vec<FoundAircraft>) {
+    let mut packages: Vec<ScanPackage> = Vec::new();
+    let mut found: Vec<FoundAircraft> = Vec::new();
+    for (root, label) in roots {
+        for d in sorted_subdirs(root) {
+            let pkg_dir = d.path();
+            if let Some((title, creator)) = detect_aircraft(&pkg_dir) {
+                let folder = d.file_name().to_string_lossy().to_string();
                 found.push(FoundAircraft {
                     index: packages.len(),
                     folder: folder.clone(),
@@ -470,20 +478,50 @@ pub async fn ascan_list_aircraft(
                     creator,
                     source_dir: format!("{} — {}", label, root.display()),
                 });
-                packages.push(ScanPackage { dir: root.clone(), folder });
+                packages.push(ScanPackage { dir: pkg_dir, folder });
+                continue;
+            }
+            for sd in sorted_subdirs(&pkg_dir) {
+                let sub_pkg_dir = sd.path();
+                if let Some((title, creator)) = detect_aircraft(&sub_pkg_dir) {
+                    let folder = sd.file_name().to_string_lossy().to_string();
+                    found.push(FoundAircraft {
+                        index: packages.len(),
+                        folder: folder.clone(),
+                        title,
+                        creator,
+                        source_dir: format!(
+                            "{} — {}/{}",
+                            label,
+                            root.display(),
+                            d.file_name().to_string_lossy()
+                        ),
+                    });
+                    packages.push(ScanPackage { dir: sub_pkg_dir, folder });
+                }
             }
         }
-        found.sort_by_key(|a| a.title.to_lowercase());
-        // Indizes nach Sortierung NICHT umschreiben — index zeigt in die
-        // packages-Liste, nicht in die Anzeige-Reihenfolge.
-        (packages, found)
-    })
-    .await
-    .map_err(|e| format!("Scan-Task abgebrochen: {e}"))?;
-
-    let (packages, found) = scanned;
-    *state.packages.lock().map_err(|_| "state poisoned".to_string())? = packages;
-    Ok(found)
+        // Root selbst als Paket (manual_dir zeigt direkt auf EIN Flugzeug,
+        // egal wo — MSFS-manifest.json ODER X-Plane-.acf).
+        if let Some((title, creator)) = detect_aircraft(root) {
+            let folder = root
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "package".to_string());
+            found.push(FoundAircraft {
+                index: packages.len(),
+                folder: folder.clone(),
+                title,
+                creator,
+                source_dir: format!("{} — {}", label, root.display()),
+            });
+            packages.push(ScanPackage { dir: root.clone(), folder });
+        }
+    }
+    found.sort_by_key(|a| a.title.to_lowercase());
+    // Indizes nach Sortierung NICHT umschreiben — index zeigt in die
+    // packages-Liste, nicht in die Anzeige-Reihenfolge.
+    (packages, found)
 }
 
 /// Exakte Dateiliste des gewaehlten Pakets — wird dem Piloten VOR dem
@@ -652,6 +690,69 @@ mod tests {
         let empty = tmp.join("empty");
         std::fs::create_dir_all(&empty).unwrap();
         assert!(detect_aircraft(&empty).is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn scan_roots_finds_xplane_aircraft_nested_in_category_folder() {
+        // Reproduziert die reale X-Plane-Struktur (Live-Befund Thomas K.,
+        // 05.07.2026): Flugzeuge liegen NICHT flach unter Aircraft/, sondern
+        // in Kategorie-Ordnern — "Aircraft/Laminar Research/Cessna 172SP/*.acf",
+        // "Aircraft/Extra Aircraft/Zibo B738/*.acf". Vor dem Fix fand die
+        // Ein-Ebenen-Suche in diesem Fixture GAR NICHTS.
+        let tmp = std::env::temp_dir().join(format!("ascan-xp-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let cessna = tmp.join("Laminar Research/Cessna 172SP");
+        let zibo = tmp.join("Extra Aircraft/Zibo B738");
+        std::fs::create_dir_all(&cessna).unwrap();
+        std::fs::create_dir_all(&zibo).unwrap();
+        std::fs::write(
+            cessna.join("Cessna_172SP.acf"),
+            "I\n1100 version\nP acf/_name Cessna 172SP\n",
+        )
+        .unwrap();
+        std::fs::write(zibo.join("B738.acf"), "I\n1100 version\nP acf/_name Zibo 737-800X\n").unwrap();
+
+        let roots = vec![(tmp.clone(), "X-Plane (Aircraft-Ordner)".to_string())];
+        let (packages, found) = scan_roots(&roots);
+
+        assert_eq!(found.len(), 2, "beide verschachtelten Flugzeuge muessen gefunden werden");
+        let titles: Vec<&str> = found.iter().map(|a| a.title.as_str()).collect();
+        assert!(titles.contains(&"Cessna 172SP"));
+        assert!(titles.contains(&"Zibo 737-800X"));
+        assert_eq!(packages.len(), 2);
+        // Die gespeicherten Paket-Pfade zeigen auf den ECHTEN Flugzeug-Ordner
+        // (zwei Ebenen tief), nicht auf den Kategorie-Ordner.
+        assert!(packages.iter().any(|p| p.dir == cessna));
+        assert!(packages.iter().any(|p| p.dir == zibo));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn scan_roots_stays_flat_for_msfs_community_folder() {
+        // Gegenprobe: ein flacher MSFS-Community-Ordner (Addon direkt unter
+        // der Wurzel) darf durch die neue zweite Ebene NICHT doppelt gezaehlt
+        // werden — das Addon wird auf Ebene 1 gefunden, Ebene 2 wird fuer
+        // dieses Verzeichnis gar nicht erst versucht.
+        let tmp = std::env::temp_dir().join(format!("ascan-msfs-flat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let addon = tmp.join("some-addon");
+        std::fs::create_dir_all(addon.join("SimObjects/Airplanes/X")).unwrap();
+        std::fs::write(
+            addon.join("manifest.json"),
+            "{\"content_type\":\"AIRCRAFT\",\"title\":\"Some Addon\"}",
+        )
+        .unwrap();
+
+        let roots = vec![(tmp.clone(), "MSFS Community".to_string())];
+        let (packages, found) = scan_roots(&roots);
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].title, "Some Addon");
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].dir, addon);
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
