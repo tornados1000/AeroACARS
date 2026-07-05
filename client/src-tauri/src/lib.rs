@@ -10641,6 +10641,19 @@ pub fn arrived_fallback_conditions_basic(
 /// Ziel (`near_planned`), voll gestanden (< 1 kt), Parkbremse gesetzt. Der
 /// Aufrufer koppelt das an den längeren Dwell, damit ein kurzer Halt mit
 /// laufenden Triebwerken (Warten vor dem Gate) nicht als Ankunft durchgeht.
+///
+/// WICHTIG (v0.17.x QA-Review, NICHT gelockert): die Parkbremsen-Pflicht
+/// bleibt bewusst hart. Der naheliegende Gedanke "was, wenn das Addon auch
+/// die Parkbremse nicht treibt" wurde geprüft und verworfen — ohne die
+/// Bremse ließe sich ein Rollhalt (z. B. Warten auf eine freie Bahn zum
+/// Kreuzen während des Taxi-in, real mehrere Minuten) nicht mehr von einer
+/// echten Ankunft unterscheiden: Position/Geschwindigkeit sind während eines
+/// solchen Halts identisch mit "geparkt". Ob der Contrail FA50 die Stock-
+/// `parking_brake`-SimVar tatsächlich setzt, ist noch NICHT am echten Flug
+/// verifiziert (siehe QA-Notiz) — das ist die richtige Reihenfolge: erst am
+/// Flugdaten-Log von D-BETI bestätigen, dann ggf. gezielt lockern (z. B. über
+/// einen zusätzlichen, wirklich addon-unabhängigen Ankunfts-Indikator statt
+/// über pure Standzeit).
 pub fn arrived_standstill_condition(
     near_planned: bool,
     on_ground: bool,
@@ -10664,8 +10677,9 @@ mod arrived_standstill_tests {
 
     #[test]
     fn requires_parking_brake() {
-        // Ohne Parkbremse NICHT — verhindert Fehlauslösung beim kurzen
-        // Rollhalt am Feld.
+        // Ohne Parkbremse NICHT — verhindert Fehlauslösung z. B. beim Warten
+        // auf eine freie Bahn während des Rollens (Kreuzungshalt, real auch
+        // mehrere Minuten).
         assert!(!cond(true, true, 0.0, false));
     }
 
