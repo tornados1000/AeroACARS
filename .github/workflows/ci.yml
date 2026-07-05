@@ -1,0 +1,105 @@
+name: CI
+
+# Build- + Test-Verifikation VOR dem Release. Ergaenzt release.yml, die
+# nur auf Version-Tags laeuft: hier bekommt JEDER Push / PR eine echte
+# Kompilier- und Testrunde — inklusive des Windows-only MSFS-Adapters
+# (sim-msfs / telemetry.rs mit dem Byte-Level-Lockstep-Test), der auf der
+# Linux-Werkbank nicht kompiliert. Kein Signieren, kein Release-Upload —
+# reine Verifikation. Modelliert nach dem Preflight-Gate + Build-Setup in
+# release.yml und dem Muster aus xplane-plugin-ci.yml.
+#
+# Hintergrund: Die MSFS-Adapter-Crate ist `#[cfg(target_os = "windows")]`
+# — Premium-Profile (FMA/Engine/Config-Mapping + Lockstep) lassen sich nur
+# auf einem Windows-Runner bauen/testen. Ohne diese CI muesste man dafuer
+# einen Release-Tag ausspielen (= ungetesteter Code an Piloten) oder lokal
+# einen Mac nutzen. Diese Datei macht „per Push verifizieren" moeglich.
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - 'client/**'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    paths:
+      - 'client/**'
+      - '.github/workflows/ci.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ─── Windows: der einzige Runner, der den MSFS-Adapter kompiliert ────
+  # sim-msfs (telemetry.rs, Lockstep, from_block-Byte-Tests) ist
+  # windows-only. `cargo test --workspace` baut hier den kompletten
+  # Rust-Baum inkl. sim-msfs (bindgen aus crates.io, SimConnect-SDK
+  # vendored in crates/sim-msfs/ffi/) und faehrt ALLE Tests — das ist die
+  # Verifikation fuer Premium-Profil-Arbeit.
+  rust-windows:
+    name: Rust (Windows — MSFS-Adapter + Lockstep)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: clippy
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: client/src-tauri -> target
+      - name: cargo test (workspace, inkl. sim-msfs)
+        working-directory: client/src-tauri
+        run: cargo test --workspace
+      - name: cargo clippy (informativ — Baseline erst pruefen, dann ggf. -D warnings)
+        working-directory: client/src-tauri
+        run: cargo clippy --workspace --all-targets
+
+  # ─── Ubuntu: schneller Cross-Check (sim-core / sim-xplane) + Frontend ─
+  # Spiegelt das release.yml-Preflight (cargo check --all-targets nach
+  # apt-Deps). Faengt „lokal gruen, remote rot" durch ungestagete Files.
+  rust-linux:
+    name: Rust (Linux — Workspace-Check) + Frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - name: Install Linux build deps (Tauri/GTK — glib etc.)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: client/src-tauri -> target
+      - name: cargo test (sim-core + sim-xplane — laufen auf Linux)
+        working-directory: client/src-tauri
+        run: cargo test -p sim-core -p sim-xplane
+      - name: cargo check (ganzer Workspace)
+        working-directory: client/src-tauri
+        run: cargo check --all-targets
+      - name: Frontend deps
+        working-directory: client
+        run: npm ci
+      - name: Frontend typecheck + Tests
+        working-directory: client
+        run: |
+          npx tsc -p tsconfig.json --noEmit
+          npx vitest run
