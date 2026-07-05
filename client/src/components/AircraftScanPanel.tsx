@@ -133,7 +133,11 @@ export function AircraftScanPanel() {
       {(step.kind === "idle" || step.kind === "listing") && (
         <>
           <button type="button" onClick={list} disabled={step.kind === "listing"}>
-            {step.kind === "listing" ? t("ascan.searching") : t("ascan.find_button")}
+            {step.kind === "listing"
+              ? t("ascan.searching")
+              : manualDir.trim()
+                ? t("ascan.find_button_manual")
+                : t("ascan.find_button")}
           </button>
           <label className="settings__field" style={{ marginTop: 10 }}>
             <span>{t("ascan.manual_dir_label")}</span>

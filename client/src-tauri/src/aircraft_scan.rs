@@ -412,33 +412,42 @@ fn build_zip(pkg_dir: &Path, folder: &str, collected: &CollectResult) -> Result<
 
 // ─── Tauri-Commands ─────────────────────────────────────────────────────
 
+/// Such-Wurzeln fuer `ascan_list_aircraft` bestimmen. Ein manuell
+/// angegebener/gewaehlter Pfad ERSETZT die Auto-Erkennung, statt sie nur zu
+/// ergaenzen — vorher wurde er einfach an die volle MSFS-Community- +
+/// X-Plane-Aircraft-Suche ANGEHAENGT, sodass ein Klick auf "Flugzeuge
+/// suchen" nach dem Waehlen eines einzelnen Ordners trotzdem die GESAMTE
+/// Bibliothek erneut mitscannte, vermischt im selben Ergebnis (Live-Befund
+/// Thomas K., 05.07.2026: "ich waehle einen Ordner, aber der scannt
+/// trotzdem den ganzen Aircraft-Ordner — ich werde wahnsinnig"). Wer bewusst
+/// einen Ordner waehlt, will GENAU DEN gescannt haben, nicht die ganze
+/// Bibliothek obendrauf.
+fn select_roots(manual_dir: Option<&str>) -> Result<Vec<(PathBuf, String)>, String> {
+    if let Some(m) = manual_dir.map(str::trim).filter(|s| !s.is_empty()) {
+        let p = PathBuf::from(m);
+        if !p.is_dir() {
+            return Err(format!("Ordner nicht gefunden: {m}"));
+        }
+        return Ok(vec![(p, "manuell gewaehlt".to_string())]);
+    }
+    Ok(community_dirs()
+        .into_iter()
+        .chain(xplane_aircraft_dirs())
+        .map(|(p, l)| (p, l.to_string()))
+        .collect())
+}
+
 /// Flugzeug-Pakete finden: MSFS-Community-Ordner (aus UserCfg.opt) +
-/// X-Plane-Aircraft-Ordner (aus x-plane_install_*.txt) automatisch, plus
-/// ein optionaler manueller Pfad (funktioniert für beide Sims und für
-/// EINEN direkt gewählten Flugzeug-Ordner, egal wo er liegt). Pro Paket
-/// wird nur die manifest.json (MSFS) bzw. der .acf-Kopf (X-Plane) gelesen.
+/// X-Plane-Aircraft-Ordner (aus x-plane_install_*.txt) automatisch, ODER —
+/// falls angegeben — ausschliesslich der manuelle Pfad (siehe
+/// [`select_roots`]). Pro Paket wird nur die manifest.json (MSFS) bzw. der
+/// .acf-Kopf (X-Plane) gelesen.
 #[tauri::command]
 pub async fn ascan_list_aircraft(
     state: tauri::State<'_, AircraftScanState>,
     manual_dir: Option<String>,
 ) -> Result<Vec<FoundAircraft>, String> {
-    let roots: Vec<(PathBuf, String)> = {
-        let mut roots: Vec<(PathBuf, String)> = community_dirs()
-            .into_iter()
-            .chain(xplane_aircraft_dirs())
-            .map(|(p, l)| (p, l.to_string()))
-            .collect();
-        if let Some(m) = manual_dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            let p = PathBuf::from(m);
-            if !p.is_dir() {
-                return Err(format!("Ordner nicht gefunden: {m}"));
-            }
-            if !roots.iter().any(|(r, _)| r == &p) {
-                roots.push((p, "manuell gewaehlt".to_string()));
-            }
-        }
-        roots
-    };
+    let roots = select_roots(manual_dir.as_deref())?;
 
     let (packages, found) = tauri::async_runtime::spawn_blocking(move || scan_roots(&roots))
         .await
@@ -763,6 +772,35 @@ mod tests {
         assert_eq!(packages[0].dir, addon);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn select_roots_manual_dir_is_exclusive_not_additive() {
+        // Live-Befund Thomas K. (05.07.2026): "ich waehle einen Ordner,
+        // aber der scannt trotzdem den ganzen Aircraft-Ordner". Vorher
+        // wurde ein manueller Pfad an die volle Auto-Erkennung ANGEHAENGT
+        // statt sie zu ersetzen — mit einem manuellen Pfad muss GENAU EINE
+        // Wurzel herauskommen, keine zusaetzlichen Auto-Erkennungs-Roots
+        // (auf dieser Linux-Testumgebung waeren die zwar ohnehin leer, das
+        // ist aber Zufall der Umgebung, nicht der Beweis — deshalb pruefen
+        // wir die Laenge explizit statt nur "enthaelt X").
+        let tmp = std::env::temp_dir().join(format!("ascan-manual-exclusive-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let roots = select_roots(Some(tmp.to_str().unwrap())).unwrap();
+        assert_eq!(roots.len(), 1, "manueller Pfad muss die EINZIGE Wurzel sein, nicht eine zusaetzliche");
+        assert_eq!(roots[0].0, tmp);
+        assert_eq!(roots[0].1, "manuell gewaehlt");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn select_roots_rejects_missing_manual_dir() {
+        let missing = std::env::temp_dir().join("ascan-does-not-exist-xyz");
+        let _ = std::fs::remove_dir_all(&missing);
+        assert!(select_roots(Some(missing.to_str().unwrap())).is_err());
     }
 
     #[test]

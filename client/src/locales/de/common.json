@@ -1719,6 +1719,7 @@
     "title": "🔬 Flugzeug zur Analyse einreichen (Aircraft-Scan)",
     "hint": "Neues Addon, das AeroACARS noch nicht richtig erkennt? Schick uns die Konfigurations- und Code-Dateien des Flugzeugs (MSFS: cfg/json/xml/js/wasm · X-Plane: acf/lua/xpl — nie Texturen, Modelle oder Sounds). Vor dem Senden siehst du die exakte Dateiliste. Deine Daten (Upload, Dateiliste, Personenbezug) kannst du auf live.kant.ovh/aircraft jederzeit löschen — nur der anonymisierte technische Analysebericht bleibt erhalten.",
     "find_button": "Flugzeuge suchen (MSFS Community- & X-Plane Aircraft-Ordner)",
+    "find_button_manual": "Ausgewählten Ordner durchsuchen",
     "searching": "Suche…",
     "manual_dir_label": "Optional: eigener Pfad — auch der Ordner EINES einzelnen Flugzeugs",
     "manual_dir_placeholder": "z. B. D:\\MSFS\\Community oder .../X-Plane 12/Aircraft",
