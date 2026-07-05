@@ -686,6 +686,15 @@ pub const TELEMETRY_FIELDS: &[TelemetryField] = &[
     F::f64("L:EFIS_C86C_FMA_SLOT_LAT_ARMED", "Number"),
     F::f64("L:EFIS_C86C_FMA_SLOT_VERT_ACTIVE", "Number"),
     F::f64("L:EFIS_C86C_FMA_SLOT_VERT_ARMED1", "Number"),
+    // Phase 2b: Autothrottle-Status + Triebwerks-Feuerlampen (→ master_
+    // warning). AUTOTHROTTLE_ACTIVE ist ein sauberes 0/1-Flag; die 3
+    // FIRE-Lampen sind die rote Master-Warning-Klasse (Konvention wie
+    // iFly/FSLabs/PMDG). LOCKSTEP: append-only, gleiche Reihenfolge in
+    // Struct + from_block + Byte-Test.
+    F::f64("L:CTL_FA50_AUTOTHROTTLE_ACTIVE", "Bool"),
+    F::f64("L:CTL_FA50_LIGHT_WARN_FIRE_ENG1", "Bool"),
+    F::f64("L:CTL_FA50_LIGHT_WARN_FIRE_ENG2", "Bool"),
+    F::f64("L:CTL_FA50_LIGHT_WARN_FIRE_ENG3", "Bool"),
 ];
 
 // Helper builders so the table above stays compact.
@@ -1077,6 +1086,11 @@ pub struct Telemetry {
     pub contrail_fma_lat_armed: f64,
     pub contrail_fma_vert_active: f64,
     pub contrail_fma_vert_armed1: f64,
+    // Phase 2b: Autothrottle + Triebwerks-Feuerlampen.
+    pub contrail_autothrottle_active: f64,
+    pub contrail_fire_eng1: f64,
+    pub contrail_fire_eng2: f64,
+    pub contrail_fire_eng3: f64,
 }
 
 // ---- Touchdown sample (separate data definition #2) ----
@@ -1627,6 +1641,11 @@ impl Telemetry {
         pull_f64!(t.contrail_fma_lat_armed);
         pull_f64!(t.contrail_fma_vert_active);
         pull_f64!(t.contrail_fma_vert_armed1);
+        // Phase 2b: Autothrottle + Feuerlampen.
+        pull_f64!(t.contrail_autothrottle_active);
+        pull_f64!(t.contrail_fire_eng1);
+        pull_f64!(t.contrail_fire_eng2);
+        pull_f64!(t.contrail_fire_eng3);
 
         // Silence the unused-assignment warning the last `pull_*!`
         // emits (the macro always advances `off`, but the very last
@@ -2673,6 +2692,10 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
         // LED an = A/THR armed ODER active (wie die echte ATHR-Taste);
         // eine getrennte Engaged-Quelle ist nicht katalogisiert.
         Some(t.fsl_athr_light > FSL_LED_LIT)
+    } else if is_contrail_fa50 {
+        // Contrail FA50 (v0.17.x Phase 2b): `L:CTL_FA50_AUTOTHROTTLE_ACTIVE`
+        // — sauberes 0/1-Flag (Systemseite treibt es echt an/aus).
+        Some(t.contrail_autothrottle_active != 0.0)
     } else {
         None
     };
@@ -2840,6 +2863,18 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
             t.fsl_master_warning != 0.0
                 || t.fsl_engfire1_lt != 0.0
                 || t.fsl_engfire2_lt != 0.0,
+        )
+    } else if is_contrail_fa50 {
+        // Contrail FA50 (v0.17.x Phase 2b): die 3 Triebwerks-Feuerlampen
+        // (`L:CTL_FA50_LIGHT_WARN_FIRE_ENG{1,2,3}`) sind die rote
+        // Master-Warning-Klasse (Trijet — 3 Triebwerke). Konvention wie
+        // iFly/FSLabs/PMDG (Fire → master_warning). Eine separate amber
+        // Master-CAUTION-Quelle ist nicht eindeutig als einzelne LVar
+        // identifiziert → master_caution bleibt None (kein Raten).
+        Some(
+            t.contrail_fire_eng1 != 0.0
+                || t.contrail_fire_eng2 != 0.0
+                || t.contrail_fire_eng3 != 0.0,
         )
     } else {
         None
@@ -3788,7 +3823,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(buf.len(), 2812, "total block size");
+        assert_eq!(buf.len(), 2844, "total block size");
         let t = Telemetry::from_block(&buf);
 
         // Identity / head sentinels.
@@ -3989,6 +4024,11 @@ mod tests {
         assert_eq!(t.contrail_fma_lat_armed, 1272.0); // idx 272
         assert_eq!(t.contrail_fma_vert_active, 1273.0); // idx 273
         assert_eq!(t.contrail_fma_vert_armed1, 1274.0); // idx 274
+        // Phase 2b: Autothrottle + Feuerlampen (idx 275..278).
+        assert_eq!(t.contrail_autothrottle_active, 1275.0); // idx 275
+        assert_eq!(t.contrail_fire_eng1, 1276.0); // idx 276
+        assert_eq!(t.contrail_fire_eng2, 1277.0); // idx 277
+        assert_eq!(t.contrail_fire_eng3, 1278.0); // idx 278
     }
 
     #[test]
@@ -4035,11 +4075,11 @@ mod tests {
             }
         }
         // Drop the whole premium tail after the v0.16.14 FSL group: 14
-        // FSLabs PREMIUM fields (v0.16.20) + 4 Contrail FA50 FMA fields
-        // (v0.17.x) = 18 fields * 8 = 144 bytes. Everything up to the
-        // v0.16.14 FSL group stays intact, the new premium slots parse to
-        // safe defaults.
-        buf.truncate(buf.len() - 144);
+        // FSLabs PREMIUM fields (v0.16.20) + 8 Contrail FA50 fields (v0.17.x:
+        // 4 FMA + 4 Phase-2b) = 22 fields * 8 = 176 bytes. Everything up to
+        // the v0.16.14 FSL group stays intact, the new premium slots parse
+        // to safe defaults.
+        buf.truncate(buf.len() - 176);
         let t = Telemetry::from_block(&buf);
         assert_eq!(t.fsl_autobrake_max_light, 1256.0); // last v0.16.14 field intact
         assert_eq!(t.ifly_autobrake_sw, 1239.0); // v0.16.11 layer intact
@@ -4049,6 +4089,8 @@ mod tests {
         assert_eq!(t.fsl_xpdr_on_off_switch, 0.0);
         assert_eq!(t.contrail_fma_lat_active, 0.0); // Contrail FA50 tail = safe defaults
         assert_eq!(t.contrail_fma_vert_armed1, 0.0);
+        assert_eq!(t.contrail_autothrottle_active, 0.0);
+        assert_eq!(t.contrail_fire_eng3, 0.0);
 
         // v0.16.14: drop the 17 FSLabs tail fields (17*8).
         buf.truncate(buf.len() - 136);
@@ -4392,6 +4434,49 @@ mod tests {
         t.title = "FlyByWire A32NX".into();
         t.atc_model = "A20N".into();
         t
+    }
+
+    fn contrail_telemetry() -> Telemetry {
+        let mut t = Telemetry::default();
+        t.title = "Contrail Falcon 50".into();
+        t.atc_model = "FA50".into();
+        t
+    }
+
+    #[test]
+    fn contrail_premium_mapping() {
+        // FMA aktiv HDG/VS, Autothrottle an, Triebwerk 2 in Flammen.
+        let mut t = contrail_telemetry();
+        t.contrail_fma_lat_active = 4.0; // HDG
+        t.contrail_fma_vert_active = 4.0; // VS
+        t.contrail_autothrottle_active = 1.0;
+        t.contrail_fire_eng2 = 1.0;
+        let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
+        assert_eq!(snap.fma_lateral_mode.as_deref(), Some("HDG"));
+        assert_eq!(snap.fma_vertical_mode.as_deref(), Some("VS"));
+        assert_eq!(snap.autothrottle_on, Some(true));
+        assert_eq!(snap.master_warning, Some(true)); // Feuer = rote Master-Klasse
+        assert_eq!(snap.aircraft_icao.as_deref(), Some("FA50"));
+
+        // Alles ruhig: Autothrottle aus, kein Feuer, kein FMA-Mode.
+        let snap = telemetry_to_snapshot(contrail_telemetry(), Simulator::Msfs2024);
+        assert_eq!(snap.autothrottle_on, Some(false));
+        assert_eq!(snap.master_warning, Some(false));
+        assert_eq!(snap.fma_lateral_mode, None);
+    }
+
+    #[test]
+    fn contrail_premium_lvars_do_not_leak_to_default_profile() {
+        // Ein Nicht-Contrail-Flieger (Default) darf die CTL_FA50-Felder
+        // NICHT als Snapshot-Werte bekommen (Phantom-Schutz wie M4).
+        let mut t = Telemetry::default();
+        t.title = "Asobo Longitude".into();
+        t.atc_model = "LJ60".into();
+        t.contrail_autothrottle_active = 1.0; // toter LVar auf fremdem Flieger
+        t.contrail_fire_eng1 = 1.0;
+        let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
+        assert_eq!(snap.autothrottle_on, None);
+        assert_eq!(snap.master_warning, None);
     }
 
     fn fenix_premium_telemetry() -> Telemetry {
