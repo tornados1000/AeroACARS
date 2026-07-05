@@ -1051,6 +1051,22 @@ pub enum AircraftProfile {
     /// ueber den "FSLabs"-Title-Praefix (alle Titles + Liveries
     /// tragen ihn).
     FsLabsA321,
+    /// v0.17.x (#Premium, Aircraft-Scan): Contrail „Dassault Falcon 50"
+    /// (MSFS, Trijet — 3 Triebwerke). Erster über das Aircraft-Scan-Tool
+    /// (live.kant.ovh/aircraft) analysierte Flieger. Kein Stub — echtes
+    /// `contrailsystem.wasm` (6,58 MB) + offener EFIS-JS-Quellcode.
+    /// Namespace `CTL_FA50_*` (System) + `EFIS_C86C_*` (Avionik).
+    /// Premium-Quellen (verifiziert per Paket-Analyse 2026-07-05):
+    ///   * Engine-Cutoff pro TW: L:CTL_FA50_SYS_ENG1/2/3_CUTOFF
+    ///   * FMA (Number-Enum): L:EFIS_C86C_FMA_SLOT_LAT_ACTIVE/_ARMED,
+    ///     _VERT_ACTIVE/_ARMED1/_ARMED2/_VNV
+    ///   * AP-Master/YD: L:EFIS_C86C_AP_BTN_MASTER_AP/_MASTER_YD
+    ///   * Autothrottle: L:CTL_FA50_AUTOTHROTTLE_ACTIVE
+    /// Detection NUR über Title `contrail`+`falcon`. Der bekannte
+    /// Auto-File-Hänger (Stock engines_running klemmt nach Shutdown auf 3)
+    /// wird primär über den addon-agnostischen Stillstands-Fallback in der
+    /// Phase-FSM abgefangen (siehe lib.rs) — polaritätsunabhängig.
+    ContrailFa50,
 }
 
 impl AircraftProfile {
@@ -1200,6 +1216,17 @@ impl AircraftProfile {
         if t.contains("fslabs") {
             return Self::FsLabsA321;
         }
+        // v0.17.x (#Premium, Aircraft-Scan): Contrail Falcon 50 (Trijet).
+        // Erster über das Aircraft-Scan-Tool eingereichte Flieger. Alle
+        // aircraft.cfg-Titles beginnen mit "Contrail Falcon 50" (Liveries
+        // hängen nur einen Reg-Suffix an, z.B. "… - 9H-DFS"). Detection
+        // über die Title-Marker `contrail` + `falcon` — KEIN bare-FA50-
+        // ICAO-Fallback für die Detection (dieselbe Misdetection-Klasse-
+        // Vorsicht wie beim entfernten A20N-Fallback, QS M4). FA50 dient
+        // nur als Anzeige-`icao_fallback`, nicht zur Erkennung.
+        if t.contains("contrail") && t.contains("falcon") {
+            return Self::ContrailFa50;
+        }
         Self::Default
     }
 
@@ -1229,6 +1256,10 @@ impl AircraftProfile {
             // Aerosoft A340-600: kanonischer Designator A346 (deckt sich
             // mit `icao_type_designator` in der aircraft.cfg).
             Self::AerosoftA346 => Some("A346"),
+            // Contrail Falcon 50: icao_type_designator "FA50" (aus der
+            // aircraft.cfg). Nur Anzeige-Fallback — die Detection läuft
+            // über den Title, nicht über diesen Wert.
+            Self::ContrailFa50 => Some("FA50"),
             _ => None,
         }
     }
@@ -1251,6 +1282,7 @@ impl AircraftProfile {
             Self::TfdiMd11 => "TFDi MD-11",
             Self::IflyMax8 => "iFly 737 MAX 8",
             Self::FsLabsA321 => "FSLabs A321",
+            Self::ContrailFa50 => "Contrail Falcon 50",
         }
     }
 }
@@ -1525,6 +1557,42 @@ mod tests {
         // FSR-Profile fallen — die haben das Knob-LVar nicht.
         let p = AircraftProfile::detect("Asobo Phenom 300", "E55P");
         assert_eq!(p, AircraftProfile::Default);
+    }
+
+    #[test]
+    fn detect_contrail_fa50() {
+        // Reale Titles aus dem Aircraft-Scan-Upload (Michael K, 05.07.2026):
+        // "Contrail Falcon 50", "Contrail Falcon 50 - 17401", "… - 9H-DFS".
+        for title in [
+            "Contrail Falcon 50",
+            "Contrail Falcon 50 - 9H-DFS",
+            "contrail falcon 50 - D-BETI",
+        ] {
+            assert_eq!(
+                AircraftProfile::detect(title, "FA50"),
+                AircraftProfile::ContrailFa50,
+                "title {title:?} sollte ContrailFa50 sein",
+            );
+        }
+        // icao_fallback + label
+        assert_eq!(AircraftProfile::ContrailFa50.icao_fallback(), Some("FA50"));
+        assert_eq!(AircraftProfile::ContrailFa50.label(), "Contrail Falcon 50");
+    }
+
+    #[test]
+    fn detect_bare_fa50_icao_without_contrail_marker_stays_default() {
+        // KEIN bare-FA50-ICAO-Fallback für die Detection (M4-Lektion):
+        // ein fremder/Default-Falcon-50 ohne "contrail"-Marker darf NICHT
+        // das Contrail-Profil (mit dessen CTL_FA50_-LVars) bekommen.
+        assert_eq!(
+            AircraftProfile::detect("Just Flight Falcon 50", "FA50"),
+            AircraftProfile::Default,
+        );
+        // "falcon" allein (z.B. Falcon 900) ohne contrail bleibt Default.
+        assert_eq!(
+            AircraftProfile::detect("Some Falcon 900", "F900"),
+            AircraftProfile::Default,
+        );
     }
 
     #[test]
