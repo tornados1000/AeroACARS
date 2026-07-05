@@ -11,7 +11,7 @@
 //! tail; nothing prior shifts.
 
 use chrono::Utc;
-use sim_core::{clean_atc_model, AircraftProfile, SimSnapshot, Simulator};
+use sim_core::{AircraftProfile, SimSnapshot, Simulator};
 
 const KG_PER_LB: f64 = 0.453_592_37;
 
@@ -3151,12 +3151,16 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
         // liefert. Profile ohne eindeutige Variante (FBW, Default)
         // behalten None und bleiben „?".
         //
-        // v0.12.10: `clean_atc_model` statt des rohen `t.atc_model` —
-        // sonst landet ein Token wie `ATCCOM.AC_MODEL C208.0.text`
-        // (BlackSquare Caravan) ungereinigt in `aircraft_icao`. Liefert
-        // `clean_atc_model` `None` (leer / nicht decodierbar), greift
-        // weiter der Profile-Fallback.
-        aircraft_icao: clean_atc_model(&t.atc_model)
+        // v0.12.10 / v0.17.x: `normalize_icao_type` statt des rohen
+        // `t.atc_model` — sonst landet ein Token wie `ATCCOM.AC_MODEL
+        // C208.0.text` (BlackSquare Caravan) oder ein Marketing-Name
+        // (`A350-900`, `PHENOM 300E`, `HA420`) ungereinigt in
+        // `aircraft_icao` (Health-Report: 42 % der Logs betroffen →
+        // Kategorie-FSM + Profil-Matching liefen blind). normalize_icao_type
+        // reinigt ATCCOM/Vendor-Tags, mappt bekannte Modellnamen auf ICAO
+        // und validiert gegen das ICAO-Muster; bei Junk `None`, dann greift
+        // der Profile-Fallback.
+        aircraft_icao: sim_core::normalize_icao_type(&t.atc_model)
             .or_else(|| profile.icao_fallback().map(str::to_string)),
         aircraft_registration: Some(t.atc_id).filter(|s| !s.is_empty()),
         simulator,

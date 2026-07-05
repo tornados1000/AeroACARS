@@ -1459,6 +1459,62 @@ pub fn clean_atc_model(raw: &str) -> Option<String> {
     Some(upper)
 }
 
+/// v0.17.x (#Premium, Aircraft-Scan / Health-Report): härtet die
+/// `aircraft_icao`-Ableitung. Eine Analyse über 614 VPS-Flight-Logs zeigte,
+/// dass in 42 % der Flüge `aircraft_icao` KEIN sauberer ICAO-Typcode war,
+/// sondern der MSFS-Modell-/ATC-Titel durchsickerte: der Lokalisierungs-
+/// String `ATCCOM.AC_MODEL A320.0.text` (→ A320), Marketing-Namen wie
+/// `A350-900` / `PHENOM 300E` / `HA420` und der Literal-String `None`. Die
+/// kategorie-abhängige FSM (`resolve_category` — Heli/Seaplane/Glider) UND
+/// das Premium-Profil-Matching keyen auf diesem Code; bei Garbage fallen die
+/// Flüge still auf „normales Fixed-Wing" zurück.
+///
+/// Pipeline: [`clean_atc_model`] (ATCCOM-/Vendor-Tag-/Leer-Behandlung) →
+/// Modellname→ICAO-Map (bekannte Marketing-Namen) → ICAO-Muster-Validierung.
+/// Gibt `None` zurück, wenn kein plausibler ICAO herauskommt — der Aufrufer
+/// nutzt dann `profile.icao_fallback()` bzw. lässt das Feld leer, statt einen
+/// Titel als „Typ" zu speichern.
+pub fn normalize_icao_type(raw: &str) -> Option<String> {
+    let candidate = clean_atc_model(raw)?;
+    // Explizite Junk-Werte, die zufällig dem 2-4-Zeichen-Muster ähneln.
+    if matches!(candidate.as_str(), "NONE" | "NULL" | "NA" | "N/A") {
+        return None;
+    }
+    let mapped = map_model_name_to_icao(&candidate).unwrap_or(candidate);
+    if is_plausible_icao(&mapped) {
+        Some(mapped)
+    } else {
+        None
+    }
+}
+
+/// Ein echter ICAO-Typcode (Doc-8643) ist 2-4 alphanumerische Zeichen
+/// (Großbuchstaben + Ziffern). Filtert Modellnamen mit Leer-/Sonderzeichen
+/// und überlange Reste heraus.
+fn is_plausible_icao(s: &str) -> bool {
+    let len = s.len();
+    (2..=4).contains(&len) && s.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+}
+
+/// Bekannte MSFS-Modell-/Marketing-Namen → ICAO-Typcode (Doc-8643).
+/// Quelle: Health-Report-Verteilung über 614 Logs + gängige Designatoren.
+/// `None` = kein bekanntes Mapping (der Aufrufer validiert dann den
+/// Rohkandidaten gegen das ICAO-Muster). Eingabe ist bereits uppercased
+/// (aus [`clean_atc_model`]).
+fn map_model_name_to_icao(s: &str) -> Option<String> {
+    let icao = match s {
+        "PHENOM 300E" | "PHENOM 300" | "EMB-505" | "EMB505" => "E55P",
+        "A350-900" | "A350-900XWB" | "A350" => "A359",
+        "A350-1000" => "A35K",
+        "A340-300" => "A343",
+        "A340-600" => "A346",
+        "A330-900" | "A330-900NEO" | "A330NEO" => "A339",
+        "HA420" | "HONDAJET" | "HONDAJET HA-420" => "HDJT",
+        _ => return None,
+    };
+    Some(icao.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1557,6 +1613,37 @@ mod tests {
         // FSR-Profile fallen — die haben das Knob-LVar nicht.
         let p = AircraftProfile::detect("Asobo Phenom 300", "E55P");
         assert_eq!(p, AircraftProfile::Default);
+    }
+
+    #[test]
+    fn normalize_icao_type_fixes_health_report_garbage() {
+        // Reale Kaputt-Werte aus 614 VPS-Flight-Logs (Health-Report).
+        // ATCCOM-Lokalisierungs-String → sauberer Typcode.
+        assert_eq!(normalize_icao_type("ATCCOM.AC_MODEL A320.0.text").as_deref(), Some("A320"));
+        assert_eq!(normalize_icao_type("ATCCOM.AC_MODEL A321.0.text").as_deref(), Some("A321"));
+        // Marketing-/Modellnamen → ICAO-Designator.
+        assert_eq!(normalize_icao_type("PHENOM 300E").as_deref(), Some("E55P"));
+        assert_eq!(normalize_icao_type("A350-900").as_deref(), Some("A359"));
+        assert_eq!(normalize_icao_type("HA420").as_deref(), Some("HDJT"));
+        // Junk → None (Aufrufer nutzt profile.icao_fallback()).
+        assert_eq!(normalize_icao_type("None"), None);
+        assert_eq!(normalize_icao_type(""), None);
+        assert_eq!(normalize_icao_type("NULL"), None);
+    }
+
+    #[test]
+    fn normalize_icao_type_passes_clean_codes_through() {
+        // Bereits saubere ICAO-Codes bleiben unverändert.
+        for c in ["A320", "B738", "E55P", "A359", "MD11", "FA50", "C172", "DH8D"] {
+            assert_eq!(normalize_icao_type(c).as_deref(), Some(c), "{c} sollte durchgehen");
+        }
+    }
+
+    #[test]
+    fn normalize_icao_type_rejects_leftover_model_names() {
+        // Unbekannte Modellnamen (Leerzeichen/zu lang) → None statt Garbage.
+        assert_eq!(normalize_icao_type("Boeing 747-8 Intercontinental"), None);
+        assert_eq!(normalize_icao_type("Super Fancy Bizjet"), None);
     }
 
     #[test]
