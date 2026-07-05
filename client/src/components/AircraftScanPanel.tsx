@@ -76,12 +76,20 @@ export function AircraftScanPanel() {
     }
   };
 
-  const list = async () => {
+  // Zwei bewusst GETRENNTE, immer gleich beschriftete Aktionen statt eines
+  // einzigen Buttons, der je nach manualDir sein Verhalten (und seinen Text)
+  // aendert — das hat Piloten verwirrt ("kann ich nicht mehr umstellen auf
+  // den kompletten Ordner", Thomas K. 05.07.2026). "Flugzeuge suchen"
+  // ignoriert manualDir IMMER (volle Auto-Erkennung); "Diesen Ordner
+  // scannen" nimmt IMMER den aktuell eingetragenen/gewaehlten Pfad. Beide
+  // Buttons bleiben immer sichtbar und tun immer dasselbe — kein Umschalten
+  // noetig, um zwischen beiden Modi zu wechseln.
+  const runSearch = async (dir: string | null) => {
     setError(null);
     setStep({ kind: "listing" });
     try {
       const aircraft = await invoke<FoundAircraft[]>("ascan_list_aircraft", {
-        manualDir: manualDir.trim() || null,
+        manualDir: dir,
       });
       if (aircraft.length === 0) {
         setError(t("ascan.none_found"));
@@ -94,6 +102,9 @@ export function AircraftScanPanel() {
       setStep({ kind: "idle" });
     }
   };
+
+  const searchAuto = () => runSearch(null);
+  const scanManualFolder = () => runSearch(manualDir.trim());
 
   const pick = async (plane: FoundAircraft) => {
     setError(null);
@@ -132,12 +143,8 @@ export function AircraftScanPanel() {
 
       {(step.kind === "idle" || step.kind === "listing") && (
         <>
-          <button type="button" onClick={list} disabled={step.kind === "listing"}>
-            {step.kind === "listing"
-              ? t("ascan.searching")
-              : manualDir.trim()
-                ? t("ascan.find_button_manual")
-                : t("ascan.find_button")}
+          <button type="button" onClick={searchAuto} disabled={step.kind === "listing"}>
+            {step.kind === "listing" ? t("ascan.searching") : t("ascan.find_button")}
           </button>
           <label className="settings__field" style={{ marginTop: 10 }}>
             <span>{t("ascan.manual_dir_label")}</span>
@@ -151,6 +158,13 @@ export function AircraftScanPanel() {
               />
               <button type="button" onClick={pickFolder}>
                 {t("ascan.pick_folder_button")}
+              </button>
+              <button
+                type="button"
+                onClick={scanManualFolder}
+                disabled={step.kind === "listing" || !manualDir.trim()}
+              >
+                {t("ascan.scan_folder_button")}
               </button>
             </div>
           </label>
