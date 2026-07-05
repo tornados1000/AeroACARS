@@ -186,8 +186,8 @@ export function LogbookView() {
   );
 }
 
-/** 3-Linien-Höhenprofil (MSL/AGL/Gelände) als SVG. */
-function profileSvg(route: RoutePt[]): string {
+/** 3-Linien-Höhenprofil (MSL/AGL/Gelände) als SVG. Exportiert fürs Testen der Strich-Zeichenreihenfolge. */
+export function profileSvg(route: RoutePt[]): string {
   const pts = route.filter((p) => typeof p.alt_ft === "number");
   if (pts.length < 2) return '<div class="aa-lb-muted" style="padding:8px">Keine Höhendaten.</div>';
   const W = 1000, H = 210;
@@ -204,11 +204,21 @@ function profileSvg(route: RoutePt[]): string {
     grid += `<line x1="0" y1="${gy.toFixed(1)}" x2="${W}" y2="${gy.toFixed(1)}" stroke="var(--border)" stroke-width="1" opacity="0.55"/>`;
     labels += `<div class="aa-lb-ylab" style="top:${((gy / H) * 100).toFixed(1)}%">${a === 0 ? "0" : a / 1000 + "k"}</div>`;
   }
+  // Reihenfolge der STRICHE bewusst MSL → Gelände → AGL (nicht wie vorher
+  // zuletzt/oben MSL): SVG malt später aufgeführte Elemente ÜBER früheren.
+  // Auf einer flachen Route (z. B. KINT→KBED, kaum Terrain-Relief) liegen
+  // AGL und Gelände über weite Strecken nur wenige hundert Fuß von MSL
+  // entfernt — bei einer 40k-ft-Skala ein Bruchteil eines Pixels. Wenn MSL
+  // zuletzt/oben gezeichnet wird, überdeckt die dickere blaue Linie die
+  // dünneren AGL-/Gelände-Linien praktisch überall dort vollständig — sie
+  // wirken "fehlend", obwohl die Werte (verifiziert in der Live-DB) korrekt
+  // vorliegen. AGL ganz oben, weil "Höhe über Grund" die für den Piloten
+  // operativ wichtigste der drei Linien ist.
   return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${grid}` +
     `<polyline points="0,${H} ${poly(msl)} ${W},${H}" fill="color-mix(in srgb, var(--accent) 14%, transparent)" stroke="none"/>` +
     `<polyline points="0,${H} ${poly(terr)} ${W},${H}" fill="color-mix(in srgb, var(--text-muted) 30%, transparent)" stroke="none"/>` +
+    `<polyline points="${poly(msl)}" fill="none" stroke="var(--accent)" stroke-width="2" vector-effect="non-scaling-stroke"/>` +
     `<polyline points="${poly(terr)}" fill="none" stroke="var(--text-muted)" stroke-width="1.4" vector-effect="non-scaling-stroke"/>` +
     `<polyline points="${poly(agl)}" fill="none" stroke="var(--success)" stroke-width="1.6" vector-effect="non-scaling-stroke"/>` +
-    `<polyline points="${poly(msl)}" fill="none" stroke="var(--accent)" stroke-width="2" vector-effect="non-scaling-stroke"/>` +
     `</svg>${labels}`;
 }

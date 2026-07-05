@@ -27815,6 +27815,22 @@ pub fn run() {
     let app_state = AppState::default();
 
     tauri::Builder::default()
+        // v0.18.x: MUSS das erste registrierte Plugin sein (Tauri-Doku).
+        // Verhindert einen zweiten AeroACARS-Prozess fuer denselben Piloten
+        // (z. B. erneuter Doppelklick aufs App-Icon, waehrend die App via
+        // Minimize-to-Tray im Hintergrund weiterlaeuft) — sonst tracken
+        // ZWEI unabhaengige Prozesse denselben aktiven Flug und posten
+        // Phase-/Touchdown-ACARS-Logs doppelt an dieselbe PIREP-ID (Live-
+        // Befund Thomas K., 05.07.2026: doppelte Zeilen im Fluglogbuch).
+        // Der zweite Start-Versuch fokussiert hier nur das bestehende
+        // Fenster, statt eine eigene Instanz hochzufahren.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())

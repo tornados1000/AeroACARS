@@ -106,6 +106,14 @@ tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-opener = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+# v0.18.x: verhindert dass zwei AeroACARS-Prozesse gleichzeitig denselben
+# aktiven Flug tracken (Minimize-to-Tray laesst die App im Hintergrund
+# weiterlaufen — ein erneuter Doppelklick auf das App-Icon startete bisher
+# einen ZWEITEN Prozess statt das Fenster zu fokussieren). Zwei Prozesse
+# posten unabhaengig voneinander Phase-/Touchdown-ACARS-Logs an dieselbe
+# PIREP-ID -> doppelte Zeilen im Fluglogbuch (Live-Befund Thomas K.,
+# 05.07.2026). Muss laut Tauri-Doku als ERSTES Plugin registriert werden.
+tauri-plugin-single-instance = "2"
 # OS-native notifications (system tray badges, banners). Used to
 # alert pilots when AeroACARS is running in tray-only mode and a
 # critical event happens (PIREP cancelled remotely, sim
