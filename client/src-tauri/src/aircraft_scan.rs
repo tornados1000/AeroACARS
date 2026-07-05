@@ -380,11 +380,20 @@ fn collect_files(pkg_dir: &Path) -> Result<CollectResult, String> {
 }
 
 /// ZIP (deflate) aus der Collect-Auswahl bauen.
+///
+/// WICHTIG: KEIN `.large_file(true)` — das erzwingt ZIP64-Erweiterungsfelder
+/// selbst fuer winzige Dateien, und der Server (`fflate`/Node) liest deren
+/// klassisches 32-Bit-Groessenfeld dann als ZIP64-Sentinel `0xFFFFFFFF`
+/// (~4 GB) statt die echte Groesse aus dem Extra-Feld zu holen — JEDE
+/// Datei wird faelschlich als "zu gross" abgelehnt (Live-Befund Thomas K.,
+/// 05.07.2026: reproduziert mit einer 6-KB-Testdatei → Server sah 4 294
+/// 967 295 Bytes). Unsere Groessenkappen (MAX_TEXT_FILE 5 MB, MAX_WASM_FILE
+/// 110 MB, MAX_TOTAL 400 MB) liegen alle weit unter der klassischen
+/// ZIP32-Grenze (~4 GB) — ZIP64 wird hier nie gebraucht.
 fn build_zip(pkg_dir: &Path, folder: &str, collected: &CollectResult) -> Result<Vec<u8>, String> {
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
     let options = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated)
-        .large_file(true);
+        .compression_method(zip::CompressionMethod::Deflated);
     for f in &collected.files {
         let abs = pkg_dir.join(&f.path);
         let mut buf = Vec::with_capacity(f.size.min(16 * 1024 * 1024) as usize);
@@ -782,6 +791,42 @@ mod tests {
             .map(|i| archive.by_index(i).unwrap().name().to_string())
             .collect();
         assert!(names.contains(&"pkg/manifest.json".to_string()));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn build_zip_does_not_emit_zip64_sentinel_size() {
+        // Live-Befund Thomas K. (05.07.2026, A330-Einreichung): der Server
+        // (Node/`fflate`) lehnte JEDE Datei als "zu gross" ab. Ursache:
+        // `.large_file(true)` erzwang ZIP64-Erweiterungsfelder auch fuer
+        // winzige Dateien; `fflate` liest dann das klassische 32-Bit-
+        // Groessenfeld im Local-File-Header NICHT als "siehe ZIP64-Extra-
+        // Feld"-Sentinel, sondern uebernimmt es woertlich — 0xFFFFFFFF
+        // (~4 GB) statt der echten Groesse. Ein Rust-Rueckwaerts-Test mit
+        // derselben `zip`-Crate haette das NICHT gefangen (sie parst ZIP64
+        // korrekt) — deshalb hier direkt die rohen Bytes des Local-File-
+        // Headers pruefen, wie es ein simplerer Reader wie fflate tut.
+        let tmp = std::env::temp_dir().join(format!("ascan-zip64-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let content = b"tiny acf content, nowhere near 4 GB".repeat(50);
+        std::fs::write(tmp.join("plane.acf"), &content).unwrap();
+
+        let collected = collect_files(&tmp).unwrap();
+        let zip_bytes = build_zip(&tmp, "pkg", &collected).unwrap();
+
+        // Klassischer ZIP-Local-File-Header: 4 Byte Signatur "PK\x03\x04",
+        // dann je 2 Byte version/flags/method/modtime/moddate (=10 Byte),
+        // dann 4 Byte CRC32, dann 4 Byte compressed size, dann 4 Byte
+        // uncompressed size — bei Offset 22.
+        assert_eq!(&zip_bytes[0..4], b"PK\x03\x04", "muss mit Local-File-Header-Signatur beginnen");
+        let uncompressed_size = u32::from_le_bytes(zip_bytes[22..26].try_into().unwrap());
+        assert_ne!(
+            uncompressed_size, 0xFFFF_FFFF,
+            "Local-File-Header darf NICHT den ZIP64-Sentinel tragen — fflate (Server) liest ihn woertlich als ~4 GB"
+        );
+        assert_eq!(uncompressed_size as usize, content.len());
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
