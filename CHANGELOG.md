@@ -4,6 +4,12 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.18.3] — 2026-07-05 · Absicherung LAN-Fernbedienung
+
+Thomas-Hinweis (auf den v0.18.2-Fund zur Doppel-Log-Ursache): koennten die Duplikate von der LAN-Fernbedienung kommen? Nicht der exakte Mechanismus des schon gefixten Bugs, aber die Nachfrage deckte eine eigenstaendige Luecke auf: `flight_resume_confirm` ist ueber `remote/bridge.rs` erreichbar, der Frontend-Doppelklick-Schutz (`confirmingRef`) lebt aber nur im Hauptfenster-React-Baum, nicht in der separaten Remote-Weboberflaeche. `spawn_position_streamer` und `spawn_phpvms_position_worker` haben bereits einen Compare-and-Swap-Guard genau dagegen ("mehrere flight_resume etc.") — `spawn_touchdown_sampler` hatte keinen. Guard ergaenzt. Details: `docs/release-notes/v0.18.3.md`.
+
+---
+
 ## [v0.18.2] — 2026-07-05 · Aircraft-Scan-Nachbesserungen
 
 Vier Fixes direkt aus Pilotenbefunden (Thomas K.): (1) ZIP64-Sentinel-Bug — `.large_file(true)` beim ZIP-Bau ließ den Server (Node/fflate) JEDE Datei fälschlich als ~4 GB lesen, wodurch der komplette Client-Upload-Pfad seit v0.18.0 für JEDE Einreichung fehlschlug (Web-Uploader nicht betroffen); Fix + Byte-Level-Regressionstest gegen den Local-File-Header. (2) X-Plane-Flugzeuge in Kategorie-Ordnern (z. B. "Aircraft/Extra Aircraft/…") wurden von der Ein-Ebenen-Suche nicht gefunden — jetzt eine Ebene tiefer nachgesehen, wenn eine Ebene nicht selbst ein Paket ist. (3) Kein Schutz gegen einen zweiten AeroACARS-Prozess (Minimize-to-Tray + Neustart nach Schlaf/Wach-Zyklus) → doppelte Phase-/Touchdown-Zeilen im PIREP; `tauri-plugin-single-instance` ergänzt. (4) AGL-/Gelände-Linie im Logbuch-Höhenprofil von der MSL-Linie verdeckt (Zeichenreihenfolge, kein Datenproblem) — behoben. Neu: nativer Ordner-Auswahl-Dialog im Aircraft-Scan-Panel. Details: `docs/release-notes/v0.18.2.md`.
