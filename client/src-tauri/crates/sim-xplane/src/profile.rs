@@ -189,6 +189,47 @@ pub const PROFILES: &[XplaneAircraftProfile] = &[
             },
         ],
     },
+    // v0.17.x (#aircraft-scan): Laminar/Zibo Boeing 737-800(X). Die
+    // `laminar/B738/autopilot/*_status`-Datarefs sind X-Plane-KERN (Laminars
+    // Default-737) — sie gelten fuer den Standard-737 UND den Zibo (der Zibo
+    // erbt X-Planes 737-Systeme). Belegt ueber das Scan-Tool: der Standard-
+    // 737-Upload zeigt sie NICHT als Ordner-Strings (stecken im XP-Binary),
+    // waehrend der Zibo sie in `zibomod.xpl` referenziert. Das Paket bringt
+    // `B738_Datarefs.txt` mit ("AUTOPILOT LIGHTS (read only)") als Doku.
+    //
+    // Wir biegen die AP-MODUS-Felder auf die 737-echten MCP-Annunciator-
+    // Lights (0/1) — authentischer als die generischen sim/cockpit2-Status.
+    // ApMaster bleibt bewusst auf dem robusten Standard-`servos_on`: das
+    // faengt CMD A ODER B (ein einzelnes Override koennte das nicht) und
+    // wird vom XP-Kern-Autopilot fuer beide 737-Varianten getrieben.
+    // Am kurzen Demo-Flug gegenzupruefen (Thomas hat XP-Demo + Zibo).
+    XplaneAircraftProfile {
+        name: "Laminar/Zibo 737-800",
+        title_match: &["boeing", "737-800"],
+        probe_dataref: "laminar/B738/autopilot/cmd_a_status",
+        overrides: &[
+            DatarefOverride {
+                field: FieldId::ApHeading,
+                dataref: "laminar/B738/autopilot/hdg_sel_status",
+                mapping: ValueMapping::Passthrough,
+            },
+            DatarefOverride {
+                field: FieldId::ApAltitude,
+                dataref: "laminar/B738/autopilot/alt_hld_status",
+                mapping: ValueMapping::Passthrough,
+            },
+            DatarefOverride {
+                field: FieldId::ApNav,
+                dataref: "laminar/B738/autopilot/lnav_status",
+                mapping: ValueMapping::Passthrough,
+            },
+            DatarefOverride {
+                field: FieldId::ApApproach,
+                dataref: "laminar/B738/autopilot/app_status",
+                mapping: ValueMapping::Passthrough,
+            },
+        ],
+    },
 ];
 
 /// LE1 stage 1: first profile whose title-match accepts `title`.
@@ -388,6 +429,40 @@ mod tests {
             .expect("FlapsHandle in catalog");
         assert_eq!(flaps.name, "Rotate/aircraft/systems/flaps_cmd_pos_deg");
         assert!(matches!(flaps.mapping, ValueMapping::DegreeTable(_)));
+    }
+
+    #[test]
+    fn zibo737_profile_matches_both_variants() {
+        let z = PROFILES
+            .iter()
+            .find(|p| p.name == "Laminar/Zibo 737-800")
+            .expect("Zibo 737 profile present");
+        // Standard-Laminar UND Zibo teilen den Basistitel.
+        assert!(z.matches_title("Boeing 737-800"), "Standard-737");
+        assert!(z.matches_title("Boeing 737-800X"), "Zibo-737");
+        // Fremde Muster NICHT.
+        assert!(!z.matches_title("MD11 Rotate MD-11P"));
+        assert!(!z.matches_title("IXEG 737 Classic"));
+    }
+
+    #[test]
+    fn zibo737_active_catalog_overrides_ap_modes_but_not_master() {
+        let z = PROFILES
+            .iter()
+            .find(|p| p.name == "Laminar/Zibo 737-800")
+            .expect("Zibo 737 profile present");
+        let active = build_active_catalog(Some(z));
+        // AP-Modus-Felder auf die 737-echten laminar/B738-Datarefs gebogen.
+        let hdg = active.iter().find(|e| e.field == FieldId::ApHeading).unwrap();
+        assert_eq!(hdg.name, "laminar/B738/autopilot/hdg_sel_status");
+        let app = active.iter().find(|e| e.field == FieldId::ApApproach).unwrap();
+        assert_eq!(app.name, "laminar/B738/autopilot/app_status");
+        // ApMaster bewusst NICHT ueberschrieben — bleibt auf servos_on
+        // (faengt CMD A ODER B).
+        let master = active.iter().find(|e| e.field == FieldId::ApMaster).unwrap();
+        assert_eq!(master.name, "sim/cockpit2/autopilot/servos_on");
+        // Lockstep: gleiche Katalog-Laenge (nur bestehende Felder gebogen).
+        assert_eq!(active.len(), CATALOG.len());
     }
 
     #[test]
