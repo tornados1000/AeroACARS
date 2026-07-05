@@ -3784,7 +3784,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(buf.len(), 2780, "total block size");
+        assert_eq!(buf.len(), 2812, "total block size");
         let t = Telemetry::from_block(&buf);
 
         // Identity / head sentinels.
@@ -4030,11 +4030,12 @@ mod tests {
                 FieldKind::String256 => buf.extend_from_slice(&[0u8; 256]),
             }
         }
-        // v0.16.20: drop the 14 FSLabs PREMIUM tail fields (14*8) — the
-        // new outermost layer (13 original + the XPDR ON/OFF Review-Fund
-        // field). Everything up to the v0.16.14 FSL group stays intact,
-        // the new premium slots parse to safe defaults.
-        buf.truncate(buf.len() - 112);
+        // Drop the whole premium tail after the v0.16.14 FSL group: 14
+        // FSLabs PREMIUM fields (v0.16.20) + 4 Contrail FA50 FMA fields
+        // (v0.17.x) = 18 fields * 8 = 144 bytes. Everything up to the
+        // v0.16.14 FSL group stays intact, the new premium slots parse to
+        // safe defaults.
+        buf.truncate(buf.len() - 144);
         let t = Telemetry::from_block(&buf);
         assert_eq!(t.fsl_autobrake_max_light, 1256.0); // last v0.16.14 field intact
         assert_eq!(t.ifly_autobrake_sw, 1239.0); // v0.16.11 layer intact
@@ -4042,6 +4043,8 @@ mod tests {
         assert_eq!(t.fsl_eng1_mstr_switch, 0.0);
         assert_eq!(t.fsl_xpdr_mode_switch, 0.0);
         assert_eq!(t.fsl_xpdr_on_off_switch, 0.0);
+        assert_eq!(t.contrail_fma_lat_active, 0.0); // Contrail FA50 tail = safe defaults
+        assert_eq!(t.contrail_fma_vert_armed1, 0.0);
 
         // v0.16.14: drop the 17 FSLabs tail fields (17*8).
         buf.truncate(buf.len() - 136);
