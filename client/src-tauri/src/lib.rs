@@ -2509,6 +2509,13 @@ struct FlightStats {
     /// persistiert (Pushback überlebt keinen Restart).
     pushback_stopped_at: Option<DateTime<Utc>>,
 
+    /// Wann die Groundspeed in der TakeoffRoll-Phase erstmals unter
+    /// `TAKEOFF_ROLL_ABORT_KT` fiel (Dwell-Start der Rückkante nach
+    /// TaxiOut — behebt TAKEOFF_ROLL_STUCK, z.B. EGLC-Backtrack-Fall).
+    /// Reset sobald die GS wieder über die Schwelle steigt oder die Phase
+    /// wechselt; nicht persistiert (überlebt keinen Restart).
+    takeoff_roll_slow_since: Option<DateTime<Utc>>,
+
     // ---- Capture at takeoff ----
     takeoff_weight_kg: Option<f64>,
     takeoff_fuel_kg: Option<f32>,
@@ -21054,6 +21061,48 @@ fn clear_approach_stability_and_rollout(stats: &mut FlightStats) {
     stats.rollout_finalize_reason = None;
 }
 
+/// Groundspeed-Schwelle, unter der TakeoffRoll (nachhaltig) als „rollt
+/// nicht" gilt. 10 kt unter dem Vorwärts-Trigger (GS > 30 kt) → Hysterese
+/// gegen Flip-Flop an der Schwelle.
+const TAKEOFF_ROLL_ABORT_KT: f32 = 20.0;
+/// Dwell, den die GS unter der Schwelle bleiben muss, bevor demotet wird
+/// (frisst GS-Einzeltick-Glitches; braucht ≥ 2 Ticks über ≥ 3 s).
+const TAKEOFF_ROLL_ABORT_DWELL_SECS: i64 = 3;
+
+/// Rückkante der TakeoffRoll-Phase — behebt den flottenweiten
+/// TAKEOFF_ROLL_STUCK (5 % der Flüge, 614-Flug-Scan 2026-07-05).
+///
+/// `TaxiOut → TakeoffRoll` triggert bei GS > 30 kt am Boden. Das trippt
+/// auch ein schneller BACKTRACK (z. B. die kurze EGLC-Bahn zum Schwellen-
+/// kopf runterrollen). Bremst der Flieger dann zum Ausrichten/Warten wieder
+/// ab, hing die Phase bisher für IMMER auf „Takeoff Roll" — der TakeoffRoll-
+/// Arm kannte nur die Vorwärtskante (on_ground → airborne = Takeoff).
+///
+/// Fällt die Groundspeed nachhaltig (Dwell) unter `TAKEOFF_ROLL_ABORT_KT`
+/// während der Flieger am Boden ist, zurück zu TaxiOut. Während einer
+/// ECHTEN Startrolle ist die Bedingung nie erfüllt (GS steigt dort monoton
+/// von > 30 auf > 150 kt, dippt nie unter 20).
+///
+/// Pur + uhrlos (Caller liefert `now`) → direkt testbar. Rückgabe:
+/// (Ziel-Phase falls demotet, neuer `slow_since`-Wert für die Stats).
+fn takeoff_roll_demote(
+    on_ground: bool,
+    groundspeed_kt: f32,
+    slow_since: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> (Option<FlightPhase>, Option<DateTime<Utc>>) {
+    if on_ground && groundspeed_kt < TAKEOFF_ROLL_ABORT_KT {
+        let since = slow_since.unwrap_or(now);
+        if (now - since).num_seconds() >= TAKEOFF_ROLL_ABORT_DWELL_SECS {
+            (Some(FlightPhase::TaxiOut), None) // Dwell erfüllt → demote + Reset
+        } else {
+            (None, Some(since)) // Dwell läuft noch → Phase halten
+        }
+    } else {
+        (None, None) // GS zurück über Schwelle / airborne → Dwell verwerfen
+    }
+}
+
 fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase> {
     let mut stats = flight.stats.lock().expect("flight stats");
     let _now_for_state_update = Utc::now();
@@ -21668,6 +21717,21 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
             if was_on_ground && !snap.on_ground {
                 next_phase = FlightPhase::Takeoff;
                 latch_takeoff_stats(&mut stats, snap, now);
+            } else {
+                // Rückkante (fehlte bisher — der Arm ging nur vorwärts):
+                // nachhaltig langsam + am Boden → zurück zu TaxiOut. Behebt
+                // TAKEOFF_ROLL_STUCK (Backtrack trippt TakeoffRoll, dann
+                // Ausrichten/Warten). Siehe takeoff_roll_demote.
+                let (demote, slow_since) = takeoff_roll_demote(
+                    snap.on_ground,
+                    snap.groundspeed_kt,
+                    stats.takeoff_roll_slow_since,
+                    now,
+                );
+                stats.takeoff_roll_slow_since = slow_since;
+                if let Some(target) = demote {
+                    next_phase = target;
+                }
             }
         }
         FlightPhase::Takeoff => {
@@ -28128,6 +28192,72 @@ pub fn run() {
 // GSG219-Log (else-if + Phase-Transition + B-005-Guard) nicht wieder
 // zurueckkehrt.
 // ----------------------------------------------------------------------
+#[cfg(test)]
+mod takeoff_roll_demote_tests {
+    use super::*;
+    use chrono::Duration;
+
+    /// Backtrack trippt TakeoffRoll, dann Ausrichten (GS → 0): nach dem
+    /// Dwell zurück zu TaxiOut, nicht ewig „Takeoff Roll".
+    #[test]
+    fn demotes_to_taxi_after_dwell() {
+        let t0 = Utc::now();
+        // Erster langsamer Tick am Boden: Dwell startet, noch KEIN Demote.
+        let (demote, slow) = takeoff_roll_demote(true, 0.0, None, t0);
+        assert_eq!(demote, None, "erster langsamer Tick darf nicht sofort demoten");
+        assert!(slow.is_some(), "Dwell-Start muss gestempelt sein");
+        // Innerhalb des Dwells (2 s): weiter TakeoffRoll.
+        let (demote, slow) =
+            takeoff_roll_demote(true, 3.0, slow, t0 + Duration::seconds(2));
+        assert_eq!(demote, None);
+        // Nach dem Dwell (4 s ≥ 3 s): zurück zu TaxiOut + Dwell zurückgesetzt.
+        let (demote, slow2) =
+            takeoff_roll_demote(true, 1.0, slow, t0 + Duration::seconds(4));
+        assert_eq!(demote, Some(FlightPhase::TaxiOut));
+        assert_eq!(slow2, None, "Dwell nach Demote zurückgesetzt");
+    }
+
+    /// Echte Startrolle: GS steigt monoton, nie unter 20 → NIE demote
+    /// (der Kern-Regressionsschutz), Dwell bleibt leer.
+    #[test]
+    fn real_takeoff_roll_never_demotes() {
+        let t0 = Utc::now();
+        let mut slow = None;
+        for (i, gs) in [35.0f32, 60.0, 90.0, 140.0].iter().enumerate() {
+            let (demote, s) =
+                takeoff_roll_demote(true, *gs, slow, t0 + Duration::seconds(i as i64));
+            assert_eq!(demote, None, "Startrolle darf nie demoten (gs={gs})");
+            slow = s;
+        }
+        assert_eq!(slow, None, "über der Schwelle bleibt der Dwell leer");
+    }
+
+    /// Ein einzelner GS-Glitch-Tick (<20) reicht NICHT: erholt sich die GS
+    /// vor Ablauf des Dwells, wird der Dwell verworfen.
+    #[test]
+    fn single_glitch_tick_does_not_demote() {
+        let t0 = Utc::now();
+        let (demote, slow) = takeoff_roll_demote(true, 5.0, None, t0); // Glitch
+        assert_eq!(demote, None);
+        assert!(slow.is_some());
+        // Nächster Tick: GS wieder hoch → Dwell verworfen, kein Demote.
+        let (demote, slow) =
+            takeoff_roll_demote(true, 80.0, slow, t0 + Duration::seconds(1));
+        assert_eq!(demote, None);
+        assert_eq!(slow, None, "GS-Erholung verwirft den Dwell");
+    }
+
+    /// Liftoff (!on_ground) verwirft den Dwell — die Vorwärtskante zu
+    /// Takeoff übernimmt separat im Arm.
+    #[test]
+    fn airborne_resets_dwell() {
+        let t0 = Utc::now();
+        let (demote, slow) = takeoff_roll_demote(false, 5.0, Some(t0), t0);
+        assert_eq!(demote, None);
+        assert_eq!(slow, None);
+    }
+}
+
 #[cfg(test)]
 mod final_landing_push_condition_tests {
     use super::*;
