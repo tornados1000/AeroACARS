@@ -1717,7 +1717,7 @@
   },
   "ascan": {
     "title": "🔬 Flugzeug zur Analyse einreichen (Aircraft-Scan)",
-    "hint": "Neues Addon, das AeroACARS noch nicht richtig erkennt? Schick uns die Konfigurations- und Code-Dateien des Flugzeugs (nur cfg/json/xml/js/wasm — nie Texturen, Modelle oder Sounds). Vor dem Senden siehst du die exakte Dateiliste; deine Einreichung kannst du auf live.kant.ovh/aircraft einsehen und jederzeit löschen.",
+    "hint": "Neues Addon, das AeroACARS noch nicht richtig erkennt? Schick uns die Konfigurations- und Code-Dateien des Flugzeugs (nur cfg/json/xml/js/wasm — nie Texturen, Modelle oder Sounds). Vor dem Senden siehst du die exakte Dateiliste. Deine Daten (Upload, Dateiliste, Personenbezug) kannst du auf live.kant.ovh/aircraft jederzeit löschen — nur der anonymisierte technische Analysebericht bleibt erhalten.",
     "find_button": "Flugzeuge im Community-Ordner suchen",
     "searching": "Suche…",
     "manual_dir_label": "Optional: eigener Community-/Addon-Pfad (z. B. bei Addon-Linker)",
@@ -1734,7 +1734,7 @@
     "done": "{{title}} wurde analysiert",
     "done_stats": "{{lvars}} LVar-Kandidaten gefunden · {{size}} übertragen",
     "stub_warning": "Hinweis: Die Systeme dieses Addons laufen vermutlich in einem externen Prozess — die statische Analyse findet nur einen Teil. Wir kümmern uns um den Rest.",
-    "see_web": "Deine Einreichungen (inkl. Dateiliste und Löschen):",
+    "see_web": "Deine Einreichungen (Dateiliste einsehen, Daten löschen — Bericht bleibt anonymisiert):",
     "again": "Weiteres Flugzeug einreichen"
   }
 }
