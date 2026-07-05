@@ -1,15 +1,20 @@
 name: Dev Build (unsigned, manual)
 
-# Manueller, UNSIGNIERTER Windows-Build zum lokalen Testen — kein Tag, kein
-# GitHub-Release, kein Auto-Updater-Eintrag (createUpdaterArtifacts wird nur
-# fuer diesen Lauf per --config auf false gesetzt, tauri.conf.json bleibt
-# unberuehrt). Fuer schnelle Iterationen (z. B. Aircraft-Scan-Fixes), die
-# Thomas auf seiner echten Windows-Maschine mit echtem MSFS/X-Plane pruefen
-# soll, BEVOR ein offizieller signierter Release-Tag geschnitten wird (siehe
-# release.yml — der bleibt der einzige Weg zu einem echten, an Piloten
-# ausgelieferten Release). Artefakt liegt 7 Tage im Actions-Run zum Download
-# bereit und verschwindet danach automatisch — bewusst kein
-# Distributionskanal.
+# Manueller, UNSIGNIERTER Build (Windows + macOS Apple Silicon) zum lokalen
+# Testen — kein Tag, kein GitHub-Release, kein Auto-Updater-Eintrag
+# (createUpdaterArtifacts wird nur fuer diesen Lauf per --config auf false
+# gesetzt, tauri.conf.json bleibt unberuehrt). Fuer schnelle Iterationen
+# (z. B. Aircraft-Scan-Fixes), die Thomas auf seiner echten Maschine mit
+# echtem MSFS/X-Plane pruefen soll, BEVOR ein offizieller signierter
+# Release-Tag geschnitten wird (siehe release.yml — der bleibt der einzige
+# Weg zu einem echten, an Piloten ausgelieferten Release). Artefakte liegen
+# 7 Tage im Actions-Run zum Download bereit und verschwinden danach
+# automatisch — bewusst kein Distributionskanal.
+#
+# macOS-Hinweis: das .app/.dmg ist UNSIGNIERT — Gatekeeper blockiert den
+# ersten Start ("nicht identifizierter Entwickler" / "beschaedigt"). Vor dem
+# ersten Oeffnen im Terminal: `xattr -cr /Pfad/zu/AeroACARS.app` (entfernt
+# das Quarantaene-Flag), dann normal per Doppelklick oeffnen.
 on:
   workflow_dispatch:
 
@@ -48,4 +53,40 @@ jobs:
         with:
           name: AeroACARS-dev-build-windows-${{ github.sha }}
           path: client/src-tauri/target/release/bundle/nsis/*.exe
+          retention-days: 7
+
+  dev-build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: client/src-tauri -> target
+
+      - name: Install frontend deps
+        working-directory: client
+        run: npm ci
+
+      - name: Build (unsigned, no updater artifacts)
+        shell: bash
+        working-directory: client
+        run: npx tauri build --target aarch64-apple-darwin --bundles app,dmg --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: AeroACARS-dev-build-macos-${{ github.sha }}
+          path: client/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
           retention-days: 7
