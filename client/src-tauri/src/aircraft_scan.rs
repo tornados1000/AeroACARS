@@ -171,30 +171,129 @@ fn read_aircraft_manifest(pkg_dir: &Path) -> Option<(String, Option<String>)> {
     Some((title, creator))
 }
 
+/// X-Plane: ein Ordner mit einer `.acf`-Datei ist ein Flugzeug. Titel/Studio
+/// aus der text-basierten .acf (`P acf/_name` / `_studio`), sonst Ordnername.
+/// Nur der Kopf der .acf wird gelesen (sie kann mehrere MB sein; die
+/// _name/_studio-Header stehen weit oben).
+fn read_xplane_acf(pkg_dir: &Path) -> Option<(String, Option<String>)> {
+    let mut acf_path: Option<PathBuf> = None;
+    for entry in std::fs::read_dir(pkg_dir).ok()?.flatten() {
+        let p = entry.path();
+        if p.is_file()
+            && p.extension().map(|x| x.eq_ignore_ascii_case("acf")).unwrap_or(false)
+        {
+            acf_path = Some(p);
+            break;
+        }
+    }
+    let acf_path = acf_path?;
+    let head = read_file_head(&acf_path, 64 * 1024).unwrap_or_default();
+    let folder_name = pkg_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("?")
+        .to_string();
+    let name = acf_prop(&head, "acf/_name").unwrap_or(folder_name);
+    let studio = acf_prop(&head, "acf/_studio");
+    Some((name, studio))
+}
+
+/// Liest eine .acf-Property-Zeile `P <key> <wert>`.
+fn acf_prop(text: &str, key: &str) -> Option<String> {
+    let prefix = format!("P {key} ");
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix(&prefix) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Die ersten `max` Bytes einer Datei als (lossy) String.
+fn read_file_head(path: &Path, max: usize) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut buf = vec![0u8; max];
+    let n = f.read(&mut buf)?;
+    buf.truncate(n);
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Ein Ordner als Flugzeug-Paket erkennen — MSFS (manifest.json) ODER
+/// X-Plane (.acf). Damit funktioniert das Direkt-Wählen EINES Flugzeug-
+/// Ordners für beide Sims, egal wo er liegt (via manual_dir).
+fn detect_aircraft(pkg_dir: &Path) -> Option<(String, Option<String>)> {
+    read_aircraft_manifest(pkg_dir).or_else(|| read_xplane_acf(pkg_dir))
+}
+
+/// X-Plane schreibt seine Installationspfade in `x-plane_install_{12,11}.txt`
+/// (eine Zeile pro Install). Wir hängen `/Aircraft` an und nehmen die als
+/// Scan-Wurzeln. Best-effort für Win/Mac/Linux; findet nichts → der Pilot
+/// gibt seinen Aircraft-Ordner manuell an (manual_dir).
+fn xplane_aircraft_dirs() -> Vec<(PathBuf, &'static str)> {
+    let mut install_files: Vec<PathBuf> = Vec::new();
+    for ver in ["12", "11"] {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            install_files.push(PathBuf::from(&local).join(format!("x-plane_install_{ver}.txt")));
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            install_files
+                .push(PathBuf::from(&home).join(format!("Library/Preferences/x-plane_install_{ver}.txt")));
+            install_files.push(PathBuf::from(&home).join(format!(".x-plane/x-plane_install_{ver}.txt")));
+        }
+    }
+    let mut out: Vec<(PathBuf, &'static str)> = Vec::new();
+    for f in install_files {
+        let Ok(text) = std::fs::read_to_string(&f) else {
+            continue;
+        };
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let ac = PathBuf::from(line).join("Aircraft");
+            if ac.is_dir() && !out.iter().any(|(p, _)| p == &ac) {
+                out.push((ac, "X-Plane (Aircraft-Ordner)"));
+            }
+        }
+    }
+    out
+}
+
 // ─── Whitelist (Spiegel von scanner.ts / aircraftAnalyzer.ts) ───────────
 
 fn is_text_ext(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     [
+        // MSFS-Text + X-Plane-Text (.acf Aircraft-Datei, .lua SASL/XLua).
         ".cfg", ".json", ".xml", ".js", ".mjs", ".html", ".htm", ".txt", ".ini", ".yaml", ".yml",
+        ".lua", ".acf",
     ]
     .iter()
     .any(|e| lower.ends_with(e))
 }
 
 fn is_wasm_ext(name: &str) -> bool {
-    name.to_ascii_lowercase().ends_with(".wasm")
+    let lower = name.to_ascii_lowercase();
+    // MSFS-WASM + X-Plane-.xpl-Plugin-Binaries (Dataref-Strings wie WASM).
+    lower.ends_with(".wasm") || lower.ends_with(".xpl")
 }
 
 /// Verzeichnisse, in die wir nicht absteigen (die Gigabyte-Fresser).
 /// `model*` wird betreten, aber nur .xml daraus mitgenommen (Behaviors).
+/// MSFS: texture/sound/model…; X-Plane: objects (.obj-3D), liveries,
+/// cockpit(_3d)-Texturen.
 fn is_excluded_dir(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     let base = lower.split('.').next().unwrap_or(&lower);
     matches!(
         base,
         "texture" | "textures" | "sound" | "soundai" | "effects" | "autogen" | "scenery" | "cgl"
-            | "font" | "fonts"
+            | "font" | "fonts" | "objects" | "liveries" | "cockpit" | "cockpit_3d"
     )
 }
 
@@ -304,8 +403,11 @@ fn build_zip(pkg_dir: &Path, folder: &str, collected: &CollectResult) -> Result<
 
 // ─── Tauri-Commands ─────────────────────────────────────────────────────
 
-/// Community-Ordner (auto + optional manuell) nach Flugzeug-Paketen
-/// durchsuchen. Liest pro Paket NUR die manifest.json.
+/// Flugzeug-Pakete finden: MSFS-Community-Ordner (aus UserCfg.opt) +
+/// X-Plane-Aircraft-Ordner (aus x-plane_install_*.txt) automatisch, plus
+/// ein optionaler manueller Pfad (funktioniert für beide Sims und für
+/// EINEN direkt gewählten Flugzeug-Ordner, egal wo er liegt). Pro Paket
+/// wird nur die manifest.json (MSFS) bzw. der .acf-Kopf (X-Plane) gelesen.
 #[tauri::command]
 pub async fn ascan_list_aircraft(
     state: tauri::State<'_, AircraftScanState>,
@@ -314,6 +416,7 @@ pub async fn ascan_list_aircraft(
     let roots: Vec<(PathBuf, String)> = {
         let mut roots: Vec<(PathBuf, String)> = community_dirs()
             .into_iter()
+            .chain(xplane_aircraft_dirs())
             .map(|(p, l)| (p, l.to_string()))
             .collect();
         if let Some(m) = manual_dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -340,9 +443,8 @@ pub async fn ascan_list_aircraft(
             dirs.sort_by_key(|e| e.file_name());
             for d in dirs {
                 let pkg_dir = d.path();
-                // Direkt-gewaehlter Paket-Ordner? (Pilot gibt das Paket statt
-                // des Community-Ordners an): manifest im Root selbst pruefen.
-                if let Some((title, creator)) = read_aircraft_manifest(&pkg_dir) {
+                // Unterordner als Paket? MSFS-manifest.json ODER X-Plane-.acf.
+                if let Some((title, creator)) = detect_aircraft(&pkg_dir) {
                     let folder = d.file_name().to_string_lossy().to_string();
                     found.push(FoundAircraft {
                         index: packages.len(),
@@ -354,8 +456,9 @@ pub async fn ascan_list_aircraft(
                     packages.push(ScanPackage { dir: pkg_dir, folder });
                 }
             }
-            // Root selbst als Paket (manual_dir zeigt direkt auf ein Addon)
-            if let Some((title, creator)) = read_aircraft_manifest(root) {
+            // Root selbst als Paket (manual_dir zeigt direkt auf EIN Flugzeug,
+            // egal wo — MSFS-manifest.json ODER X-Plane-.acf).
+            if let Some((title, creator)) = detect_aircraft(root) {
                 let folder = root
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
@@ -512,8 +615,44 @@ mod tests {
         for d in ["texture", "TEXTURE.FLEET", "sound", "SoundAI", "effects", "cgl"] {
             assert!(is_excluded_dir(d), "{d} muss ausgeschlossen sein");
         }
+        // X-Plane-Gigabyte-Ordner ebenfalls ausschliessen.
+        for d in ["objects", "liveries", "cockpit", "cockpit_3d"] {
+            assert!(is_excluded_dir(d), "{d} (X-Plane) muss ausgeschlossen sein");
+        }
         assert!(!is_excluded_dir("panel"));
+        assert!(!is_excluded_dir("plugins"));
         assert!(is_model_dir("model.LVFR"));
+    }
+
+    #[test]
+    fn xplane_whitelist_and_acf_detection() {
+        // Whitelist: X-Plane-Dateitypen akzeptiert.
+        assert!(matches!(whitelist_verdict("777.acf", 100, false), Verdict::Yes));
+        assert!(matches!(whitelist_verdict("modules/auto_thr.lua", 100, false), Verdict::Yes));
+        assert!(matches!(whitelist_verdict("plugins/sys/win.xpl", 100, false), Verdict::Yes));
+        assert!(matches!(whitelist_verdict("objects/skin.obj", 100, false), Verdict::No));
+
+        // .acf-Property-Parser.
+        let acf = "I\n800 version\nP acf/_ICAO B77W\nP acf/_name Boeing 777-300ER\nP acf/_studio Stratosphere\n";
+        assert_eq!(acf_prop(acf, "acf/_ICAO").as_deref(), Some("B77W"));
+        assert_eq!(acf_prop(acf, "acf/_name").as_deref(), Some("Boeing 777-300ER"));
+        assert_eq!(acf_prop(acf, "acf/_missing"), None);
+
+        // read_xplane_acf erkennt einen Ordner mit .acf, liefert Name+Studio.
+        let tmp = std::env::temp_dir().join(format!("ascan-xp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("myplane.acf"), acf).unwrap();
+        let (name, studio) = read_xplane_acf(&tmp).unwrap();
+        assert_eq!(name, "Boeing 777-300ER");
+        assert_eq!(studio.as_deref(), Some("Stratosphere"));
+        // detect_aircraft findet es auch (X-Plane-Zweig).
+        assert!(detect_aircraft(&tmp).is_some());
+        // Ordner ohne .acf/manifest.json → kein Flugzeug.
+        let empty = tmp.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(detect_aircraft(&empty).is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
