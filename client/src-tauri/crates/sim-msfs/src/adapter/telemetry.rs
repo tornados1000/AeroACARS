@@ -674,6 +674,18 @@ pub const TELEMETRY_FIELDS: &[TelemetryField] = &[
     // append-only am Tabellen-Ende, gleiche Reihenfolge im
     // pull_f64!-Block + Telemetry-Struct.
     F::f64("L:VC_PED_ATCXPDR_ON_OFF_Switch", "Number"),
+    // ---- Contrail Falcon 50 PREMIUM (v0.17.x, Aircraft-Scan) ----
+    // FMA-Slots des Collins EFIS-86C. Number-Enums (verifiziert in
+    // EADIConstants/Types.js, hex): lateral 0=NONE/1=GA/2=ROLL/3=LOC/
+    // 4=HDG/5=VOR/6=FMS; vertikal 0=NONE/1=GA/2=ALT/3=ALTS/4=VS/5=DES/
+    // 7=IAS/9=GS/10=PITCH/11=VNV. Unbekannte Werte fliessen als "#n"
+    // (Label-Bestaetigung am ersten D-BETI-Flug). Quelle: L:EFIS_C86C_
+    // FMA_SLOT_*. LOCKSTEP: append-only am Tabellen-Ende, gleiche
+    // Reihenfolge im pull_f64!-Block + Telemetry-Struct + Byte-Test.
+    F::f64("L:EFIS_C86C_FMA_SLOT_LAT_ACTIVE", "Number"),
+    F::f64("L:EFIS_C86C_FMA_SLOT_LAT_ARMED", "Number"),
+    F::f64("L:EFIS_C86C_FMA_SLOT_VERT_ACTIVE", "Number"),
+    F::f64("L:EFIS_C86C_FMA_SLOT_VERT_ARMED1", "Number"),
 ];
 
 // Helper builders so the table above stays compact.
@@ -1059,6 +1071,12 @@ pub struct Telemetry {
     // v0.16.20 (Review-Fund): XPDR ON/OFF-Schalter (0=OFF, 10=AUTO,
     // 20=ON per Skript-`/10`). Gated `xpdr_mode_label` auf OFF.
     pub fsl_xpdr_on_off_switch: f64,
+    // ---- Contrail Falcon 50 PREMIUM (v0.17.x) ----
+    // EFIS-86C FMA-Slot-Enums (siehe TELEMETRY_FIELDS-Kommentar).
+    pub contrail_fma_lat_active: f64,
+    pub contrail_fma_lat_armed: f64,
+    pub contrail_fma_vert_active: f64,
+    pub contrail_fma_vert_armed1: f64,
 }
 
 // ---- Touchdown sample (separate data definition #2) ----
@@ -1604,6 +1622,11 @@ impl Telemetry {
         pull_f64!(t.fsl_xpdr_mode_switch);
         // v0.16.20 (Review-Fund): XPDR ON/OFF — neuer outermost-Slot.
         pull_f64!(t.fsl_xpdr_on_off_switch);
+        // ---- Contrail Falcon 50 PREMIUM (v0.17.x) ----
+        pull_f64!(t.contrail_fma_lat_active);
+        pull_f64!(t.contrail_fma_lat_armed);
+        pull_f64!(t.contrail_fma_vert_active);
+        pull_f64!(t.contrail_fma_vert_armed1);
 
         // Silence the unused-assignment warning the last `pull_*!`
         // emits (the macro always advances `off`, but the very last
@@ -1756,6 +1779,59 @@ fn fbw_fma_vertical_label(n: i32) -> Option<String> {
     })
 }
 
+/// v0.17.x (#Premium, Aircraft-Scan): Contrail Falcon 50 EFIS-86C
+/// FMA-Slot-Enums → Modus-Label. Werte hex-verifiziert aus
+/// EADIConstants/Types.js. Unbekannte Werte (Enum-Lücken 6/8 vertikal,
+/// noch nicht am Live-Flug beobachtet) fliessen als "#n" — Label-
+/// Bestaetigung am ersten D-BETI-Flug (kein Raten). 0=NONE → None.
+fn contrail_fma_lateral_label(n: i32) -> Option<String> {
+    Some(match n {
+        0 => return None,
+        1 => "GA".to_string(),
+        2 => "ROLL".to_string(),
+        3 => "LOC".to_string(),
+        4 => "HDG".to_string(),
+        5 => "VOR".to_string(),
+        6 => "FMS".to_string(),
+        other => format!("#{other}"),
+    })
+}
+
+fn contrail_fma_vertical_label(n: i32) -> Option<String> {
+    Some(match n {
+        0 => return None,
+        1 => "GA".to_string(),
+        2 => "ALT".to_string(),
+        3 => "ALT SEL".to_string(),
+        4 => "VS".to_string(),
+        5 => "DES".to_string(),
+        7 => "IAS".to_string(),
+        9 => "GS".to_string(),
+        10 => "PITCH".to_string(),
+        11 => "VNAV".to_string(),
+        other => format!("#{other}"),
+    })
+}
+
+/// Kombiniert Active- + Armed-Slot zu einem FMA-Label: „HDG" bzw.
+/// „HDG (→LOC)" wenn ein Modus armed ist. `lateral` waehlt die
+/// Decode-Tabelle. Beide Slots kommen als f64-Number-LVar.
+fn contrail_fma_combined(active: f64, armed: f64, lateral: bool) -> Option<String> {
+    let decode = |v: f64| {
+        if lateral {
+            contrail_fma_lateral_label(v.round() as i32)
+        } else {
+            contrail_fma_vertical_label(v.round() as i32)
+        }
+    };
+    match (decode(active), decode(armed)) {
+        (Some(a), Some(arm)) => Some(format!("{a} (→{arm})")),
+        (Some(a), None) => Some(a),
+        (None, Some(arm)) => Some(format!("(→{arm})")),
+        (None, None) => None,
+    }
+}
+
 /// FBW `A32NX_AUTOTHRUST_MODE` → FMA-Thrust-Label (FBW-Doku).
 fn fbw_fma_thrust_label(n: i32) -> Option<String> {
     Some(match n {
@@ -1824,6 +1900,11 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
     // bleiben ehrlich None bzw. auf den Standard-SimVars + Kaskaden
     // (EX1/N1-Fallbacks greifen addon-agnostisch).
     let is_fsl = matches!(profile, AircraftProfile::FsLabsA321);
+    // v0.17.x (#Premium, Aircraft-Scan): Contrail Falcon 50 — EFIS-86C
+    // FMA-Slots (L:EFIS_C86C_FMA_SLOT_*), strikt profile-gegated. Der
+    // Auto-File-Fix laeuft addon-agnostisch ueber die Phase-FSM
+    // (Stillstands-Fallback), NICHT hier.
+    let is_contrail_fa50 = matches!(profile, AircraftProfile::ContrailFa50);
     // FSL-LED-Schwelle: die `_Brt_Lt`-LVars tragen LED-HELLIGKEIT,
     // kein 0/1-Flag — HubHop-Button-Presets pruefen ">50", wir werten
     // konservativer > 10 als "leuchtet" (faengt gedimmte Cockpits;
@@ -2611,6 +2692,8 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
         fbw_fma_lateral_label(t.fbw_fma_lateral.round() as i32)
     } else if is_ini {
         raw_enum_label(t.ini_roll_mode)
+    } else if is_contrail_fa50 {
+        contrail_fma_combined(t.contrail_fma_lat_active, t.contrail_fma_lat_armed, true)
     } else {
         None
     };
@@ -2618,6 +2701,8 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
         fbw_fma_vertical_label(t.fbw_fma_vertical.round() as i32)
     } else if is_ini {
         raw_enum_label(t.ini_pitch_mode)
+    } else if is_contrail_fa50 {
+        contrail_fma_combined(t.contrail_fma_vert_active, t.contrail_fma_vert_armed1, false)
     } else {
         None
     };
@@ -3894,6 +3979,42 @@ mod tests {
         assert_eq!(t.fsl_eng2_anti_ice, 1268.0); // idx 268
         assert_eq!(t.fsl_xpdr_mode_switch, 1269.0); // idx 269
         assert_eq!(t.fsl_xpdr_on_off_switch, 1270.0); // idx 270 (Review-Fund)
+
+        // ---- Contrail Falcon 50 PREMIUM (idx 271..274, v0.17.x) ----
+        assert_eq!(t.contrail_fma_lat_active, 1271.0); // idx 271
+        assert_eq!(t.contrail_fma_lat_armed, 1272.0); // idx 272
+        assert_eq!(t.contrail_fma_vert_active, 1273.0); // idx 273
+        assert_eq!(t.contrail_fma_vert_armed1, 1274.0); // idx 274
+    }
+
+    #[test]
+    fn contrail_fma_decode_and_combine() {
+        // Bekannte Enum-Werte (hex-verifiziert) → Klartext.
+        assert_eq!(contrail_fma_lateral_label(4), Some("HDG".to_string()));
+        assert_eq!(contrail_fma_lateral_label(3), Some("LOC".to_string()));
+        assert_eq!(contrail_fma_vertical_label(4), Some("VS".to_string()));
+        assert_eq!(contrail_fma_vertical_label(11), Some("VNAV".to_string()));
+        // 0 = NONE → keine Anzeige.
+        assert_eq!(contrail_fma_lateral_label(0), None);
+        // Unbekannter Wert → roh "#n" (Label-Bestaetigung am Live-Flug).
+        assert_eq!(contrail_fma_vertical_label(6), Some("#6".to_string()));
+        // Combined: nur aktiv.
+        assert_eq!(
+            contrail_fma_combined(4.0, 0.0, true),
+            Some("HDG".to_string())
+        );
+        // Combined: aktiv HDG, armed LOC.
+        assert_eq!(
+            contrail_fma_combined(4.0, 3.0, true),
+            Some("HDG (→LOC)".to_string())
+        );
+        // Combined: beide NONE → None.
+        assert_eq!(contrail_fma_combined(0.0, 0.0, false), None);
+        // Combined vertikal: aktiv VS, armed ALT SEL.
+        assert_eq!(
+            contrail_fma_combined(4.0, 3.0, false),
+            Some("VS (→ALT SEL)".to_string())
+        );
     }
 
     /// Truncated block (e.g. all 12 new tail LVars rejected by an older
