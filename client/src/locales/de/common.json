@@ -1722,6 +1722,7 @@
     "searching": "Suche…",
     "manual_dir_label": "Optional: eigener Pfad — auch der Ordner EINES einzelnen Flugzeugs",
     "manual_dir_placeholder": "z. B. D:\\MSFS\\Community oder .../X-Plane 12/Aircraft",
+    "pick_folder_button": "Ordner wählen…",
     "none_found": "Weder MSFS- noch X-Plane-Installation automatisch gefunden. Du kannst unten auch direkt den Ordner eines einzelnen Flugzeugs angeben.",
     "pick_hint": "{{count}} Flugzeuge gefunden — welches soll analysiert werden?",
     "back": "Zurück",

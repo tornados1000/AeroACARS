@@ -106,6 +106,10 @@ tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-opener = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+# v0.18.x: nativer Ordner-Auswahl-Dialog fuers Aircraft-Scan-Panel — der
+# Pilot musste den Community-/Aircraft-Pfad bisher als Text eintippen
+# (fehleranfaellig unter Windows/macOS-Pfaden). Ein Klick statt Tippen.
+tauri-plugin-dialog = "2"
 # v0.18.x: verhindert dass zwei AeroACARS-Prozesse gleichzeitig denselben
 # aktiven Flug tracken (Minimize-to-Tray laesst die App im Hintergrund
 # weiterlaufen — ein erneuter Doppelklick auf das App-Icon startete bisher

@@ -10,6 +10,7 @@
 
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "../lib/ipc";
 
 interface FoundAircraft {
@@ -62,6 +63,18 @@ export function AircraftScanPanel() {
   const [step, setStep] = useState<Step>({ kind: "idle" });
   const [manualDir, setManualDir] = useState("");
   const [error, setError] = useState<string | null>(null);
+
+  const pickFolder = async () => {
+    setError(null);
+    try {
+      const selected = await open({ directory: true, multiple: false });
+      if (typeof selected === "string") {
+        setManualDir(selected);
+      }
+    } catch (e) {
+      setError(String(e));
+    }
+  };
 
   const list = async () => {
     setError(null);
@@ -124,12 +137,18 @@ export function AircraftScanPanel() {
           </button>
           <label className="settings__field" style={{ marginTop: 10 }}>
             <span>{t("ascan.manual_dir_label")}</span>
-            <input
-              type="text"
-              value={manualDir}
-              placeholder={t("ascan.manual_dir_placeholder")}
-              onChange={(e) => setManualDir(e.target.value)}
-            />
+            <div style={{ display: "flex", gap: 8 }}>
+              <input
+                type="text"
+                value={manualDir}
+                placeholder={t("ascan.manual_dir_placeholder")}
+                onChange={(e) => setManualDir(e.target.value)}
+                style={{ flex: 1 }}
+              />
+              <button type="button" onClick={pickFolder}>
+                {t("ascan.pick_folder_button")}
+              </button>
+            </div>
           </label>
         </>
       )}

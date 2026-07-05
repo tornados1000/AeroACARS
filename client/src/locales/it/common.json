@@ -1722,6 +1722,7 @@
     "searching": "Ricerca…",
     "manual_dir_label": "Opzionale: percorso personalizzato — funziona anche con la cartella di un singolo aereo",
     "manual_dir_placeholder": "es. D:\\MSFS\\Community oppure .../X-Plane 12/Aircraft",
+    "pick_folder_button": "Scegli cartella…",
     "none_found": "Non è stata trovata automaticamente né un'installazione di MSFS né di X-Plane. Puoi anche inserire direttamente la cartella di un singolo aereo qui sotto.",
     "pick_hint": "Trovati {{count}} aerei — quale analizzare?",
     "back": "Indietro",
