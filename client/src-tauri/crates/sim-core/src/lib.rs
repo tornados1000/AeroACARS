@@ -1285,6 +1285,23 @@ impl AircraftProfile {
             Self::ContrailFa50 => "Contrail Falcon 50",
         }
     }
+
+    /// v0.18.x (QA-Härtung, addon-agnostischer Stillstands-Fallback): true
+    /// NUR für Flugzeug-Add-ons, bei denen wir per Aircraft-Scan-Analyse
+    /// bestätigt haben, dass die Triebwerkszähler-SimVar nach dem Shutdown
+    /// nicht auf 0 fällt (Contrail FA50: bleibt bei 3). Der Stillstands-
+    /// Fallback im FSM (siehe `arrived_standstill_condition`) darf NUR für
+    /// diese explizit bestätigten Flugzeuge laufen — NICHT als generelle
+    /// Fleet-weite Regel. Grund: ohne den harten engines-off-Test lässt sich
+    /// ein normaler, langer Rollhalt (Parkbremse gesetzt, z. B. beim Warten
+    /// auf weitere Rollfreigabe an einem großen Hub) nicht mehr von einer
+    /// echten Ankunft unterscheiden — das darf für die überwältigende
+    /// Mehrheit der Flugzeuge, deren Triebwerkszähler korrekt funktioniert,
+    /// nicht riskiert werden. Neue Add-ons kommen hier erst rein, wenn ein
+    /// Aircraft-Scan-Bericht das kaputte Verhalten konkret belegt.
+    pub fn engine_count_unreliable(self) -> bool {
+        matches!(self, Self::ContrailFa50)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1664,6 +1681,24 @@ mod tests {
         // icao_fallback + label
         assert_eq!(AircraftProfile::ContrailFa50.icao_fallback(), Some("FA50"));
         assert_eq!(AircraftProfile::ContrailFa50.label(), "Contrail Falcon 50");
+    }
+
+    #[test]
+    fn engine_count_unreliable_only_for_confirmed_broken_profiles() {
+        // v0.18.x QA-Härtung: der addon-agnostische Stillstands-Fallback (FSM)
+        // darf NUR für Flugzeuge laufen, bei denen ein Aircraft-Scan-Bericht
+        // das kaputte Verhalten konkret belegt hat — aktuell ausschließlich
+        // der Contrail FA50. Jedes andere Profil muss false liefern, sonst
+        // greift der schwächere Stillstands-Test (ohne harten engines-off-
+        // Check) fleet-weit und ein normaler Rollhalt mit Parkbremse (z. B.
+        // Warten auf Rollfreigabe an einem großen Hub) könnte fälschlich als
+        // Ankunft gewertet werden.
+        assert!(AircraftProfile::ContrailFa50.engine_count_unreliable());
+        assert!(!AircraftProfile::Default.engine_count_unreliable());
+        assert!(!AircraftProfile::FbwA32nx.engine_count_unreliable());
+        assert!(!AircraftProfile::Pmdg737.engine_count_unreliable());
+        assert!(!AircraftProfile::FenixA320.engine_count_unreliable());
+        assert!(!AircraftProfile::AerosoftA346.engine_count_unreliable());
     }
 
     #[test]

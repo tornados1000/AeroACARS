@@ -456,12 +456,22 @@ const ARRIVED_FALLBACK_DWELL_SECS: i64 = 30;
 /// Ziel). Fängt Addons ab, deren `engines_running`-SimVar nach dem Shutdown
 /// klemmt: der Contrail-FA50-Trijet meldet dauerhaft 3 laufende Triebwerke,
 /// sodass der engines-off-Pfad NIE feuert und Auto-File hängt (Michel D.,
-/// D-BETI). Bewusst 4× länger als die 30 s des engines-off-Pfads — ein
-/// kurzer Halt mit laufenden Triebwerken (Warten vor dem Gate) darf nicht als
-/// Ankunft durchgehen; 2 Minuten voll gestanden MIT gesetzter Parkbremse am
-/// Zielflughafen ist dagegen eindeutig eine Ankunft. Addon-agnostisch: hilft
-/// jedem Flieger mit klemmendem Triebwerkszähler, unabhängig von LVars.
-const ARRIVED_STANDSTILL_DWELL_SECS: i64 = 120;
+/// D-BETI).
+///
+/// v0.18.x QA-Härtung (Einwand Thomas: lange Rollhalte an großen Hubs, z. B.
+/// Warten auf weitere Rollfreigabe, wo Piloten realistisch die Parkbremse
+/// ziehen): 2 Minuten reichten dafür nicht als Sicherheitsmarge. ZWEI
+/// unabhängige Gegenmaßnahmen, nicht nur eine:
+///   1. Dieser Pfad läuft nur noch für Flugzeuge mit bestätigt kaputtem
+///      Triebwerkszähler (`AircraftProfile::engine_count_unreliable`), NICHT
+///      mehr fleet-weit — ein Rollhalt in einem Fenix/PMDG/FBW/etc. kann
+///      diesen Pfad gar nicht mehr erreichen, weil der harte engines-off-Test
+///      (30 s) für die die einzige Rolle spielt.
+///   2. Für die verbleibenden, eng begrenzten Fälle (aktuell nur FA50) ist der
+///      Dwell auf 5 Minuten verlängert — deutlich länger als ein typischer
+///      Rollhalt, aber am echten Zielflughafen nach Blockzeit ohne
+///      spürbaren Nachteil für den Piloten.
+const ARRIVED_STANDSTILL_DWELL_SECS: i64 = 300;
 
 // ---- Touch-and-Go / Go-Around detection (Stage 3) ----
 //
@@ -22983,21 +22993,28 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                 snap.groundspeed_kt,
             )
         };
-        // v0.17.x (#Premium, Aircraft-Scan): addon-agnostischer Stillstands-
-        // Fallback. Manche Addons klemmen `engines_running` nach dem Shutdown
-        // (Contrail FA50 Trijet: bleibt bei 3 → der engines-off-Pfad feuert
-        // NIE, Auto-File hängt). Ein Flieger, der am Zielflughafen voll steht
-        // (< 1 kt) MIT gesetzter Parkbremse, ist angekommen — unabhängig vom
-        // (falschen) Triebwerkszähler. NUR `near_planned` (der Divert-Pfad
-        // unten behält die strikte engines-off-Bedingung, damit ein
-        // Zwischenstopp mit laufenden Triebwerken nie als Divert fehl-filed
-        // wird); längerer Dwell als Schutz gegen kurzes Parken.
-        let standstill_path = arrived_standstill_condition(
-            near_planned,
-            snap.on_ground,
-            snap.groundspeed_kt,
-            snap.parking_brake,
-        );
+        // v0.17.x (#Premium, Aircraft-Scan): Stillstands-Fallback für Addons,
+        // deren `engines_running` nach dem Shutdown klemmt (Contrail FA50
+        // Trijet: bleibt bei 3 → der engines-off-Pfad feuert NIE, Auto-File
+        // hängt). Ein Flieger, der am Zielflughafen voll steht (< 1 kt) MIT
+        // gesetzter Parkbremse, ist angekommen — unabhängig vom (falschen)
+        // Triebwerkszähler. NUR `near_planned` (der Divert-Pfad unten behält
+        // die strikte engines-off-Bedingung).
+        //
+        // v0.18.x QA-Härtung: bewusst NICHT mehr fleet-weit (Einwand Thomas —
+        // an großen Hubs ziehen Piloten die Parkbremse auch bei einem langen
+        // Rollhalt, z. B. beim Warten auf weitere Rollfreigabe; ohne Gate hätte
+        // das JEDEN Piloten mitten auf dem Rollweg beenden können). Läuft nur
+        // noch für Flugzeuge mit bestätigt kaputtem Triebwerkszähler (siehe
+        // `AircraftProfile::engine_count_unreliable`) — für alle anderen bleibt
+        // ausschließlich der harte engines-off-Pfad übrig, exakt wie vor v0.17.x.
+        let standstill_path = snap.aircraft_profile.engine_count_unreliable()
+            && arrived_standstill_condition(
+                near_planned,
+                snap.on_ground,
+                snap.groundspeed_kt,
+                snap.parking_brake,
+            );
         let conditions_basic = engines_off_path || standstill_path;
         if conditions_basic {
             let pending_at = stats.arrived_fallback_pending_since.get_or_insert(now);

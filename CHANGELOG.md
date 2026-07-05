@@ -4,9 +4,9 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
-## [v0.18.0] — 2026-07-05 · Aircraft-Scan, Falcon 50 & Zibo 737 (X-Plane)
+## [v0.18.1] — 2026-07-05 · Aircraft-Scan, Falcon 50 & Zibo 737 (X-Plane)
 
-Neues Aircraft-Scan-Werkzeug (Settings → Aircraft-Scan): geladenes Flugzeug-Add-on direkt einreichen statt den kompletten Community-Ordner hochzuladen, für schnellere Premium-Profil-Entwicklung. Zwei neue Profile: Contrail Falcon 50 (FMA, Autothrottle, Master-/Feuerwarnung) und Zibo/Laminar 737-800 (X-Plane, AP-Modi über `laminar/B738`-Datarefs). Fix: addon-agnostischer Stillstands-Fallback für Auto-File bei Addons mit klemmendem Triebwerkszähler (Parkbremse bleibt Pflicht, damit ein Rollhalt beim Warten auf eine freie Bahn nicht als Ankunft gilt). Fix: TakeoffRoll-Rückkante nach Startabbruch. Fix: ICAO-Typ-Ableitung gehärtet (42 % Datenmüll in der internen Erfassung behoben). Neu: GitHub-Actions-CI baut/testet bei jedem Push. Details: `docs/release-notes/v0.18.0.md`.
+Neues Aircraft-Scan-Werkzeug (Settings → Aircraft-Scan): geladenes Flugzeug-Add-on direkt einreichen statt den kompletten Community-Ordner hochzuladen, für schnellere Premium-Profil-Entwicklung. Zwei neue Profile: Contrail Falcon 50 (FMA, Autothrottle, Master-/Feuerwarnung) und Zibo/Laminar 737-800 (X-Plane, AP-Modi über `laminar/B738`-Datarefs). Fix: Stillstands-Fallback für Auto-File beim Falcon 50 (klemmender Triebwerkszähler) — bewusst NUR für Flugzeuge mit per Aircraft-Scan bestätigtem Fehler gegatet (`AircraftProfile::engine_count_unreliable`), Dwell 5 min, Parkbremse bleibt Pflicht; kein Fleet-weiter Fallback, damit ein Rollhalt beim Warten auf Rollfreigabe an großen Flughäfen bei keinem anderen Flugzeug fälschlich als Ankunft gilt (QS-Einwand Thomas, v0.18.0 intern verworfen ohne Veröffentlichung). Fix: TakeoffRoll-Rückkante nach Startabbruch. Fix: ICAO-Typ-Ableitung gehärtet (42 % Datenmüll in der internen Erfassung behoben). Neu: GitHub-Actions-CI baut/testet bei jedem Push. Details: `docs/release-notes/v0.18.1.md`.
 
 ---
 
