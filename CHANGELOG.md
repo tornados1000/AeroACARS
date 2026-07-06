@@ -4,6 +4,12 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.18.4] — 2026-07-06 · Aircraft-Scan-Bedienung überarbeitet
+
+Letzte Nachbesserung an der in v0.18.2 eingefuehrten Ordnerauswahl. Fix: ein manuell gewaehlter/eingetippter Pfad wurde bisher nur an die volle Auto-Erkennung ANGEHAENGT statt sie zu ersetzen — "Flugzeuge suchen" durchsuchte trotzdem die komplette Bibliothek erneut, vermischt mit dem gewaehlten Ordner (Live-Befund Thomas K.). Root-Auswahl in `select_roots()` extrahiert und testbar gemacht: ein manueller Pfad ist jetzt die EINZIGE Suchwurzel. UI dafuer neu aufgeteilt: zwei feste, immer sichtbare Buttons ("Flugzeuge suchen" fuer die volle Auto-Erkennung, "Diesen Ordner scannen" fuer ausschliesslich den gewaehlten Pfad) statt einem Button, der sein Verhalten/seinen Text je nach Eingabefeld aendert. Details: `docs/release-notes/v0.18.4.md`.
+
+---
+
 ## [v0.18.3] — 2026-07-05 · Absicherung LAN-Fernbedienung
 
 Thomas-Hinweis (auf den v0.18.2-Fund zur Doppel-Log-Ursache): koennten die Duplikate von der LAN-Fernbedienung kommen? Nicht der exakte Mechanismus des schon gefixten Bugs, aber die Nachfrage deckte eine eigenstaendige Luecke auf: `flight_resume_confirm` ist ueber `remote/bridge.rs` erreichbar, der Frontend-Doppelklick-Schutz (`confirmingRef`) lebt aber nur im Hauptfenster-React-Baum, nicht in der separaten Remote-Weboberflaeche. `spawn_position_streamer` und `spawn_phpvms_position_worker` haben bereits einen Compare-and-Swap-Guard genau dagegen ("mehrere flight_resume etc.") — `spawn_touchdown_sampler` hatte keinen. Guard ergaenzt. Details: `docs/release-notes/v0.18.3.md`.
