@@ -22,7 +22,7 @@
 //! Architektur (2 Layer, beide pur + uhrlos — Caller liefert Timestamps):
 //!
 //!   * **Layer 1 — [`KinematicSegmenter`]:** zeitbasierter Ring-Buffer
-//!     (~90 s Fenster, max. 64 Samples). Klassifiziert die Bewegung als
+//!     (~60 s Fenster, max. 64 Samples). Klassifiziert die Bewegung als
 //!     `Ground / Climbing / Level / Descending / Insufficient` aus
 //!     Fenster-EVIDENZ (Altitude-Rate über das Fenster + Median-V/S),
 //!     nie aus einem einzelnen Tick. Hysterese-Band zwischen den
@@ -52,18 +52,29 @@ use std::collections::VecDeque;
 
 /// Klassifikations-Fenster: es werden Samples gehalten, die zusammen
 /// mindestens dieses Zeitfenster abdecken.
-pub const WINDOW_SECS: f64 = 90.0;
+///
+/// 2026-07-06: 90 → 60 s. Messung über 189 reale Schatten-Flüge
+/// (418k Enroute-Ticks): die tatsächliche Streamer-Tick-Kadenz liegt im
+/// GESAMTEN En-Route-Band bei median ~3 s (nicht den früher angenommenen
+/// bis zu 60 s), p99 < 6 s. Ein 90-s-Fenster war dadurch messbar zu träge
+/// (Top-of-Climb-Latenz median 77,5 s). 60 s spart median 24 s an ToC /
+/// 15 s an ToD und schließt die beobachteten Phasen-Lag-Läufe; Kosten nur
+/// +~10 % Segment-Flips (+0,56/Flug). Bei 3-s-Kadenz trägt 60 s noch ~20
+/// Samples — mehr als genug für eine stabile Rate.
+pub const WINDOW_SECS: f64 = 60.0;
 /// Unter dieser Fenster-Spannweite (oder < 2 Samples) gibt es keine
 /// belastbare Evidenz → `Insufficient` (vorheriges Segment wird gehalten).
-pub const MIN_SPAN_SECS: f64 = 60.0;
-/// Sample-Cap. Zusammen mit `MIN_SAMPLE_SPACING_SECS` garantiert das,
-/// dass 64 Samples immer ≥ 90 s abdecken (64 × 1.5 s = 96 s) — die
-/// Streamer-Tick-Cadence variiert von 0.5 s (Flare) bis 60 s (Cruise),
-/// schnelle Ticks dürfen das Fenster nicht unter `MIN_SPAN_SECS` drücken.
+/// Proportional zum 60-s-Fenster gesenkt (war 60 s bei 90-s-Fenster).
+pub const MIN_SPAN_SECS: f64 = 45.0;
+/// Sample-Cap gegen unbegrenztes Buffer-Wachstum. HINWEIS: In 189 realen
+/// Flügen wurde dieser Cap NIE erreicht — die Trim-by-Span-Logik wirft
+/// alte Samples längst vorher raus (bei ~3-s-Kadenz ~20 Samples im
+/// 60-s-Fenster, bei 0.5-s-Flare-Kadenz ~40 über MIN_SPAN). Der Cap ist
+/// reiner Sicherheitsgurt, keine kalibrierte Konstante.
 pub const MAX_SAMPLES: usize = 64;
 /// Aufnahme-Mindestabstand in den Buffer. Schnellere Ticks werden für
 /// die Klassifikation trotzdem verarbeitet, nur nicht gespeichert —
-/// über ein 90-s-Fenster trägt ein 0.5-s-Nachbarsample keine neue
+/// über ein 60-s-Fenster trägt ein 0.5-s-Nachbarsample keine neue
 /// Information.
 pub const MIN_SAMPLE_SPACING_SECS: f64 = 1.5;
 /// Sample-Lücke, ab der der Segmenter komplett resettet (Sim-Reload,
@@ -90,7 +101,33 @@ pub const CRUISE_REF_BAND_FT: f64 = 1000.0;
 /// Fallback ohne `cruise_ref`: so lange muss ein Level-Segment
 /// anhalten, bevor es als Cruise gilt (am 429-Flug-Korpus validierte
 /// Heuristik — typische ATC-Level-Offs im Climb/Descent sind kürzer).
+/// Wird im SINKFLUG durch die Observed-Cruise-Ref (s. u.) ersetzt und
+/// greift dort nur noch, wenn noch keine Referenz-Höhe beobachtet wurde.
 pub const LEVEL_TO_CRUISE_FALLBACK_SECS: i64 = 240;
+/// Observed-Cruise-Ref-Band (2026-07-06): das höchste je im En-Route-Band
+/// erreichte Level (`obsref`) ist eine ref-lose, aus dem Höhenstrom selbst
+/// abgeleitete Cruise-Referenz — verfügbar für 100 % der Flüge (im
+/// Gegensatz zum bei GSG fast immer leeren `cruise_ref`). Ein Level-Segment
+/// im SINKFLUG gilt nur dann wieder als Cruise, wenn `alt ≥ obsref − BAND`.
+/// Das killt die Descent-Level-Off→Cruise-Fehlpromotion (158 → 3 Ticks über
+/// den 189-Flug-Korpus) ohne die Steig-Gewinne anzutasten. BEWUSST NUR im
+/// Sinkflug: im Steig ist `obsref == aktuelle Höhe` → eine Level-Restriction
+/// würde sofort fälschlich Cruise (Premature-Cruise-Falle) — dort bleibt der
+/// Dauer-Fallback oben maßgeblich.
+pub const OBSREF_BAND_FT: f64 = 2000.0;
+/// Go-Around-Bestätigung (2026-07-06): aus Approach/Final wird erst dann
+/// Climb, wenn seit dem ERSTEN Climbing-Segment-Tick netto mindestens so
+/// viel AGL gewonnen wurde. Trennt echte Go-Arounds von Glideslope-/
+/// Flare-Ballooning (kurzer +V/S-Spike bzw. Level-Bump hoch oben, der
+/// wieder kollabiert). Killt die geklebte-Climb-Kaskade (0 Stuck-Flüge im
+/// 189-Flug-Korpus). Schwelle 700 ft empirisch bestimmt: der echte
+/// pto705-Go-Around (+1219 ft ab Tiefpunkt, ab Segment-Anker ~+800 ft)
+/// bestätigt, der a3V0DXn-Level-Bump (~+150 ft) und der 207-ft-Blip aus
+/// `phase_holding_pending_leak` werden korrekt gehalten. Der Segment-Anker
+/// (nicht der Anflug-Tiefpunkt) ist bewusst gewählt: er misst den LOKALEN
+/// Steig ab Climbing-Beginn und wird dadurch nicht von einem viel tieferen
+/// früheren Anflugpunkt getäuscht (der a3V0DXn fälschlich +2000 ft gäbe).
+pub const GA_CONFIRM_FT: f64 = 700.0;
 /// Fallback ohne `cruise_ref`: so lange muss ein Climbing-Segment im
 /// Cruise anhalten, bevor die Phase zurück auf Climb geht (Step-Climbs
 /// ohne Referenz nicht von echten Re-Climbs unterscheidbar — kurze
@@ -315,6 +352,20 @@ pub struct ShadowPhaseEngine {
     /// Seit wann `current_segment` ununterbrochen gemeldet wird — Basis
     /// der Dauer-Heuristiken (Level ≥ 240 s, Climbing ≥ 60 s).
     segment_since: Option<DateTime<Utc>>,
+    /// Observed-Cruise-Ref: höchste je im En-Route-Band erreichte MSL-Höhe.
+    /// Ref-lose Cruise-Referenz für den Sinkflug (s. `OBSREF_BAND_FT`).
+    ///
+    /// Wird bewusst NUR per `.max()` angehoben und über Resets/Time-Skips/
+    /// Baseline-Sync NICHT gelöscht: die Engine lebt per-Flug (frisch pro
+    /// Flug in `FlightStats`), und ein „zu hoch" stehen gebliebener Wert (z. B.
+    /// nach einem Touch-and-Go zu tieferem Zweit-Leg) macht den Descent-Level-
+    /// Guard nur KONSERVATIVER (bleibt Descent) — er kann nie fälschlich
+    /// Cruise promoten. Damit gibt es keinen Premature-Cruise-Pfad über obsref.
+    obsref_ft: Option<f64>,
+    /// AGL beim ERSTEN Climbing-Tick eines Approach/Final-Climb-Outs — Anker
+    /// der Go-Around-Bestätigung (`GA_CONFIRM_FT`). `None`, solange nicht in
+    /// einem Approach/Final-Climbing-Ausstieg.
+    ga_entry_agl_ft: Option<f64>,
 }
 
 impl ShadowPhaseEngine {
@@ -346,11 +397,18 @@ impl ShadowPhaseEngine {
             .map(|s| (t - s).num_seconds())
             .unwrap_or(0);
 
+        // Observed-Cruise-Ref pflegen: höchste MSL-Höhe, solange irgendeine
+        // der beiden Engines im En-Route-Band ist (deckt den ganzen Flug ab).
+        if old_is_enroute(old_phase) || shadow_is_enroute(self.phase) {
+            self.obsref_ft = Some(self.obsref_ft.map_or(alt_msl_ft, |r| r.max(alt_msl_ft)));
+        }
+
         if !old_is_enroute(old_phase) {
             // Boden-/Terminal-Band: alte FSM 1:1 spiegeln (Boarding/
             // Pushback/Taxi/TakeoffRoll/Takeoff/Landing/TaxiIn/BlocksOn/
             // Arrived/…). Der Diff soll das En-Route-Band zeigen.
             self.phase = old_phase;
+            self.ga_entry_agl_ft = None;
         } else if !shadow_is_enroute(self.phase) {
             // Baseline-Sync: die alte FSM ist im En-Route-Band, v2 noch
             // nicht (Engine-Start mid-flight / Resume / Takeoff→Climb-
@@ -370,6 +428,7 @@ impl ShadowPhaseEngine {
             segment = Segment::Insufficient;
             self.current_segment = segment;
             self.segment_since = Some(t);
+            self.ga_entry_agl_ft = None;
         } else {
             self.phase = self.resolve(
                 segment,
@@ -390,10 +449,13 @@ impl ShadowPhaseEngine {
 
     /// Vollständiger symmetrischer Übergangs-Graph für das
     /// En-Route-Band — der Kern-Fix. „Sustained" steckt bereits im
-    /// Segment selbst (90-s-Fenster-Evidenz); die Dauer-Heuristiken
+    /// Segment selbst (60-s-Fenster-Evidenz); die Dauer-Heuristiken
     /// (`seg_held_secs`) greifen nur in den ref-losen Fallbacks.
+    ///
+    /// `&mut self`, weil die Go-Around-Bestätigung (`GA_CONFIRM_FT`) den
+    /// AGL-Anker über mehrere Ticks hält (`ga_entry_agl_ft`).
     fn resolve(
-        &self,
+        &mut self,
         segment: Segment,
         seg_held_secs: i64,
         alt_msl_ft: f64,
@@ -404,6 +466,33 @@ impl ShadowPhaseEngine {
         // „Am/über dem geplanten Cruise-Level" (Band: ref − 1000 ft).
         let near_or_above_ref =
             |alt: f64| cruise_ref_ft.map(|r| alt >= r - CRUISE_REF_BAND_FT);
+        // Ref-lose Cruise-Entscheidung im SINKFLUG: Observed-Cruise-Ref
+        // (höchste erreichte Höhe) schlägt den Dauer-Fallback. Nur im
+        // Sinkflug korrekt — der Aufrufer nutzt das nur im Descent-Zweig.
+        let cruise_from_level_descending = |alt: f64| match near_or_above_ref(alt) {
+            Some(at) => at,
+            None => match self.obsref_ft {
+                Some(r) => alt >= r - OBSREF_BAND_FT,
+                None => seg_held_secs >= LEVEL_TO_CRUISE_FALLBACK_SECS,
+            },
+        };
+
+        // Der GA-Anker gilt im Approach/Final-Ausstieg. Er ÜBERLEBT kurze
+        // Level-/Insufficient-Dips im Steigflug (gestufter Go-Around, z. B.
+        // ATC-Stopp-Höhe oder eine Steigrate, die kurz unter die
+        // Fensterschwelle pendelt), damit der AGL-Gewinn KUMULATIV ab dem
+        // ersten Climbing-Tick zählt. Ein Re-Anker bei jedem Dip würde höher
+        // ansetzen und einen gestuften GA nie `GA_CONFIRM_FT` am Stück
+        // erreichen lassen (→ geklebter Approach, das Spiegelbild des Bugs,
+        // den der Guard behebt). Gelöscht wird der Anker nur, wenn wieder
+        // gesunken wird (`Descending` = GA aufgegeben) oder das Approach/
+        // Final-Band verlassen ist (sonst bestätigte ein späterer Anflug
+        // gegen einen veralteten, tieferen Anker).
+        if !matches!(self.phase, FlightPhase::Approach | FlightPhase::Final)
+            || segment == Segment::Descending
+        {
+            self.ga_entry_agl_ft = None;
+        }
 
         match self.phase {
             FlightPhase::Climb => match segment {
@@ -420,7 +509,10 @@ impl ShadowPhaseEngine {
                         // Level-RESTRICTION → Climb + Label Level
                         // (killt die 69 Premature-Cruise-Flüge).
                         Some(at) => at,
-                        // ref unbekannt: Dauer-Heuristik.
+                        // ref unbekannt: Dauer-Heuristik. BEWUSST NICHT
+                        // obsref — im Steigflug ist obsref == aktuelle Höhe,
+                        // das würde jede Level-Restriction sofort fälschlich
+                        // zu Cruise promoten (Premature-Cruise-Falle).
                         None => seg_held_secs >= LEVEL_TO_CRUISE_FALLBACK_SECS,
                     };
                     if cruise && agl_ft > CRUISE_MIN_AGL_FT {
@@ -436,6 +528,15 @@ impl ShadowPhaseEngine {
                 // sofort Descent, nicht auf Fenster-Evidenz warten.
                 if vs_fpm < CRUISE_FASTPATH_VS_FPM && agl_ft < CRUISE_FASTPATH_AGL_FT {
                     return FlightPhase::Descent;
+                }
+                // Cruise→Approach-Kante (symmetrisch zur Descent→Approach-
+                // Kante): tief + sinkend. Schließt das Cruise-Kleben bei
+                // < 5000 AGL (approach→cruise 181 → 0). Departure-sicher:
+                // Cruise unter 5000 AGL entsteht nur durch Hineinsinken
+                // (CRUISE_MIN_AGL_FT-Gate), nie im Steig — 0 Gegenbeispiele
+                // im 189-Flug-Korpus.
+                if agl_ft < APPROACH_AGL_FT && vs_fpm < 0.0 {
+                    return FlightPhase::Approach;
                 }
                 match segment {
                     // Cruise + Descending sustained → Descent. KEIN
@@ -477,12 +578,11 @@ impl ShadowPhaseEngine {
                     Segment::Level => {
                         // ATC-Level-Off im Sinkflug: bleibt Descent +
                         // Label Level (killt die 193 Descent→Cruise-
-                        // Flaps). Nur am/über dem geplanten Level (bzw.
-                        // ref-los nach 240 s) ist es wieder Cruise.
-                        let cruise = match near_or_above_ref(alt_msl_ft) {
-                            Some(at) => at,
-                            None => seg_held_secs >= LEVEL_TO_CRUISE_FALLBACK_SECS,
-                        };
+                        // Flaps). Nur am/über dem geplanten Level (ref-los:
+                        // Observed-Cruise-Ref) ist es wieder Cruise — der
+                        // Restriktions-Level tief im Sinkflug bleibt Descent
+                        // (descent→cruise 158 → 3 im Korpus).
+                        let cruise = cruise_from_level_descending(alt_msl_ft);
                         if cruise && agl_ft > CRUISE_MIN_AGL_FT {
                             FlightPhase::Cruise
                         } else {
@@ -494,8 +594,15 @@ impl ShadowPhaseEngine {
             }
             FlightPhase::Approach => {
                 if segment == Segment::Climbing {
-                    // Go-Around (fenster-evident).
-                    FlightPhase::Climb
+                    // Go-Around — aber erst NACH bestätigtem AGL-Gewinn
+                    // (Balloon-Guard): ein Glideslope-Capture-Balloon
+                    // erzeugt kurz ein Climbing-Segment, ohne dass der
+                    // Flieger nachhaltig steigt.
+                    if self.confirm_go_around(agl_ft) {
+                        FlightPhase::Climb
+                    } else {
+                        FlightPhase::Approach
+                    }
                 } else if agl_ft < FINAL_AGL_FT {
                     // Final-Kante (alte FSM 1:1).
                     FlightPhase::Final
@@ -505,10 +612,15 @@ impl ShadowPhaseEngine {
             }
             FlightPhase::Final => {
                 if segment == Segment::Climbing {
-                    // Go-Around aus dem Final. Landing kommt per
-                    // Sync von der alten FSM (on_ground-Edge + Sampler
-                    // bleiben deren Domäne).
-                    FlightPhase::Climb
+                    // Go-Around aus dem Final — mit demselben Balloon-Guard
+                    // wie im Approach (Flare-Ballooning erzeugt sonst einen
+                    // Phantom-Climb). Landing kommt per Sync von der alten
+                    // FSM (on_ground-Edge + Sampler bleiben deren Domäne).
+                    if self.confirm_go_around(agl_ft) {
+                        FlightPhase::Climb
+                    } else {
+                        FlightPhase::Final
+                    }
                 } else {
                     FlightPhase::Final
                 }
@@ -517,6 +629,16 @@ impl ShadowPhaseEngine {
             // step) — defensiv: Phase halten.
             other => other,
         }
+    }
+
+    /// Go-Around-Bestätigung: liefert `true`, sobald seit dem ersten
+    /// Climbing-Tick netto ≥ `GA_CONFIRM_FT` AGL gewonnen wurde. Ankert den
+    /// AGL-Startwert beim ersten Aufruf. Der Aufrufer stellt sicher, dass
+    /// der Anker außerhalb des Approach/Final-Climbing-Ausstiegs gelöscht
+    /// wird (Guard am Anfang von `resolve`).
+    fn confirm_go_around(&mut self, agl_ft: f64) -> bool {
+        let anchor = *self.ga_entry_agl_ft.get_or_insert(agl_ft);
+        agl_ft >= anchor + GA_CONFIRM_FT
     }
 }
 
@@ -606,17 +728,17 @@ mod tests {
     fn segmenter_insufficient_until_min_span() {
         let mut seg = KinematicSegmenter::default();
         let mut t = t0();
-        // 50 s Klettern: span < 60 s → Insufficient.
+        // 35 s Klettern (7 Samples ab t0+5): span < MIN_SPAN_SECS(45) → Insufficient.
         let mut s = Segment::Insufficient;
-        for i in 0..10 {
+        for i in 0..7 {
             t += Duration::seconds(5);
             s = seg.push(t, 1000.0 + (i as f64) * 200.0, 1000.0, 2400.0, false);
         }
         assert_eq!(s, Segment::Insufficient);
-        // Weitere 45 s → genug Evidenz → Climbing.
-        for i in 0..9 {
+        // Weiter steigen bis die Fenster-Spannweite ≥ 45 s trägt → Climbing.
+        for i in 0..7 {
             t += Duration::seconds(5);
-            s = seg.push(t, 3000.0 + (i as f64) * 200.0, 3000.0, 2400.0, false);
+            s = seg.push(t, 2400.0 + (i as f64) * 200.0, 2400.0, 2400.0, false);
         }
         assert_eq!(s, Segment::Climbing);
     }
@@ -920,7 +1042,7 @@ mod tests {
         sim.depart();
         sim.alt = 38000.0;
         sim.fly(300, 0.0, FlightPhase::Cruise);
-        // −6000 fpm: nach ~90 s Fenster-Evidenz → Descent (alte FSM
+        // −6000 fpm: nach ~60 s Fenster-Evidenz → Descent (alte FSM
         // hätte 5000 ft Verlust ohnehin nach ~50 s).
         let (p, _) = sim.fly(120, -6000.0, FlightPhase::Cruise);
         assert_eq!(p, FlightPhase::Descent);
@@ -1034,6 +1156,74 @@ mod tests {
         assert_eq!(p, FlightPhase::TaxiIn);
         let (p, _) = sim.fly_with_tick(60, 5, 0.0, FlightPhase::Arrived, true);
         assert_eq!(p, FlightPhase::Arrived);
+    }
+
+    /// R1 (Observed-Cruise-Ref): ref-loser Descent-Level-Off tief unten
+    /// bleibt Descent — der 240-s-Fallback hätte fälschlich Cruise gelatcht,
+    /// obsref (höchste erreichte Höhe) verhindert das.
+    #[test]
+    fn descent_level_off_refless_stays_descent_via_obsref() {
+        let mut sim = Sim::new(None);
+        sim.depart();
+        sim.alt = 500.0;
+        // Auf ~FL350 steigen → obsref etabliert sich bei ~35000.
+        sim.fly(1000, 2100.0, FlightPhase::Climb);
+        sim.alt = 35000.0;
+        sim.fly(180, 0.0, FlightPhase::Cruise);
+        // Sinkflug.
+        sim.fly(800, -2000.0, FlightPhase::Descent);
+        sim.alt = 8000.0;
+        // 10 min Level-Off auf 8000 ft (Restriktion tief im Sinkflug),
+        // ref-los. Ohne obsref → 240-s-Fallback → Cruise (falsch).
+        let (p, s) = sim.fly(600, 0.0, FlightPhase::Descent);
+        assert_eq!(p, FlightPhase::Descent, "Restriktion tief im Sinkflug ≠ Cruise");
+        assert_eq!(s, Segment::Level);
+    }
+
+    /// E1 (Cruise→Approach-Kante): Cruise, das unter 5000 ft AGL sinkt,
+    /// geht in Approach statt kleben zu bleiben.
+    #[test]
+    fn cruise_low_agl_descending_to_approach_edge() {
+        let mut sim = Sim::new(None);
+        sim.depart();
+        // Cruise tief etablieren (agl > 5000, ref-los via Dauer-Fallback).
+        sim.alt = 6000.0;
+        let (p, _) = sim.fly(300, 0.0, FlightPhase::Cruise);
+        assert_eq!(p, FlightPhase::Cruise);
+        // Moderater Sinkflug unter 5000 AGL (NICHT Fast-Path: agl > 3000).
+        sim.alt = 4500.0;
+        let (p, _) = sim.fly(10, -300.0, FlightPhase::Descent);
+        assert_eq!(p, FlightPhase::Approach, "Cruise <5000 AGL + sinkend → Approach");
+    }
+
+    /// E2 (Balloon-Guard): ein kurzer, schwacher Steig-Blip im Final
+    /// (< `GA_CONFIRM_FT` = 700 ft AGL-Gewinn) latcht NICHT Climb; erst der
+    /// bestätigte Go-Around (≥ 700 ft Gewinn) tut es.
+    #[test]
+    fn go_around_balloon_guard_holds_until_confirmed() {
+        let mut sim = Sim::new(None);
+        sim.depart();
+        // In den Anflug/Final bringen.
+        sim.alt = 4000.0;
+        sim.fly(200, -1000.0, FlightPhase::Approach);
+        sim.alt = 600.0;
+        let (p, _) = sim.fly(20, -300.0, FlightPhase::Final);
+        assert_eq!(p, FlightPhase::Final);
+        // Schwacher, anhaltender Steig-Blip (+400 fpm): erzeugt irgendwann
+        // ein Climbing-Segment, aber solange < 700 ft ab Anker gewonnen sind,
+        // bleibt es Final (Balloon-Guard). +400 fpm × 60 s = 400 ft < 700.
+        let (p, _) = sim.fly(60, 400.0, FlightPhase::Climb);
+        assert_eq!(p, FlightPhase::Final, "Balloon <700 ft AGL darf nicht Climb latchen");
+        // Echter Go-Around-Steigflug (+2500 fpm) → > 700 ft Gewinn → Climb.
+        let mut reached = false;
+        for _ in 0..12 {
+            let (p, _) = sim.fly(15, 2500.0, FlightPhase::Climb);
+            if p == FlightPhase::Climb {
+                reached = true;
+                break;
+            }
+        }
+        assert!(reached, "bestätigter Go-Around muss Climb erreichen");
     }
 
     #[test]

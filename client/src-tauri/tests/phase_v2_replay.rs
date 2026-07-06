@@ -268,12 +268,16 @@ fn golden_arc_pto705_go_around() {
 #[test]
 fn golden_arc_phase_holding_pending_leak() {
     // Anflug-Ausschnitt (Positions beginnen erst bei 723 ft AGL im
-    // Sinkflug und enden im Go-Around-Steigflug): v2 synct auf
-    // Approach, folgt nach Final und in den GA-Climb — und zeigt nie
-    // die (Bug-)Holding-Episode der alten FSM.
+    // Sinkflug und enden im Go-Around-Steigflug): v2 synct auf Approach
+    // und folgt nach Final — und zeigt nie die (Bug-)Holding-Episode der
+    // alten FSM. Der Ausschnitt ENDET bei nur +207 ft ab Steigbeginn
+    // (988→1195 ft AGL), also VOR der GA-Bestätigungsschwelle
+    // (`GA_CONFIRM_FT` = 700 ft) — der Balloon-Guard hält deshalb korrekt
+    // Final, statt einen 207-ft-Blip als Climb zu latchen. Der echte,
+    // ausgeflogene Go-Around ist in `pto705` abgedeckt (+1219 ft → Climb).
     let arc = assert_golden(
         "phase_holding_pending_leak.jsonl.gz",
-        "Approach>Final>Climb",
+        "Approach>Final",
     );
     assert!(!arc.iter().any(|(_, p)| *p == FlightPhase::Holding));
 }
