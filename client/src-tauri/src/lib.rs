@@ -8230,9 +8230,13 @@ fn flight_info(flight: &ActiveFlight, resume_position_suspect: bool) -> ActiveFl
         arr_airport: flight.arr_airport.clone(),
         distance_nm: stats.distance_nm,
         position_count: stats.position_count,
-        phase: phase_to_snake(stats.phase).to_string(),
-        // v0.16.12 (#phase-v2): Schatten-Sicht für die dezente
-        // UI-Statuszeile (nur Anzeige, keine Entscheidung).
+        // #phase-v2 Cutover: angezeigte Phase = v2 (effective_phase); die
+        // v1-FSM bleibt mechanisch autoritativ. `shadow_segment` unten trägt
+        // das „Level"-Label für Restriktionen ans Frontend.
+        phase: phase_to_snake(effective_phase(&stats)).to_string(),
+        // v0.16.12 (#phase-v2): Schatten-Sicht (= dieselbe v2-Phase). Nach dem
+        // Cutover == `phase`; die frühere dezente „v2:"-UI-Zeile deaktiviert
+        // sich dadurch selbst und wird im Frontend entfernt.
         shadow_phase: stats.shadow_phase.map(|p| phase_to_snake(p).to_string()),
         shadow_segment: stats
             .shadow_segment
@@ -8347,6 +8351,42 @@ fn flight_info(flight: &ActiveFlight, resume_position_suspect: bool) -> ActiveFl
             planned_arr_icao: flight.arr_airport.clone(),
             requires_reason: stats.divert_hint.is_some(),
         },
+    }
+}
+
+/// v0.19 (#phase-v2 cutover): wenn `true`, kommt die ANGEZEIGTE/PUBLIZIERTE
+/// Flugphase aus der v2-Engine (`shadow_phase`); die v1-FSM bleibt mechanisch
+/// autoritativ (Touchdown, PIREP, Timing, Resume lesen `stats.phase` direkt).
+/// Rollback = diese eine Konstante auf `false` → alle Anzeige/Publish-Pfade
+/// fallen sofort auf v1 zurück. Als `const` (nicht Runtime-Flag): der Compiler
+/// prunt den toten Zweig, und es gibt keinen Grund, das live umzuschalten.
+const PHASE_V2_CUTOVER: bool = true;
+
+/// Die Phase, die dem Piloten GEZEIGT und nach außen PUBLIZIERT wird
+/// (Frontend-UI, MQTT-Live-Map, phpVMS-Status, Tray). Nur hierfür verwenden —
+/// mechanische FSM-Konsumenten (Touchdown-Gating, PIREP-Finalisierung, Timing,
+/// Resume-Restore) lesen weiterhin `stats.phase` DIREKT. v2 spiegelt v1 im
+/// Boden-/Terminal-Band 1:1 (synct jeden Tick auf die alte FSM), sodass der
+/// Cutover nur die En-Route-Anzeige verändert.
+fn effective_phase(stats: &FlightStats) -> FlightPhase {
+    if PHASE_V2_CUTOVER {
+        if let Some(sp) = stats.shadow_phase {
+            return sp;
+        }
+    }
+    stats.phase
+}
+
+/// Wie [`effective_phase`], aber für Publish-Pfade, die `stats` nicht gelockt
+/// halten (MQTT-Position, phpVMS-Heartbeat): der Aufrufer reicht die v1-Phase
+/// dieses Ticks und die zuvor gecachte v2-Sicht (`tick_shadow_phase`) herein.
+/// Fällt bei fehlender v2-Sicht (Pause/Slew: Schatten-Engine tickt nicht) auf
+/// v1 zurück.
+fn effective_display_phase(v1_phase: FlightPhase, shadow: Option<FlightPhase>) -> FlightPhase {
+    if PHASE_V2_CUTOVER {
+        shadow.unwrap_or(v1_phase)
+    } else {
+        v1_phase
     }
 }
 
@@ -18741,6 +18781,11 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                 sampler_path_rollout_tick(&mut stats, &snap);
             }
 
+            // #phase-v2 Cutover: v2-Phase dieses Ticks für die Publish-Pfade
+            // (MQTT-Position, phpVMS-Heartbeat) cachen. `None` bei Pause/Slew
+            // (Schatten-Engine tickt dann nicht) → Publish fällt auf v1 zurück.
+            let mut tick_shadow_phase: Option<FlightPhase> = None;
+
             // v0.16.12 (#phase-v2): Schatten-Phasen-Engine ticken — NACH
             // step_flight (braucht die autoritative Post-Step-Phase als
             // Sync-Quelle außerhalb des En-Route-Bands), VOR dem JSONL-
@@ -18784,6 +18829,7 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                 );
                 stats.shadow_phase = Some(shadow_phase);
                 stats.shadow_segment = Some(shadow_segment);
+                tick_shadow_phase = Some(shadow_phase);
                 // Holding ist in v2 (Runde 1) bewusst unmodelliert —
                 // diese Ticks zählen nicht als Divergenz (Report klammert
                 // sie ebenfalls aus).
@@ -19395,7 +19441,17 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                     let app_state = app.state::<AppState>();
                     let mqtt = app_state.mqtt.lock().await;
                     if let Some(handle) = mqtt.as_ref() {
-                        handle.phase(new_phase, Utc::now());
+                        // #phase-v2 Cutover: der retained „current phase"-Topic
+                        // schreibt (wie der Position-Payload) die DB-current_phase
+                        // im Recorder → muss dieselbe v2-Phase publizieren, sonst
+                        // flackert die Live-Map bei jeder v1-Transition kurz auf
+                        // v1. (Die „Phase:"-ACARS-Textlog-Zeile oben bleibt
+                        // bewusst v1 — sie ist ein v1-transitions-getriebenes
+                        // Änderungsprotokoll, kein Live-Status.)
+                        handle.phase(
+                            effective_display_phase(new_phase, tick_shadow_phase),
+                            Utc::now(),
+                        );
                     }
                 }
             }
@@ -19512,7 +19568,11 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                     // v0.5.14: pass current phase so it's inlined into
                     // the position payload — Monitor doesn't have to
                     // wait for a separate phase-topic delivery.
-                    let live_phase = phase_change.unwrap_or(prev_phase);
+                    // #phase-v2 Cutover: Live-Map bekommt die v2-Phase.
+                    let live_phase = effective_display_phase(
+                        phase_change.unwrap_or(prev_phase),
+                        tick_shadow_phase,
+                    );
                     handle.position(&snap, &meta, live_phase);
                 }
             }
@@ -19742,7 +19802,11 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
             // mid-flight). Both purposes use the same payload — sending
             // monotonic flight_time / distance also guarantees the row is
             // dirty so Eloquent always writes UPDATE and bumps updated_at.
-            let phase_for_heartbeat = phase_change.unwrap_or(current_phase);
+            // #phase-v2 Cutover: phpVMS-Live-Status = v2-Phase.
+            let phase_for_heartbeat = effective_display_phase(
+                phase_change.unwrap_or(current_phase),
+                tick_shadow_phase,
+            );
             let due_for_heartbeat = last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL;
             if phase_change.is_some() || due_for_heartbeat {
                 let body = {
@@ -27519,7 +27583,8 @@ fn compute_tray_display(app: &AppHandle) -> TrayDisplay {
         .map(|t| (now - t).num_seconds())
         .unwrap_or(i64::MAX);
     let queue = stats.queued_position_count;
-    let phase_label = phase_human_label(stats.phase);
+    // #phase-v2 Cutover: Tray-Tooltip zeigt die v2-Phase.
+    let phase_label = phase_human_label(effective_phase(&stats));
     let callsign = format_callsign(&flight.airline_icao, &flight.flight_number);
     let route = format!("{} → {}", flight.dpt_airport, flight.arr_airport);
 

@@ -3979,6 +3979,7 @@ input:disabled {
 .active-flight__phase--takeoff_roll::before,
 .active-flight__phase--takeoff::before,
 .active-flight__phase--climb::before,
+.active-flight__phase--level::before,
 .active-flight__phase--descent::before,
 .active-flight__phase--approach::before,
 .active-flight__phase--final::before,
@@ -4041,6 +4042,14 @@ input:disabled {
 .active-flight__phase--descent {
   background: color-mix(in srgb, var(--success, #22c55e) 14%, var(--surface-2));
   color: color-mix(in srgb, var(--success, #22c55e) 70%, var(--warning, orange));
+}
+
+/* #phase-v2: Level-Off an einer Höhen-Restriktion (Climb/Descent auf ATC-
+   Zwischenhöhe) — eigener, ruhiger Cyan-Ton, klar unterscheidbar von
+   Climb/Cruise (grün) und Descent (grün→amber). */
+.active-flight__phase--level {
+  background: color-mix(in srgb, var(--info, #38bdf8) 16%, var(--surface-2));
+  color: var(--info, #38bdf8);
 }
 
 .active-flight__phase--approach,

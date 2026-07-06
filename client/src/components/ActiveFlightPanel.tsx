@@ -35,6 +35,28 @@ function fmtDistance(nm: number, locale: string): string {
   )} nmi`;
 }
 
+/**
+ * #phase-v2 Cutover: bestimmt Label-Key + CSS-Klassen-Suffix des Phasen-Badges.
+ * `phase` ist die (v2-)Flugphase; `shadowSegment` ist das ROHE Kinematik-Segment
+ * der v2-Engine (`ground|climbing|level|descending|insufficient`).
+ *
+ * „Level" ist eine RESTRIKTION: ein Level-Off UNTER der Reiseflughöhe während
+ * Steig- oder Sinkflug (ATC-Zwischenhöhe). Deshalb greift der „Level"-Override
+ * NUR bei `climb`/`descent`. Im Reiseflug (`cruise`) fliegt der Flieger normal
+ * level → `shadowSegment` ist dort dauerhaft `"level"`, aber das bleibt „Cruise",
+ * NICHT „Level" (sonst zeigte das Badge den ganzen Reiseflug fälschlich „Level").
+ * Boden-/Terminal-Phasen sind ohnehin ausgenommen. Pur + exportiert für den Test.
+ */
+export function phaseBadgeDisplay(
+  phase: string,
+  shadowSegment: string | undefined | null,
+): { labelKey: string; className: string } {
+  const inRestrictable = phase === "climb" || phase === "descent";
+  const showLevel = shadowSegment === "level" && inRestrictable;
+  const key = showLevel ? "level" : phase;
+  return { labelKey: key, className: key };
+}
+
 export function ActiveFlightPanel({
   info,
   simSnapshot,
@@ -454,6 +476,17 @@ export function ActiveFlightPanel({
     }
   }
 
+  // #phase-v2 Cutover: `info.phase` ist jetzt die v2-Phase. Die Badge-
+  // Entscheidung (inkl. „Level" bei Höhen-Restriktion) steckt in der puren
+  // `phaseBadgeDisplay`-Helper (unten, exportiert + unit-getestet).
+  const { labelKey, className: phaseClass } = phaseBadgeDisplay(
+    info.phase,
+    info.shadow_segment,
+  );
+  const phaseLabel = t(`active_flight.phase.${labelKey}`, {
+    defaultValue: info.phase,
+  });
+
   return (
     <section className="active-flight">
       {confirmDialog}
@@ -484,29 +517,15 @@ export function ActiveFlightPanel({
                 ? `${info.airline_icao} ${info.flight_number}`
                 : info.flight_number}
             </h2>
+            {/* #phase-v2 Cutover: Haupt-Badge = v2-Phase; bei einer
+                Höhen-Restriktion zeigt es „Level" (s. showLevel oben). Die
+                frühere dezente „v2:"-Schatten-Zeile ist entfernt — v2 IST
+                jetzt die angezeigte Phase. */}
             <span
-              className={`active-flight__phase active-flight__phase--${info.phase}`}
+              className={`active-flight__phase active-flight__phase--${phaseClass}`}
             >
-              {t(`active_flight.phase.${info.phase}`, {
-                defaultValue: info.phase,
-              })}
+              {phaseLabel}
             </span>
-            {/* v0.16.12 (#phase-v2): dezente Schatten-Engine-Zeile —
-                reine Verifikations-Hilfe, NUR sichtbar wenn die v2-Sicht
-                von der aktiven Phase abweicht. Bewusst unauffällig
-                (Piloten sollen nicht verwirrt werden). */}
-            {info.shadow_phase && info.shadow_phase !== info.phase && (
-              <span
-                className="active-flight__shadow-phase"
-                title="Phasen-Engine v2 (Schatten-Modus, ohne Funktion)"
-              >
-                v2:{" "}
-                {t(`active_flight.phase.${info.shadow_phase}`, {
-                  defaultValue: info.shadow_phase,
-                })}
-                {info.shadow_segment === "level" ? " · Level" : ""}
-              </span>
-            )}
           </div>
         </div>
         <div className="active-flight__route">
