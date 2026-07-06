@@ -1527,7 +1527,25 @@ fn map_model_name_to_icao(s: &str) -> Option<String> {
         "A340-600" => "A346",
         "A330-900" | "A330-900NEO" | "A330NEO" => "A339",
         "HA420" | "HONDAJET" | "HONDAJET HA-420" => "HDJT",
-        _ => return None,
+        // v0.18.x (Health-Report-Nachmessung, cross-session 2026-07-06):
+        // "FALCON 50" und "A400M" fehlten komplett; beide ergaenzt.
+        "FALCON 50" | "FALCON 50EX" | "DASSAULT FALCON 50" => "FA50",
+        "A400M" | "A400M ATLAS" | "AIRBUS A400M" => "A400",
+        _ => {
+            // Suffix-tolerante Sonderfaelle: reale Airline-/Addon-Custom-
+            // Designatoren haengen oft Varianten-Suffixe an bekannte
+            // Marketing-Namen (z. B. "A350-900 ULR" fuer Ultra-Long-Range).
+            // Eine exakte Literal-Liste kann das nicht abdecken, ohne jede
+            // Kombination einzeln aufzuzaehlen — deshalb hier ein
+            // Praefix-Fallback fuer die bekannten variantenreichen Familien.
+            if s.starts_with("A350-900") {
+                "A359"
+            } else if s.starts_with("A400M") {
+                "A400"
+            } else {
+                return None;
+            }
+        }
     };
     Some(icao.to_string())
 }
@@ -1646,6 +1664,19 @@ mod tests {
         assert_eq!(normalize_icao_type("None"), None);
         assert_eq!(normalize_icao_type(""), None);
         assert_eq!(normalize_icao_type("NULL"), None);
+    }
+
+    #[test]
+    fn normalize_icao_type_covers_remaining_health_report_names() {
+        // Nachmessung 06.07.2026 (cross-session Health-Report-Review):
+        // ATCCOM-Faelle sind erledigt (v0.18.x-Fix greift live), aber diese
+        // ausgeschriebenen Modellnamen fielen noch durch — kein ATCCOM-
+        // Muster, deshalb vom vorherigen Fix nicht abgedeckt.
+        assert_eq!(normalize_icao_type("FALCON 50").as_deref(), Some("FA50"));
+        assert_eq!(normalize_icao_type("A400M").as_deref(), Some("A400"));
+        // Suffix-Variante ("Ultra Long Range") — Praefix-Fallback, nicht
+        // Teil der exakten Literal-Liste.
+        assert_eq!(normalize_icao_type("A350-900 ULR").as_deref(), Some("A359"));
     }
 
     #[test]
