@@ -4,6 +4,12 @@ Alle nennenswerten Änderungen an AeroACARS. Format: lose an [Keep a Changelog](
 
 ---
 
+## [v0.18.5] — 2026-07-06 · Health-Report-Nachbesserung
+
+Nachmessung 06.07.2026 (cross-session Health-Report-Review): ATCCOM-Faelle sind erledigt, aber "FALCON 50" und "A400M" fehlten in map_model_name_to_icao() komplett, Suffix-Varianten wie "A350-900 ULR" fielen durch die exakte Literal-Liste. Beide ergaenzt + Praefix-Fallback fuer variantenreiche Familien. Vor dem Release lief eine Multi-Agent-Code-Review (8 Finder-Winkel + Verifikation) ueber diesen UND den analogen Fix im aeroacars-live-Audit-Tooling — dabei zwei echte Luecken im Audit-Tool (nicht in diesem Client-Diff) gefunden und separat gefixt: Case-Sensitivity-Bug + fehlender Junk-Sentinel-Filter in `cleanAircraftIcao` (siehe aeroacars-live-Commit 29cf55b). Details: `docs/release-notes/v0.18.5.md`.
+
+---
+
 ## [v0.18.4] — 2026-07-06 · Aircraft-Scan-Bedienung überarbeitet
 
 Letzte Nachbesserung an der in v0.18.2 eingefuehrten Ordnerauswahl. Fix: ein manuell gewaehlter/eingetippter Pfad wurde bisher nur an die volle Auto-Erkennung ANGEHAENGT statt sie zu ersetzen — "Flugzeuge suchen" durchsuchte trotzdem die komplette Bibliothek erneut, vermischt mit dem gewaehlten Ordner (Live-Befund Thomas K.). Root-Auswahl in `select_roots()` extrahiert und testbar gemacht: ein manueller Pfad ist jetzt die EINZIGE Suchwurzel. UI dafuer neu aufgeteilt: zwei feste, immer sichtbare Buttons ("Flugzeuge suchen" fuer die volle Auto-Erkennung, "Diesen Ordner scannen" fuer ausschliesslich den gewaehlten Pfad) statt einem Button, der sein Verhalten/seinen Text je nach Eingabefeld aendert. Details: `docs/release-notes/v0.18.4.md`.
