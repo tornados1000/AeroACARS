@@ -45,7 +45,14 @@ function fmtDistance(nm: number, locale: string): string {
  * NUR bei `climb`/`descent`. Im Reiseflug (`cruise`) fliegt der Flieger normal
  * level → `shadowSegment` ist dort dauerhaft `"level"`, aber das bleibt „Cruise",
  * NICHT „Level" (sonst zeigte das Badge den ganzen Reiseflug fälschlich „Level").
- * Boden-/Terminal-Phasen sind ohnehin ausgenommen. Pur + exportiert für den Test.
+ *
+ * v0.19.1: "Final" blieb nach dem Aufsetzen früher minutenlang stehen
+ * (Rollout/Taxi-in/Shutdown), weil die v2-Engine im Boden-/Terminal-Band rein
+ * auf die alte FSM 1:1 sync-te und die bei manchen Flügen selbst hängen blieb
+ * (Field-Report GSG22 EDLN→EDDL). Behoben an der Quelle in `phase_v2.rs`
+ * (`Final` promotet sich jetzt selbst auf `Landing`, sobald der Kinematik-
+ * Segmenter `Ground` meldet) — `phase` hier ist dadurch bereits `"landing"`,
+ * kein zusätzliches Label-Override in dieser rein UI-seitigen Funktion nötig.
  */
 export function phaseBadgeDisplay(
   phase: string,
@@ -55,6 +62,23 @@ export function phaseBadgeDisplay(
   const showLevel = shadowSegment === "level" && inRestrictable;
   const key = showLevel ? "level" : phase;
   return { labelKey: key, className: key };
+}
+
+/**
+ * v0.7.18 (B-014): is_finalizable check for the file-first Cancel logic.
+ * Spec §B-014 — once the flight is essentially done (LANDING/TaxiIn/
+ * BLOCKS_ON/Arrived + a valid touchdown), Cancel must not discard directly;
+ * a 3-button confirm offers "try filing instead" first. Pure + exported so
+ * it's regression-testable without mounting the component (same reasoning
+ * as `phaseBadgeDisplay`).
+ */
+export function isFlightFinalizable(phase: string, landingAt: string | null): boolean {
+  const isTdPhase =
+    phase === "landing" ||
+    phase === "taxi_in" ||
+    phase === "blocks_on" ||
+    phase === "arrived";
+  return isTdPhase && landingAt !== null;
 }
 
 export function ActiveFlightPanel({
@@ -242,14 +266,10 @@ export function ActiveFlightPanel({
   //   - „Lieber filen versuchen" → flight_cancel ohne force
   //   - „Abbrechen" → kein Cancel, Dialog zu
   //   - „Trotzdem verwerfen" → flight_cancel mit force=true
+  // See `isFlightFinalizable` (pure, exported, unit-tested) for the condition.
   function isFinalizable(): boolean {
     if (!info) return false;
-    const isTdPhase =
-      info.phase === "landing" ||
-      info.phase === "taxi_in" ||
-      info.phase === "blocks_on" ||
-      info.phase === "arrived";
-    return isTdPhase && info.landing_at !== null;
+    return isFlightFinalizable(info.phase, info.landing_at);
   }
 
   /** User accepted the cancel option from the validation dialog. */

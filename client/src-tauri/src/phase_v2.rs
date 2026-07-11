@@ -315,8 +315,35 @@ impl KinematicSegmenter {
 
 // ─── Layer 2: ShadowPhaseEngine (PhaseResolver) ─────────────────────────
 
-/// Phasen, in denen v2 frei läuft (En-Route-Band). Alles andere wird
-/// 1:1 von der alten FSM übernommen.
+/// Phasen, in denen v2 frei läuft (auf eigener Kinematik-Evidenz
+/// entscheidet) statt in `step()`s Baseline-Sync-Zweig auf die alte Phase
+/// zurückgesetzt zu werden. Gilt NUR für die Baseline-Sync-Prüfung
+/// (`!shadow_is_enroute(self.phase)` in `step()`) — für die Frage, ob die
+/// alte FSM diesen Tick als vertrauenswürdige Sync-Quelle gilt, ist
+/// `old_is_enroute` zuständig, MIT ABSICHT eine separate, unveränderte
+/// Liste (s. dort).
+///
+/// `Landing` gehört seit v0.19.1 dazu, obwohl es kein En-Route-Band mehr
+/// ist: `resolve()`s `Final`-Arm promotet jetzt selbst auf `Landing`,
+/// sobald der Kinematik-Segmenter `Ground` meldet (robustes `on_ground`-
+/// Mehrheits-Signal, siehe `KinematicSegmenter::classify`) — unabhängig
+/// davon, ob die alte FSM diese Kante überhaupt je selbst schafft. Vorher
+/// verließ sich `Final` dafür ausschließlich auf den 1:1-Sync von der
+/// alten FSM (Kommentar dort: "Landing kommt per Sync von der alten
+/// FSM"); bleibt die alte FSM auf einer En-Route-Phase hängen (Feld-Fund
+/// GSG22 EDLN→EDDL: `stats.phase` verharrte die ganze Landung/Rollout
+/// über bei `Climb`), kommt dieser Sync nie — v2 (und alles, was
+/// `effective_phase`/`effective_display_phase` liest: Cockpit-UI,
+/// Live-Karte, phpVMS-Heartbeat, Tray, Discord, ACARS-Log) hing dadurch
+/// unbegrenzt lange auf `Final` fest, obwohl der Flieger längst am Boden
+/// rollte. `Landing` MUSS deshalb HIER (nicht in `old_is_enroute`)
+/// stehen — sonst würde die Baseline-Sync-Verzweigung in `step()` die
+/// frisch promotete `Landing`-Phase im allernächsten Tick sofort wieder
+/// auf die (weiterhin hängende) alte Phase zurücksetzen. Holt die alte
+/// FSM später doch noch auf (erreicht TaxiIn/BlocksOn/Arrived), gewinnt
+/// automatisch wieder der normale 1:1-Sync-Zweig oben in `step()`
+/// (`!old_is_enroute(old_phase)`), da jene Phasen nicht in `old_is_enroute`
+/// stehen — kein Sonderfall nötig.
 fn shadow_is_enroute(p: FlightPhase) -> bool {
     matches!(
         p,
@@ -325,6 +352,7 @@ fn shadow_is_enroute(p: FlightPhase) -> bool {
             | FlightPhase::Descent
             | FlightPhase::Approach
             | FlightPhase::Final
+            | FlightPhase::Landing
     )
 }
 
@@ -332,8 +360,28 @@ fn shadow_is_enroute(p: FlightPhase) -> bool {
 /// (= das Band, in dem die Engines voneinander abweichen dürfen).
 /// `Holding` gehört dazu: v2 modelliert es nicht (dokumentierter Diff),
 /// darf während old==Holding aber auch nicht zwangs-gesynct werden.
+///
+/// v0.19.1: bewusst NICHT (mehr) von `shadow_is_enroute` abgeleitet, obwohl
+/// beide Listen bis auf `Landing` identisch sind — die beiden Prädikate
+/// beantworten unterschiedliche Fragen und dürfen nicht zusammenfallen.
+/// `old_is_enroute` entscheidet "ist die alte Phase DIESEN Tick eine
+/// vertrauenswürdige Sync-Quelle" — eine alte FSM, die korrekt und prompt
+/// `Landing` erreicht (der Normalfall), MUSS weiterhin sofort 1:1
+/// übernommen werden (Tests `bush_hop_never_cruise`, `normal_arrival_arc`,
+/// `touch_and_go_resyncs_to_climb`). Würde `old_is_enroute(Landing)` auch
+/// `true` liefern (wie es eine naive Ableitung von `shadow_is_enroute` mit
+/// `Landing` täte), bliebe genau dieser funktionierende Sync-Pfad aus —
+/// entdeckt beim ersten Testlauf dieser Änderung, bevor es released wurde.
 fn old_is_enroute(p: FlightPhase) -> bool {
-    shadow_is_enroute(p) || matches!(p, FlightPhase::Holding)
+    matches!(
+        p,
+        FlightPhase::Climb
+            | FlightPhase::Cruise
+            | FlightPhase::Descent
+            | FlightPhase::Approach
+            | FlightPhase::Final
+            | FlightPhase::Holding
+    )
 }
 
 /// Layer 2 — Schatten-Engine: Segment + Kontext → `(FlightPhase, Segment)`.
@@ -366,6 +414,13 @@ pub struct ShadowPhaseEngine {
     /// der Go-Around-Bestätigung (`GA_CONFIRM_FT`). `None`, solange nicht in
     /// einem Approach/Final-Climbing-Ausstieg.
     ga_entry_agl_ft: Option<f64>,
+    /// v0.19.1: `old_phase` des VORHERIGEN Ticks — Basis für die
+    /// Touch-and-Go-Weiche in `step()` (erkennt eine FRISCHE alte-FSM-
+    /// Transition zurück ins En-Route-Band, während wir selbst `Landing`
+    /// halten). Startet bei `Preflight` (Default), harmlos: die Weiche
+    /// prüft zusätzlich `self.phase == Landing`, was zu Flugbeginn nie
+    /// zutrifft.
+    last_old_phase: FlightPhase,
 }
 
 impl ShadowPhaseEngine {
@@ -403,11 +458,61 @@ impl ShadowPhaseEngine {
             self.obsref_ft = Some(self.obsref_ft.map_or(alt_msl_ft, |r| r.max(alt_msl_ft)));
         }
 
-        if !old_is_enroute(old_phase) {
+        // v0.19.1: FRISCHE alte-FSM-Transition zurück ins En-Route-Band,
+        // während wir selbst `Landing` halten (unabhängig ob durch
+        // 1:1-Mirror einer funktionierenden alten FSM oder durch unsere
+        // eigene `Final`→`Landing`-Promotion erreicht) — z. B. Touch-and-Go
+        // oder Rejected Landing. Die alte FSM hat einen eigenen,
+        // spezialisierten On-Ground-Kanten-Detektor dafür; der reagiert
+        // sofort. Unsere eigene Climbing-Klassifikation im Landing-Arm von
+        // `resolve()` würde dagegen erst reagieren, sobald die Fenster-
+        // MEHRHEIT der gepufferten Samples nicht mehr `on_ground` zeigt —
+        // bei einem frischen Abheben nach längerem Boden-Rollen dauert das
+        // (Fenster bis 60 s) deutlich zu lange. Bedingung `last_old_phase
+        // != old_phase` (nicht nur `old_is_enroute(old_phase)`) ist
+        // entscheidend: ein DURCHGEHEND hängender alter Wert (z. B. Climb
+        // über die gesamte Landung/Rollout — der GSG22-Fall, den dieser
+        // ganze Fix behebt) darf NICHT jeden Tick erneut zurück-syncen.
+        //
+        // Härtung (Code-Review): `old_is_enroute(old_phase) && last_old_phase
+        // != old_phase` allein vertraut JEDER Änderung des alten Werts,
+        // nicht nur einer, die tatsächlich "Boden verlassen" bedeutet — eine
+        // alte FSM, die zwischen zwei En-Route-Phasen hin- und herspringt
+        // (z. B. Climb→Approach), OHNE je tatsächlich abzuheben, würde sonst
+        // das korrekt gehaltene `Landing` verlassen. Über die aktuell
+        // bekannten alten Übergangs-Pfade (Go-Around-Klassifikator, T&G-
+        // Erkennung) nicht auslösbar (beide sind hart hinter `!on_ground`
+        // gated, dasselbe `on_ground`-Signal wie hier), aber genau das
+        // Verhalten einer NICHT vollständig verstandenen alten FSM ist der
+        // Grund für diesen ganzen Fix — zusätzlich `!on_ground` verlangen:
+        // nur eine frische alte Transition VERTRAUEN, wenn das ROHE
+        // Telemetrie-Signal DIESES Ticks auch wirklich "in der Luft" sagt.
+        // Bewusst `on_ground` (Rohwert, sofort) statt `segment != Ground`
+        // (Fenster-Mehrheit, hinkt nach dem Aufsetzen bis zu 60 s hinterher
+        // — hätte exakt den Touch-and-Go-Fastpath wieder ausgehebelt, den
+        // dieser ganze Zweig herstellen soll).
+        let fresh_enroute_transition_from_landing = self.phase == FlightPhase::Landing
+            && old_is_enroute(old_phase)
+            && self.last_old_phase != old_phase
+            && !on_ground;
+        self.last_old_phase = old_phase;
+
+        if !old_is_enroute(old_phase) || fresh_enroute_transition_from_landing {
             // Boden-/Terminal-Band: alte FSM 1:1 spiegeln (Boarding/
             // Pushback/Taxi/TakeoffRoll/Takeoff/Landing/TaxiIn/BlocksOn/
-            // Arrived/…). Der Diff soll das En-Route-Band zeigen.
+            // Arrived/…) — bzw. bei `fresh_enroute_transition_from_landing`
+            // der Touch-and-Go-Sonderfall oben. Der Diff soll das
+            // En-Route-Band zeigen.
             self.phase = old_phase;
+            if fresh_enroute_transition_from_landing {
+                // Gleiche Begründung wie beim Baseline-Sync unten: Evidenz
+                // aus der Landung/dem Rollout würde einen frischen Climb
+                // sofort wieder nach Ground/Descent kippen.
+                self.segmenter.reset();
+                segment = Segment::Insufficient;
+                self.current_segment = segment;
+                self.segment_since = Some(t);
+            }
             self.ga_entry_agl_ft = None;
         } else if !shadow_is_enroute(self.phase) {
             // Baseline-Sync: die alte FSM ist im En-Route-Band, v2 noch
@@ -477,17 +582,21 @@ impl ShadowPhaseEngine {
             },
         };
 
-        // Der GA-Anker gilt im Approach/Final-Ausstieg. Er ÜBERLEBT kurze
-        // Level-/Insufficient-Dips im Steigflug (gestufter Go-Around, z. B.
+        // Der GA-Anker gilt im Approach/Final-Ausstieg. `Landing` (seit
+        // v0.19.1) braucht ihn NICHT — dessen eigener Climbing-Zweig ruft
+        // `confirm_go_around` bewusst nicht auf (kein Flare-Balloon mehr
+        // möglich, sobald `Ground` schon bestätigt war; siehe die
+        // `FlightPhase::Landing`-Arm-Doku). Er ÜBERLEBT kurze Level-/
+        // Insufficient-Dips im Steigflug (gestufter Go-Around, z. B.
         // ATC-Stopp-Höhe oder eine Steigrate, die kurz unter die
         // Fensterschwelle pendelt), damit der AGL-Gewinn KUMULATIV ab dem
-        // ersten Climbing-Tick zählt. Ein Re-Anker bei jedem Dip würde höher
-        // ansetzen und einen gestuften GA nie `GA_CONFIRM_FT` am Stück
-        // erreichen lassen (→ geklebter Approach, das Spiegelbild des Bugs,
-        // den der Guard behebt). Gelöscht wird der Anker nur, wenn wieder
-        // gesunken wird (`Descending` = GA aufgegeben) oder das Approach/
-        // Final-Band verlassen ist (sonst bestätigte ein späterer Anflug
-        // gegen einen veralteten, tieferen Anker).
+        // ersten Climbing-Tick zählt. Ein Re-Anker bei jedem Dip würde
+        // höher ansetzen und einen gestuften GA nie `GA_CONFIRM_FT` am
+        // Stück erreichen lassen (→ geklebter Approach, das Spiegelbild
+        // des Bugs, den der Guard behebt). Gelöscht wird der Anker nur,
+        // wenn wieder gesunken wird (`Descending` = GA aufgegeben) oder
+        // das Approach/Final-Band verlassen ist (sonst bestätigte ein
+        // späterer Anflug gegen einen veralteten, tieferen Anker).
         if !matches!(self.phase, FlightPhase::Approach | FlightPhase::Final)
             || segment == Segment::Descending
         {
@@ -614,15 +723,50 @@ impl ShadowPhaseEngine {
                 if segment == Segment::Climbing {
                     // Go-Around aus dem Final — mit demselben Balloon-Guard
                     // wie im Approach (Flare-Ballooning erzeugt sonst einen
-                    // Phantom-Climb). Landing kommt per Sync von der alten
-                    // FSM (on_ground-Edge + Sampler bleiben deren Domäne).
+                    // Phantom-Climb).
                     if self.confirm_go_around(agl_ft) {
                         FlightPhase::Climb
                     } else {
                         FlightPhase::Final
                     }
+                } else if segment == Segment::Ground {
+                    // v0.19.1: promote on our OWN kinematic evidence
+                    // (robust on_ground-majority signal, see
+                    // KinematicSegmenter::classify) instead of waiting on
+                    // the old FSM's 1:1 sync — see shadow_is_enroute's doc
+                    // comment for why that sync alone isn't reliable
+                    // enough (field report GSG22 EDLN→EDDL: old FSM never
+                    // left Climb for the whole flight).
+                    FlightPhase::Landing
                 } else {
                     FlightPhase::Final
+                }
+            }
+            FlightPhase::Landing => {
+                // v0.19.1: unlike the Final arm, NO balloon-guard here —
+                // that guard exists solely for the flare-ballooning
+                // ambiguity while still airborne on short final (a VS
+                // spike that looks like climbing but isn't really leaving).
+                // Once genuinely on the ground (segment reached Ground —
+                // the majority-of-window on_ground evidence that got us
+                // into this arm in the first place), there's no such
+                // ambiguity left: a `Climbing` segment here means the
+                // 60 s-window-confirmed kinematic evidence already shows a
+                // real climb-out (touch-and-go / rejected landing), not a
+                // flare bounce — Layer 1 already filtered the transient
+                // case. Immediate transition, matching how promptly the
+                // old FSM's own touch-and-go reset fires (test
+                // `touch_and_go_resyncs_to_climb`).
+                //
+                // Otherwise holds here on its own evidence until the old
+                // FSM catches up to a real terminal phase (TaxiIn/
+                // BlocksOn/Arrived), at which point step()'s ordinary
+                // 1:1-sync branch takes back over (those phases aren't in
+                // `old_is_enroute`).
+                if segment == Segment::Climbing {
+                    FlightPhase::Climb
+                } else {
+                    FlightPhase::Landing
                 }
             }
             // Nicht-En-Route-Phasen erreichen resolve() nie (Guard in
@@ -1156,6 +1300,141 @@ mod tests {
         assert_eq!(p, FlightPhase::TaxiIn);
         let (p, _) = sim.fly_with_tick(60, 5, 0.0, FlightPhase::Arrived, true);
         assert_eq!(p, FlightPhase::Arrived);
+    }
+
+    /// Baut denselben Anflug wie `normal_arrival_arc` bis zu `Final` auf, so
+    /// dass die vier v0.19.1-Tests unten (Stuck-Old-FSM-Szenario) sich nicht
+    /// wiederholen müssen.
+    fn sim_at_final() -> Sim {
+        let mut sim = Sim::new(Some(36000.0));
+        sim.depart();
+        sim.alt = 36000.0;
+        sim.fly(300, 0.0, FlightPhase::Cruise);
+        sim.fly(900, -2000.0, FlightPhase::Descent);
+        sim.fly(120, -1000.0, FlightPhase::Descent);
+        sim.alt = 600.0;
+        let (p, _) = sim.fly(10, -700.0, FlightPhase::Final);
+        assert_eq!(p, FlightPhase::Final, "setup precondition");
+        sim
+    }
+
+    /// v0.19.1 — Kernfix. Feld-Fund GSG22 EDLN→EDDL: die alte FSM
+    /// (`stats.phase`) blieb die GESAMTE Landung/Rollout über bei `Climb`
+    /// hängen (ein separater, vorbestehender Legacy-FSM-Bug, den dieser Fix
+    /// NICHT repariert) — vorher hätte das v2 für immer auf `Final`
+    /// festgenagelt (der 1:1-Sync von der alten FSM war der EINZIGE Weg zu
+    /// `Landing`). Jetzt promotet `Final` sich selbst anhand des robusten
+    /// `Ground`-Mehrheits-Signals, unabhängig vom (weiterhin hängenden)
+    /// `old_phase`.
+    /// Boden-Ticks bis der Kinematik-Segmenter zuverlässig auf `Ground`
+    /// umklassifiziert. Das braucht bis zu `WINDOW_SECS` (60 s) — das
+    /// 60-s-Fenster kann beim Eintritt noch voller Luft-Samples aus dem
+    /// vorangegangenen Anflug sein (hier: der lange `sim_at_final()`-
+    /// Descent/Approach/Final-Bogen sättigt das Fenster garantiert), und
+    /// „Boden-Mehrheit" braucht so lange, bis die alten Luft-Samples aus
+    /// dem gleitenden Fenster gealtert sind. 90 s liegt sicher darüber.
+    const GROUND_MAJORITY_SETTLE_SECS: i64 = 90;
+
+    /// v0.19.1 — Kernfix. Feld-Fund GSG22 EDLN→EDDL: die alte FSM
+    /// (`stats.phase`) blieb die GESAMTE Landung/Rollout über bei `Climb`
+    /// hängen (ein separater, vorbestehender Legacy-FSM-Bug, den dieser Fix
+    /// NICHT repariert) — vorher hätte das v2 für immer auf `Final`
+    /// festgenagelt (der 1:1-Sync von der alten FSM war der EINZIGE Weg zu
+    /// `Landing`). Jetzt promotet `Final` sich selbst anhand des robusten
+    /// `Ground`-Mehrheits-Signals, unabhängig vom (weiterhin hängenden)
+    /// `old_phase`.
+    #[test]
+    fn final_promotes_to_landing_via_ground_evidence_even_when_old_fsm_stuck() {
+        let mut sim = sim_at_final();
+        let (p, s) =
+            sim.fly_with_tick(GROUND_MAJORITY_SETTLE_SECS, 5, 0.0, FlightPhase::Climb, true);
+        assert_eq!(
+            p,
+            FlightPhase::Landing,
+            "muss sich selbst promoten statt auf die haengende alte FSM zu warten"
+        );
+        assert_eq!(s, Segment::Ground);
+    }
+
+    /// Fortsetzung: die alte FSM bleibt noch MINUTENLANG (wie im echten
+    /// GSG22-Fall, ~4 min) bei `Climb` hängen — `Landing` darf dadurch NICHT
+    /// jeden Tick zurück auf `Climb` fallen (der eigentliche Bug). Siehe
+    /// `old_is_enroute`/`shadow_is_enroute`s Doku für die bewusste
+    /// Entkopplung, die das ermöglicht.
+    #[test]
+    fn landing_holds_indefinitely_while_old_fsm_remains_stuck() {
+        let mut sim = sim_at_final();
+        let (p, _) =
+            sim.fly_with_tick(GROUND_MAJORITY_SETTLE_SECS, 5, 0.0, FlightPhase::Climb, true);
+        assert_eq!(p, FlightPhase::Landing, "setup precondition: promotion must have happened");
+        let (p, _) = sim.fly_with_tick(240, 5, 0.0, FlightPhase::Climb, true);
+        assert_eq!(
+            p,
+            FlightPhase::Landing,
+            "darf NICHT auf die weiterhin haengende alte FSM zurueckfallen"
+        );
+    }
+
+    /// Selbstheilung: sobald die alte FSM (z. B. via des ebenfalls in
+    /// v0.19.1 verkürzten `ARRIVED_FALLBACK_DWELL_SECS`-Fallbacks in
+    /// lib.rs) endlich `Arrived` erreicht, übernimmt der ganz normale
+    /// 1:1-Sync-Zweig sofort — `Arrived` steht nicht in `old_is_enroute`,
+    /// also kein Sonderfall nötig.
+    #[test]
+    fn landing_self_heals_once_old_fsm_finally_reaches_arrived() {
+        let mut sim = sim_at_final();
+        let (p, _) =
+            sim.fly_with_tick(GROUND_MAJORITY_SETTLE_SECS, 5, 0.0, FlightPhase::Climb, true);
+        assert_eq!(p, FlightPhase::Landing, "setup precondition: promotion must have happened");
+        let (p, _) = sim.fly_with_tick(10, 5, 0.0, FlightPhase::Arrived, true);
+        assert_eq!(p, FlightPhase::Arrived);
+    }
+
+    /// Wie `touch_and_go_resyncs_to_climb`, aber ausgehend von einem SELBST
+    /// promoteten `Landing` (alte FSM hing bei `Approach` fest, statt via
+    /// 1:1-Mirror `Landing` selbst korrekt zu melden) — die
+    /// Fresh-Transition-Weiche in `step()` muss unabhängig davon greifen,
+    /// WIE `Landing` erreicht wurde.
+    #[test]
+    fn self_promoted_landing_resyncs_immediately_on_fresh_old_fsm_transition() {
+        let mut sim = sim_at_final();
+        // Alte FSM haengt bei Approach fest (noch nicht mal Final) waehrend
+        // wir schon selbst auf Landing promoten.
+        let (p, _) =
+            sim.fly_with_tick(GROUND_MAJORITY_SETTLE_SECS, 5, 0.0, FlightPhase::Approach, true);
+        assert_eq!(p, FlightPhase::Landing, "self-promoted trotz haengender alter FSM");
+        // Fresh Transition: alte FSM meldet jetzt (verspätet) Climb — z. B.
+        // ein spät erkannter Touch-and-Go/Rejected-Landing.
+        let (p, _) = sim.fly(5, 1800.0, FlightPhase::Climb);
+        assert_eq!(
+            p,
+            FlightPhase::Climb,
+            "frische alte-FSM-Transition muss sofort syncen, auch ab selbst-promotetem Landing"
+        );
+    }
+
+    /// v0.19.1 Code-Review-Härtung: eine frische `old_phase`-Änderung ALLEIN
+    /// (ohne dass `on_ground` auch nur einmal `false` wird) darf das korrekt
+    /// gehaltene `Landing` NICHT verlassen — die alte FSM könnte (in einem
+    /// aktuell nicht reproduzierbaren, aber wegen der Ausgangslage dieses
+    /// ganzen Fixes plausiblen Fall) zwischen zwei En-Route-Phasen
+    /// hin- und herspringen, ohne dass der Flieger je abgehoben hat.
+    /// `fresh_enroute_transition_from_landing` verlangt deshalb zusätzlich
+    /// `!on_ground` DIESES Ticks (Rohsignal, nicht das nachhinkende Segment).
+    #[test]
+    fn stuck_old_fsm_flip_between_enroute_phases_does_not_leave_landing_while_grounded() {
+        let mut sim = sim_at_final();
+        let (p, _) =
+            sim.fly_with_tick(GROUND_MAJORITY_SETTLE_SECS, 5, 0.0, FlightPhase::Climb, true);
+        assert_eq!(p, FlightPhase::Landing, "setup precondition: promotion must have happened");
+        // Alte FSM springt auf einen ANDEREN En-Route-Wert — aber der
+        // Flieger steht die ganze Zeit am Boden (on_ground=true durchgehend).
+        let (p, _) = sim.fly_with_tick(10, 5, 0.0, FlightPhase::Approach, true);
+        assert_eq!(
+            p,
+            FlightPhase::Landing,
+            "eine alte-FSM-Aenderung OHNE on_ground=false darf Landing nicht verlassen"
+        );
     }
 
     /// R1 (Observed-Cruise-Ref): ref-loser Descent-Level-Off tief unten

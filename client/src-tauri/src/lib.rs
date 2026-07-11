@@ -444,13 +444,39 @@ const KG_TO_LB: f64 = 2.20462262;
 /// normal Pushback → Cruise → BlocksOn chain doesn't fire cleanly.
 ///
 /// When the aircraft is on-ground with engines off, sitting within
-/// `ARRIVED_FALLBACK_RADIUS_NM` of the destination airport for at
-/// least `ARRIVED_FALLBACK_DWELL_SECS`, the FSM jumps straight to
-/// `Arrived` regardless of what phase it's currently in (apart from
-/// pre-block-off phases — we won't accidentally end a flight that
+/// `ARRIVED_FALLBACK_RADIUS_NM` of the destination airport, the FSM jumps
+/// straight to `Arrived` regardless of what phase it's currently in (apart
+/// from pre-block-off phases — we won't accidentally end a flight that
 /// hasn't started yet).
 const ARRIVED_FALLBACK_RADIUS_NM: f64 = 2.0;
-const ARRIVED_FALLBACK_DWELL_SECS: i64 = 30;
+/// Wall-clock dwell the engines-off condition
+/// (`arrived_fallback_conditions_basic`) must hold, uninterrupted, before
+/// the fallback fires. `engines_running` is an unsmoothed per-tick SimVar
+/// read (`GENERAL ENG COMBUSTION:N` / N1-fallback) with no read-side
+/// debouncing, so a lone stray sample shouldn't end the flight — but once
+/// it has genuinely held for a few seconds there is nothing left to wait
+/// for (the shutdown-pacing concern the old 30 s dwell was also covering
+/// is already handled by requiring `engines_running == 0` in the first
+/// place, not by waiting longer after it's confirmed).
+///
+/// Deliberately wall-clock, NOT a tick count: `adaptive_tick_interval`
+/// drops the streamer's tick cadence to 500 ms whenever the phase
+/// is Approach/Final/Landing/Takeoff/TakeoffRoll below 100 ft AGL — which
+/// is exactly the "stuck on Final while already on the ground" state this
+/// fallback exists to rescue. A fixed *tick-count* threshold would confirm
+/// up to ~6x faster than intended in that window (an earlier version of
+/// this fix made exactly that mistake — caught in code review before
+/// release); wall-clock time is cadence-independent by construction.
+///
+/// Lowered from 30 s (set at v0.1.20, never re-tuned) after a field report
+/// (GSG22 EDLN→EDDL, PIREP XrRp6eMQYvJJlExP): the pilot perceived the app
+/// as frozen on "Final" for 3-4 min after touchdown. Flight-log analysis
+/// showed the vast majority of that was real taxi-in + the pilot's own
+/// shutdown pacing; the only software-attributable wait was this dwell.
+/// 9 s still comfortably rules out a single bad sample (≥3 ticks at the
+/// normal 3 s ground cadence; far more during the sub-second flare
+/// cadence).
+const ARRIVED_FALLBACK_DWELL_SECS: i64 = 9;
 /// v0.17.x (#Premium, Aircraft-Scan): längerer Dwell für den engines-
 /// UNABHÄNGIGEN Stillstands-Fallback (Groundspeed < 1 kt + Parkbremse am
 /// Ziel). Fängt Addons ab, deren `engines_running`-SimVar nach dem Shutdown
@@ -466,7 +492,7 @@ const ARRIVED_FALLBACK_DWELL_SECS: i64 = 30;
 ///      Triebwerkszähler (`AircraftProfile::engine_count_unreliable`), NICHT
 ///      mehr fleet-weit — ein Rollhalt in einem Fenix/PMDG/FBW/etc. kann
 ///      diesen Pfad gar nicht mehr erreichen, weil der harte engines-off-Test
-///      (30 s) für die die einzige Rolle spielt.
+///      (`ARRIVED_FALLBACK_DWELL_SECS`) für die die einzige Rolle spielt.
 ///   2. Für die verbleibenden, eng begrenzten Fälle (aktuell nur FA50) ist der
 ///      Dwell auf 5 Minuten verlängert — deutlich länger als ein typischer
 ///      Rollhalt, aber am echten Zielflughafen nach Blockzeit ohne
@@ -2412,6 +2438,21 @@ struct FlightStats {
     /// Wall-Clock des letzten Schatten-Engine-Ticks (dt-Quelle für den
     /// Divergenz-Zähler). Runtime-only.
     shadow_last_tick_at: Option<DateTime<Utc>>,
+    /// v0.19.1: letzte EFFEKTIVE (v2-bevorzugte) Phase, für die eine ACARS-
+    /// "Phase: …"-Textlog-Zeile + der retained MQTT-Phase-Publish bereits
+    /// abgesetzt wurden. Vorher waren beide rein an v1-Transitions
+    /// (`phase_change`) gekoppelt — bei einer FSM, die (Feld-Fund GSG22
+    /// EDLN→EDDL) auf einer En-Route-Phase hängen bleibt, obwohl v2 anhand
+    /// echter Kinematik längst weiter ist, blieben Log + Live-Status-Topic
+    /// dadurch stumm/veraltet, obwohl andere v2-gespeiste Pfade (Positions-
+    /// Payload, phpVMS-Heartbeat, Tray, Cockpit-UI) längst korrekt liefen.
+    /// Jetzt Trigger = "die angezeigte Phase hat sich geändert", nicht
+    /// "v1 hat intern transitioniert" — deckt beide Fälle ab und vermeidet
+    /// Doppel-Log wenn v1 und v2 im selben Tick gemeinsam wechseln.
+    /// Runtime-only (kein Persistenz-Bedarf: nach Resume einfach neu
+    /// gesetzt beim nächsten Tick, kostet höchstens eine harmlose
+    /// Doppel-Zeile).
+    last_logged_effective_phase: Option<FlightPhase>,
     /// v0.16.12 (#phase-v2): geplante Cruise-Altitude in ft als
     /// `cruise_ref` der Schatten-Engine. Quelle: `bid.flight.level`
     /// (phpVMS-Flight, FL→ft normalisiert) bzw. `plan.cruise_level_ft`
@@ -2446,10 +2487,15 @@ struct FlightStats {
 
     /// First tick at which the universal "we're done" fallback saw all
     /// the conditions satisfied (on-ground, engines off, within 2 nmi
-    /// of arrival). Once now − this ≥ `ARRIVED_FALLBACK_DWELL_SECS`
-    /// the FSM jumps to Arrived regardless of prior phase. Cleared
-    /// the moment any condition stops being true (so a brief engine
-    /// restart or move resets the dwell). Powers helicopter flights,
+    /// of arrival) — shared by both `engines_off_path` (dwell:
+    /// `ARRIVED_FALLBACK_DWELL_SECS`) and `standstill_path` (dwell:
+    /// `ARRIVED_STANDSTILL_DWELL_SECS`; `engine_count_unreliable` addons
+    /// only). Once now − this ≥ the active path's dwell, the FSM jumps to
+    /// Arrived regardless of prior phase. Cleared the moment `conditions_
+    /// basic` (either path) stops being true — NOT reset just because the
+    /// *which* path is active flips tick to tick, so an aircraft that
+    /// occasionally satisfies both paths doesn't have its accumulated
+    /// dwell time wiped out by the switch. Powers helicopter flights,
     /// short hops, and emergency landings near destination.
     arrived_fallback_pending_since: Option<DateTime<Utc>>,
 
@@ -10689,7 +10735,7 @@ fn open_landing_store(app: &AppHandle) -> Option<LandingStore> {
 ///
 /// Ab v0.7.5: `groundspeed_kt < 1.0` Pflicht — echtes Stillstand statt nur "on ground".
 ///
-/// Returns true wenn der 30s-Dwell starten/laufen darf.
+/// Returns true wenn der ARRIVED_FALLBACK_DWELL_SECS-Dwell starten/laufen darf.
 pub fn arrived_fallback_conditions_basic(
     on_ground: bool,
     engines_running: u8,
@@ -19427,9 +19473,61 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
             // summary. Posted in a single batch at the end of the tick to
             // minimise HTTP round-trips.
             let mut acars_log_entries: Vec<api_client::LogEntry> = Vec::new();
-            if let Some(new_phase) = phase_change {
+            // v0.19.1: trigger is "the DISPLAYED (v2-preferred) phase
+            // changed", not "v1 transitioned" — computed every tick
+            // (unconditionally), independent of `phase_change`. Previously
+            // both the log line and the retained MQTT phase topic below
+            // only fired on a v1 transition; if v1 gets stuck on an
+            // en-route phase (field report GSG22 EDLN→EDDL — legacy FSM
+            // never left Climb) while v2 correctly progresses on its own
+            // kinematic evidence, neither ever fired even though every
+            // OTHER v2-fed path (position payload, phpVMS heartbeat, tray,
+            // cockpit UI) already showed the real phase. Comparing against
+            // `last_logged_effective_phase` (not `phase_change`) also
+            // naturally de-dupes the common case where v1 and v2 change
+            // together in the same tick — only one line, not two.
+            //
+            // Uses `effective_phase(&stats)` — the same PERSISTED
+            // `stats.shadow_phase` every other display surface
+            // (`flight_info`, tray) reads — NOT `effective_display_phase`
+            // with this tick's `tick_shadow_phase`. `tick_shadow_phase` is
+            // `None` on a paused/slew tick (the shadow engine skips
+            // stepping then), and `effective_display_phase` falls back to
+            // the raw v1 phase in that case — caught in code review: on
+            // sim-pause this would have republished/relogged a stale v1
+            // value (e.g. a still-stuck `Climb`) even though every other
+            // surface kept correctly showing the last real v2 phase
+            // (`stats.shadow_phase` is simply left untouched on a paused
+            // tick, not cleared) — exactly the "Live-Karte flackert kurz
+            // auf v1" failure the old, now-removed comment warned about,
+            // just reachable via ordinary pausing instead of a v1-race.
+            //
+            // Exception: v2 deliberately never models `Holding` (documented
+            // diff, see phase_v2.rs) — without a special case, a real ATC
+            // hold would silently vanish from this log (previously the one
+            // surface still showing it, since it read raw v1). Treat a v1
+            // transition INTO Holding as an unconditional, Holding-labelled
+            // log-worthy change, and record it so leaving the hold (v2
+            // resuming e.g. Cruise) is itself detected as a change too —
+            // a clean start/end pair, matching the old pure-v1 log.
+            let v1_entered_holding = phase_change == Some(FlightPhase::Holding);
+            let (effective_phase_changed, effective_phase_this_tick) = {
+                let mut stats = flight.stats.lock().expect("flight stats");
+                let effective = if v1_entered_holding {
+                    FlightPhase::Holding
+                } else {
+                    effective_phase(&stats)
+                };
+                let changed =
+                    v1_entered_holding || stats.last_logged_effective_phase != Some(effective);
+                if changed {
+                    stats.last_logged_effective_phase = Some(effective);
+                }
+                (changed, effective)
+            };
+            if effective_phase_changed {
                 acars_log_entries.push(api_client::LogEntry {
-                    log: format!("Phase: {}", phase_human_label(new_phase)),
+                    log: format!("Phase: {}", phase_human_label(effective_phase_this_tick)),
                     lat: Some(snap.lat),
                     lon: Some(snap.lon),
                     created_at: Some(Utc::now().to_rfc3339()),
@@ -19441,17 +19539,7 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                     let app_state = app.state::<AppState>();
                     let mqtt = app_state.mqtt.lock().await;
                     if let Some(handle) = mqtt.as_ref() {
-                        // #phase-v2 Cutover: der retained „current phase"-Topic
-                        // schreibt (wie der Position-Payload) die DB-current_phase
-                        // im Recorder → muss dieselbe v2-Phase publizieren, sonst
-                        // flackert die Live-Map bei jeder v1-Transition kurz auf
-                        // v1. (Die „Phase:"-ACARS-Textlog-Zeile oben bleibt
-                        // bewusst v1 — sie ist ein v1-transitions-getriebenes
-                        // Änderungsprotokoll, kein Live-Status.)
-                        handle.phase(
-                            effective_display_phase(new_phase, tick_shadow_phase),
-                            Utc::now(),
-                        );
+                        handle.phase(effective_phase_this_tick, Utc::now());
                     }
                 }
             }
@@ -23029,9 +23117,10 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
     // The escape hatch: once the aircraft has actually started
     // moving (block_off recorded), if it's now sitting on-ground
     // with engines off within 2 nmi of the arrival airport for at
-    // least 30 s, we force `Arrived` regardless of prior phase.
-    // Block_on_at gets back-filled here so the PIREP file logic
-    // (which reads it for flight-time / chocks-on) still works.
+    // least ARRIVED_FALLBACK_DWELL_SECS, we force `Arrived` regardless
+    // of prior phase. Block_on_at gets back-filled here so the PIREP
+    // file logic (which reads it for flight-time / chocks-on) still
+    // works.
     let already_done = matches!(
         next_phase,
         FlightPhase::Arrived | FlightPhase::PirepSubmitted
@@ -23044,7 +23133,7 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
     // detection inside it) if the aircraft has actually been airborne
     // at some point. Without this, GSX/sim ground-handling jitter at
     // the gate can stamp `block_off_at` (any motion >0.5 kt counts),
-    // and 30 s later the fallback fires with phase=Arrived plus a
+    // and ARRIVED_FALLBACK_DWELL_SECS later the fallback fires with phase=Arrived plus a
     // bogus divert hint pointing at the departure airport — exactly
     // the bug pilots reported with NKS 833 KFLL→MKJS where GSX wackeln
     // produced "you landed at KFLL, planned was MKJS, file as divert?".
@@ -23066,12 +23155,13 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
         // ops: EMS offload, sightseeing turnaround, pad/rig work), so the
         // engines-off requirement would never finalise their arrival. Relax it
         // for rotorcraft — but ONLY at the planned destination (`near_planned`)
-        // with the same on-ground + stationary + 30 s dwell guards, so a
-        // rotors-running intermediate stop can never be mis-filed as a divert
-        // (the divert path keeps the strict engines-off requirement).
-        // Original engines-off-Pfad (30 s Dwell) inkl. Rotorcraft-Relaxation
-        // (Rotoren laufen oft nach dem Aufsetzen weiter → nur Stillstand am
-        // Ziel gefordert).
+        // with the same on-ground + stationary + ARRIVED_FALLBACK_DWELL_SECS
+        // guards, so a rotors-running intermediate stop can never be
+        // mis-filed as a divert (the divert path keeps the strict
+        // engines-off requirement).
+        // Original engines-off-Pfad (ARRIVED_FALLBACK_DWELL_SECS Dwell) inkl.
+        // Rotorcraft-Relaxation (Rotoren laufen oft nach dem Aufsetzen weiter
+        // → nur Stillstand am Ziel gefordert).
         let engines_off_path = if category.is_rotorcraft() && near_planned {
             snap.on_ground && snap.groundspeed_kt < 1.0
         } else {
@@ -23105,9 +23195,12 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
             );
         let conditions_basic = engines_off_path || standstill_path;
         if conditions_basic {
+            // Shared wall-clock timer for both paths (see
+            // arrived_fallback_pending_since's doc comment for why it's
+            // deliberately shared rather than reset on every path switch).
+            // Only the dwell threshold differs by path.
             let pending_at = stats.arrived_fallback_pending_since.get_or_insert(now);
             let elapsed = (now - *pending_at).num_seconds();
-            // engines-off/Rotor: 30 s; reiner Stillstands-Pfad: längerer Dwell.
             let dwell_needed = if engines_off_path {
                 ARRIVED_FALLBACK_DWELL_SECS
             } else {
@@ -23259,6 +23352,243 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
         Some(next_phase)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod arrived_fallback_dwell_tests {
+    //! v0.19.1 — tests for the universal Arrived-fallback's `engines_off_path`
+    //! dwell, lowered from a flat 30 s to `ARRIVED_FALLBACK_DWELL_SECS = 9 s`
+    //! (field report: GSG22 EDLN→EDDL, pilot perceived the app as frozen on
+    //! "Final" for 3-4 min after touchdown — see docs/release-notes/v0.19.1.md).
+    //!
+    //! Deliberately still wall-clock (not a tick count): `step_flight` reads
+    //! real time via `Utc::now()` with no injectable clock, and — more
+    //! importantly — a tick-count threshold would be wrong on its own terms
+    //! here, because `adaptive_tick_interval` drops the ground/near-ground
+    //! tick cadence to 500 ms exactly in the "stuck on Final near/at 0 AGL"
+    //! state this fallback rescues (an earlier version of this fix used tick
+    //! counting and was caught doing this in code review before release —
+    //! see the ARRIVED_FALLBACK_DWELL_SECS doc comment). These tests seed
+    //! `arrived_fallback_pending_since` directly to simulate "N seconds have
+    //! already elapsed" without sleeping in the test.
+    //!
+    //! `standstill_path` (engine_count_unreliable addons, e.g. Contrail
+    //! FA50) shares the same `arrived_fallback_pending_since` timer with a
+    //! separate, much longer dwell (`ARRIVED_STANDSTILL_DWELL_SECS`) — see
+    //! `standstill_path_uses_its_own_longer_dwell_via_the_shared_timer`.
+
+    use super::*;
+
+    /// Minimal ActiveFlight for exercising `step_flight` directly. Uses a
+    /// non-existent arrival ICAO so `runway::airport_position` returns
+    /// `None` and the fallback's `near_planned` check short-circuits to
+    /// `true` — isolates these tests to the dwell mechanic itself, not
+    /// runway-distance geometry (covered elsewhere).
+    fn fixture() -> ActiveFlight {
+        ActiveFlight {
+            pirep_id: "test-pirep".into(),
+            bid_id: 0,
+            flight_id: String::new(),
+            bid_callsign: None,
+            pilot_callsign: None,
+            started_at: Utc::now(),
+            airline_icao: String::new(),
+            planned_registration: String::new(),
+            aircraft_icao: "C172".into(),
+            aircraft_name: String::new(),
+            flight_number: "1".into(),
+            dpt_airport: "EDDF".into(),
+            arr_airport: "ZZZZ".into(),
+            airline_logo_url: None,
+            fares: Vec::new(),
+            stats: Mutex::new(FlightStats::new()),
+            stop: AtomicBool::new(false),
+            was_just_resumed: AtomicBool::new(false),
+            streamer_spawned: AtomicBool::new(false),
+            cancelled_remotely: AtomicBool::new(false),
+            position_outbox: Mutex::new(std::collections::VecDeque::new()),
+            phpvms_worker_spawned: AtomicBool::new(false),
+            touchdown_sampler_spawned: AtomicBool::new(false),
+            connection_state: std::sync::atomic::AtomicU8::new(CONN_STATE_LIVE),
+            navdata: Mutex::new(NavdataCache::default()),
+        }
+    }
+
+    /// Arms the "has genuinely flown" gate the universal fallback requires
+    /// (`block_off_at.is_some() && was_airborne`). Starts from `Climb`, not
+    /// a ground/terminal phase: this is deliberately the real-world
+    /// scenario that triggers the escape hatch (legacy FSM stuck on an
+    /// en-route phase, e.g. the GSG22 flight this fix is based on) — and,
+    /// as a test-isolation bonus, `Climb`'s own match arm only reacts to
+    /// altitude, so it can't independently transition on the ground-
+    /// condition snapshots these tests feed in (a ground/terminal starting
+    /// phase like `TaxiIn` would confound the fallback's own dwell with the
+    /// *normal* FSM's blocks-on transition, which reacts to the exact same
+    /// conditions).
+    ///
+    /// `dwell_started_secs_ago`: pre-seeds `arrived_fallback_pending_since`
+    /// so the very first `step_flight` call already sees that much elapsed
+    /// time, without sleeping. `None` leaves it unset (fresh timer, starts
+    /// on the first qualifying tick — real `now()`).
+    fn armed_flight(dwell_started_secs_ago: Option<i64>) -> ActiveFlight {
+        let flight = fixture();
+        {
+            let mut stats = flight.stats.lock().unwrap();
+            stats.phase = FlightPhase::Climb;
+            stats.block_off_at = Some(Utc::now() - chrono::Duration::minutes(20));
+            stats.was_airborne = true;
+            if let Some(secs) = dwell_started_secs_ago {
+                stats.arrived_fallback_pending_since =
+                    Some(Utc::now() - chrono::Duration::seconds(secs));
+            }
+        }
+        flight
+    }
+
+    /// `SimSnapshot::default()` is already "parked, engines off, on the
+    /// ground" (see its doc comment) — exactly `arrived_fallback_
+    /// conditions_basic`'s satisfied state.
+    fn arrived_conditions_snap() -> SimSnapshot {
+        SimSnapshot::default()
+    }
+
+    #[test]
+    fn does_not_fire_before_dwell_elapsed() {
+        let flight = armed_flight(Some(ARRIVED_FALLBACK_DWELL_SECS - 3));
+        let snap = arrived_conditions_snap();
+        let result = step_flight(&flight, &snap);
+        assert_eq!(result, None);
+        assert_eq!(flight.stats.lock().unwrap().phase, FlightPhase::Climb);
+        assert!(
+            flight
+                .stats
+                .lock()
+                .unwrap()
+                .arrived_fallback_pending_since
+                .is_some(),
+            "the timer keeps running, just hasn't reached the dwell yet"
+        );
+    }
+
+    #[test]
+    fn fires_once_dwell_elapsed() {
+        let flight = armed_flight(Some(ARRIVED_FALLBACK_DWELL_SECS + 1));
+        let snap = arrived_conditions_snap();
+        let result = step_flight(&flight, &snap);
+        assert_eq!(result, Some(FlightPhase::Arrived));
+        assert_eq!(flight.stats.lock().unwrap().phase, FlightPhase::Arrived);
+    }
+
+    #[test]
+    fn fires_exactly_at_the_dwell_boundary() {
+        // elapsed >= dwell_needed — the boundary itself must fire, not just
+        // strictly-greater.
+        let flight = armed_flight(Some(ARRIVED_FALLBACK_DWELL_SECS));
+        let snap = arrived_conditions_snap();
+        let result = step_flight(&flight, &snap);
+        assert_eq!(result, Some(FlightPhase::Arrived));
+    }
+
+    #[test]
+    fn an_interrupting_tick_resets_the_dwell_timer() {
+        let flight = armed_flight(Some(ARRIVED_FALLBACK_DWELL_SECS + 1));
+        let mut snap_engine_on = arrived_conditions_snap();
+        snap_engine_on.engines_running = 1; // stray "still running" sample
+
+        // The condition breaks before the (already-elapsed) dwell is ever
+        // checked against a qualifying tick — must reset, not fire.
+        let result = step_flight(&flight, &snap_engine_on);
+        assert_eq!(result, None);
+        assert!(
+            flight
+                .stats
+                .lock()
+                .unwrap()
+                .arrived_fallback_pending_since
+                .is_none(),
+            "condition broke — timer must reset"
+        );
+
+        // A fresh qualifying tick starts a NEW timer at `now` — does not
+        // fire immediately even though the aircraft was "ready" a moment
+        // ago, because the interruption discarded that progress.
+        let snap_ok = arrived_conditions_snap();
+        let result = step_flight(&flight, &snap_ok);
+        assert_eq!(result, None);
+        assert_eq!(flight.stats.lock().unwrap().phase, FlightPhase::Climb);
+    }
+
+    #[test]
+    fn standstill_path_uses_its_own_longer_dwell_via_the_shared_timer() {
+        // engine_count_unreliable aircraft (Contrail FA50 pattern): stock
+        // engines_running is stuck NONZERO, so engines_off_path is false
+        // and only standstill_path (no engines_running requirement) can
+        // fire — gated by the much longer ARRIVED_STANDSTILL_DWELL_SECS.
+        let flight = armed_flight(Some(ARRIVED_FALLBACK_DWELL_SECS + 1));
+        let mut snap = arrived_conditions_snap();
+        snap.aircraft_profile = sim_core::AircraftProfile::ContrailFa50;
+        snap.engines_running = 3; // stuck nonzero — the documented FA50 bug
+
+        // Only ARRIVED_FALLBACK_DWELL_SECS (9s) has elapsed — far short of
+        // the standstill path's 300s. Must NOT fire.
+        let result = step_flight(&flight, &snap);
+        assert_eq!(
+            result, None,
+            "standstill_path must not borrow engines_off_path's short dwell"
+        );
+
+        // Now simulate the full standstill dwell having elapsed.
+        {
+            let mut stats = flight.stats.lock().unwrap();
+            stats.arrived_fallback_pending_since =
+                Some(Utc::now() - chrono::Duration::seconds(ARRIVED_STANDSTILL_DWELL_SECS + 1));
+        }
+        let result = step_flight(&flight, &snap);
+        assert_eq!(result, Some(FlightPhase::Arrived));
+    }
+
+    #[test]
+    fn switching_between_paths_does_not_discard_accumulated_dwell_time() {
+        // Regression guard: an aircraft that satisfies engines_off_path on
+        // most ticks but standstill_path on an occasional flaky tick (e.g.
+        // an unreliable engine counter that isn't permanently stuck, just
+        // flaky) must not have its progress wiped by the path switch —
+        // both paths share one timer that only resets when BOTH are false.
+        // Seeded comfortably PAST the short engines_off_path dwell (9s) but
+        // nowhere near the long standstill_path dwell (300s) — tick 1 must
+        // stay None (standstill_path's own threshold isn't met), tick 2
+        // must fire immediately once engines_off_path becomes active,
+        // proving the accumulated time carried over rather than restarting.
+        let flight = armed_flight(Some(ARRIVED_FALLBACK_DWELL_SECS + 1));
+        let mut snap = arrived_conditions_snap();
+        snap.aircraft_profile = sim_core::AircraftProfile::ContrailFa50;
+        snap.engines_running = 3; // this tick: only standstill_path qualifies
+
+        // Not enough elapsed yet for standstill_path's 300s dwell.
+        let result = step_flight(&flight, &snap);
+        assert_eq!(result, None);
+        assert!(
+            flight
+                .stats
+                .lock()
+                .unwrap()
+                .arrived_fallback_pending_since
+                .is_some(),
+            "standstill_path being active must not clear the shared timer"
+        );
+
+        // Next tick: engines_running flickers to 0 (engines_off_path now
+        // qualifies instead). The ORIGINAL start time must be preserved —
+        // total elapsed is now comfortably over the short engines_off_path
+        // dwell, so it fires immediately rather than restarting from 0.
+        snap.engines_running = 0;
+        let result = step_flight(&flight, &snap);
+        assert_eq!(
+            result,
+            Some(FlightPhase::Arrived),
+            "switching to engines_off_path must use the time already accumulated, not restart"
+        );
     }
 }
 
