@@ -3,7 +3,7 @@
 // (shadow_segment === 'level') im En-Route-Band zeigt es 'Level' -- aber NIE
 // am Boden (sonst ueberschriebe ein Level-Segment 'Taxi'/'Boarding').
 import { describe, it, expect } from "vitest";
-import { phaseBadgeDisplay } from "./ActiveFlightPanel";
+import { phaseBadgeDisplay, isFlightFinalizable } from "./ActiveFlightPanel";
 
 describe("phaseBadgeDisplay (#phase-v2 cutover)", () => {
   it("shows the normal phase when no level segment is present", () => {
@@ -63,5 +63,36 @@ describe("phaseBadgeDisplay (#phase-v2 cutover)", () => {
       labelKey: "cruise",
       className: "cruise",
     });
+  });
+
+  // v0.19.1: the "stuck on Final after touchdown" bug (field report GSG22
+  // EDLN→EDDL) is fixed upstream in phase_v2.rs (Final self-promotes to
+  // Landing on ground-segment evidence) — `phase` here is already "landing"
+  // by the time it reaches the frontend, so no UI-side override is needed.
+  // This just confirms phaseBadgeDisplay renders "landing" plainly, like any
+  // other phase.
+  it("renders 'landing' plainly once phase itself says so (fixed upstream)", () => {
+    expect(phaseBadgeDisplay("landing", "ground")).toEqual({
+      labelKey: "landing",
+      className: "landing",
+    });
+  });
+});
+
+describe("isFlightFinalizable (B-014)", () => {
+  it("is finalizable for the terminal phases, given a recorded touchdown", () => {
+    for (const phase of ["landing", "taxi_in", "blocks_on", "arrived"]) {
+      expect(isFlightFinalizable(phase, "2026-07-11T15:11:12Z")).toBe(true);
+    }
+  });
+
+  it("requires a recorded touchdown even in a terminal phase", () => {
+    expect(isFlightFinalizable("landing", null)).toBe(false);
+  });
+
+  it("is not finalizable for en-route phases regardless of touchdown", () => {
+    for (const phase of ["cruise", "climb", "descent", "approach", "final", "taxi_out"]) {
+      expect(isFlightFinalizable(phase, "2026-07-11T15:11:12Z")).toBe(false);
+    }
   });
 });
