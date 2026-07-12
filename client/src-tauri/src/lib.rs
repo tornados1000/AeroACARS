@@ -570,6 +570,61 @@ const GO_AROUND_DWELL_SECS: i64 = 8;
 /// verzoegert wird (-500 fpm × 15 s = 125 ft Verlust, vernachlaessigbar
 /// gegen typische 25.000-ft-TOD-Strecken).
 const DESCENT_DWELL_SECS: i64 = 15;
+/// En-Route-Versöhner (Korpus-Audit 2026-07, 632 Flüge): Sicherheitsnetz
+/// für die GANZE Fehlerklasse "alte FSM hängt auf einer Luft-Phase fest",
+/// nicht für einen einzelnen Übergangs-Arm. Historie derselben Klasse,
+/// jedes Mal als Einzelfix hinterher: v0.5.40 (Pushback klemmt,
+/// pushback_state konstant 3), v0.13.17 (Boden-Phasen klemmen, tote
+/// Engine-SimVars), v0.19.1 (Final→Landing, Anzeige-only), GSG-105
+/// (Descent-Falle, es gibt keinen Descent→Climb-Weg zurück), zuletzt
+/// GSG22 EDLN→EDDL + eine C172 (Climb→Descent mathematisch unerreichbar:
+/// `lost_from_peak > 500..1200 ft` kann bei < 1000 ft Climb-Peak nie
+/// eintreten — Ansatz-Problem, kein Schwellenwert-Problem).
+///
+/// Mechanik: weicht v1 in einer Luft-Phase (Climb/Cruise/Descent/
+/// Approach/Final — NICHT Holding, das v2 bewusst nicht modelliert) so
+/// lange von v2s aufgelöster Phase ab, ohne sich selbst zu bewegen, wird
+/// v1s echter Zustand auf v2s Phase gezogen — über den normalen
+/// `next_phase`-Commit, also mit echtem `PhaseChanged`-Event (Treibstoff-
+/// Snapshot, METAR-Abruf, ACARS-Log, Auto-File-Kette ziehen alle nach;
+/// das unterscheidet ihn von der reinen Anzeige-Korrektur aus v0.19.1).
+/// Es wird KEINE neue Heuristik erfunden: Ziel ist v2s bereits
+/// review-gehärtete Resolver-Phase (phase_v2.rs), keine Roh-Segmente.
+///
+/// Der PRIMÄRE Schutz vor Fehl-Zügen ist NICHT der Dwell, sondern das
+/// Kinematik-Widerspruchs-Gate [`segment_contradicts_v1`]: gefeuert wird
+/// ausschließlich, wenn die Fenster-Evidenz v1s aktuelle Phase aktiv
+/// WIDERLEGT (Climb während anhaltenden Sinkens/am Boden, Descent während
+/// anhaltenden Steigens, …). Bloßes v1≠v2 genügt NICHT — QS-Runde 1
+/// bewies empirisch, dass v1 und v2 bei Level-Flug GEWOLLT und dauerhaft
+/// auseinanderliegen (v2 promotet Climb→Cruise ref-los erst nach 240 s
+/// Level; v2 hält bei Zwischen-Level-Offs bewusst Descent, wo v1s B-003
+/// sofort Cruise recovert; v1 latcht Cruise bei Climb-Restrictions
+/// single-tick, wo v2 korrekt Climb hält) — ein rein v1≠v2-basierter
+/// Versöhner oszillierte auf JEDEM gesunden Normalflug (Zug → v1s
+/// Primär-Arm latcht zurück → Zug → …). `Level`/`Insufficient`
+/// widersprechen deshalb NIE einer Luft-Phase.
+///
+/// Der Dwell obendrauf ist ASYMMETRISCH nach Zug-Richtung im natürlichen
+/// Flugbogen (Climb→Cruise→Descent→Approach→Final→Landing, s.
+/// `enroute_phase_rank`):
+///
+/// * **Rückwärts** (v2 hinter v1) — 90 s: die vorsichtigere Richtung
+///   (Defense-in-Depth über das Widerspruchs-Gate hinaus); länger als
+///   v2s komplettes Evidenz-Fenster (60 s) + Hysterese-Reserve, damit
+///   ein nachhinkendes v2 eine gesunde, frisch transitionierte v1 nie
+///   zurückzieht (die Uhr resettet bei jeder v1-Transition ohnehin).
+/// * **Vorwärts** (v2 vor v1) — 45 s: ein v2, das VORAUS ist, hat MEHR
+///   bestätigte Evidenz, nicht weniger. Replay-Befund BE24 (der Feld-
+///   Report-Flug): die ehrliche Divergenz-Spanne vor dem Touchdown
+///   betrug nur 82 s — mit einem symmetrischen 90-s-Dwell käme die
+///   Rettung erst NACH dem Aufsetzen, mit 45 s noch in der Luft (v1
+///   erlebt Final/Landing als echte Phasen und erfasst den Touchdown
+///   über die eigene Landing-Kante statt Sampler-Carry-Over).
+const ENROUTE_RECONCILE_DWELL_SECS: i64 = 90;
+/// Vorwärts-Dwell des En-Route-Versöhners — siehe
+/// [`ENROUTE_RECONCILE_DWELL_SECS`].
+const ENROUTE_RECONCILE_FORWARD_DWELL_SECS: i64 = 45;
 /// v0.7.17 (B-010): Gewichts-Schwelle Light-GA vs. Medium/Heavy.
 ///
 /// 5700 kg = MTOM-Grenze EASA CS-23/CS-25 (Single/Twin-Prop GA vs.
@@ -3059,6 +3114,23 @@ struct FlightStats {
     /// Cleared sobald die Bedingungen wieder brechen.
     descent_pending_since: Option<DateTime<Utc>>,
 
+    /// En-Route-Versöhner (siehe `ENROUTE_RECONCILE_DWELL_SECS`): die
+    /// v1-Phase, für die die Divergenz-Uhr läuft, + seit wann v1 dort
+    /// UNVERÄNDERT steht, während v2 durchgehend (irgendwie) abweicht.
+    /// Bewusst NUR an v1 gekoppelt: v2 darf während des Dwells
+    /// weiterwandern (Descent→Approach→Final ist bei kurzen, flachen
+    /// Anflügen normaler Evidenz-Fortschritt — Replay-Befund BE24: eine
+    /// paar-gekoppelte Uhr startete bei jedem v2-Fortschritt neu und
+    /// feuerte erst NACH dem Touchdown). Resets: jede v1-Transition
+    /// (lebendige FSM), jeder Tick mit Gleichstand/Ineligibilität/
+    /// fehlender Evidenz, jeder Reload-Glitch-Tick. Der Phasen-Anteil
+    /// deckt auch v1-Wechsel ab, die den normalen Commit-Pfad umgehen
+    /// (v0.13.17-Airborne-Rescue mit early return, Resume-Restore).
+    /// Runtime-only wie die Schatten-Engine selbst (nach App-Restart
+    /// wärmt v2 sich in ≤ 2 Fenstern wieder auf, der Versöhner beginnt
+    /// dann einfach frisch).
+    enroute_divergence_since: Option<(FlightPhase, DateTime<Utc>)>,
+
     // ---- v0.5.11 holding-pattern tracking ----
     /// Timestamp of the first tick where the aircraft satisfied
     /// holding-pattern conditions (banked turn at constant altitude).
@@ -4112,9 +4184,13 @@ pub struct ApproachBufferSample {
     pub stall_warning: bool,
 }
 
-fn push_approach_sample(stats: &mut FlightStats, snap: &SimSnapshot) {
+fn push_approach_sample(stats: &mut FlightStats, snap: &SimSnapshot, now: DateTime<Utc>) {
     stats.approach_buffer.push_back(ApproachBufferSample {
-        at: Utc::now(),
+        // Tick-Zeit vom Caller (step_flight_at) — nicht Utc::now(): sonst
+        // trügen Replay-Läufe Wall-Clock-Timestamps im Approach-Buffer,
+        // während landing_at historisch ist → approach_buffer_window
+        // fände ein leeres Fenster (QS-Runde 1, Replay-Fidelity).
+        at: now,
         agl_ft: snap.altitude_agl_ft as f32,
         msl_ft: snap.altitude_msl_ft as f32,
         gs_kt: snap.groundspeed_kt,
@@ -4308,6 +4384,143 @@ fn check_descent_transition(
         // Sink-Run einen frischen 15-s-Countdown bekommt.
         stats.descent_pending_since = None;
         None
+    }
+}
+
+/// En-Route-Versöhner: Eignungs-Prüfung (rein, testbar) — dürfen dieses
+/// v1/v2-Phasen-Paar überhaupt versöhnt werden? Siehe Doc an
+/// `ENROUTE_RECONCILE_DWELL_SECS` für die Gesamt-Mechanik.
+///
+/// * v1 muss in einer Luft-Phase stehen — `Holding` ausgenommen: v2
+///   modelliert es bewusst nicht (dokumentierter Diff), dort DARF v1
+///   abweichen. Boden-/Terminal-Phasen ebenfalls nicht: dort ist v1
+///   autoritativ (v2 synct sich 1:1 von ihr).
+/// * v2 muss selbst im Luft-Band oder auf `Landing` stehen — `Landing`
+///   ist v2s Ground-Evidenz-Selbstbeförderung (v0.19.1) und genau der
+///   Endzustand, in den eine durchgehend festgehangene v1 gezogen werden
+///   muss, damit ihre eigene Landing→TaxiIn→BlocksOn→Arrived-Kette
+///   normal weiterlaufen kann. Alles andere (Preflight etc.) wäre bei
+///   einer luft-phasigen v1 ein Rückwärts-Sync und ist tabu.
+/// * Gleichstand ist keine Divergenz.
+fn enroute_reconcile_eligible(v1: FlightPhase, v2: FlightPhase) -> bool {
+    let v1_air = matches!(
+        v1,
+        FlightPhase::Climb
+            | FlightPhase::Cruise
+            | FlightPhase::Descent
+            | FlightPhase::Approach
+            | FlightPhase::Final
+    );
+    let v2_target = matches!(
+        v2,
+        FlightPhase::Climb
+            | FlightPhase::Cruise
+            | FlightPhase::Descent
+            | FlightPhase::Approach
+            | FlightPhase::Final
+            | FlightPhase::Landing
+    );
+    v1_air && v2_target && v1 != v2
+}
+
+/// Position im natürlichen Flugbogen für die Zug-Richtungs-Frage des
+/// En-Route-Versöhners (vorwärts = kürzerer Dwell, rückwärts = längerer —
+/// siehe [`ENROUTE_RECONCILE_DWELL_SECS`]). `None` für Phasen außerhalb
+/// des Bogens — der Aufrufer behandelt jede Richtung, die sich nicht aus
+/// zwei gültigen Rängen ergibt, als "rückwärts" (= konservativer, langer
+/// Dwell). Hinter [`enroute_reconcile_eligible`] kommt das nicht vor.
+fn enroute_phase_rank(p: FlightPhase) -> Option<u8> {
+    match p {
+        FlightPhase::Climb => Some(0),
+        FlightPhase::Cruise => Some(1),
+        FlightPhase::Descent => Some(2),
+        FlightPhase::Approach => Some(3),
+        FlightPhase::Final => Some(4),
+        FlightPhase::Landing => Some(5),
+        _ => None,
+    }
+}
+
+/// Zieht v2 VORWÄRTS im Flugbogen? Nur dann gilt der kürzere Dwell —
+/// alles Unklare fällt auf den langen Rückwärts-Dwell zurück.
+fn enroute_reconcile_is_forward(v1: FlightPhase, v2: FlightPhase) -> bool {
+    matches!(
+        (enroute_phase_rank(v1), enroute_phase_rank(v2)),
+        (Some(a), Some(b)) if b > a
+    )
+}
+
+/// Kinematik-Widerspruchs-Gate des En-Route-Versöhners (rein, testbar) —
+/// das PRIMÄRE Feuer-Kriterium, siehe [`ENROUTE_RECONCILE_DWELL_SECS`].
+/// True nur, wenn die Fenster-Evidenz v1s Phase aktiv WIDERLEGT:
+///
+/// * `Climb` ⊥ Descending/Ground — die GSG22-Klasse (Climb festgefahren,
+///   Flieger sinkt/rollt längst; ein gesunder Steigflug hat nie 45 s+
+///   Fenster-Mehrheit „sinkend").
+/// * `Cruise` ⊥ Ground — Absurditäts-Guard; ein sinkendes Cruise wird
+///   BEWUSST NICHT gezogen: v1s eigener −500-fpm-Trigger deckt jeden
+///   echten TOD ab (Korpus: 0 von 632 Flügen in Cruise festgefahren),
+///   und ATC-Step-Downs sind bei v1 by design Cruise — ein Zug erzeugte
+///   dort nur den in QS-Runde 1 bewiesenen Pull/Recovery-Zyklus.
+/// * `Descent` ⊥ Climbing/Ground — die GSG-105-Klasse (Descent-Falle:
+///   v1 hat keinen Descent→Climb-Weg zurück). `Level` widerspricht NICHT
+///   (Zwischen-Level-Off; v1s B-003-Recovery übernimmt bei |V/S| < 200).
+/// * `Approach`/`Final` ⊥ Climbing/Ground — verpasster Go-Around (v1s
+///   eigener GA-Detektor braucht `engines_running` > 0 und ist bei toten
+///   Engine-SimVars blind) bzw. verpasste Touchdown-Kante.
+///
+/// `Level` und `Insufficient` widersprechen NIE — Level-Flug ist mit
+/// jeder Luft-Phase vereinbar (TOC-Wartezeit, Restrictions, Step-Downs),
+/// und ohne Evidenz wird nicht geurteilt.
+fn segment_contradicts_v1(v1: FlightPhase, segment: phase_v2::Segment) -> bool {
+    use phase_v2::Segment;
+    match v1 {
+        FlightPhase::Climb => {
+            matches!(segment, Segment::Descending | Segment::Ground)
+        }
+        FlightPhase::Cruise => matches!(segment, Segment::Ground),
+        FlightPhase::Descent | FlightPhase::Approach | FlightPhase::Final => {
+            matches!(segment, Segment::Climbing | Segment::Ground)
+        }
+        _ => false,
+    }
+}
+
+/// `landing_at`-Rettung aus dem 50-Hz-Sampler, wenn der FSM-Pfad die
+/// Final→Landing-Kante übersprungen hat (v0.5.4, historisch inline im
+/// universellen Arrived-Fallback; QS-Runde 1: auch der En-Route-Versöhner
+/// braucht sie bei einem Zug direkt auf `Landing`, sonst hinterlässt der
+/// Zug `landing_at=None` — aufgeblähte flight_time, kein LandingRecord,
+/// toter Landing-Arm-Analyzer). Der Sampler latcht den Touchdown
+/// phasenunabhängig (v0.15.20), hier werden Zeitstempel + VS/G nur in die
+/// FSM-Felder übernommen — niemals überschreibend (`get_or_insert`-
+/// Semantik pro Feld).
+fn rescue_landing_at_from_sampler(stats: &mut FlightStats, now: DateTime<Utc>) {
+    if stats.landing_at.is_some() || stats.takeoff_at.is_none() {
+        return;
+    }
+    if let Some(sampler_at) = stats.sampler_touchdown_at {
+        stats.landing_at = Some(sampler_at);
+        if let Some(vs) = stats.sampler_touchdown_vs_fpm {
+            if stats.landing_rate_fpm.is_none() {
+                finalize_landing_rate(stats, vs, None, Some("sampler_carry_over"));
+            }
+        }
+        if let Some(g) = stats.sampler_touchdown_g_force {
+            if stats.landing_g_force.is_none() {
+                stats.landing_g_force = Some(g);
+            }
+            if stats.landing_peak_g_force.is_none() {
+                stats.landing_peak_g_force = Some(g);
+            }
+        }
+        tracing::info!(
+            "landing_at rescued from sampler: vs={:?} g={:?}",
+            stats.sampler_touchdown_vs_fpm,
+            stats.sampler_touchdown_g_force
+        );
+    } else {
+        stats.landing_at = Some(now);
     }
 }
 
@@ -21304,8 +21517,22 @@ fn takeoff_roll_demote(
 }
 
 fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase> {
+    step_flight_at(flight, snap, Utc::now())
+}
+
+/// Uhr-injizierbare Variante von [`step_flight`] — `now` ist DER Zeitpunkt
+/// dieses Ticks für sämtliche Dwell-Timer und Zeitstempel im FSM-Schritt.
+/// Produktion ruft immer über den [`step_flight`]-Wrapper (echte Uhr);
+/// Replay-Tests füttern historische Timestamps aus echten Flug-Logs und
+/// machen damit die v1-FSM erstmals offline-replayfähig (das JSONL-
+/// Recorder-Format verspricht das seit jeher — "feed it back into the FSM
+/// offline", crates/recorder).
+fn step_flight_at(
+    flight: &ActiveFlight,
+    snap: &SimSnapshot,
+    now: DateTime<Utc>,
+) -> Option<FlightPhase> {
     let mut stats = flight.stats.lock().expect("flight stats");
-    let _now_for_state_update = Utc::now();
 
     // Category-aware FSM: a rotorcraft flies a profile the fixed-wing phase
     // logic mis-reads (operates below the 500 ft Climb gate, arrests its
@@ -21332,7 +21559,7 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
     // Cleanup/neuem Flight-Start (Spec §Leitentscheidung 6).
     if snap.crashed && !stats.accident_detected {
         stats.accident_detected = true;
-        stats.accident_at = Some(Utc::now());
+        stats.accident_at = Some(now);
         stats.accident_kind = Some(accident::AccidentKind::SimCrash.as_wire_str().to_string());
         stats.accident_confidence = Some("high".into());
         let source = snap.crash_source.clone().unwrap_or_else(|| "sim_event".into());
@@ -21347,7 +21574,7 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
     // Muss am Anfang passieren damit alle nachfolgenden Phase-Handler den
     // aktuellen Stand sehen.
     if snap.engines_running > 0 {
-        stats.last_engines_running_above_zero_at = Some(_now_for_state_update);
+        stats.last_engines_running_above_zero_at = Some(now);
     }
     if let Some(pb) = snap.pushback_state {
         if pb != 3 {
@@ -21461,7 +21688,6 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
     // it transitions to Landing, just with 30× more samples to pick
     // the worst V/S and peak G from.
 
-    let now = Utc::now();
     let prev_phase = stats.phase;
     let mut next_phase = prev_phase;
     let was_on_ground = stats.was_on_ground.unwrap_or(snap.on_ground);
@@ -21507,6 +21733,13 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
     // timers (Holding, Touch-and-Go, Go-Around) keep their last
     // value and continue from there.
     if snap.paused || snap.slew_mode {
+        // QS-Runde 1 (Pause-Loch): die Versöhner-Uhr ist Wanduhr — eine
+        // Sim-Pause unterhalb der Reload-Gap-Schwelle (bis 150 s bei
+        // Cruise-Kadenz!) liefe sonst voll in den Dwell ein, und der erste
+        // Resume-Tick feuerte mit VOR-Pause-Evidenz (die Schatten-Engine
+        // tickt erst NACH step_flight, ihre eigene Gap-Erkennung greift
+        // erst > 5 min). Pause unterbricht die Beobachtung → Uhr neu.
+        stats.enroute_divergence_since = None;
         return None;
     }
 
@@ -21584,7 +21817,7 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
         snap.altitude_agl_ft,
         snap.vertical_speed_fpm,
     ) {
-        push_approach_sample(&mut stats, snap);
+        push_approach_sample(&mut stats, snap, now);
     }
 
     // Match on a local Copy so the rest of the body is free to mutate `stats`.
@@ -22384,7 +22617,7 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                         .map(|e| e.fpm);
                     let last_low_recent = stats
                         .last_low_agl_vs_fpm
-                        .filter(|(_, ts)| (Utc::now() - *ts).num_seconds() <= 15);
+                        .filter(|(_, ts)| (now - *ts).num_seconds() <= 15);
                     let result = match (xp_est_plausible, last_low_recent) {
                         (Some(est), Some((last, _))) => est.min(last),
                         (Some(est), None) => est,
@@ -22463,7 +22696,7 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                     // - "agl_estimate_xp_implausible" = Estimator-Window ≥3s, also wahrscheinlich Spread-Artifact (= reported als low confidence)
                     let est_plausible = agl_estimate_xp.map(|e| e.window_ms < 3000).unwrap_or(false);
                     let last_low_recent = stats.last_low_agl_vs_fpm
-                        .map(|(_, ts)| (Utc::now() - ts).num_seconds() <= 15)
+                        .map(|(_, ts)| (now - ts).num_seconds() <= 15)
                         .unwrap_or(false);
                     if est_plausible && last_low_recent {
                         // Beide vorhanden — wir haben den deeperen genommen
@@ -23275,58 +23508,9 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
                     // Helicopters often don't fire a touchdown event the
                     // way the analyzer expects. If we never recorded
                     // landing_at, stamp it now so the file body has a
-                    // sensible flight_time.
-                    //
-                    // v0.5.4 enhancement: prefer the sampler's actual
-                    // touchdown timestamp + VS / G if it captured the
-                    // edge. The sampler runs at 50 Hz independently of
-                    // the FSM, so even when we skipped Final → Landing
-                    // (e.g. the v0.5.3 low-altitude-cruise FSM bug),
-                    // the touchdown moment is still recorded in
-                    // `stats.sampler_touchdown_*`. Without this
-                    // rescue path the file_body would have null VS
-                    // and a `now`-anchored landing_at, losing the
-                    // landing-rate data entirely.
-                    if stats.landing_at.is_none() && stats.takeoff_at.is_some() {
-                        if let Some(sampler_at) = stats.sampler_touchdown_at {
-                            stats.landing_at = Some(sampler_at);
-                            // Also copy VS / G / rate so the LandingRecord
-                            // has real touchdown values, not nulls. Without
-                            // these, the dashboard shows "0 fpm / no rating"
-                            // for any flight that bypassed Final → Landing.
-                            if let Some(vs) = stats.sampler_touchdown_vs_fpm {
-                                // v0.7.1 P2.2-D: nur setzen wenn noch nichts
-                                // gesetzt war (sonst wuerden wir touchdown_v2-
-                                // Werte vom Pfad in Site 1 ueberschreiben).
-                                // Source ist hier "sampler_carry_over" weil
-                                // wir Phase Final → Landing uebersprungen haben.
-                                if stats.landing_rate_fpm.is_none() {
-                                    finalize_landing_rate(
-                                        &mut stats,
-                                        vs,
-                                        None,
-                                        Some("sampler_carry_over"),
-                                    );
-                                }
-                            }
-                            if let Some(g) = stats.sampler_touchdown_g_force {
-                                if stats.landing_g_force.is_none() {
-                                    stats.landing_g_force = Some(g);
-                                }
-                                if stats.landing_peak_g_force.is_none() {
-                                    stats.landing_peak_g_force = Some(g);
-                                }
-                            }
-                            tracing::info!(
-                                "Arrived fallback rescued touchdown from sampler: \
-                                 vs={:?} g={:?}",
-                                stats.sampler_touchdown_vs_fpm,
-                                stats.sampler_touchdown_g_force
-                            );
-                        } else {
-                            stats.landing_at = Some(now);
-                        }
-                    }
+                    // sensible flight_time. (Shared helper — the enroute-
+                    // reconcile Landing pull needs the exact same rescue.)
+                    rescue_landing_at_from_sampler(&mut stats, now);
                     if let Some(hint) = detected_hint {
                         stats.divert_hint = Some(hint);
                     }
@@ -23341,6 +23525,113 @@ fn step_flight(flight: &ActiveFlight, snap: &SimSnapshot) -> Option<FlightPhase>
 
     stats.was_on_ground = Some(snap.on_ground);
     stats.was_parking_brake = Some(snap.parking_brake);
+
+    // En-Route-Versöhner (siehe Doc an `ENROUTE_RECONCILE_DWELL_SECS`):
+    // läuft NACH allen regulären Übergangs-Armen und NUR, wenn keiner von
+    // ihnen diesen Tick etwas entschieden hat — der Primärpfad behält
+    // immer Vorrang. Liest `stats.shadow_phase` vom VORHERIGEN Tick
+    // (die Schatten-Engine tickt im Streamer nach `step_flight`) — bei
+    // 90 s Dwell irrelevant. `Insufficient` = v2 hat gerade keine echte
+    // Kinematik-Evidenz (frisch resettet nach Reload/Time-Skip) → nicht
+    // nur nicht feuern, sondern die Divergenz-Uhr komplett neu starten.
+    if next_phase == prev_phase && !reload_gap_suspect {
+        // PRIMÄRES Gate: die Kinematik muss v1s Phase aktiv WIDERLEGEN —
+        // bloßes v1≠v2 genügt nicht (QS-Runde 1: sonst Oszillation auf
+        // gesunden Flügen, siehe segment_contradicts_v1-Doc). Subsumiert
+        // `Insufficient` (widerspricht nie → keine Evidenz, kein Urteil).
+        let contradicted =
+            segment_contradicts_v1(prev_phase, stats.shadow_engine.current_segment());
+        match stats.shadow_phase {
+            Some(v2)
+                if enroute_reconcile_eligible(prev_phase, v2)
+                    && contradicted
+                    // QS-Runde 1: `Landing` als Ziel nur mit ROHEM
+                    // on_ground dieses Ticks — v2s Ground-Mehrheit ist
+                    // fensterträge; hebt der Flieger im Versatz-Tick
+                    // wieder ab (Balked Landing), würde ein Luft-Zug auf
+                    // Landing BEIDE Engines unlösbar festnageln (v2
+                    // spiegelt Landing 1:1 zurück, v1=Landing hat ohne
+                    // landing_at keinen Luft-Ausstieg, der Versöhner
+                    // selbst ist raus).
+                    && (v2 != FlightPhase::Landing || snap.on_ground) =>
+            {
+                // Uhr ist an v1s STILLSTAND gekoppelt, nicht an ein
+                // stabiles (v1, v2)-Paar — v2 darf während des Dwells
+                // legitim weiterwandern (siehe Feld-Doc). Gezogen wird
+                // auf v2s AKTUELLE Phase (frischeste Evidenz).
+                let since = match stats.enroute_divergence_since {
+                    Some((p1, t)) if p1 == prev_phase => t,
+                    _ => {
+                        stats.enroute_divergence_since = Some((prev_phase, now));
+                        now
+                    }
+                };
+                // Asymmetrischer Dwell nach Zug-Richtung — siehe
+                // ENROUTE_RECONCILE_DWELL_SECS-Doc. Die Richtung wird pro
+                // Tick aus der AKTUELLEN v2-Phase bestimmt: wandert v2
+                // während des Dwells vorwärts (Descent→Approach→Final),
+                // gilt ab da der Vorwärts-Dwell — die Uhr selbst läuft
+                // von ihrem einen Startpunkt weiter.
+                let dwell_needed = if enroute_reconcile_is_forward(prev_phase, v2) {
+                    ENROUTE_RECONCILE_FORWARD_DWELL_SECS
+                } else {
+                    ENROUTE_RECONCILE_DWELL_SECS
+                };
+                if (now - since).num_seconds() >= dwell_needed {
+                    tracing::warn!(
+                        ?prev_phase,
+                        target = ?v2,
+                        held_secs = (now - since).num_seconds(),
+                        dwell_needed,
+                        "enroute-reconcile: v1 auf Luft-Phase festgefahren, Kinematik \
+                         widerlegt sie, v2-Evidenz zeigt beständig eine andere Phase — \
+                         ziehe v1 nach"
+                    );
+                    stats.enroute_divergence_since = None;
+                    // Timer-Hygiene (QS-Runde 1): armierte Dwell-Timer
+                    // anderer Detektoren dürfen den Quer-Zug nicht als
+                    // Alt-Zustand überleben — ein stehen gebliebener
+                    // go_around_climb_pending_since könnte bei späterem
+                    // Approach-Wiedereintritt via get_or_insert die 8-s-
+                    // GA-Dwell sofort erfüllen (falscher Go-Around).
+                    stats.descent_pending_since = None;
+                    stats.go_around_climb_pending_since = None;
+                    stats.touch_and_go_pending_since = None;
+                    match v2 {
+                        FlightPhase::Approach => {
+                            // Gleiche Entry-Semantik wie die reguläre
+                            // Descent→Approach-Kante: frisches Per-
+                            // Anflug-Bild (Werte eines FRÜHEREN Anflugs
+                            // dürfen nicht in den Touchdown-VS-Fallback
+                            // sickern). Bei Ziel Final BEWUSST nicht —
+                            // dort läuft der aktuelle Anflug bereits,
+                            // seine Low-AGL-Samples sind die Wahrheit.
+                            stats.low_agl_vs_min_fpm = None;
+                            stats.last_low_agl_vs_fpm = None;
+                        }
+                        FlightPhase::Landing => {
+                            // Zug direkt auf Landing = die Final→Landing-
+                            // Kante (dort latcht normal landing_at) wurde
+                            // übersprungen — ohne diese Rettung bliebe
+                            // landing_at=None (aufgeblähte flight_time,
+                            // kein LandingRecord, Landing-Arm-Analyzer
+                            // komplett tot, is_finalizable=false).
+                            rescue_landing_at_from_sampler(&mut stats, now);
+                        }
+                        _ => {}
+                    }
+                    next_phase = v2;
+                }
+            }
+            _ => {
+                stats.enroute_divergence_since = None;
+            }
+        }
+    } else {
+        // Frische v1-Transition (= lebendige FSM, wird NIE übersteuert)
+        // oder Reload-Glitch-Tick: Divergenz-Uhr neu starten.
+        stats.enroute_divergence_since = None;
+    }
 
     if next_phase != prev_phase {
         // v0.7.5 Phase-Safety Hotfix (Spec §13.9): siehe should_reset_holding_pending.
@@ -23589,6 +23880,1114 @@ mod arrived_fallback_dwell_tests {
             Some(FlightPhase::Arrived),
             "switching to engines_off_path must use the time already accumulated, not restart"
         );
+    }
+}
+
+#[cfg(test)]
+mod enroute_reconcile_tests {
+    //! En-Route-Versöhner (Korpus-Audit 2026-07, 632 Flüge) — siehe Doc an
+    //! `ENROUTE_RECONCILE_DWELL_SECS`. Diese Tests seeden
+    //! `enroute_divergence_since` direkt (gleiches Muster wie
+    //! `arrived_fallback_dwell_tests`: `step_flight` liest `Utc::now()`
+    //! ohne injizierbare Uhr — seeden statt schlafen). Die v2-Evidenz wird
+    //! ECHT aufgebaut (Samples durch die Schatten-Engine), damit die Tests
+    //! nicht an Resolver-Interna vorbei konstruieren.
+
+    use super::*;
+
+    fn fixture() -> ActiveFlight {
+        ActiveFlight {
+            pirep_id: "test-pirep".into(),
+            bid_id: 0,
+            flight_id: String::new(),
+            bid_callsign: None,
+            pilot_callsign: None,
+            started_at: Utc::now(),
+            airline_icao: String::new(),
+            planned_registration: String::new(),
+            aircraft_icao: "BE24".into(),
+            aircraft_name: String::new(),
+            flight_number: "22".into(),
+            dpt_airport: "EDLN".into(),
+            arr_airport: "ZZZZ".into(),
+            airline_logo_url: None,
+            fares: Vec::new(),
+            stats: Mutex::new(FlightStats::new()),
+            stop: AtomicBool::new(false),
+            was_just_resumed: AtomicBool::new(false),
+            streamer_spawned: AtomicBool::new(false),
+            cancelled_remotely: AtomicBool::new(false),
+            position_outbox: Mutex::new(std::collections::VecDeque::new()),
+            phpvms_worker_spawned: AtomicBool::new(false),
+            touchdown_sampler_spawned: AtomicBool::new(false),
+            connection_state: std::sync::atomic::AtomicU8::new(CONN_STATE_LIVE),
+            navdata: Mutex::new(NavdataCache::default()),
+        }
+    }
+
+    /// Baut ECHTE v2-Fenster-Evidenz auf: `n` Samples im 3-s-Raster durch
+    /// die Schatten-Engine, `old_phase` konstant gehalten (wie eine
+    /// festgefahrene v1). Endet zeitlich bei ~`Utc::now()`, damit der
+    /// nachfolgende `step_flight`-Tick keinen Segmenter-Time-Skip sieht.
+    /// Gibt die zuletzt aufgelöste v2-Phase zurück; der Test stempelt sie
+    /// — wie der Streamer — nach `stats.shadow_phase`.
+    #[allow(clippy::too_many_arguments)]
+    fn feed_v2_evidence(
+        stats: &mut FlightStats,
+        old_phase: FlightPhase,
+        n: usize,
+        alt0: f64,
+        alt_step: f64,
+        agl0: f64,
+        agl_step: f64,
+        vs: f32,
+        on_ground: bool,
+    ) -> FlightPhase {
+        feed_v2_evidence_ending(
+            stats, old_phase, n, alt0, alt_step, agl0, agl_step, vs, on_ground, 0,
+        )
+    }
+
+    /// Wie [`feed_v2_evidence`], aber das Sample-Fenster endet
+    /// `end_secs_ago` Sekunden VOR jetzt — für Tests, die zwei Evidenz-
+    /// Regime hintereinander füttern (z. B. Sinkflug, dann Level-Off):
+    /// zwei Feeds, die beide bei `now` endeten, überlappten sich zeitlich,
+    /// und der Segmenter verwürfe die rückdatierten Samples still (Min-
+    /// Abstands-Guard gegen rückwärts laufende Zeit).
+    #[allow(clippy::too_many_arguments)]
+    fn feed_v2_evidence_ending(
+        stats: &mut FlightStats,
+        old_phase: FlightPhase,
+        n: usize,
+        alt0: f64,
+        alt_step: f64,
+        agl0: f64,
+        agl_step: f64,
+        vs: f32,
+        on_ground: bool,
+        end_secs_ago: i64,
+    ) -> FlightPhase {
+        let start =
+            Utc::now() - chrono::Duration::seconds(3 * n as i64 + end_secs_ago);
+        let mut phase = old_phase;
+        for i in 0..n {
+            let t = start + chrono::Duration::seconds(3 * i as i64);
+            let (p, _) = stats.shadow_engine.step(
+                t,
+                alt0 + alt_step * i as f64,
+                (agl0 + agl_step * i as f64).max(0.0),
+                vs,
+                on_ground,
+                old_phase,
+                None,
+            );
+            phase = p;
+        }
+        stats.shadow_phase = Some(phase);
+        phase
+    }
+
+    /// GSG22-Form: v1 hängt auf `Climb`, während der Flieger real längst
+    /// sinkt. Snapshot so gewählt, dass JEDER reguläre Climb-Arm-Übergang
+    /// still bleibt: V/S −300 (über der −500-standard_tod-Schwelle),
+    /// `climb_peak_msl` == aktuelle MSL (lost_from_peak = 0 → low_alt/
+    /// near_ground unerreichbar — exakt die Niedrig-Peak-Blockade aus dem
+    /// Audit), AGL < 5000 (Cruise-Gate zu).
+    fn stuck_climb_flight(divergence_seeded_secs_ago: Option<i64>) -> (ActiveFlight, SimSnapshot) {
+        let flight = fixture();
+        let mut snap = SimSnapshot::default();
+        snap.on_ground = false;
+        snap.altitude_msl_ft = 900.0;
+        snap.altitude_agl_ft = 800.0;
+        snap.vertical_speed_fpm = -300.0;
+        snap.groundspeed_kt = 95.0;
+        snap.engines_running = 1;
+        {
+            let mut stats = flight.stats.lock().unwrap();
+            stats.phase = FlightPhase::Climb;
+            stats.climb_peak_msl = Some(snap.altitude_msl_ft as f32);
+            stats.was_airborne = true;
+            stats.was_on_ground = Some(false);
+            // Sinkende Fenster-Evidenz: −600 fpm über ~2 min → Segment
+            // Descending, v2-Phase Descent (von Descent aus gefüttert,
+            // Baseline-Sync beim ersten Sample). AGL bleibt über dem
+            // 5000-ft-Approach-Gate, damit v2 nicht schon zu Approach
+            // weiterbefördert — die Tests wollen das Paar (Climb, Descent).
+            let v2 = feed_v2_evidence(
+                &mut stats,
+                FlightPhase::Descent,
+                40,
+                9000.0,
+                -30.0,
+                8000.0,
+                -30.0,
+                -600.0,
+                false,
+            );
+            assert_eq!(
+                v2,
+                FlightPhase::Descent,
+                "test setup: v2 must resolve a sustained descent as Descent"
+            );
+            if let Some(secs) = divergence_seeded_secs_ago {
+                stats.enroute_divergence_since = Some((
+                    FlightPhase::Climb,
+                    Utc::now() - chrono::Duration::seconds(secs),
+                ));
+            }
+        }
+        (flight, snap)
+    }
+
+    // ---- Eignungs-Prüfung (rein) ----
+
+    #[test]
+    fn eligible_pairs_within_the_air_band() {
+        for (v1, v2) in [
+            (FlightPhase::Climb, FlightPhase::Descent),
+            (FlightPhase::Climb, FlightPhase::Landing),
+            (FlightPhase::Cruise, FlightPhase::Descent),
+            (FlightPhase::Descent, FlightPhase::Cruise),
+            (FlightPhase::Approach, FlightPhase::Final),
+            (FlightPhase::Final, FlightPhase::Landing),
+        ] {
+            assert!(enroute_reconcile_eligible(v1, v2), "{v1:?} → {v2:?}");
+        }
+    }
+
+    #[test]
+    fn holding_is_never_reconciled() {
+        // v2 modelliert Holding bewusst nicht — dort DARF v1 abweichen.
+        for v2 in [
+            FlightPhase::Climb,
+            FlightPhase::Cruise,
+            FlightPhase::Descent,
+            FlightPhase::Landing,
+        ] {
+            assert!(!enroute_reconcile_eligible(FlightPhase::Holding, v2));
+        }
+        // ... und Holding ist auch als ZIEL tabu (v2 erzeugt es nie —
+        // defensive Absicherung, falls sich das je ändert).
+        assert!(!enroute_reconcile_eligible(FlightPhase::Cruise, FlightPhase::Holding));
+    }
+
+    #[test]
+    fn ground_and_terminal_v1_phases_are_authoritative() {
+        // Außerhalb des Luft-Bands ist v1 die Sync-QUELLE für v2 (1:1-
+        // Mirror) — der Versöhner darf dort nie eingreifen. `Landing` als
+        // v1 gehört dazu: eine v1, die Landing selbst erreicht hat, ist
+        // nicht festgefahren.
+        for v1 in [
+            FlightPhase::Preflight,
+            FlightPhase::Boarding,
+            FlightPhase::Pushback,
+            FlightPhase::TaxiOut,
+            FlightPhase::TakeoffRoll,
+            FlightPhase::Takeoff,
+            FlightPhase::Landing,
+            FlightPhase::TaxiIn,
+            FlightPhase::BlocksOn,
+            FlightPhase::Arrived,
+        ] {
+            assert!(!enroute_reconcile_eligible(v1, FlightPhase::Descent), "{v1:?}");
+        }
+    }
+
+    #[test]
+    fn v2_targets_outside_the_air_band_are_taboo() {
+        for v2 in [
+            FlightPhase::Preflight,
+            FlightPhase::Boarding,
+            FlightPhase::TaxiIn,
+            FlightPhase::BlocksOn,
+            FlightPhase::Arrived,
+        ] {
+            assert!(!enroute_reconcile_eligible(FlightPhase::Climb, v2), "{v2:?}");
+        }
+    }
+
+    #[test]
+    fn agreement_is_not_divergence() {
+        for p in [
+            FlightPhase::Climb,
+            FlightPhase::Cruise,
+            FlightPhase::Descent,
+            FlightPhase::Approach,
+            FlightPhase::Final,
+        ] {
+            assert!(!enroute_reconcile_eligible(p, p));
+        }
+    }
+
+    #[test]
+    fn contradiction_gate_matrix() {
+        use phase_v2::Segment;
+        // Climb: nur ein sinkendes oder bodenständiges Fenster widerlegt
+        // einen Steigflug — nie Level (TOC-Wartezeit, Restrictions) oder
+        // Climbing (er steigt ja gerade, per Definition kein Widerspruch).
+        assert!(segment_contradicts_v1(FlightPhase::Climb, Segment::Descending));
+        assert!(segment_contradicts_v1(FlightPhase::Climb, Segment::Ground));
+        assert!(!segment_contradicts_v1(FlightPhase::Climb, Segment::Climbing));
+        assert!(!segment_contradicts_v1(FlightPhase::Climb, Segment::Level));
+        assert!(!segment_contradicts_v1(FlightPhase::Climb, Segment::Insufficient));
+
+        // Cruise: BEWUSST nur Ground (Absurditäts-Guard). NICHT Descending
+        // — v1s eigener single-tick −500-fpm-Trigger deckt jeden echten
+        // TOD ab (0/632 Flüge im Korpus je in Cruise festgefahren); ein
+        // Zug bei Descending erzeugte in QS-Runde 1 den bewiesenen Pull/
+        // Recovery-Zyklus bei ATC-Step-Downs. Diese Zeile hält die
+        // Absicht fest — NICHT versehentlich auf Descending erweitern.
+        assert!(segment_contradicts_v1(FlightPhase::Cruise, Segment::Ground));
+        assert!(!segment_contradicts_v1(FlightPhase::Cruise, Segment::Descending));
+        assert!(!segment_contradicts_v1(FlightPhase::Cruise, Segment::Climbing));
+        assert!(!segment_contradicts_v1(FlightPhase::Cruise, Segment::Level));
+
+        // Descent/Approach/Final: nur ein steigendes oder bodenständiges
+        // Fenster widerlegt sie (GSG-105-Klasse + verpasster Go-Around /
+        // verpasste Touchdown-Kante) — nie Level (Zwischen-Level-Off,
+        // v1s B-003-Recovery übernimmt eigenständig bei |V/S|<200) oder
+        // Descending (konsistent mit der eigenen Phase).
+        for p in [FlightPhase::Descent, FlightPhase::Approach, FlightPhase::Final] {
+            assert!(segment_contradicts_v1(p, Segment::Climbing), "{p:?}");
+            assert!(segment_contradicts_v1(p, Segment::Ground), "{p:?}");
+            assert!(!segment_contradicts_v1(p, Segment::Descending), "{p:?}");
+            assert!(!segment_contradicts_v1(p, Segment::Level), "{p:?}");
+        }
+
+        // Außerhalb des Luft-Bands (z. B. Holding) widerspricht nichts —
+        // der Versöhner ist dort ohnehin nicht eligible.
+        assert!(!segment_contradicts_v1(FlightPhase::Holding, Segment::Descending));
+    }
+
+    #[test]
+    fn cruise_with_sustained_descending_evidence_is_never_pulled() {
+        // Absurditäts-Guard, integrationsscharf: selbst eine lange (weit
+        // über jedem Dwell liegende), durchgehend bestätigte Descending-
+        // Evidenz darf ein Cruise NIE über den Versöhner nach Descent
+        // ziehen — das ist v1s eigenem single-tick-Trigger vorbehalten
+        // (Absicht siehe contradiction_gate_matrix). Snapshot selbst hält
+        // v1s Trigger bewusst still (vs>−500, AGL fern von Boden, kein
+        // 5000-ft-Verlust seit Peak).
+        let flight = fixture();
+        let mut snap = SimSnapshot::default();
+        snap.on_ground = false;
+        snap.altitude_msl_ft = 33000.0;
+        snap.altitude_agl_ft = 32000.0;
+        snap.vertical_speed_fpm = -480.0; // knapp unter v1s -500-Schwelle
+        snap.groundspeed_kt = 400.0;
+        snap.engines_running = 2;
+        {
+            let mut stats = flight.stats.lock().unwrap();
+            stats.phase = FlightPhase::Cruise;
+            stats.cruise_peak_msl = Some(35000.0); // lost_alt = 2000 < 5000
+            stats.was_airborne = true;
+            stats.was_on_ground = Some(false);
+            let v2 = feed_v2_evidence(
+                &mut stats,
+                FlightPhase::Descent,
+                40,
+                35000.0,
+                -20.0,
+                34000.0,
+                -20.0,
+                -480.0,
+                false,
+            );
+            assert_eq!(v2, FlightPhase::Descent, "test setup: v2 resolves sustained descent");
+            assert_eq!(stats.shadow_engine.current_segment(), phase_v2::Segment::Descending);
+            stats.enroute_divergence_since = Some((
+                FlightPhase::Cruise,
+                Utc::now() - chrono::Duration::seconds(ENROUTE_RECONCILE_DWELL_SECS + 500),
+            ));
+        }
+        let result = step_flight(&flight, &snap);
+        assert_eq!(result, None, "Cruise must never be pulled to Descent by the reconciler");
+        assert_eq!(flight.stats.lock().unwrap().phase, FlightPhase::Cruise);
+    }
+
+    #[test]
+    fn pull_direction_follows_the_flight_arc() {
+        // Vorwärts (kurzer Dwell): v2 ist im Bogen weiter als v1.
+        assert!(enroute_reconcile_is_forward(FlightPhase::Climb, FlightPhase::Descent));
+        assert!(enroute_reconcile_is_forward(FlightPhase::Climb, FlightPhase::Landing));
+        assert!(enroute_reconcile_is_forward(FlightPhase::Final, FlightPhase::Landing));
+        assert!(enroute_reconcile_is_forward(FlightPhase::Cruise, FlightPhase::Approach));
+        // Rückwärts (langer Dwell): v2 hängt hinter v1.
+        assert!(!enroute_reconcile_is_forward(FlightPhase::Descent, FlightPhase::Cruise));
+        assert!(!enroute_reconcile_is_forward(FlightPhase::Final, FlightPhase::Approach));
+        assert!(!enroute_reconcile_is_forward(FlightPhase::Cruise, FlightPhase::Climb));
+        // Gleichstand ist keine Richtung.
+        assert!(!enroute_reconcile_is_forward(FlightPhase::Cruise, FlightPhase::Cruise));
+    }
+
+    // ---- Integration über step_flight ----
+
+    #[test]
+    fn stuck_climb_with_sustained_v2_descent_reconciles_after_dwell() {
+        // Climb→Descent ist VORWÄRTS im Bogen → der kurze Dwell gilt.
+        let (flight, snap) = stuck_climb_flight(Some(ENROUTE_RECONCILE_FORWARD_DWELL_SECS + 1));
+        {
+            // QS-Runde 1: Timer-Hygiene-Assertions nicht-vakuös machen —
+            // die Timer ECHT armieren, damit ihr Clear beweisbar am
+            // Feuer-Pfad hängt (check_descent_transition nullt
+            // descent_pending bei diesem Snapshot ohnehin jeden Tick,
+            // die anderen beiden räumt NUR der Versöhner).
+            let mut stats = flight.stats.lock().unwrap();
+            stats.go_around_climb_pending_since =
+                Some(Utc::now() - chrono::Duration::seconds(3));
+            stats.touch_and_go_pending_since = Some(Utc::now() - chrono::Duration::seconds(3));
+        }
+        let result = step_flight(&flight, &snap);
+        assert_eq!(result, Some(FlightPhase::Descent));
+        let stats = flight.stats.lock().unwrap();
+        assert_eq!(stats.phase, FlightPhase::Descent);
+        assert!(stats.enroute_divergence_since.is_none(), "fired — clock cleared");
+        assert!(
+            stats.descent_pending_since.is_none(),
+            "primary-path dwell must not carry stale arming into Descent"
+        );
+        assert!(
+            stats.go_around_climb_pending_since.is_none(),
+            "a stale armed GA dwell must not survive the pull (false GA on re-entry)"
+        );
+        assert!(
+            stats.touch_and_go_pending_since.is_none(),
+            "a stale armed T&G dwell must not survive the pull"
+        );
+    }
+
+    #[test]
+    fn does_not_fire_before_dwell_elapsed() {
+        let (flight, snap) = stuck_climb_flight(Some(ENROUTE_RECONCILE_FORWARD_DWELL_SECS - 10));
+        let result = step_flight(&flight, &snap);
+        assert_eq!(result, None);
+        let stats = flight.stats.lock().unwrap();
+        assert_eq!(stats.phase, FlightPhase::Climb);
+        assert!(
+            stats.enroute_divergence_since.is_some(),
+            "clock keeps running, just hasn't reached the dwell yet"
+        );
+    }
+
+    #[test]
+    fn backward_pull_needs_the_long_dwell() {
+        // GSG-105-Klasse: v1 hängt in Descent (es gibt keinen Descent→
+        // Climb-Weg zurück), der Flieger steigt aber real und nachhaltig —
+        // das Kinematik-Gate ist erfüllt (Climbing ⊥ Descent). v2 sagt
+        // Cruise — RÜCKWÄRTS im Bogen. Der kurze Vorwärts-Dwell darf hier
+        // NICHT reichen; erst der lange Dwell feuert.
+        fn descent_stuck_flight(seed_secs: i64) -> (ActiveFlight, SimSnapshot) {
+            let flight = fixture();
+            let mut snap = SimSnapshot::default();
+            snap.on_ground = false;
+            snap.altitude_msl_ft = 9000.0;
+            snap.altitude_agl_ft = 8000.0;
+            // +800 fpm: hält BEIDE Descent-Arm-Pfade still (Approach
+            // braucht vs<0, die B-003-Cruise-Recovery |vs|<200).
+            snap.vertical_speed_fpm = 800.0;
+            snap.groundspeed_kt = 250.0;
+            snap.engines_running = 2;
+            {
+                let mut stats = flight.stats.lock().unwrap();
+                stats.phase = FlightPhase::Descent;
+                stats.was_airborne = true;
+                stats.was_on_ground = Some(false);
+                // Steigende Fenster-Evidenz (+800 fpm) → Segment Climbing;
+                // v2 promotet aus Cruise heraus auf Climb → Ziel = Climb,
+                // Rang 0 < 2 = rückwärts.
+                let v2 = feed_v2_evidence(
+                    &mut stats,
+                    FlightPhase::Cruise,
+                    40,
+                    7000.0,
+                    40.0,
+                    6000.0,
+                    40.0,
+                    800.0,
+                    false,
+                );
+                assert_eq!(v2, FlightPhase::Climb, "test setup: v2 resolves the sustained climb");
+                assert_eq!(
+                    stats.shadow_engine.current_segment(),
+                    phase_v2::Segment::Climbing,
+                    "test setup: sustained climb evidence"
+                );
+                stats.enroute_divergence_since = Some((
+                    FlightPhase::Descent,
+                    Utc::now() - chrono::Duration::seconds(seed_secs),
+                ));
+            }
+            (flight, snap)
+        }
+
+        // Vorwärts-Dwell überschritten, Rückwärts-Dwell nicht → kein Zug.
+        let (flight, snap) = descent_stuck_flight(ENROUTE_RECONCILE_FORWARD_DWELL_SECS + 1);
+        let result = step_flight(&flight, &snap);
+        assert_eq!(result, None, "backward pull must not borrow the short forward dwell");
+        assert_eq!(flight.stats.lock().unwrap().phase, FlightPhase::Descent);
+
+        // Rückwärts-Dwell voll → jetzt zieht v2 die festgefahrene v1.
+        let (flight, snap) = descent_stuck_flight(ENROUTE_RECONCILE_DWELL_SECS + 1);
+        let result = step_flight(&flight, &snap);
+        assert_eq!(result, Some(FlightPhase::Climb));
+    }
+
+    // ---- QS-Runde 1: Anti-Oszillations-Gate (segment_contradicts_v1) ----
+
+    #[test]
+    fn atc_step_down_level_off_is_never_pulled() {
+        // QS-Befund F1a (empirisch bewiesen): ATC-Step-Down, dann Level —
+        // v1 bleibt by design Cruise, v2 hält unterhalb obsref−2000 ft
+        // BEWUSST Descent. Ohne Kinematik-Gate zog der Versöhner v1 alle
+        // ~55 s in einen Pull/Recovery-Zyklus. Level widerspricht Cruise
+        // NICHT → kein Zug, Uhr wird verworfen.
+        let flight = fixture();
+        let mut snap = SimSnapshot::default();
+        snap.on_ground = false;
+        snap.altitude_msl_ft = 7500.0;
+        snap.altitude_agl_ft = 6500.0;
+        snap.vertical_speed_fpm = -50.0;
+        snap.groundspeed_kt = 280.0;
+        snap.engines_running = 2;
+        {
+            let mut stats = flight.stats.lock().unwrap();
+            stats.phase = FlightPhase::Cruise;
+            stats.was_airborne = true;
+            stats.was_on_ground = Some(false);
+            // Sinkflug 10000→7500 (endet vor 90 s), dann Level-Hold bei
+            // 7500 (< obsref −2000) → v2 bleibt Descent, Segment kippt
+            // auf Level.
+            feed_v2_evidence_ending(
+                &mut stats,
+                FlightPhase::Descent,
+                30,
+                10000.0,
+                -85.0,
+                9000.0,
+                -85.0,
+                -1500.0,
+                false,
+                90,
+            );
+            let v2 = feed_v2_evidence(
+                &mut stats,
+                FlightPhase::Descent,
+                30,
+                7500.0,
+                0.0,
+                6500.0,
+                0.0,
+                0.0,
+                false,
+            );
+            assert_eq!(v2, FlightPhase::Descent, "test setup: v2 holds Descent on level-off");
+            assert_eq!(
+                stats.shadow_engine.current_segment(),
+                phase_v2::Segment::Level,
+                "test setup: level evidence"
+            );
+            stats.enroute_divergence_since = Some((
+                FlightPhase::Cruise,
+                Utc::now() - chrono::Duration::seconds(ENROUTE_RECONCILE_DWELL_SECS + 100),
+            ));
+        }
+        let result = step_flight(&flight, &snap);
+        assert_eq!(result, None, "a healthy level Cruise must never be pulled");
+        let stats = flight.stats.lock().unwrap();
+        assert_eq!(stats.phase, FlightPhase::Cruise);
+        assert!(stats.enroute_divergence_since.is_none(), "no contradiction — clock discarded");
+    }
+
+    #[test]
+    fn toc_healthy_cruise_without_ref_is_never_pulled_back() {
+        // QS-Befund F1c (empirisch bewiesen): Top-of-Climb ohne cruise_ref
+        // — v1 latcht Cruise single-tick, v2 braucht 240 s Level-Dauer-
+        // Heuristik → bis zu ~285 s gewollte Divergenz (Cruise, Climb).
+        // Ohne Kinematik-Gate: deterministischer Rückzug + Oszillation an
+        // JEDEM normalen TOC. Level widerspricht Cruise nicht → kein Zug.
+        let flight = fixture();
+        let mut snap = SimSnapshot::default();
+        snap.on_ground = false;
+        snap.altitude_msl_ft = 36000.0;
+        snap.altitude_agl_ft = 35000.0;
+        snap.vertical_speed_fpm = -20.0;
+        snap.groundspeed_kt = 480.0;
+        snap.engines_running = 2;
+        {
+            let mut stats = flight.stats.lock().unwrap();
+            stats.phase = FlightPhase::Cruise;
+            stats.was_airborne = true;
+            stats.was_on_ground = Some(false);
+            // 2 min Level-Evidenz (< 240 s) mit old=Climb → v2 hält Climb.
+            let v2 = feed_v2_evidence(
+                &mut stats,
+                FlightPhase::Climb,
+                40,
+                36000.0,
+                0.0,
+                35000.0,
+                0.0,
+                0.0,
+                false,
+            );
+            assert_eq!(v2, FlightPhase::Climb, "test setup: v2 still on Climb before 240s");
+            stats.enroute_divergence_since = Some((
+                FlightPhase::Cruise,
+                Utc::now() - chrono::Duration::seconds(ENROUTE_RECONCILE_DWELL_SECS + 100),
+            ));
+        }
+        let result = step_flight(&flight, &snap);
+        assert_eq!(result, None, "healthy TOC cruise must never be pulled back to Climb");
+        assert_eq!(flight.stats.lock().unwrap().phase, FlightPhase::Cruise);
+    }
+
+    #[test]
+    fn ga_climbout_is_never_pulled_back_into_the_approach() {
+        // QS-Befund F3: v1 klassifiziert einen Go-Around korrekt (→Climb),
+        // v2 hält Final bis +700 ft Bestätigung — bei langsamen Steigern
+        // u. U. minutenlang. (Climb, Final) wäre „vorwärts" (45 s) — aber
+        // Climbing widerspricht Climb NICHT → kein Rückzug in den Anflug,
+        // keine GA-Doppelzählung.
+        let flight = fixture();
+        let mut snap = SimSnapshot::default();
+        snap.on_ground = false;
+        snap.altitude_msl_ft = 1400.0;
+        snap.altitude_agl_ft = 900.0;
+        snap.vertical_speed_fpm = 450.0;
+        snap.groundspeed_kt = 120.0;
+        snap.engines_running = 1;
+        {
+            let mut stats = flight.stats.lock().unwrap();
+            stats.phase = FlightPhase::Climb;
+            stats.climb_peak_msl = Some(snap.altitude_msl_ft as f32);
+            stats.was_airborne = true;
+            stats.was_on_ground = Some(false);
+            // Steigende Evidenz (+400 fpm, +500 ft gesamt — unter der
+            // 700-ft-GA-Bestätigung) mit old=Final → v2 hält Final.
+            let v2 = feed_v2_evidence(
+                &mut stats,
+                FlightPhase::Final,
+                25,
+                900.0,
+                20.0,
+                400.0,
+                20.0,
+                400.0,
+                false,
+            );
+            assert_eq!(v2, FlightPhase::Final, "test setup: v2 still holds Final during climb-out");
+            assert_eq!(
+                stats.shadow_engine.current_segment(),
+                phase_v2::Segment::Climbing,
+                "test setup: climbing evidence"
+            );
+            stats.enroute_divergence_since = Some((
+                FlightPhase::Climb,
+                Utc::now() - chrono::Duration::seconds(ENROUTE_RECONCILE_DWELL_SECS + 100),
+            ));
+        }
+        let result = step_flight(&flight, &snap);
+        assert_eq!(result, None, "a genuine climb-out must never be pulled back to Final");
+        assert_eq!(flight.stats.lock().unwrap().phase, FlightPhase::Climb);
+    }
+
+    #[test]
+    fn paused_tick_resets_the_clock() {
+        // QS-Befund (Pause-Loch): die Uhr ist Wanduhr; eine Sim-Pause
+        // unter der Reload-Gap-Schwelle (Cruise: bis 150 s!) liefe sonst
+        // voll in den Dwell. Pause unterbricht die Beobachtung → Reset.
+        let (flight, mut snap) = stuck_climb_flight(Some(ENROUTE_RECONCILE_FORWARD_DWELL_SECS + 1));
+        snap.paused = true;
+        let result = step_flight(&flight, &snap);
+        assert_eq!(result, None);
+        assert!(
+            flight.stats.lock().unwrap().enroute_divergence_since.is_none(),
+            "a paused tick must discard the divergence clock"
+        );
+    }
+
+    #[test]
+    fn fires_exactly_at_the_dwell_boundary() {
+        // >= — die Grenze selbst muss feuern (QS-Runde 1: Mutation >= → >
+        // überlebte die Suite; dieser Test tötet sie).
+        let (flight, snap) = stuck_climb_flight(Some(ENROUTE_RECONCILE_FORWARD_DWELL_SECS));
+        let result = step_flight(&flight, &snap);
+        assert_eq!(result, Some(FlightPhase::Descent));
+    }
+
+    #[test]
+    fn first_divergent_tick_only_arms_the_clock() {
+        let (flight, snap) = stuck_climb_flight(None);
+        let result = step_flight(&flight, &snap);
+        assert_eq!(result, None);
+        let stats = flight.stats.lock().unwrap();
+        let (p1, since) = stats
+            .enroute_divergence_since
+            .expect("first divergent tick must arm the clock");
+        assert_eq!(p1, FlightPhase::Climb);
+        assert!((Utc::now() - since).num_seconds() < 5, "armed at ~now");
+    }
+
+    #[test]
+    fn insufficient_evidence_resets_the_clock() {
+        // Frisch resettete Schatten-Engine (Reload/Time-Skip): v2s Phase
+        // steht zwar noch auf Descent, aber ohne aktuelle Fenster-Evidenz
+        // (`Insufficient`) darf der Versöhner weder feuern noch die Uhr
+        // weiterlaufen lassen.
+        let (flight, snap) = stuck_climb_flight(Some(ENROUTE_RECONCILE_DWELL_SECS + 100));
+        {
+            let mut stats = flight.stats.lock().unwrap();
+            stats.shadow_engine = phase_v2::ShadowPhaseEngine::default();
+            stats.shadow_phase = Some(FlightPhase::Descent);
+        }
+        let result = step_flight(&flight, &snap);
+        assert_eq!(result, None);
+        let stats = flight.stats.lock().unwrap();
+        assert_eq!(stats.phase, FlightPhase::Climb);
+        assert!(
+            stats.enroute_divergence_since.is_none(),
+            "no evidence — clock must reset, not idle along"
+        );
+    }
+
+    #[test]
+    fn v2_progress_during_the_dwell_does_not_restart_the_clock() {
+        // Replay-Befund BE24: eine paar-gekoppelte Uhr startete bei jedem
+        // legitimen v2-Evidenz-Fortschritt (Descent→Approach→Final auf
+        // kurzen, flachen Anflügen) neu und feuerte erst NACH dem
+        // Touchdown. Die Uhr hängt deshalb an v1s STILLSTAND: hier wurde
+        // sie (irgendwann, mit damals anderem v2-Wert) für das
+        // festgefahrene Climb gestartet — v2 zeigt inzwischen Descent.
+        // Der abgelaufene Dwell muss auf v2s AKTUELLE Phase ziehen.
+        let (flight, snap) = stuck_climb_flight(Some(ENROUTE_RECONCILE_DWELL_SECS + 1));
+        let result = step_flight(&flight, &snap);
+        assert_eq!(
+            result,
+            Some(FlightPhase::Descent),
+            "v1's standstill is what counts — v2 wandering must not reset the dwell"
+        );
+    }
+
+    #[test]
+    fn stale_clock_from_another_v1_phase_re_arms() {
+        // Die gespeicherte Uhr gehört zu einer ANDEREN v1-Phase (Cruise) —
+        // z. B. weil v1 über einen Pfad gewechselt hat, der den normalen
+        // Commit umgeht (v0.13.17-Airborne-Rescue early return, Resume-
+        // Restore). Sie darf nicht für das jetzige Climb weiterzählen.
+        let (flight, snap) = stuck_climb_flight(None);
+        {
+            let mut stats = flight.stats.lock().unwrap();
+            stats.enroute_divergence_since = Some((
+                FlightPhase::Cruise,
+                Utc::now() - chrono::Duration::seconds(ENROUTE_RECONCILE_DWELL_SECS + 500),
+            ));
+        }
+        let result = step_flight(&flight, &snap);
+        assert_eq!(result, None, "a clock armed for another v1 phase must not fire");
+        let stats = flight.stats.lock().unwrap();
+        let (p1, since) = stats.enroute_divergence_since.expect("re-armed");
+        assert_eq!(p1, FlightPhase::Climb);
+        assert!((Utc::now() - since).num_seconds() < 5, "fresh clock");
+    }
+
+    #[test]
+    fn fresh_v1_transition_wins_and_resets_the_clock() {
+        // v1 lebt: ihr eigener Climb→Cruise-Übergang feuert diesen Tick
+        // (V/S ±0, AGL > 5000). Der Versöhner — obwohl sein Dwell längst
+        // um wäre — darf den Normalpfad weder übersteuern noch seine Uhr
+        // behalten.
+        let (flight, mut snap) = stuck_climb_flight(Some(ENROUTE_RECONCILE_DWELL_SECS + 100));
+        snap.vertical_speed_fpm = -50.0;
+        snap.altitude_agl_ft = 6000.0;
+        snap.altitude_msl_ft = 7000.0;
+        {
+            // Peak nachziehen, damit der Descent-Primärpfad still bleibt.
+            let mut stats = flight.stats.lock().unwrap();
+            stats.climb_peak_msl = Some(snap.altitude_msl_ft as f32);
+        }
+        let result = step_flight(&flight, &snap);
+        assert_eq!(result, Some(FlightPhase::Cruise), "the normal path always wins");
+        let stats = flight.stats.lock().unwrap();
+        assert!(
+            stats.enroute_divergence_since.is_none(),
+            "a live v1 transition restarts the divergence clock"
+        );
+    }
+
+    #[test]
+    fn reload_glitch_tick_neither_fires_nor_keeps_the_clock() {
+        let (flight, snap) = stuck_climb_flight(Some(ENROUTE_RECONCILE_DWELL_SECS + 100));
+        {
+            // 60 s Lücke seit dem letzten Tick — weit über dem Reload-
+            // Verdacht (2.5 × 10 s Climb-Intervall).
+            let mut stats = flight.stats.lock().unwrap();
+            stats.last_step_at = Some(Utc::now() - chrono::Duration::seconds(60));
+        }
+        let result = step_flight(&flight, &snap);
+        assert_eq!(result, None);
+        let stats = flight.stats.lock().unwrap();
+        assert_eq!(stats.phase, FlightPhase::Climb);
+        assert!(
+            stats.enroute_divergence_since.is_none(),
+            "glitch tick restarts the clock"
+        );
+    }
+
+    #[test]
+    fn stuck_climb_on_the_ground_is_pulled_to_v2_landing() {
+        // GSG22-Endzustand: v1 hing noch auf Climb, als der Flieger längst
+        // ausrollte; v2 hatte sich per Ground-Evidenz auf Landing
+        // selbstbefördert (v0.19.1). Der Versöhner zieht v1 nach Landing —
+        // ab dort läuft v1s EIGENE Landing→TaxiIn→BlocksOn→Arrived-Kette
+        // normal weiter, statt dass erst der Not-Arrived-Fallback greift.
+        let flight = fixture();
+        let mut snap = SimSnapshot::default();
+        snap.on_ground = true;
+        snap.altitude_msl_ft = 120.0;
+        snap.altitude_agl_ft = 0.0;
+        snap.vertical_speed_fpm = 0.0;
+        snap.groundspeed_kt = 25.0; // Rollout — Arrived-Fallback bleibt still
+        snap.engines_running = 1;
+        {
+            let mut stats = flight.stats.lock().unwrap();
+            stats.phase = FlightPhase::Climb;
+            stats.climb_peak_msl = Some(snap.altitude_msl_ft as f32);
+            stats.was_airborne = true;
+            stats.was_on_ground = Some(true);
+            // Für den landing_at-Rescue (QS-Runde 1): der Flug ist real
+            // gestartet, der 50-Hz-Sampler hat den Touchdown gelatcht.
+            stats.takeoff_at = Some(Utc::now() - chrono::Duration::minutes(10));
+            stats.sampler_touchdown_at = Some(Utc::now() - chrono::Duration::seconds(30));
+            stats.sampler_touchdown_vs_fpm = Some(-320.0);
+            let v2 = feed_v2_evidence(
+                &mut stats,
+                FlightPhase::Landing,
+                40,
+                120.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                true,
+            );
+            assert_eq!(
+                v2,
+                FlightPhase::Landing,
+                "test setup: old=Landing is mirrored 1:1 while ground evidence accumulates"
+            );
+            stats.enroute_divergence_since = Some((
+                FlightPhase::Climb,
+                Utc::now() - chrono::Duration::seconds(ENROUTE_RECONCILE_DWELL_SECS + 1),
+            ));
+        }
+        let result = step_flight(&flight, &snap);
+        assert_eq!(result, Some(FlightPhase::Landing));
+        let stats = flight.stats.lock().unwrap();
+        assert_eq!(stats.phase, FlightPhase::Landing);
+        // QS-Runde 1 (HIGH): der Zug auf Landing überspringt die Final→
+        // Landing-Kante — landing_at MUSS aus dem Sampler gerettet werden,
+        // sonst: aufgeblähte flight_time, kein LandingRecord, toter
+        // Landing-Arm-Analyzer, is_finalizable=false.
+        assert_eq!(stats.landing_at, stats.sampler_touchdown_at);
+        assert_eq!(stats.landing_rate_fpm, Some(-320.0));
+    }
+
+    #[test]
+    fn landing_pull_requires_raw_on_ground_this_tick() {
+        // QS-Runde 1 (HIGH): v2=Landing stammt aus fensterträger Ground-
+        // Mehrheit — hebt der Flieger im Versatz-Tick wieder ab (Balked
+        // Landing), würde ein Luft-Zug auf Landing beide Engines unlösbar
+        // festnageln. Rohes on_ground=false ⇒ kein Landing-Zug.
+        let flight = fixture();
+        let mut snap = SimSnapshot::default();
+        snap.on_ground = false; // wieder in der Luft
+        snap.altitude_msl_ft = 200.0;
+        snap.altitude_agl_ft = 80.0;
+        snap.vertical_speed_fpm = 900.0;
+        snap.groundspeed_kt = 130.0;
+        snap.engines_running = 1;
+        {
+            let mut stats = flight.stats.lock().unwrap();
+            stats.phase = FlightPhase::Climb;
+            stats.climb_peak_msl = Some(snap.altitude_msl_ft as f32);
+            stats.was_airborne = true;
+            stats.was_on_ground = Some(false);
+            let v2 = feed_v2_evidence(
+                &mut stats,
+                FlightPhase::Landing,
+                40,
+                120.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                true,
+            );
+            assert_eq!(v2, FlightPhase::Landing, "test setup: v2 still says Landing");
+            stats.enroute_divergence_since = Some((
+                FlightPhase::Climb,
+                Utc::now() - chrono::Duration::seconds(ENROUTE_RECONCILE_DWELL_SECS + 100),
+            ));
+        }
+        let result = step_flight(&flight, &snap);
+        assert_eq!(result, None, "no Landing pull while airborne");
+        assert_eq!(flight.stats.lock().unwrap().phase, FlightPhase::Climb);
+    }
+}
+
+#[cfg(test)]
+mod enroute_reconcile_replay_tests {
+    //! End-to-End-Replay der ECHTEN Flug-Logs aus dem Korpus-Audit 2026-07
+    //! durch die komplette v1-FSM (`step_flight_at`, historische Uhr) plus
+    //! Schatten-Engine — exakt in der Kopplung des Streamer-Ticks (v1
+    //! zuerst, dann v2 mit der Post-Step-Phase als Sync-Quelle, Ergebnis
+    //! nach `stats.shadow_phase` gestempelt, wo der Versöhner des
+    //! NÄCHSTEN Ticks es liest).
+    //!
+    //! Fixtures (Dateinamen ohne Callsigns, Konvention wie phase_*):
+    //!   * `phase_stuck_climb_be24.jsonl.gz` — der Feld-Report-Flug
+    //!     (GSG22-Klasse): v1 blieb historisch von 15:00 bis zum Not-
+    //!     Arrived-Fallback auf `Climb` (die `lost_from_peak`-Schwellen
+    //!     sind bei 883 ft Peak-AGL mathematisch unerreichbar). Erwartung
+    //!     NEU: der Versöhner zieht v1 noch IN DER LUFT aus `Climb`, und
+    //!     der Flug endet über die normale Terminal-Kette.
+    //!   * `phase_stuck_climb_c172.jsonl.gz` — Ultra-Low-Bush-Hop (Peak
+    //!     357 ft AGL, Median 135 ft): v1 bleibt by-design in `Takeoff`
+    //!     (500-ft-Climb-Gate nie erreicht), v2 spiegelt Takeoff 1:1 —
+    //!     der Versöhner hat hier NICHTS zu tun und darf keine En-Route-
+    //!     Phasen erfinden (Negativ-/Regressions-Beleg).
+
+    use super::*;
+    use flate2::read::GzDecoder;
+    use std::io::{BufRead, BufReader};
+
+    fn fixture_path(name: &str) -> std::path::PathBuf {
+        let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.push("tests");
+        p.push("fixtures");
+        p.push(name);
+        p
+    }
+
+    struct ReplaySample {
+        t: DateTime<Utc>,
+        snap: SimSnapshot,
+    }
+
+    /// Positions-Events laden. Bewusst KEINE volle SimSnapshot-
+    /// Deserialisierung (ältere Logs kennen neuere Pflichtfelder nicht) —
+    /// Default + gezielte Overrides der Felder, die die durchlaufenen
+    /// FSM-Arme konsultieren.
+    fn load_positions(name: &str) -> Vec<ReplaySample> {
+        let f = std::fs::File::open(fixture_path(name)).expect("fixture file");
+        let r = BufReader::new(GzDecoder::new(f));
+        let mut out = Vec::new();
+        for line in r.lines() {
+            let Ok(line) = line else { continue };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+            if v["type"].as_str() != Some("position") {
+                continue;
+            }
+            let Some(t) = v["timestamp"]
+                .as_str()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.with_timezone(&Utc))
+            else {
+                continue;
+            };
+            let s = &v["snapshot"];
+            let mut snap = SimSnapshot::default();
+            macro_rules! f64_field {
+                ($field:ident) => {
+                    if let Some(x) = s[stringify!($field)].as_f64() {
+                        snap.$field = x;
+                    }
+                };
+            }
+            macro_rules! f32_field {
+                ($field:ident) => {
+                    if let Some(x) = s[stringify!($field)].as_f64() {
+                        snap.$field = x as f32;
+                    }
+                };
+            }
+            f64_field!(lat);
+            f64_field!(lon);
+            f64_field!(altitude_msl_ft);
+            f64_field!(altitude_agl_ft);
+            f32_field!(vertical_speed_fpm);
+            f32_field!(groundspeed_kt);
+            f32_field!(fuel_total_kg);
+            f32_field!(pitch_deg);
+            f32_field!(bank_deg);
+            if let Some(x) = s["on_ground"].as_bool() {
+                snap.on_ground = x;
+            }
+            if let Some(x) = s["paused"].as_bool() {
+                snap.paused = x;
+            }
+            if let Some(x) = s["slew_mode"].as_bool() {
+                snap.slew_mode = x;
+            }
+            if let Some(x) = s["parking_brake"].as_bool() {
+                snap.parking_brake = x;
+            }
+            if let Some(x) = s["engines_running"].as_u64() {
+                snap.engines_running = x as u8;
+            }
+            snap.pushback_state = s["pushback_state"].as_u64().map(|x| x as u8);
+            snap.velocity_body_z_fps = s["velocity_body_z_fps"].as_f64().map(|x| x as f32);
+            snap.total_weight_kg = s["total_weight_kg"].as_f64().map(|x| x as f32);
+            snap.zfw_kg = s["zfw_kg"].as_f64().map(|x| x as f32);
+            snap.aircraft_icao = s["aircraft_icao"].as_str().map(str::to_owned);
+            out.push(ReplaySample { t, snap });
+        }
+        out
+    }
+
+    fn replay_fixture() -> ActiveFlight {
+        ActiveFlight {
+            pirep_id: "replay".into(),
+            bid_id: 0,
+            flight_id: String::new(),
+            bid_callsign: None,
+            pilot_callsign: None,
+            started_at: Utc::now(),
+            airline_icao: String::new(),
+            planned_registration: String::new(),
+            aircraft_icao: String::new(),
+            aircraft_name: String::new(),
+            flight_number: "22".into(),
+            dpt_airport: "EDLN".into(),
+            // Absichtlich nicht im (leeren) Navdata-Cache auflösbar —
+            // `near_planned` kurzschließt dann zu true (gleiche Isolation
+            // wie in arrived_fallback_dwell_tests; Distanz-Geometrie ist
+            // dort separat abgedeckt).
+            arr_airport: "ZZZZ".into(),
+            airline_logo_url: None,
+            fares: Vec::new(),
+            stats: Mutex::new(FlightStats::new()),
+            stop: AtomicBool::new(false),
+            was_just_resumed: AtomicBool::new(false),
+            streamer_spawned: AtomicBool::new(false),
+            cancelled_remotely: AtomicBool::new(false),
+            position_outbox: Mutex::new(std::collections::VecDeque::new()),
+            phpvms_worker_spawned: AtomicBool::new(false),
+            touchdown_sampler_spawned: AtomicBool::new(false),
+            connection_state: std::sync::atomic::AtomicU8::new(CONN_STATE_LIVE),
+            navdata: Mutex::new(NavdataCache::default()),
+        }
+    }
+
+    /// Replayt ein Fixture durch v1+v2 in Streamer-Kopplung und liefert
+    /// den v1-Phasen-Bogen als (Zeitpunkt, Phase)-Transitions-Liste.
+    fn run_v1_arc(name: &str) -> Vec<(DateTime<Utc>, FlightPhase)> {
+        let samples = load_positions(name);
+        assert!(samples.len() > 100, "fixture must carry real telemetry");
+        let flight = replay_fixture();
+        let mut arc: Vec<(DateTime<Utc>, FlightPhase)> = Vec::new();
+        for ReplaySample { t, snap } in samples {
+            if let Some(p) = step_flight_at(&flight, &snap, t) {
+                arc.push((t, p));
+            }
+            if !snap.paused && !snap.slew_mode {
+                let mut stats = flight.stats.lock().unwrap();
+                let old_phase_post_step = stats.phase;
+                let (shadow, _seg) = stats.shadow_engine.step(
+                    t,
+                    snap.altitude_msl_ft,
+                    snap.altitude_agl_ft,
+                    snap.vertical_speed_fpm,
+                    snap.on_ground,
+                    old_phase_post_step,
+                    None,
+                );
+                stats.shadow_phase = Some(shadow);
+                stats.shadow_segment = Some(_seg);
+            }
+        }
+        arc
+    }
+
+    #[test]
+    fn be24_field_report_flight_leaves_climb_in_the_air_and_lands_normally() {
+        // Historisch (echtes Log): Climb ab 15:00:39, dann NICHTS mehr bis
+        // der Not-Arrived-Fallback um 15:15:16 zuschlug — Touchdown war
+        // 15:11:13. Mit dem Versöhner muss v1 den Climb VOR dem Touchdown
+        // verlassen und der Flug über die reguläre Kette enden.
+        let arc = run_v1_arc("phase_stuck_climb_be24.jsonl.gz");
+        let touchdown =
+            DateTime::parse_from_rfc3339("2026-07-11T15:11:13.795049900Z")
+                .unwrap()
+                .with_timezone(&Utc);
+
+        // Abflug-Kette unangetastet (der Versöhner greift erst im
+        // Luft-Band): Boarding→TaxiOut→TakeoffRoll→Takeoff→Climb wie im
+        // echten Log.
+        let phases: Vec<FlightPhase> = arc.iter().map(|(_, p)| *p).collect();
+        assert_eq!(
+            &phases[..4],
+            &[
+                FlightPhase::TaxiOut,
+                FlightPhase::TakeoffRoll,
+                FlightPhase::Takeoff,
+                FlightPhase::Climb,
+            ],
+            "departure chain must replay unchanged; full arc: {phases:?}"
+        );
+
+        // Kern-Assertion: v1 verlässt Climb IN DER LUFT (vor Touchdown) —
+        // exakt das, was im echten Flug nie passierte.
+        let left_climb_at = arc
+            .iter()
+            .skip_while(|(_, p)| *p != FlightPhase::Climb)
+            .skip(1)
+            .map(|(t, _)| *t)
+            .next()
+            .expect("v1 must transition out of Climb somewhere");
+        assert!(
+            left_climb_at < touchdown,
+            "reconciler must pull v1 out of Climb before touchdown \
+             (left at {left_climb_at}, touchdown {touchdown}); arc: {phases:?}"
+        );
+
+        // Terminal-Kette erreicht (Arrived — egal ob über BlocksOn oder
+        // den Fallback; entscheidend ist, dass der Flug regulär endet).
+        assert_eq!(
+            phases.last(),
+            Some(&FlightPhase::Arrived),
+            "flight must terminate in Arrived; arc: {phases:?}"
+        );
+        // ... und die Landung wurde als Phase erlebt, nicht übersprungen.
+        assert!(
+            phases.contains(&FlightPhase::Landing),
+            "the landing must appear as a real phase in the arc: {phases:?}"
+        );
+    }
+
+    #[test]
+    fn c172_ultra_low_bush_hop_stays_untouched_by_the_reconciler() {
+        // Peak 357 ft AGL — das 500-ft-Climb-Gate wird nie erreicht, v1
+        // bleibt by-design in Takeoff, v2 spiegelt Takeoff 1:1 (kein
+        // En-Route-Band, keine Divergenz). Der Versöhner darf hier keine
+        // Luft-Phasen erfinden — der Bogen muss dem historischen Verlauf
+        // entsprechen (Bush-Hop-Verhalten, Landing-Erfassung läuft seit
+        // v0.15.23 ohnehin phasenunabhängig über den Sampler).
+        let arc = run_v1_arc("phase_stuck_climb_c172.jsonl.gz");
+        let phases: Vec<FlightPhase> = arc.iter().map(|(_, p)| *p).collect();
+        for (_, p) in &arc {
+            assert!(
+                matches!(
+                    p,
+                    FlightPhase::TaxiOut
+                        | FlightPhase::TakeoffRoll
+                        | FlightPhase::Takeoff
+                        | FlightPhase::Arrived
+                ),
+                "no invented en-route phase on a sub-gate bush hop; arc: {phases:?}"
+            );
+        }
+        assert_eq!(phases.last(), Some(&FlightPhase::Arrived), "arc: {phases:?}");
     }
 }
 
