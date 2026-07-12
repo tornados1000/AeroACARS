@@ -424,6 +424,17 @@ pub struct ShadowPhaseEngine {
 }
 
 impl ShadowPhaseEngine {
+    /// Zuletzt klassifiziertes Kinematik-Segment (Stand: Ende des
+    /// VORHERIGEN `step()`-Aufrufs — `step_flight` (alte FSM) läuft im
+    /// Streamer-Tick vor `shadow_engine.step()`, kann diesen Tick also nur
+    /// die Evidenz des Vorticks lesen). Konsument: der En-Route-Versöhner
+    /// in lib.rs — `Insufficient` heißt dort "v2 hat gerade keine echte
+    /// Evidenz (frisch resettet), nicht versöhnen". Für dessen 90-s-Dwell
+    /// ist der Ein-Tick-Versatz irrelevant.
+    pub fn current_segment(&self) -> Segment {
+        self.current_segment
+    }
+
     /// Ein Streamer-Tick. Pur: alle Zeit kommt vom Caller.
     ///
     /// * `old_phase` — Phase der alten FSM NACH `step_flight` dieses Ticks
