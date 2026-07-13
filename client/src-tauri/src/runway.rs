@@ -22,6 +22,23 @@ use std::sync::OnceLock;
 /// is essentially static on human timescales.
 const RUNWAYS_CSV: &str = include_str!("../data/ourairports-runways.csv");
 
+/// Embedded snapshot of the ourairports **airports** table (ident, type,
+/// reference point). Same source, same public domain, same refresh cadence.
+///
+/// v0.19.3: added because every previous attempt to reason about airport
+/// geometry was crippled by not having it. The runways table alone cannot tell
+/// you where an airport *is*: for 74.7 % of them (one runway, two thresholds)
+/// there is no way to tell a good coordinate from a corrupt one, so a repair
+/// pass has to guess — and a guess put WAJI 5.2 nm from itself. Worse, 6,446
+/// real ICAO airports and effectively every heliport have no usable runway
+/// coordinates at all, so the client simply did not know where they were, and
+/// fell back on asking phpVMS at runtime (which it might or might not answer).
+///
+/// A published reference point per airport removes all of that: corrupt
+/// thresholds can be *identified* rather than guessed at, and every airport has
+/// a position even when its runways don't.
+const AIRPORTS_CSV: &str = include_str!("../data/ourairports-airports.csv");
+
 /// Mean Earth radius (meters) — same value used by the haversine formula
 /// throughout aviation tooling.
 const EARTH_RADIUS_M: f64 = 6_371_000.0;
@@ -60,6 +77,14 @@ struct RunwayRow {
     he_lat: f64,
     he_lon: f64,
     he_heading_true: f32,
+    /// v0.19.3: did the CSV actually STATE these headings, or did we compute
+    /// them from the two thresholds? It matters for the corrupt-coordinate
+    /// repair: a computed heading is derived from the very coordinate we are
+    /// trying to repair, so projecting along it would faithfully reproduce the
+    /// corruption. A stated heading is independent evidence — and it is precise,
+    /// where the runway's NAME is only rounded to 10° (using the name put KCLE's
+    /// repaired threshold 529 m from its true position).
+    headings_stated: bool,
 }
 
 /// Result of resolving a touchdown coordinate to a runway.
@@ -123,6 +148,158 @@ fn looks_like_icao(ident: &str) -> bool {
     ident.len() == 4 && ident.chars().all(|c| c.is_ascii_uppercase())
 }
 
+/// Published reference point of an airport (its official ARP), from the
+/// embedded airports table. `None` for an ident the table doesn't carry.
+///
+/// This is the airport's *position* — independent of its runway data, and
+/// therefore the thing that lets us judge whether that runway data is any good.
+/// It exists for every airport, including the ~6,400 ICAO fields and the 7,000+
+/// heliports whose runway rows have no coordinates.
+pub fn airport_reference(icao: &str) -> Option<(f64, f64)> {
+    airports_by_ident()
+        .get(&icao.trim().to_uppercase())
+        .map(|a| (a.lat, a.lon))
+}
+
+/// The nearest airport whose published reference point is within `max_nm` —
+/// EXCLUDING `exclude_icao`. Returns its ident and the distance in nm.
+///
+/// Answers "is this aircraft sitting on some *other* airport?" even when that
+/// airport has no usable runway geometry — which is the case for ~6,400 ICAO
+/// fields and effectively every heliport, i.e. exactly the ones the
+/// runway-threshold search cannot see. Without this, "the pilot is parked at a
+/// neighbouring field" and "the pilot put it down in a meadow short of his
+/// destination" look identical, and they must not: the first must not be allowed
+/// to file as a normal arrival, the second must.
+pub fn nearest_airport_reference(
+    lat: f64,
+    lon: f64,
+    max_nm: f64,
+    exclude_icao: &str,
+) -> Option<(String, f64)> {
+    if !lat.is_finite() || !lon.is_finite() {
+        return None;
+    }
+    let exclude = exclude_icao.trim().to_uppercase();
+    let max_m = max_nm * 1852.0;
+    // Coarse box first (1° lat ≈ 111 km; longitude shrinks with cos(lat)).
+    let lat_span = (max_m / 111_000.0).max(0.05);
+    let cos_lat = lat.to_radians().cos().abs().max(0.01);
+    let lon_span = (lat_span / cos_lat).min(180.0);
+
+    let mut best: Option<(String, f64)> = None;
+    for (icao, entry) in airports_by_ident().iter() {
+        if *icao == exclude || !entry.landable {
+            continue;
+        }
+        let (alat, alon) = (entry.lat, entry.lon);
+        if (alat - lat).abs() > lat_span || lon_delta_deg(alon, lon) > lon_span {
+            continue;
+        }
+        let d = haversine_m(lat, lon, alat, alon);
+        if d > max_m {
+            continue;
+        }
+        if best.as_ref().is_none_or(|(_, bd)| d / 1852.0 < *bd) {
+            best = Some((icao.clone(), d / 1852.0));
+        }
+    }
+    best
+}
+
+/// One airport's reference point, plus whether an aircraft could actually have
+/// come to rest there.
+#[derive(Debug, Clone, Copy)]
+struct AirportRef {
+    lat: f64,
+    lon: f64,
+    /// A field an AEROPLANE could have come to rest on: an airport or a water
+    /// base. Not a closed field (13,332 of those), not a balloonport — and not
+    /// a heliport (23,116 of those).
+    ///
+    /// This exists for one question: "is this aircraft standing on some OTHER
+    /// airport?" (`nearest_airport_reference`), which decides whether a pilot may
+    /// confirm his planned destination as his actual landing site.
+    ///
+    /// Counting every ident answers "yes" almost anywhere near a city: 59 % of
+    /// plausible off-field spots around a major airport have SOMETHING within
+    /// 3 nm. Even at 1 nm, a hospital helipad is enough — and an A340 did not
+    /// land on a hospital helipad. Blocking the honest pilot who put it down in a
+    /// field short of his destination, because there is a helipad 0.9 nm away, is
+    /// exactly the kind of nonsense this whole rewrite exists to end.
+    ///
+    /// (A helicopter that sets down on another PAD is not covered by this test —
+    /// its hint carries no ICAO either, since the runway table has no heliport
+    /// geometry. That gap is known and narrow: the flight is a rotorcraft
+    /// operation whose pilot is filing by hand anyway.)
+    landable: bool,
+}
+
+fn airports_by_ident() -> &'static std::collections::HashMap<String, AirportRef> {
+    static CELL: OnceLock<std::collections::HashMap<String, AirportRef>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(AIRPORTS_CSV.as_bytes());
+        let mut map = std::collections::HashMap::with_capacity(90_000);
+        for rec in rdr.records().flatten() {
+            let (Some(ident), Some(kind), Some(lat), Some(lon)) =
+                (rec.get(0), rec.get(1), rec.get(2), rec.get(3))
+            else {
+                continue;
+            };
+            let (Ok(lat), Ok(lon)) = (lat.parse::<f64>(), lon.parse::<f64>()) else {
+                continue;
+            };
+            if !lat.is_finite() || !lon.is_finite() {
+                continue;
+            }
+            let landable = matches!(
+                kind,
+                "large_airport" | "medium_airport" | "small_airport" | "seaplane_base"
+            );
+            map.insert(
+                ident.trim().to_uppercase(),
+                AirportRef { lat, lon, landable },
+            );
+        }
+        tracing::debug!(count = map.len(), "airport reference points parsed");
+        map
+    })
+}
+
+/// Ident → row indices, built once alongside the table. Turns "give me the
+/// runways of EDDF" from a 48k-row linear scan into a hash lookup plus a
+/// handful of rows.
+///
+/// This is what makes a per-tick `distance_to_airport_m` affordable, and it
+/// is why the callers that used to memoize an airport's position to dodge the
+/// scan (`divert_prefetch_decision`) no longer need to: the scan is gone.
+fn runways_by_ident() -> &'static std::collections::HashMap<String, Vec<u32>> {
+    static CELL: OnceLock<std::collections::HashMap<String, Vec<u32>>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let mut map: std::collections::HashMap<String, Vec<u32>> =
+            std::collections::HashMap::with_capacity(24_000);
+        for (i, row) in runways().iter().enumerate() {
+            map.entry(row.airport_ident.to_uppercase())
+                .or_default()
+                .push(i as u32);
+        }
+        map
+    })
+}
+
+/// Rows belonging to one airport ident (case-insensitive). Empty slice when
+/// the ident isn't in the table.
+fn rows_for_airport(icao: &str) -> impl Iterator<Item = &'static RunwayRow> {
+    let table = runways();
+    let idx = runways_by_ident()
+        .get(&icao.trim().to_uppercase())
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+    idx.iter().map(move |i| &table[*i as usize])
+}
+
 /// Parse the embedded CSV exactly once. The OnceLock means concurrent
 /// callers from a thread pool don't race on parsing — first one through
 /// the door does the work, everyone else waits on the lock and reads
@@ -155,16 +332,20 @@ fn runways() -> &'static Vec<RunwayRow> {
 
             let airport_ident = record.get(2).unwrap_or("").to_string();
             let length_ft = parse_f32(record.get(3)).unwrap_or(0.0);
+
             let width_ft = parse_f32(record.get(4)).unwrap_or(0.0);
             let surface = record.get(5).unwrap_or("").to_string();
             let le_ident = record.get(8).unwrap_or("").to_string();
             // The CSV occasionally omits headings — fall back to a computed
             // bearing from the threshold to the far end. That's what real
             // ATC charts use anyway.
-            let le_heading = parse_f32(record.get(12))
+            let le_heading_csv = parse_f32(record.get(12));
+            let he_heading_csv = parse_f32(record.get(18));
+            let headings_stated = le_heading_csv.is_some() && he_heading_csv.is_some();
+            let le_heading = le_heading_csv
                 .unwrap_or_else(|| initial_bearing_deg(le_lat, le_lon, he_lat, he_lon) as f32);
             let he_ident = record.get(14).unwrap_or("").to_string();
-            let he_heading = parse_f32(record.get(18))
+            let he_heading = he_heading_csv
                 .unwrap_or_else(|| initial_bearing_deg(he_lat, he_lon, le_lat, le_lon) as f32);
 
             out.push(RunwayRow {
@@ -180,6 +361,7 @@ fn runways() -> &'static Vec<RunwayRow> {
                 he_lat,
                 he_lon,
                 he_heading_true: he_heading,
+                headings_stated,
             });
         }
         tracing::debug!(count = out.len(), "runway table parsed (raw)");
@@ -224,14 +406,263 @@ fn runways() -> &'static Vec<RunwayRow> {
                 }
             }
         }
-        let final_out: Vec<RunwayRow> = out
+        let mut final_out: Vec<RunwayRow> = out
             .into_iter()
             .enumerate()
             .filter_map(|(i, r)| if to_drop[i] { None } else { Some(r) })
             .collect();
         tracing::debug!(count = final_out.len(), "runway table after ICAO dedupe");
+        repair_corrupt_thresholds(&mut final_out);
         final_out
     })
+}
+/// A runway is, by definition, one runway-length from end to end. When the two
+/// stored thresholds are much farther apart than that, one of them is wrong —
+/// this is what identifies a corrupt row, and it needs no outside reference.
+///
+/// 3× the stated length (or 8 km when no length is given) is generous enough
+/// that no real runway trips it, and tight enough to catch KCLE's 06R threshold,
+/// which is stored 4 nm from the field: its row spans 13.3 km for a 3.0 km
+/// runway.
+fn row_is_internally_impossible(r: &RunwayRow) -> bool {
+    let end_to_end_m = haversine_m(r.le_lat, r.le_lon, r.he_lat, r.he_lon);
+    let length_m = r.length_ft as f64 * 0.3048;
+    let plausible_m = if length_m > 0.0 {
+        (length_m * 3.0).max(2_000.0)
+    } else {
+        8_000.0
+    };
+    end_to_end_m > plausible_m
+}
+
+/// A runway this far from its airport's published reference point is not that
+/// airport's runway (UUMU has one in Belgorod, 319 nm away; 12WV has one in
+/// Florida, 480 nm).
+///
+/// It must stay well clear of legitimate sprawl: measured over all 29,410
+/// thresholds that have a reference point, 99 % are within 1.71 nm and the
+/// largest genuine outlier is EHAM's Polderbaan at 3.77 nm. The corrupt ones do
+/// not sit just past the edge — they are hundreds or thousands of nautical miles
+/// out. 10 nm sits in the empty gap between the two populations.
+///
+/// Note this canNOT be used to detect KCLE's corruption: its bad threshold is
+/// 4.0 nm from the field — *inside* the legitimate band, and closer in than
+/// EHAM's Polderbaan. That is why corruption is identified by
+/// `row_is_internally_impossible` and the reference point is used only to decide
+/// WHICH end of a broken row is the bad one.
+const RUNWAY_MISPLACED_NM: f64 = 10.0;
+
+/// Repair — and where that's impossible, discard — thresholds that OurAirports
+/// has in the wrong place.
+///
+/// Two real corruptions, both of which poison everything downstream:
+///
+///   * **A truncated coordinate.** KCLE's 06R threshold is stored as
+///     41.300/-81.800 — four nautical miles south-east of the field. Its 24L end
+///     is perfectly correct.
+///   * **A wholly misplaced runway.** One UUMU row sits at 50.648/36.576 —
+///     Belgorod, 319 nm away.
+///
+/// Either drags the airport's geometry to a phantom location, so
+/// `arrival::locate` would treat a 2 nm circle around the phantom as "on the
+/// field", and a genuine divert there would be filed as a normal arrival without
+/// ever asking the pilot.
+///
+/// # The two questions, kept apart
+///
+/// **Is this row broken?** Answered from the row itself — its ends are farther
+/// apart than the runway is long. Nothing external, so a sprawling airport
+/// cannot be mistaken for bad data. (Three earlier attempts at this pass failed
+/// precisely by conflating the two questions: judging "broken" by distance from
+/// some centre threw away EHAM's Polderbaan, which is legitimately 3.8 nm from
+/// the terminal, while missing KCLE's bad threshold, which is only 4.0 nm out.)
+///
+/// **Which end is broken?** Answered by the published reference point — the one
+/// piece of evidence that is independent of the runway data. Without it the
+/// question is unanswerable, and the two earlier attempts guessed: one dropped
+/// the whole row (losing KCLE's good 24L threshold, and with it a real pilot's
+/// runway match), the other took the "median" of the two ends — which is simply
+/// the larger coordinate — and at WAJI declared the GOOD threshold the outlier,
+/// moving a working airport 5.2 nm from itself.
+fn repair_corrupt_thresholds(rows: &mut Vec<RunwayRow>) {
+    let misplaced_m = RUNWAY_MISPLACED_NM * 1852.0;
+    let mut repaired = 0_u32;
+    let mut dropped = 0_u32;
+
+    // Thresholds per airport, so a suspect runway can be checked against its
+    // siblings before we throw it away. This matters: sometimes it is the
+    // *reference point* that is wrong, not the runway. OurAirports puts FAHS's
+    // reference point 2,446 nm from the airport while its two runways are
+    // correct (verified against Navigraph, which agrees with the runways to
+    // within 1 nm). Judging by the reference point alone would have discarded
+    // two perfectly good runways.
+    let siblings: std::collections::HashMap<String, Vec<(f64, f64)>> = {
+        let mut m: std::collections::HashMap<String, Vec<(f64, f64)>> =
+            std::collections::HashMap::new();
+        for r in rows.iter() {
+            let e = m.entry(r.airport_ident.to_uppercase()).or_default();
+            e.push((r.le_lat, r.le_lon));
+            e.push((r.he_lat, r.he_lon));
+        }
+        m
+    };
+
+    rows.retain_mut(|r| {
+        let reference = airport_reference(&r.airport_ident);
+
+        // A runway that is internally consistent but sits far from the airport
+        // is either a misfiled runway (UUMU has one in Belgorod) or the symptom
+        // of a wrong reference point (FAHS). Ask the other runways which it is:
+        // a runway that agrees with its siblings is corroborated, and then the
+        // reference point is the odd one out.
+        if let Some((alat, alon)) = reference {
+            let le_m = haversine_m(r.le_lat, r.le_lon, alat, alon);
+            let he_m = haversine_m(r.he_lat, r.he_lon, alat, alon);
+            if le_m > misplaced_m && he_m > misplaced_m {
+                let corroborated = siblings
+                    .get(&r.airport_ident.to_uppercase())
+                    .map(|pts| {
+                        pts.iter()
+                            .filter(|(plat, plon)| {
+                                // Not this row's own two thresholds.
+                                haversine_m(*plat, *plon, r.le_lat, r.le_lon) > 1.0
+                                    && haversine_m(*plat, *plon, r.he_lat, r.he_lon) > 1.0
+                            })
+                            .any(|(plat, plon)| {
+                                haversine_m(*plat, *plon, r.le_lat, r.le_lon) <= misplaced_m
+                            })
+                    })
+                    .unwrap_or(false);
+                if !corroborated {
+                    dropped += 1;
+                    tracing::debug!(
+                        ident = %r.airport_ident,
+                        "runway row dropped: far from the airport and unsupported by any \
+                         other runway there"
+                    );
+                    return false;
+                }
+                // Corroborated: the runways agree with each other and it is the
+                // reference point that is wrong. Keep the runway, and do NOT let
+                // that reference point decide anything else about this row.
+                return true;
+            }
+        }
+
+        if !row_is_internally_impossible(r) {
+            return true;
+        }
+
+        // The row is broken. Which end?
+        let Some((alat, alon)) = reference else {
+            // No reference point → unanswerable. Drop the row rather than guess;
+            // `arrival::locate` still places the airport by other means.
+            dropped += 1;
+            tracing::debug!(
+                ident = %r.airport_ident,
+                "runway row dropped: ends implausibly far apart and no reference point                  to tell us which one is wrong"
+            );
+            return false;
+        };
+        let le_m = haversine_m(r.le_lat, r.le_lon, alat, alon);
+        let he_m = haversine_m(r.he_lat, r.he_lon, alat, alon);
+        let le_bad = le_m > he_m;
+
+        let length_m = r.length_ft as f64 * 0.3048;
+        if length_m < 50.0 {
+            dropped += 1;
+            return false;
+        }
+
+        // Heading source, in order of trustworthiness:
+        //   1. the CSV's stated heading — precise, and (unlike a bearing computed
+        //      between the thresholds) not derived from the corrupt coordinate we
+        //      are repairing;
+        //   2. the runway's NAME ("24L" → 240°) — independent, but magnetic and
+        //      rounded to 10°, which at KCLE alone would put the rebuilt threshold
+        //      529 m off. A last resort, not a default.
+        let (good_lat, good_lon, hdg) = if le_bad {
+            let stated = r.headings_stated.then_some(r.he_heading_true as f64);
+            let Some(h) = stated.or_else(|| heading_from_ident(&r.he_ident)) else {
+                dropped += 1;
+                return false;
+            };
+            (r.he_lat, r.he_lon, h)
+        } else {
+            let stated = r.headings_stated.then_some(r.le_heading_true as f64);
+            let Some(h) = stated.or_else(|| heading_from_ident(&r.le_ident)) else {
+                dropped += 1;
+                return false;
+            };
+            (r.le_lat, r.le_lon, h)
+        };
+
+        let (lat, lon) = project(good_lat, good_lon, hdg, length_m);
+        // The rebuilt threshold has to be plausibly at the airport. If it isn't,
+        // our inputs were worse than we thought — drop the row rather than
+        // publish an invented coordinate.
+        if haversine_m(lat, lon, alat, alon) > misplaced_m {
+            dropped += 1;
+            tracing::debug!(
+                ident = %r.airport_ident,
+                "runway row dropped: reconstruction landed nowhere near the airport"
+            );
+            return false;
+        }
+
+        if le_bad {
+            r.le_lat = lat;
+            r.le_lon = lon;
+        } else {
+            r.he_lat = lat;
+            r.he_lon = lon;
+        }
+        repaired += 1;
+        tracing::debug!(
+            ident = %r.airport_ident,
+            runway = %r.le_ident,
+            "runway threshold reconstructed from the opposite end"
+        );
+        true
+    });
+    tracing::debug!(repaired, dropped, "runway threshold repair pass");
+}
+
+/// The runway's heading, taken from its NAME ("24L" → 240°) — the one piece of
+/// information a corrupt coordinate cannot have contaminated.
+///
+/// Deliberately NOT the stored `*_heading_true`: when the CSV omits a heading,
+/// the parser fills it with the bearing computed *between the two thresholds*
+/// (see the parse loop) — and on a row we are repairing, one of those two is the
+/// corrupt one. Projecting along that bearing would faithfully reproduce the
+/// corruption. Names like "H1", "ALL" or "N/A" yield `None`, and the row is then
+/// dropped rather than guessed at.
+fn heading_from_ident(ident: &str) -> Option<f64> {
+    let digits: String = ident
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    let n: f64 = digits.parse().ok()?;
+    if (1.0..=36.0).contains(&n) {
+        Some(n * 10.0)
+    } else {
+        None
+    }
+}
+
+/// Point reached by travelling `distance_m` from (lat, lon) along `bearing_deg`.
+fn project(lat: f64, lon: f64, bearing_deg: f64, distance_m: f64) -> (f64, f64) {
+    let ang = distance_m / EARTH_RADIUS_M;
+    let (br, p1, l1) = (
+        bearing_deg.to_radians(),
+        lat.to_radians(),
+        lon.to_radians(),
+    );
+    let p2 = (p1.sin() * ang.cos() + p1.cos() * ang.sin() * br.cos()).asin();
+    let l2 = l1
+        + (br.sin() * ang.sin() * p1.cos()).atan2(ang.cos() - p1.sin() * p2.sin());
+    (p2.to_degrees(), l2.to_degrees())
 }
 
 fn parse_f64(s: Option<&str>) -> Option<f64> {
@@ -252,23 +683,62 @@ fn parse_f32(s: Option<&str>) -> Option<f32> {
 /// Returns `None` when the ident isn't in the OurAirports table
 /// (uncommon strips, military closed fields, etc.).
 pub fn airport_position(icao: &str) -> Option<(f64, f64)> {
-    let table = runways();
-    let needle = icao.trim().to_uppercase();
     let mut sum_lat = 0.0_f64;
     let mut sum_lon = 0.0_f64;
     let mut count = 0_u32;
-    for row in table.iter() {
-        if row.airport_ident.eq_ignore_ascii_case(&needle) {
-            sum_lat += (row.le_lat + row.he_lat) / 2.0;
-            sum_lon += (row.le_lon + row.he_lon) / 2.0;
-            count += 1;
-        }
+    for row in rows_for_airport(icao) {
+        sum_lat += (row.le_lat + row.he_lat) / 2.0;
+        sum_lon += (row.le_lon + row.he_lon) / 2.0;
+        count += 1;
     }
     if count == 0 {
         None
     } else {
         Some((sum_lat / count as f64, sum_lon / count as f64))
     }
+}
+
+/// Absolute longitude difference in degrees, wrapped across the antimeridian.
+///
+/// A naive `(a - b).abs()` makes 179.5°E and 179.5°W look 359° apart instead of
+/// 1°, so any bounding-box filter using it silently drops everything on the
+/// other side of the dateline. Divert searches in the Pacific (Aleutians, Fiji,
+/// NZ) returned an empty list because of this.
+fn lon_delta_deg(a: f64, b: f64) -> f64 {
+    let d = (a - b).abs() % 360.0;
+    if d > 180.0 {
+        360.0 - d
+    } else {
+        d
+    }
+}
+
+/// Distance in meters from a point to the *nearest runway threshold* of
+/// the given airport — the one metric the whole app uses to answer "is
+/// the aircraft on this field". Returns `None` when the ident isn't in
+/// the embedded table.
+///
+/// Why not `airport_position()`: that returns the centroid of the runway
+/// layout, which is not a point on the field in any useful sense at a
+/// large airport. At EDDF the centroid is dragged ~1.5 nm south-west by
+/// runway 18 (Startbahn West), so a stand at Terminal 2 measures 2.04 nm
+/// from the centroid while sitting 0.30 nm off the 07C threshold. Feeding
+/// centroid distance into an on-field radius while `find_nearest_airports`
+/// feeds threshold distance into the *same* radius is what produced the
+/// "landed at EDDF instead of planned EDDF" divert banner. Both probes now
+/// answer with the same geometry, so they can no longer contradict each
+/// other about the same airport.
+///
+/// This is deliberately the same `min(le, he)` per-runway measure that
+/// `find_nearest_airports` uses — see the note there.
+pub fn distance_to_airport_m(icao: &str, lat: f64, lon: f64) -> Option<f64> {
+    let mut best: Option<f64> = None;
+    for row in rows_for_airport(icao) {
+        let d = haversine_m(lat, lon, row.le_lat, row.le_lon)
+            .min(haversine_m(lat, lon, row.he_lat, row.he_lon));
+        best = Some(best.map_or(d, |b: f64| b.min(d)));
+    }
+    best
 }
 
 /// Great-circle distance in meters between two WGS84 points.
@@ -308,43 +778,122 @@ pub struct NearestAirport {
 ///
 /// Returns an empty vec when no airport is in range — caller decides
 /// how to recover (we typically fall back to "manual override").
+///
+/// Includes national/local identifiers (`US-4991`, `48FA`). That is what the
+/// runway-correlation paths want — a pilot who lands on a numbered FAA strip
+/// landed *there*, and calling it by the ICAO field 20 nm away would be a lie.
+/// Callers that will hand the answer to phpVMS as an arrival airport must use
+/// [`find_nearest_icao_airports`] instead; see the note there.
 pub fn find_nearest_airports(
     lat: f64,
     lon: f64,
     max_radius_m: f64,
     limit: usize,
 ) -> Vec<NearestAirport> {
+    find_nearest(lat, lon, max_radius_m, limit, false)
+}
+
+/// Same, but only real ICAO airports.
+///
+/// This is the list a divert can be *named* from. The name goes into the banner,
+/// into `flight_end(divert_to)`, and from there into phpVMS's `arr_airport_id` —
+/// which cannot resolve "48FA". A pilot diverting to KLEE (Leesburg) would be
+/// told he landed at 48FA, whose threshold sits 964 m from the apron.
+///
+/// v0.19.3 first put this filter inside `find_nearest_airports` itself, which
+/// was the wrong layer: it also blinded `correlate_airport_icao` and
+/// `resolve_touchdown_airport`, so a pilot landing ON a non-ICAO strip had his
+/// touchdown attributed to an ICAO field up to 25 nm away. The constraint
+/// belongs where the ICAO code is *used as an airport identity phpVMS must
+/// accept*, not in the shared geometry primitive.
+///
+/// When the field a pilot actually used has no ICAO code, the honest answer is
+/// "we don't know which field" — the divert banner then asks him to pick one.
+pub fn find_nearest_icao_airports(
+    lat: f64,
+    lon: f64,
+    max_radius_m: f64,
+    limit: usize,
+) -> Vec<NearestAirport> {
+    find_nearest(lat, lon, max_radius_m, limit, true)
+}
+
+fn find_nearest(
+    lat: f64,
+    lon: f64,
+    max_radius_m: f64,
+    limit: usize,
+    icao_only: bool,
+) -> Vec<NearestAirport> {
+    // QS round 8: without this, a NaN query made EVERY comparison below false —
+    // so nothing was filtered out, all 14.7k rows came back with `distance_m =
+    // NaN`, the sort degenerated into hash order, and the caller was handed five
+    // arbitrary airports from anywhere on Earth as "the nearest fields". The
+    // 50 Hz touchdown sampler is not behind the streamer's snapshot gate, so a
+    // NaN sample really can reach here and put the wrong airport in a PIREP.
+    if !lat.is_finite() || !lon.is_finite() {
+        return Vec::new();
+    }
     use std::collections::HashMap;
     let table = runways();
     let mut by_apt: HashMap<&str, (f64, f64, f64, f32)> = HashMap::new();
-    // Coarse bounding-box pre-filter so we don't haversine the entire
-    // world catalog. 1 degree latitude ≈ 111 km, so for a 50 nmi
-    // (~93 km) max-radius we look ~1 degree out generously.
-    let bbox_deg = (max_radius_m / 100_000.0).max(0.5);
+
+    // Coarse bounding-box pre-filter so we don't haversine the entire world
+    // catalog. Latitude is easy: 1° ≈ 111 km everywhere.
+    let lat_span_deg = (max_radius_m / 111_000.0).max(0.5);
+    // Longitude is NOT. A degree of longitude shrinks with cos(latitude), so a
+    // box that is `lat_span_deg` wide in longitude covers less and less ground
+    // the further north you go.
+    //
+    // v0.19.3: this used the same span for both axes, which quietly truncated
+    // every search away from the equator — a nominal 50 nm divert search
+    // reached only ~36 nm east/west at Frankfurt (50°N) and ~24 nm at
+    // Reykjavík (64°N). The pilot's manual divert list was simply missing
+    // fields. Scale by 1/cos(lat), clamped for the poles where cos(lat) → 0
+    // and the correction blows up (there, just take the whole longitude band —
+    // there is nothing to filter out that far north anyway).
+    let cos_lat = lat.to_radians().cos().abs().max(0.01);
+    let lon_span_deg = (lat_span_deg / cos_lat).min(180.0);
+
     for row in table.iter() {
+        // Only real ICAO idents when the caller will use the answer as an
+        // airport identity phpVMS has to accept — see `find_nearest_icao_airports`.
+        if icao_only && !looks_like_icao(&row.airport_ident) {
+            continue;
+        }
         let approx_lat = (row.le_lat + row.he_lat) / 2.0;
         let approx_lon = (row.le_lon + row.he_lon) / 2.0;
-        if (approx_lat - lat).abs() > bbox_deg
-            || (approx_lon - lon).abs() > bbox_deg
+        if (approx_lat - lat).abs() > lat_span_deg
+            || lon_delta_deg(approx_lon, lon) > lon_span_deg
         {
             continue;
         }
-        // Use the closer of the two threshold positions for each
-        // runway as that runway's distance to the query. The pilot
-        // touched down somewhere on the field — the nearer threshold
-        // is the better proxy than the centroid.
+        // Use the closer of the two threshold positions for each runway as that
+        // runway's distance to the query. The pilot touched down somewhere on
+        // the field — the nearer threshold is the better proxy than the
+        // centroid.
         let d_le = haversine_m(lat, lon, row.le_lat, row.le_lon);
         let d_he = haversine_m(lat, lon, row.he_lat, row.he_lon);
-        let d = d_le.min(d_he);
+        // The point the distance actually refers to. `NearestAirport.lat/lon`
+        // reports THIS, so that the coordinates and the distance next to them
+        // describe the same place — they used to be the runway midpoint while
+        // the distance was to the threshold, ~2 km apart at EDDF (harmless
+        // while nothing plotted the pin; a bug waiting for the first map that
+        // does).
+        let (d, near_lat, near_lon) = if d_le <= d_he {
+            (d_le, row.le_lat, row.le_lon)
+        } else {
+            (d_he, row.he_lat, row.he_lon)
+        };
         if d > max_radius_m {
             continue;
         }
         let entry = by_apt
             .entry(&row.airport_ident)
-            .or_insert((approx_lat, approx_lon, d, 0.0));
+            .or_insert((near_lat, near_lon, d, 0.0));
         if d < entry.2 {
-            entry.0 = approx_lat;
-            entry.1 = approx_lon;
+            entry.0 = near_lat;
+            entry.1 = near_lon;
             entry.2 = d;
         }
         if row.length_ft > entry.3 {
@@ -761,6 +1310,252 @@ fn heading_diff(a: f32, b: f32) -> f32 {
         d = 360.0 - d;
     }
     d
+}
+
+#[cfg(test)]
+mod geo_search_tests {
+    use super::*;
+
+    /// KCLE's 06R threshold is stored 4 nm off the field; its 24L end is fine.
+    /// The repair must keep the runway usable (a pilot landing on 24L still
+    /// gets a match) AND stop the bad coordinate from dragging the airport's
+    /// geometry to a phantom location.
+    #[test]
+    fn a_truncated_threshold_is_reconstructed_not_thrown_away() {
+        // The airport must still know its 06R/24L runway.
+        let rows: Vec<_> = rows_for_airport("KCLE")
+            .filter(|r| r.le_ident == "06R" || r.he_ident == "24L")
+            .collect();
+        assert!(
+            !rows.is_empty(),
+            "KCLE 06R/24L must survive — dropping the row costs a real landing its runway match"
+        );
+
+        // And every one of its thresholds must now sit ON the field. KCLE's
+        // reference point is 41.4117/-81.8498.
+        for r in rows {
+            for (lat, lon, end) in [
+                (r.le_lat, r.le_lon, "06R"),
+                (r.he_lat, r.he_lon, "24L"),
+            ] {
+                let off_nm = haversine_m(lat, lon, 41.4117, -81.8498) / 1852.0;
+                assert!(
+                    off_nm < 2.0,
+                    "KCLE {end} is {off_nm:.2} nm from the airport — corrupt coordinate not repaired"
+                );
+            }
+        }
+
+        // The bad coordinate must no longer make a point 4 nm off the field
+        // look like "at KCLE".
+        let phantom_nm = distance_to_airport_m("KCLE", 41.300, -81.800)
+            .expect("KCLE has geometry")
+            / 1852.0;
+        assert!(
+            phantom_nm > 2.0,
+            "the phantom threshold still makes a point {phantom_nm:.2} nm off the field read as on-field"
+        );
+    }
+
+    /// The one that got away in QA round 3, and the reason this test exists.
+    ///
+    /// 74.7 % of airports have a SINGLE runway — two thresholds, no independent
+    /// reference. An earlier cut of the repair pass took their "median", which
+    /// per axis is just the larger of the two coordinates: a coin flip about
+    /// which end is the truth. At WAJI (Mararena Sarmi) it lost that flip,
+    /// declared the GOOD threshold an outlier and projected it next to the
+    /// corrupt one — moving a working airport 5.2 nm from where it is. Every
+    /// pilot flying there would then have been told he had diverted, at his own
+    /// destination, and auto-start would have refused to fire from its apron.
+    ///
+    /// Where we cannot tell which end is wrong, we must not guess.
+    #[test]
+    fn a_single_runway_airport_is_never_guessed_at() {
+        // WAJI's real reference point: -1.873077 / 138.749002.
+        const WAJI: (f64, f64) = (-1.873077, 138.749002);
+
+        for r in rows_for_airport("WAJI") {
+            for (lat, lon) in [(r.le_lat, r.le_lon), (r.he_lat, r.he_lon)] {
+                let off_nm = haversine_m(lat, lon, WAJI.0, WAJI.1) / 1852.0;
+                assert!(
+                    off_nm < 2.0,
+                    "WAJI threshold sits {off_nm:.2} nm from the airport — the repair \
+                     pass invented a position instead of dropping the row"
+                );
+            }
+        }
+
+        // Whatever we kept must not place the airport somewhere it isn't: an
+        // aircraft parked ON WAJI has to read as being on WAJI (or the geometry
+        // has to be absent, so the phpVMS reference point takes over).
+        match distance_to_airport_m("WAJI", WAJI.0, WAJI.1) {
+            Some(m) => assert!(
+                m / 1852.0 <= 2.0,
+                "an aircraft parked at WAJI reads {:.2} nm away — false divert at its own \
+                 destination",
+                m / 1852.0
+            ),
+            None => { /* geometry dropped — the reference-point fallback places it */ }
+        }
+    }
+
+    /// A runway row that is internally consistent but sits in another country
+    /// (UUMU has one in Belgorod, 319 nm away) is a fabrication — there is
+    /// nothing to reconstruct from, so it must be discarded outright.
+    #[test]
+    fn a_wholly_misplaced_runway_is_discarded() {
+        // UUMU (Chkalovsky) is at 55.89/38.04. The CSV carries a second runway
+        // row at 50.65/36.58 — Belgorod, 319 nm south — internally consistent
+        // and therefore invisible to any per-row plausibility check.
+        let rows: Vec<_> = rows_for_airport("UUMU").collect();
+        assert!(!rows.is_empty(), "UUMU must keep its real runway");
+        for r in rows {
+            let off_nm = haversine_m(r.le_lat, r.le_lon, 55.8898, 38.0435) / 1852.0;
+            assert!(
+                off_nm < 5.0,
+                "a UUMU runway is still {off_nm:.0} nm from the airport — misplaced row not discarded"
+            );
+        }
+        // And the phantom must no longer answer "yes, you're at UUMU" for an
+        // aircraft parked in Belgorod.
+        let belgorod_nm = distance_to_airport_m("UUMU", 50.6485, 36.5757)
+            .expect("UUMU has geometry")
+            / 1852.0;
+        assert!(
+            belgorod_nm > 100.0,
+            "Belgorod still reads as {belgorod_nm:.0} nm from UUMU"
+        );
+    }
+
+    /// Sometimes it is the REFERENCE POINT that is wrong, not the runway — and
+    /// then throwing the runway away is the mistake.
+    ///
+    /// OurAirports puts FAHS's reference point 2,446 nm from the airport, while
+    /// its two runways are correct (Navigraph, the authoritative source Thomas
+    /// re-uploads every AIRAC cycle, agrees with the runways to within 1 nm).
+    /// A rule that judged runways purely by their distance from the reference
+    /// point would have discarded both.
+    ///
+    /// The tie-breaker is corroboration: runways that agree with each other
+    /// outvote a lone reference point.
+    #[test]
+    fn a_wrong_reference_point_does_not_cost_an_airport_its_runways() {
+        let n = rows_for_airport("FAHS").count();
+        assert!(
+            n >= 2,
+            "FAHS must keep its runways — the reference point is the thing that is \
+             wrong there, and the runways corroborate each other (kept: {n})"
+        );
+    }
+
+    /// "Is the aircraft standing on some OTHER airport?" — the question that
+    /// decides whether a pilot may confirm his planned destination as his actual
+    /// landing site (see `standing_on_another_field` in lib.rs).
+    ///
+    /// It has to say YES at a neighbouring airport, and NO in a field. The first
+    /// cut counted every ident in the table — including 23,116 heliports and
+    /// 13,332 CLOSED fields — within 3 nm, which answers "yes" for 59 % of
+    /// plausible off-field spots around a major airport. That would have blocked
+    /// the honest pilot this path exists to serve.
+    #[test]
+    fn standing_on_a_neighbouring_airport_is_recognised() {
+        // Parked at LFPB (Le Bourget) on a flight planned to LFPG. 5.4 nm apart.
+        let lfpb = (48.9694, 2.4414);
+        let hit = nearest_airport_reference(lfpb.0, lfpb.1, 1.0, "LFPG");
+        assert_eq!(
+            hit.as_ref().map(|(i, _)| i.as_str()),
+            Some("LFPB"),
+            "an aircraft parked at Le Bourget is standing on Le Bourget"
+        );
+    }
+
+    #[test]
+    fn a_field_short_of_the_destination_is_not_another_airport() {
+        // ~6 nm north-east of EDDF, off-airport (the Frankfurt city forest).
+        let off_field = (50.1100, 8.6600);
+        let hit = nearest_airport_reference(off_field.0, off_field.1, 1.0, "EDDF");
+        assert!(
+            hit.is_none(),
+            "an off-field landing near the destination must not read as 'standing \
+             on another airport' (got {hit:?})"
+        );
+    }
+
+    /// Closed fields and helipads are not places an AEROPLANE comes to rest —
+    /// but they stay in the table, because they still have reference points.
+    #[test]
+    fn heliports_and_closed_fields_are_not_places_an_aeroplane_parks() {
+        let idx = airports_by_ident();
+        let not_landable = idx.values().filter(|a| !a.landable).count();
+        assert!(
+            not_landable > 30_000,
+            "heliports (23k) and closed fields (13k) must not count as somewhere an \
+             aeroplane could be standing: {not_landable}"
+        );
+        // …and they are still reachable as reference points.
+        assert!(airport_reference("EDDF").is_some());
+    }
+
+    #[test]
+    fn longitude_delta_wraps_the_antimeridian() {
+        assert!((lon_delta_deg(179.5, -179.5) - 1.0).abs() < 1e-9);
+        assert!((lon_delta_deg(-179.5, 179.5) - 1.0).abs() < 1e-9);
+        assert!((lon_delta_deg(10.0, 8.0) - 2.0).abs() < 1e-9);
+        assert!((lon_delta_deg(-170.0, 170.0) - 20.0).abs() < 1e-9);
+    }
+
+    /// The search box must not shrink east-west as you go north. At Frankfurt
+    /// (50°N) an un-corrected box covered only ~36 nm of a nominal 50 nm
+    /// search, so the divert picker was silently missing fields.
+    #[test]
+    fn the_search_radius_holds_up_at_northern_latitudes() {
+        // EDDF (50.03N, 8.57E). EDRK (Koblenz-Winningen) is 43.9 nm away —
+        // comfortably inside a 50 nm search — but 1.05° of longitude west,
+        // which the old un-scaled bounding box (0.926°) cut off. At 50°N that
+        // box only reached ~36 nm east-west of a nominal 50 nm search.
+        let found = find_nearest_airports(50.0333, 8.5706, 50.0 * 1852.0, 60);
+        let idents: Vec<&str> = found.iter().map(|a| a.icao.as_str()).collect();
+        assert!(
+            idents.contains(&"EDRK"),
+            "a 50 nm search from EDDF must reach EDRK (43.9 nm west) — the \
+             longitude box has to scale with 1/cos(lat) (found: {idents:?})"
+        );
+    }
+
+    /// A search right on the dateline must see both sides of it.
+    #[test]
+    fn a_search_on_the_dateline_sees_both_sides() {
+        // NFFN (Nadi, Fiji) sits at ~177.4E. Query from just EAST of the
+        // antimeridian (i.e. negative longitude, ~179.9W): Nadi is ~150 nm
+        // away in reality, so a generous search must still find *something*
+        // west of the line rather than returning an empty list.
+        let near_line = find_nearest_airports(-17.75, -179.9, 200.0 * 1852.0, 10);
+        assert!(
+            near_line.iter().any(|a| a.lon > 170.0),
+            "a search just east of the dateline must reach airports west of it \
+             (got: {:?})",
+            near_line.iter().map(|a| (&a.icao, a.lon)).collect::<Vec<_>>()
+        );
+    }
+
+    /// `NearestAirport.lat/lon` must describe the same point `distance_m`
+    /// measures to — otherwise anything that plots the pin lands ~2 km off.
+    #[test]
+    fn the_reported_position_is_the_point_the_distance_refers_to() {
+        let from = (50.0500, 8.5860); // EDDF Terminal 2
+        let eddf = find_nearest_airports(from.0, from.1, 5.0 * 1852.0, 5)
+            .into_iter()
+            .find(|a| a.icao == "EDDF")
+            .expect("EDDF found");
+        let recomputed = haversine_m(from.0, from.1, eddf.lat, eddf.lon);
+        assert!(
+            (recomputed - eddf.distance_m).abs() < 1.0,
+            "distance_m ({:.0} m) must be the distance to the reported lat/lon \
+             ({:.0} m)",
+            eddf.distance_m,
+            recomputed
+        );
+    }
 }
 
 #[cfg(test)]
