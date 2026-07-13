@@ -12266,7 +12266,10 @@ fn emit_landing_finalized(app: &AppHandle, flight: &ActiveFlight) {
     let (final_vs, final_score_label) = {
         let s = flight.stats.lock().expect("flight stats");
         (
-            s.landing_rate_fpm,
+            // v0.19.3: kanonisch — dieses Forensik-Event ist die Zahl, gegen
+            // die wir spaeter Pilot-Reports rekonstruieren. Sie MUSS die
+            // gleiche sein wie in Log, Karte, Score und PIREP.
+            s.canonical_landing_rate_fpm(),
             s.landing_score.map(|sc| format!("{:?}", sc)),
         )
     };
@@ -32076,6 +32079,65 @@ mod canonical_landing_rate_fpm_tests {
                 stats.bounce_count
             ),
         );
+    }
+
+    /// Strukturelle Schranke gegen den PIA3452-Rueckfall.
+    ///
+    /// Die Regel "Anzeige-/Filing-Pfade lesen NIE `landing_rate_fpm` /
+    /// `landing_peak_vs_fpm` direkt, sondern immer `canonical_landing_rate_
+    /// fpm()`" stand seit v0.7.17 als KOMMENTAR im Code — und wurde vom
+    /// touchdown-v2-Pfad trotzdem unterlaufen, weil ein Kommentar nichts
+    /// erzwingt. Dieser Test macht die Regel pruefbar: er liest den eigenen
+    /// Quelltext und faellt um, sobald eine der Funktionen, die dem Piloten
+    /// eine V/S-Zahl ZEIGT oder sie an phpVMS SCHICKT, wieder direkt auf ein
+    /// Rohfeld zugreift.
+    ///
+    /// Die Rohfelder bleiben absichtlich schreibbar (Streamer-Refinement,
+    /// FSM-Fallback, Snapshot-Restore, LandingRecord-Forensik) — verboten ist
+    /// nur das LESEN in den unten gelisteten Ausgabe-Funktionen.
+    #[test]
+    fn display_and_filing_paths_never_read_raw_vs_fields() {
+        const SRC: &str = include_str!("lib.rs");
+        /// Funktionen, die eine V/S-Zahl nach aussen geben (Pilot-UI, ACARS-
+        /// Log, Flight-Log-Forensik). Neue Ausgabe-Pfade hier eintragen.
+        const OUTPUT_FNS: [&str; 2] = [
+            "fn announce_landing_score(",
+            "fn emit_landing_finalized(",
+        ];
+        for needle in OUTPUT_FNS {
+            let start = SRC
+                .find(needle)
+                .unwrap_or_else(|| panic!("Ausgabe-Funktion nicht mehr gefunden: {needle} — Test anpassen, nicht loeschen"));
+            // Body bis zur naechsten Top-Level-Funktion.
+            let rest = &SRC[start..];
+            let end = rest[1..].find("\nfn ").map(|i| i + 1).unwrap_or(rest.len());
+            // Kommentare raus — die DUERFEN die Rohfelder benennen (sie
+            // erklaeren ja gerade, warum man sie nicht liest).
+            let body: String = rest[..end]
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let body = body.as_str();
+            // Punkt-Praefix, sonst matcht `.canonical_landing_rate_fpm()`
+            // auf sein eigenes Suffix `landing_rate_fpm`.
+            for raw in [".landing_peak_vs_fpm", ".landing_rate_fpm"] {
+                assert!(
+                    !body.contains(raw),
+                    "{needle} liest das Rohfeld `{raw}` direkt. Das ist der \
+                     PIA3452-Bug (Log -233 vs Karte/PIREP -206): Rohfelder \
+                     koennen touchdown-v2s Fenster-Minimum tragen, waehrend \
+                     Score und PIREP ueber die Kanonik den 50-Hz-Edge zeigen. \
+                     Nutze `stats.canonical_landing_rate_fpm()`.",
+                );
+            }
+            assert!(
+                body.contains("canonical_landing_rate_fpm()"),
+                "{needle} gibt eine V/S-Zahl aus, holt sie aber nicht ueber \
+                 `canonical_landing_rate_fpm()` — genau so ist der PIA3452-Split \
+                 entstanden.",
+            );
+        }
     }
 
     #[test]
