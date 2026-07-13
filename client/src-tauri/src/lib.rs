@@ -18812,12 +18812,73 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
                 let pg_500 = analysis.get("peak_g_post_500ms").and_then(|v| v.as_f64()).map(|x| x as f32);
                 {
                     let mut s = flight.stats.lock().expect("flight stats");
-                    if let Some(ref v2) = v2_result {
-                        // Forensik-v2 hat einen plausiblen VS gewählt
-                        // (HARD GUARD strukturell ausgeschlossen positiv)
-                        // v0.7.1 P2.2-D: atomic write via finalize_landing_rate
-                        // damit confidence/source zum finalen Wert konsistent
-                        // bleiben.
+                    // v0.19.3 (PIA3452): Edge gewinnt vor v2 — dieselbe
+                    // Ordnung die `canonical_landing_rate_fpm` schon immer
+                    // liest. Vorher schrieb v2 (= Fenster-MINIMUM ueber
+                    // [contact-250ms, contact+100ms]) in `landing_rate_fpm` /
+                    // `landing_peak_vs_fpm`, waehrend Score, LandingRecord und
+                    // PIREP ueber die Kanonik weiter `vs_at_edge_fpm` (=
+                    // Interpolation exakt am on_ground-Frame) nahmen. Ein
+                    // Fenster-Minimum ist konstruktionsbedingt <= der
+                    // Interpolation → der Pilot sah drei Zahlen fuer EINEN
+                    // Touchdown: Log -233 (v2), Karte/Score/PIREP -206 (Edge),
+                    // und die Einstufung unten klassifizierte auf -233. Der
+                    // Edge-Wert ist der physikalisch richtige (FAR-25.473-
+                    // Standard, siehe scoreBasisVs()), also finalisieren wir
+                    // jetzt AUF IHN — v2 bleibt Fallback, wenn kein gueltiger
+                    // Edge existiert. v2s eigener Wert bleibt als Forensik-Key
+                    // `vs_at_impact_frame_fpm` in der Analysis erhalten.
+                    if let Some(edge) = edge_vs {
+                        // Confidence kommt weiter von v2 wenn v2 gelaufen ist
+                        // (v2 validiert DASS es ein echter Touchdown war),
+                        // sonst Medium wie im alten REJECT-Zweig.
+                        let conf_str = v2_result
+                            .as_ref()
+                            .map(|v2| format!("{:?}", v2.confidence))
+                            .unwrap_or_else(|| "Medium".to_string());
+                        let previous = s.landing_rate_fpm.unwrap_or(0.0);
+                        finalize_landing_rate(
+                            &mut s,
+                            edge,
+                            Some(&conf_str),
+                            Some("vs_at_edge_50hz"),
+                        );
+                        if let Some(ref v2) = v2_result {
+                            // Forensik-Spur: v2s Fenster-Minimum nicht verlieren.
+                            if let Some(map) = s
+                                .landing_analysis
+                                .as_mut()
+                                .and_then(|a| a.as_object_mut())
+                            {
+                                map.insert(
+                                    "vs_at_impact_frame_fpm".to_string(),
+                                    serde_json::json!(v2.vs_fpm),
+                                );
+                            }
+                            tracing::info!(
+                                pirep_id = %flight.pirep_id,
+                                vs_fpm = edge,
+                                v2_vs_fpm = v2.vs_fpm,
+                                previous = previous,
+                                source = "vs_at_edge_50hz",
+                                confidence = %conf_str,
+                                forensics_version = v2.forensics_version,
+                                "landing rate finalized on 50Hz edge (v2 value kept as forensic key)"
+                            );
+                        } else {
+                            tracing::info!(
+                                pirep_id = %flight.pirep_id,
+                                vs_fpm = edge,
+                                previous = previous,
+                                source = "vs_at_edge_50hz",
+                                "v0.7.11: v2-REJECT, override mit vs_at_edge_fpm"
+                            );
+                        }
+                    } else if let Some(ref v2) = v2_result {
+                        // Kein gueltiger Edge (positiv / nicht finite / Buffer-
+                        // Luecke) → v2 ist die beste verfuegbare Quelle. Die
+                        // Kanonik faellt in diesem Fall ohnehin auf
+                        // `landing_peak_vs_fpm` durch, also bleibt alles konsistent.
                         let conf_str = format!("{:?}", v2.confidence);
                         finalize_landing_rate(
                             &mut s,
@@ -18831,28 +18892,7 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
                             source = %v2.source,
                             confidence = ?v2.confidence,
                             forensics_version = v2.forensics_version,
-                            "touchdown-forensics-v2 landing rate computed"
-                        );
-                    } else if let Some(edge) = edge_vs {
-                        // v0.7.11: v2-REJECT-Fallback auf vs_at_edge_fpm
-                        // statt SimVar-latched. Der Edge-Wert ist die
-                        // 50-Hz-Buffer-Interpolation am exakten on_ground-
-                        // Frame — genauer als der SimVar-latched-Read der
-                        // typisch 1 Frame versetzt sein kann (Beispiel DAL804:
-                        // SimVar -407 fpm vs Edge -364 fpm).
-                        let previous = s.landing_rate_fpm.unwrap_or(0.0);
-                        finalize_landing_rate(
-                            &mut s,
-                            edge,
-                            Some("Medium"),
-                            Some("vs_at_edge_50hz"),
-                        );
-                        tracing::info!(
-                            pirep_id = %flight.pirep_id,
-                            vs_fpm = edge,
-                            previous = previous,
-                            source = "vs_at_edge_50hz",
-                            "v0.7.11: v2-REJECT, override mit vs_at_edge_fpm"
+                            "touchdown-forensics-v2 landing rate computed (no valid edge)"
                         );
                     } else {
                         // Echter REJECT: weder v2 noch Edge verfuegbar.
@@ -18916,7 +18956,12 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
                         s.landing_rate_fpm = Some(corrected);
                         s.landing_peak_vs_fpm = Some(corrected);
                     }
-                    let peak_vs = s.landing_peak_vs_fpm.unwrap_or(0.0);
+                    // v0.19.3: ueber die Kanonik lesen, nicht das Rohfeld — die
+                    // Einstufung (SMOOTH/FIRM/HARD) muss auf DERSELBEN Zahl
+                    // klassifizieren, die Score, Karte, Log und PIREP zeigen.
+                    // (Vor dem Fix: Klasse aus v2s Fenster-Minimum, Punkte aus
+                    // dem Edge-Wert → "SMOOTH · 92/100" aus zwei Metriken.)
+                    let peak_vs = s.canonical_landing_rate_fpm().unwrap_or(0.0);
                     // v0.12.3 (LE8/QS-P1): classify on the EMA-scored G, not
                     // the raw 50 Hz peak — a single raw spike must not push
                     // the landing to Hard/Severe on its own.
@@ -27789,7 +27834,11 @@ fn announce_landing_score(app: &AppHandle, flight: &ActiveFlight) -> Option<Stri
         // Wenn sampler_touchdown_at None ist (= Sampler hat keinen Edge
         // detektiert, FSM-Pfad scored stattdessen) → sofort freigeben.
     }
-    let peak_vs = stats.landing_peak_vs_fpm.unwrap_or(0.0);
+    // v0.19.3 (PIA3452): kanonisch lesen, nicht `landing_peak_vs_fpm` direkt.
+    // Das Rohfeld konnte v2s Fenster-Minimum tragen, waehrend Karte, Score und
+    // PIREP ueber die Kanonik den 50-Hz-Edge zeigten → Pilot sah "-233 fpm" im
+    // ACARS-Log und "-206 fpm" auf der Landing-Karte fuer denselben Touchdown.
+    let peak_vs = stats.canonical_landing_rate_fpm().unwrap_or(0.0);
     let peak_g = stats.landing_peak_g_force.unwrap_or(0.0);
     let bounces = stats.bounce_count;
     // v0.12.3 (LE7/LE8): der gescorte G-Wert (EMA, sonst raw_fallback) —
@@ -31973,6 +32022,60 @@ mod canonical_landing_rate_fpm_tests {
             .canonical_landing_rate_fpm()
             .map(|v| v.round() as i32);
         assert_eq!(rounded, Some(-194));
+    }
+
+    /// PIA3452 (FenixA320, MSFS, 13.07.2026): der Pilot sah DREI Zahlen fuer
+    /// EINEN Touchdown — ACARS-Log -233 fpm (touchdown_v2 `vs_at_impact_frame`
+    /// = Fenster-MINIMUM), Landing-Karte/Score/PIREP -206 fpm (`vs_at_edge_fpm`
+    /// = Interpolation am on_ground-Frame), und die Einstufung klassifizierte
+    /// auf -233 waehrend die Punkte aus -206 kamen. Seit v0.19.3 finalisiert
+    /// der Buffer-Dump auf den Edge-Wert, und Log + Klasse lesen die Kanonik.
+    fn pia3452_live_stats() -> FlightStats {
+        let mut stats = FlightStats::default();
+        // Was der v2-Cascade-Finalize frueher in BEIDE Rohfelder schrieb.
+        stats.landing_rate_fpm = Some(-233.0);
+        stats.landing_peak_vs_fpm = Some(-233.0);
+        stats.landing_peak_g_force = Some(1.13);
+        stats.landing_analysis = Some(json!({
+            "vs_at_edge_fpm": -206.0,
+            "vs_at_impact_frame_fpm": -233.0,
+        }));
+        stats
+    }
+
+    #[test]
+    fn pia3452_log_score_and_pirep_all_read_the_same_vs() {
+        // Die Log-Zeile ("Touchdown: V/S … fpm"), die Score-Basis und der
+        // PIREP-Wert gehen seit v0.19.3 alle durch dieselbe Kanonik — es darf
+        // KEINE Konstellation geben in der sie auseinanderlaufen.
+        let stats = pia3452_live_stats();
+        let canonical = stats.canonical_landing_rate_fpm().expect("some");
+        assert!(
+            (canonical - (-206.0)).abs() < 0.001,
+            "Kanonik muss den 50-Hz-Edge liefern, nicht v2s Fenster-Minimum: got {canonical}",
+        );
+        // Score-Basis (Sinkrate-Punkte) == Log-Wert == PIREP-Wert.
+        assert_eq!(score_basis_vs_fpm(&stats), Some(canonical));
+        assert_eq!(canonical.round() as i32, -206);
+    }
+
+    #[test]
+    fn pia3452_class_is_derived_from_the_same_vs_as_the_score() {
+        // Vor dem Fix: classify() lief auf `landing_peak_vs_fpm` (-233),
+        // die Punkte auf dem Edge (-206) → "SMOOTH · 92/100" aus zwei
+        // verschiedenen Metriken. Klasse und Punkte muessen auf DERSELBEN
+        // Zahl beruhen.
+        let stats = pia3452_live_stats();
+        let canonical = stats.canonical_landing_rate_fpm().expect("some");
+        let scored_g = score_g_for_stats(&stats).scored_g;
+        assert_eq!(
+            LandingScore::classify(canonical, scored_g, stats.bounce_count),
+            LandingScore::classify(
+                score_basis_vs_fpm(&stats).expect("some"),
+                scored_g,
+                stats.bounce_count
+            ),
+        );
     }
 
     #[test]
