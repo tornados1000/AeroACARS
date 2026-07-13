@@ -410,17 +410,10 @@ function getSubScores(r: LandingRecord): SubScore[] {
     });
   }
   // Legacy-Pfad fuer pre-v0.7.1-PIREPs (forward-compat)
-  // v0.7.17 (B-015): vs_at_edge_fpm bevorzugen — der 50-Hz-Edge-Wert
-  // ist der echte FAR-25.473-Engineering-Standard. Ohne diesen Fix
-  // zog der Pilot-Client den Streamer-Tick-Wert (-311 fpm in
-  // EIN799-Fall), waehrend die Webapp den Edge-Wert nutzte (-265).
-  // Pilot konnte die Diskrepanz nicht erklaeren.
-  const peakVs =
-    (r.vs_at_edge_fpm != null && r.vs_at_edge_fpm < 0
-      ? r.vs_at_edge_fpm
-      : null) ??
-    r.landing_peak_vs_fpm ??
-    r.landing_rate_fpm;
+  // v0.19.3: ueber scoreBasisVs() statt handkopierter Kaskade — dieselbe
+  // Regel dreimal ausgeschrieben ist genau die Drift, aus der der
+  // PIA3452-Split entstanden ist (Log -233 vs Karte -206).
+  const peakVs = scoreBasisVs(r);
   const subs: LibSubScore[] = libComputeSubScores({
     vs_fpm: peakVs,
     peak_g_load: r.landing_peak_g_force,
@@ -1950,14 +1943,9 @@ function QuickFlags({ record }: { record: LandingRecord }) {
 
   // HARD LANDING — V/S oder Peak-G erreichen Hard/Severe-Schwellen
   // (gespiegelt aus landingScoring.ts T_VS_HARD_FPM / T_G_HARD).
-  // v0.7.17 (B-015): vs_at_edge_fpm bevorzugen — siehe scoreBasisVs Doc.
+  // v0.19.3: ueber scoreBasisVs() statt handkopierter Kaskade (siehe oben).
   // v0.12.3 (LE9): G-Flag auf dem gescorten (EMA) Wert, nicht dem Roh-Peak.
-  const peakVs =
-    (record.vs_at_edge_fpm != null && record.vs_at_edge_fpm < 0
-      ? record.vs_at_edge_fpm
-      : null) ??
-    record.landing_peak_vs_fpm ??
-    record.landing_rate_fpm;
+  const peakVs = scoreBasisVs(record);
   const gForFlag = scoreG(record) ?? 0;
   const isHardVs = Math.abs(peakVs) >= 600;
   const isHardG = gForFlag >= 1.7;
