@@ -222,7 +222,19 @@ jobs:
           # latest.json `notes` field the in-app update modal renders.
           releaseBody: ${{ steps.relnotes.outputs.body }}
           releaseDraft: true
-          prerelease: false
+          # BETA-KANAL (v0.21): Tags mit "-beta"/"-rc" werden als PRE-RELEASE
+          # markiert. Das ist keine Kosmetik, sondern die Schranke:
+          #
+          # Der Auto-Updater der Piloten fragt
+          #   /releases/latest/download/latest.json
+          # ab. GitHub fuehrt ein Pre-Release NICHT als "latest" — die
+          # Beta ist dort also unsichtbar. Wer sie testen will, laedt sie
+          # bewusst von der Releases-Seite.
+          #
+          # Ohne diese Zeile waere `prerelease: false` hart verdrahtet und
+          # ein Beta-Tag ginge an JEDEN Piloten raus. Genau das soll die
+          # Beta verhindern.
+          prerelease: ${{ contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') }}
           includeUpdaterJson: true
           args: ${{ matrix.args }}
 
