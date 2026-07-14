@@ -12124,6 +12124,15 @@ fn build_pirep_payload(
         // (Fuel/Loadsheet/Stability/Rollout fliessen ein),
         // mit Fallback auf Touchdown-Klassifikation.
         landing_score: payload_landing_score,
+        // v0.19.3: Klasse und Note EINGEFROREN zum Score mitgeben — dieselben
+        // beiden Funktionen, die auch der Landungs-Tab und die PIREP-Notizen
+        // benutzen. Die Webapp leitete das Wort bisher selbst aus der Zahl ab,
+        // mit einer eigenen Leiter. Zwei Kopien einer Regel driften; hier
+        // gibt es nur noch eine.
+        landing_score_label: payload_landing_score
+            .map(|s| aggregate_score_label(s.clamp(0, 100) as u8).to_string()),
+        landing_score_grade: payload_landing_score
+            .map(|s| letter_grade(s).to_string()),
         go_around_count: Some(stats.go_around_count),
         touchdown_count: Some(touchdown_count),
         dep_gate: stats.dep_gate.clone(),
@@ -20367,6 +20376,13 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                         // v0.8.0: identische Assessment-Werte wie
                         // im LandingRecord (single source: assess_touchdown).
                         let payload_assessed = assess_touchdown(&stats);
+                        // v0.19.3: EIN Verdict — Punkte, Klasse und Note stammen
+                        // aus demselben Aufruf. Die Webapp leitet nichts mehr ab.
+                        let payload_verdict = canonical_landing_verdict(
+                            flight.as_ref(),
+                            &stats,
+                            td_actual_icao.as_deref().unwrap_or(&flight.arr_airport),
+                        );
                         aeroacars_mqtt::TouchdownPayload {
                             ts: td_ts.timestamp_millis(),
                             // v0.11.1: Pilot-Client-Version aus dem Cargo-
@@ -20418,19 +20434,25 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                             sideslip_deg: stats.touchdown_sideslip_deg,
                             headwind_kt: stats.landing_headwind_kt,
                             crosswind_kt: stats.landing_crosswind_kt,
-                            // v0.19.3: die EINE Bewertung — nicht mehr die
-                            // Touchdown-Klasse (100/80/60/30/0). Vorher trug die
-                            // Live-Map/Recorder-Touchdown-Zeile `100`, waehrend
-                            // dieselbe Landung im PIREP mit `92` ankam.
-                            // `td_actual_icao` ist der tatsaechliche Landeplatz
-                            // (Divert eingeschlossen), also dieselbe Geometrie-
-                            // Basis wie im LandingRecord.
-                            score: canonical_landing_verdict(
-                                flight.as_ref(),
-                                &stats,
-                                td_actual_icao.as_deref().unwrap_or(&flight.arr_airport),
-                            )
-                            .map(|v| v.numeric),
+                            // `score` bleibt die diskrete Touchdown-Klasse
+                            // (100/80/60/30/0) — das ist die Wire-Semantik, auf
+                            // die der Recorder und die Webapp gebaut sind. Den
+                            // Composite propagiert der Recorder separat aus der
+                            // PIREP-Zeile in die Spalte `landing_score`.
+                            score: stats.landing_score.map(|s| s.numeric()),
+                            // v0.19.3: das EINGEFRORENE Urteil zum Composite —
+                            // Klasse und Note, wie der Client sie zeigt. Die
+                            // Webapp leitete das Wort bisher selbst aus einer
+                            // Zahl ab, mit einer eigenen Leiter (90/70/45) neben
+                            // unserer (88/75/50). Zwei Kopien derselben Regel
+                            // driften — genau die PIA3452-Krankheit. Jetzt
+                            // klassifiziert der Client, die Webapp zeigt an.
+                            score_label: payload_verdict
+                                .as_ref()
+                                .map(|v| v.label.to_string()),
+                            score_grade: payload_verdict
+                                .as_ref()
+                                .map(|v| v.grade.to_string()),
                             bounce: Some(stats.bounce_count > 0),
                             bounce_count: Some(stats.bounce_count),
                             // v0.16.6 (Daten-Audit 2026-06-11): `approach_runway`

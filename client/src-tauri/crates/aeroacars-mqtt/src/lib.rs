@@ -321,6 +321,23 @@ pub struct TouchdownPayload {
     pub headwind_kt: Option<f32>,
     pub crosswind_kt: Option<f32>,
     pub score: Option<i32>,
+    /// v0.19.3: Klasse und Note zum `score` — EINGEFROREN, nicht ableitbar.
+    ///
+    /// Vorher trug `score` die diskrete Touchdown-Klasse (100/80/60/30/0) und
+    /// die Webapp leitete das Label mit einer EIGENEN Schwellen-Leiter daraus
+    /// ab (90/70/45/15). Seit `score` die echte Gesamtbewertung traegt, waere
+    /// das eine zweite Wahrheit: bei 89 Punkten sagt der Client "smooth"
+    /// (>= 88), die Webapp-Leiter aber "Acceptable" (< 90). Dieselbe Landung,
+    /// zwei Urteile — genau die Krankheit aus PIA3452.
+    ///
+    /// Die Regel darf nicht zweimal existieren. Der Client klassifiziert, die
+    /// Webapp zeigt an. Additiv + `serde(default)`: Alt-Payloads ohne die
+    /// Felder deserialisieren zu `None`, die Webapp faellt dann auf ihre
+    /// Legacy-Leiter zurueck (die fuer die alten diskreten Werte stimmt).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score_grade: Option<String>,
     pub bounce: Option<bool>,
     pub bounce_count: Option<u8>,
     /// v0.8.3 (#8): Forensisch erkannte Hopser >= 5 ft AGL (
@@ -786,6 +803,14 @@ pub struct PirepPayload {
     pub peak_altitude_ft: Option<i32>,
     pub landing_vs_fpm: Option<i32>,
     pub landing_score: Option<i32>,
+    /// v0.19.3: Klasse und Note zum `landing_score` — eingefroren, damit die
+    /// Webapp sie nicht aus der Zahl nachrechnet. Spiegel der gleichnamigen
+    /// Felder im `TouchdownPayload`; beide stammen aus demselben
+    /// `canonical_landing_verdict()`-Aufruf. Additiv, `serde(default)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing_score_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing_score_grade: Option<String>,
     pub go_around_count: Option<u32>,
     pub touchdown_count: Option<u32>,
     pub dep_gate: Option<String>,
