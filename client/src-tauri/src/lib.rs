@@ -11823,24 +11823,56 @@ pub fn ofp_matches_active_flight(
 ///   2. `stats.landing_peak_vs_fpm` (Touchdown-Window-Peak, Streamer-
 ///      Tick-Cadence)
 ///   3. `stats.landing_rate_fpm` (Streamer-Tick-Snapshot am TD-Frame)
+/// Ist dieser Wert ueberhaupt eine Landerate?
+///
+/// v0.20.2: `vs_at_edge_fpm` ist eine reine lineare Interpolation zwischen dem
+/// letzten Sample in der Luft und dem ersten am Boden (siehe Buffer-Dump) —
+/// **ohne jeden Guard**. Seit v0.20.0 ist genau dieser Wert die Kanonik, waehrend
+/// touchdown_v2 (das seinen Riegel `finalize_vs` laengst hat: nie positiv, nie
+/// unter -3000 fpm) nur noch Fallback ist. Damit wurde der UNGESCHUETZTE Pfad
+/// zur Wahrheit und der geschuetzte zum Ersatz.
+///
+/// Dass das keine Theorie ist, zeigt Flug 804 (ELLX, 14.07.2026): Edge-Wert
+/// **+24,47 fpm** — eine positive Sinkrate beim Aufsetzen. Aufgefangen wurde er
+/// nur, weil die alte Bedingung zufaellig `< 0` lautete. Ein negativ-absurder
+/// Glitch (-30.000) waere ungebremst in Score, Log und PIREP gewandert.
+///
+/// Nutzt DIESELBE Untergrenze wie `touchdown_v2::finalize_vs` — importiert, nicht
+/// abgeschrieben, damit es nicht zwei Definitionen von "plausibel" geben kann.
+///
+/// Eine Abweichung bleibt bewusst: `finalize_vs` laesst exakt 0.0 fpm zu (es hat
+/// eigene Kategorie-Floors fuer Helis und Wasserflugzeuge, die bewusst mit
+/// nahezu null Sinkrate aufsetzen). Hier verlangen wir strikt < 0, weil die
+/// Kanonik sonst einen Glitch mit 0.0 als "Landung" ausliefern koennte, ohne dass
+/// touchdown_v2 je gefragt wurde. Bei 0.0 faellt sie auf den naechsten Kandidaten
+/// — und der laeuft durch touchdown_v2s eigenen Guard.
+fn landing_rate_is_plausible(fpm: f32) -> bool {
+    fpm.is_finite() && fpm < 0.0 && fpm >= touchdown_v2::VS_FLOOR_FPM
+}
+
 impl FlightStats {
     /// SSoT fuer den V/S-Wert in fpm den Pilot/PIREP/MQTT/phpVMS sehen.
     /// Direkter Zugriff auf `stats.landing_rate_fpm` /
     /// `stats.landing_peak_vs_fpm` ist in Anzeige-/Filing-Pfaden ein
     /// Bug — siehe MS713-QS-Befund 2026-05-13.
     pub fn canonical_landing_rate_fpm(&self) -> Option<f32> {
-        if let Some(edge) = self
+        // v0.20.2: JEDER Kandidat der Kaskade muss plausibel sein — nicht nur
+        // der erste. Vorher war der Edge-Wert gegen "positiv" geprueft und die
+        // beiden Fallbacks gegen gar nichts. Ein Glitch-Sample konnte also
+        // ueber den Fallback trotzdem als Landerate in Score, Log und PIREP
+        // wandern. Bleibt kein Kandidat uebrig, gibt es KEINE Landerate — das
+        // ist ehrlicher als eine erfundene Zahl (touchdown_v2 lehnt aus genau
+        // diesem Grund seit jeher ab, statt zu raten).
+        let edge = self
             .landing_analysis
             .as_ref()
             .and_then(|v| v.get("vs_at_edge_fpm"))
             .and_then(|v| v.as_f64())
-        {
-            let edge_f32 = edge as f32;
-            if edge_f32 < 0.0 {
-                return Some(edge_f32);
-            }
-        }
-        self.landing_peak_vs_fpm.or(self.landing_rate_fpm)
+            .map(|x| x as f32);
+        [edge, self.landing_peak_vs_fpm, self.landing_rate_fpm]
+            .into_iter()
+            .flatten()
+            .find(|&v| landing_rate_is_plausible(v))
     }
 
     /// SSoT fuer die Bank-Streuung (sigma) im Anflug.
@@ -13115,7 +13147,17 @@ where
 
         // v0.5.43: Forensik aus dem 50-Hz-Sampler-Buffer (compute_landing_analysis)
         // wenn der Buffer-Dump erfolgreich war. Sonst alle None.
-        vs_at_edge_fpm: ana_f32(&stats.landing_analysis, "vs_at_edge_fpm"),
+        //
+        // v0.20.2: unplausible Edge-Werte werden hier NICHT durchgereicht. Die
+        // Kanonik verwirft sie zwar fuer Score, Log und PIREP — aber die
+        // Forensik-Kachel im Client und die Webapp lesen `vs_at_edge_fpm`
+        // direkt (`scoreBasisVs()` nimmt es sogar als erste Wahl). Bei Flug 804
+        // (ELLX) haette die Forensik also weiter "+24 fpm" als Aufsetz-Sinkrate
+        // gezeigt, waehrend die Kachel daneben -38 sagt. Zwei Zahlen fuer
+        // denselben Touchdown — genau der Riss, den wir ausraeumen. Ist der
+        // Wert kein Flugzustand, gibt es ihn nicht.
+        vs_at_edge_fpm: ana_f32(&stats.landing_analysis, "vs_at_edge_fpm")
+            .filter(|&v| landing_rate_is_plausible(v)),
         vs_smoothed_250ms_fpm: ana_f32(&stats.landing_analysis, "vs_smoothed_250ms_fpm"),
         vs_smoothed_500ms_fpm: ana_f32(&stats.landing_analysis, "vs_smoothed_500ms_fpm"),
         vs_smoothed_1000ms_fpm: ana_f32(&stats.landing_analysis, "vs_smoothed_1000ms_fpm"),
@@ -32374,6 +32416,82 @@ mod canonical_landing_rate_fpm_tests {
         let (vs_ok, bank_ok) = mk(STABILITY_MIN_SAMPLES + 5);
         assert!(vs_ok.is_some(), "ausreichende Stichprobe muss bewertet werden");
         assert!(bank_ok.is_some());
+    }
+
+    #[test]
+    fn ellx804_positiver_edge_wert_wird_nicht_als_landerate_ausgeliefert() {
+        // Flug 804 (ELLX, 14.07.2026, Client v0.20.0): der Edge-Wert war
+        // +24,47 fpm — eine POSITIVE Sinkrate beim Aufsetzen, physikalisch
+        // Unsinn. Er wurde nur deshalb nicht ausgeliefert, weil die Kanonik
+        // zufaellig auf "< 0" prueft. Ein negativ-absurder Glitch waere
+        // ungebremst durchgegangen.
+        let mut stats = FlightStats::default();
+        stats.landing_peak_vs_fpm = Some(-38.0);
+        stats.landing_analysis = Some(json!({ "vs_at_edge_fpm": 24.474783 }));
+        assert_eq!(
+            stats.canonical_landing_rate_fpm(),
+            Some(-38.0),
+            "positiver Edge-Wert darf nicht als Landerate durchgehen",
+        );
+    }
+
+    #[test]
+    fn absurde_landerate_wird_verworfen_statt_ausgeliefert() {
+        // Der Fall, den nichts aufgehalten haette: ein Sim-Glitch mit stark
+        // NEGATIVER Sinkrate. Der Edge-Wert ist eine ungeguardete Interpolation;
+        // touchdown_v2 lehnt so etwas seit jeher ab (finalize_vs), die Kanonik
+        // tat es nicht.
+        let mut stats = FlightStats::default();
+        stats.landing_analysis = Some(json!({ "vs_at_edge_fpm": -30_000.0 }));
+        stats.landing_peak_vs_fpm = Some(-247.0);
+        assert_eq!(
+            stats.canonical_landing_rate_fpm(),
+            Some(-247.0),
+            "absurder Edge-Wert muss auf den naechsten plausiblen Kandidaten fallen",
+        );
+
+        // Auch der FALLBACK muss geprueft werden — sonst wandert der Glitch
+        // eben ueber ihn in den PIREP.
+        let mut all_broken = FlightStats::default();
+        all_broken.landing_analysis = Some(json!({ "vs_at_edge_fpm": -30_000.0 }));
+        all_broken.landing_peak_vs_fpm = Some(-42_000.0);
+        all_broken.landing_rate_fpm = Some(f32::NAN);
+        assert_eq!(
+            all_broken.canonical_landing_rate_fpm(),
+            None,
+            "wenn KEIN Kandidat plausibel ist, gibt es keine Landerate — \
+             das ist ehrlicher als eine erfundene Zahl",
+        );
+
+        // Eine harte, aber echte Landung bleibt eine Landung.
+        let mut hard = FlightStats::default();
+        hard.landing_analysis = Some(json!({ "vs_at_edge_fpm": -890.0 }));
+        assert_eq!(hard.canonical_landing_rate_fpm(), Some(-890.0));
+    }
+
+    #[test]
+    fn ohne_landerate_wird_die_achse_sichtbar_uebersprungen_nicht_weggelassen() {
+        // Der gefaehrlichste Befund aus dem Review dieses Fixes: seit die
+        // Kanonik unplausible Werte verwirft, kann sie None liefern — und dann
+        // fehlte der Sinkraten-Sub-Score KOMPLETT. Das Aggregat waere aus den
+        // uebrigen Achsen gebildet worden, und ein Flug, dessen Landerate gar
+        // nicht messbar war, haette einen gut aussehenden Score bekommen. Die
+        // wichtigste Achse still wegzulassen ist schlimmer als die falsche Zahl,
+        // die wir gerade abgeschafft haben.
+        let input = landing_scoring::LandingScoringInput {
+            vs_fpm: None,
+            peak_g_load: Some(1.2),
+            scored_g_load: Some(1.18),
+            bounce_count: Some(0),
+            ..Default::default()
+        };
+        let subs = landing_scoring::compute_sub_scores(&input);
+        let rate = subs
+            .iter()
+            .find(|s| s.key == "landing_rate")
+            .expect("die Sinkraten-Achse MUSS auftauchen — sichtbar als skipped");
+        assert!(rate.skipped, "sie muss als 'nicht bewertet' markiert sein");
+        assert_eq!(rate.reason.as_deref(), Some("landing_rate_unmeasurable"));
     }
 
     #[test]

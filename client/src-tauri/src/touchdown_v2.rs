@@ -552,7 +552,15 @@ pub enum RejectionReason {
     ImplausiblyHigh,
 }
 
-/// HARD GUARD: niemals positiv, niemals < -3000 fpm
+/// Untergrenze einer physikalisch moeglichen Landerate.
+///
+/// v0.20.2: exportiert, damit die Kanonik in `lib.rs` DIESELBE Grenze nutzt.
+/// Sie stand vorher nur hier drin — und die Kanonik (die den ungeguardeten
+/// Edge-Wert ausliefert) kannte sie nicht. Zwei Definitionen von "plausibel"
+/// waeren genau der Riss, den wir gerade ausraeumen.
+pub const VS_FLOOR_FPM: f32 = -3000.0;
+
+/// HARD GUARD: niemals positiv, niemals unter `VS_FLOOR_FPM`
 fn finalize_vs(candidate_fpm: f32) -> Result<f32, RejectionReason> {
     if !candidate_fpm.is_finite() {
         return Err(RejectionReason::EmptyWindow);
@@ -560,7 +568,7 @@ fn finalize_vs(candidate_fpm: f32) -> Result<f32, RejectionReason> {
     if candidate_fpm > 0.0 {
         return Err(RejectionReason::PositiveVs);
     }
-    if candidate_fpm < -3000.0 {
+    if candidate_fpm < VS_FLOOR_FPM {
         return Err(RejectionReason::ImplausiblyHigh);
     }
     Ok(candidate_fpm)

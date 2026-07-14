@@ -255,8 +255,24 @@ fn scoring_input_has_v2_fields(input: &LandingScoringInput) -> bool {
 pub fn compute_sub_scores(input: &LandingScoringInput) -> Vec<SubScoreEntry> {
     let mut out = Vec::with_capacity(8);
 
-    if let Some(vs) = input.vs_fpm {
-        out.push(sub_landing_rate::sub_landing_rate(vs));
+    // v0.20.2: Fehlt die Sinkrate, wird die Achse SICHTBAR als "nicht bewertet"
+    // ausgewiesen — sie darf nicht stillschweigend aus der Bewertung fallen.
+    //
+    // Bis v0.20.1 lieferte die Kanonik immer irgendeinen Wert (notfalls einen
+    // falschen aus einem Glitch-Sample). Seit sie unplausible Werte verwirft,
+    // kann sie `None` liefern — und dann fehlte hier der Sub-Score komplett.
+    // Folge: das Aggregat waere nur noch aus G-Kraft, Hopsern, Anflug, Bahn und
+    // Sprit gebildet worden. Ein Flug, dessen LANDERATE gar nicht messbar war,
+    // haette einen gut aussehenden Gesamtscore bekommen, ohne dass der Pilot
+    // etwas davon merkt. Die wichtigste Achse still wegzulassen ist schlimmer
+    // als die falsche Zahl, die wir gerade abgeschafft haben.
+    match input.vs_fpm {
+        Some(vs) => out.push(sub_landing_rate::sub_landing_rate(vs)),
+        None => out.push(SubScoreEntry::skipped(
+            "landing_rate",
+            "landing.sub.landing_rate",
+            "landing_rate_unmeasurable",
+        )),
     }
     // v0.12.3 (LE8): score the EMA-smoothed `scored_g_load` when present;
     // fall back to the raw `peak_g_load` for pre-v0.12.3 callers.
@@ -331,6 +347,26 @@ pub fn compute_sub_scores(input: &LandingScoringInput) -> Vec<SubScoreEntry> {
 /// (Gewicht 1) und "flare" (Gewicht 1) — siehe Spec §5.5 Tabelle.
 pub fn aggregate_master_score(subs: &[SubScoreEntry]) -> Option<u8> {
     if subs.is_empty() {
+        return None;
+    }
+    // v0.20.2: Ohne Sinkrate gibt es KEINE Landungsbewertung.
+    //
+    // `skipped` fliegt aus Summe UND Gewichtssumme — und die Sinkrate traegt das
+    // hoechste Gewicht (3). Fehlt sie, wurde der Master trotzdem gebildet, nur
+    // eben aus den uebrigen Achsen. Ein Flug ganz ohne Messwerte kam so auf
+    // **100 Punkte**, allein weil "keine Hopser" als perfekt zaehlt (der
+    // Goldenset-Test `empty_input_returns_only_bounces_loadsheet_fuel` hat genau
+    // das festgeschrieben).
+    //
+    // Seit die Kanonik unplausible Landeraten verwirft, ist das kein
+    // theoretischer Fall mehr: ein Glitch-Flug haette eine glaenzende Note
+    // bekommen, gerade WEIL seine Landung nicht messbar war. Eine
+    // Landungsbewertung ohne die Sinkrate der Landung ist keine Bewertung —
+    // dann lieber gar keine Note als eine geschenkte.
+    let has_landing_rate = subs
+        .iter()
+        .any(|s| s.key == "landing_rate" && !s.skipped);
+    if !has_landing_rate {
         return None;
     }
     let mut sum: f32 = 0.0;

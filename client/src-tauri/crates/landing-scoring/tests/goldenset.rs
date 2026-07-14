@@ -256,17 +256,38 @@ fn underburn_minus_25_pct_warns() {
 
 #[test]
 fn empty_input_returns_only_bounces_loadsheet_fuel() {
-    // Default-Input: alles None ausser bounces (default 0)
-    //   bounces=100, fuel=skipped, loadsheet=skipped
-    // → Master nur aus bounces = 100
+    // v0.20.2 — ERWARTUNG BEWUSST GEAENDERT.
+    //
+    // Vorher schrieb dieser Test fest: Default-Input (keinerlei Messwerte) →
+    // Master = **100 Punkte**, gebildet allein aus `bounces` (default 0 Hopser
+    // = perfekt). Die Sinkraten-Achse fehlte einfach, und `skipped` fliegt aus
+    // der Gewichtung.
+    //
+    // Das war ein geschenkter Score. Solange die Kanonik immer irgendeine
+    // Landerate lieferte (notfalls eine falsche), war es nur theoretisch. Seit
+    // sie unplausible Werte verwirft (Flug 804, ELLX: Edge-Wert +24 fpm), ist es
+    // real: ein Glitch-Flug haette die Bestnote bekommen, gerade WEIL seine
+    // Landung nicht messbar war.
+    //
+    // Eine Landungsbewertung ohne die Sinkrate der Landung ist keine Bewertung.
+    // Die Achse taucht jetzt sichtbar als "nicht bewertet" auf, und der Master
+    // ist None statt einer geschenkten 100.
     let input = LandingScoringInput::default();
     let subs = compute_sub_scores(&input);
-    no_sub(&subs, "landing_rate");
+    assert!(
+        skipped(&subs, "landing_rate"),
+        "die Sinkraten-Achse muss sichtbar als 'nicht bewertet' erscheinen, \
+         nicht stillschweigend fehlen",
+    );
     no_sub(&subs, "g_force");
     no_sub(&subs, "stability");
     no_sub(&subs, "rollout");
     assert_eq!(pts(&subs, "bounces"), 100);
     assert!(skipped(&subs, "fuel"));
     assert!(skipped(&subs, "loadsheet"));
-    assert_eq!(aggregate_master_score(&subs), Some(100));
+    assert_eq!(
+        aggregate_master_score(&subs),
+        None,
+        "ohne messbare Landerate gibt es keine Note — lieber keine als eine geschenkte",
+    );
 }
