@@ -179,10 +179,23 @@ export function RunwayDiagramV2(props: RunwayDiagramV2Props) {
       : null;
   const exitX = exitDistM != null ? mToX(exitDistM) : null;
 
-  // Bahn-Auslastung
+  // Bahn-Auslastung.
+  //
+  // v0.19.3: dieselbe Formel wie die rollout-Kachel in LandingPanel
+  // (`buildRolloutValueLabel`): used = max(td + rollout, rollout), Nenner ist
+  // die LDA. Vorher wich das hier zweifach ab — Nenner war die physische
+  // Laenge (siehe Mapper-Kommentar), und die Klemmung auf 100 % verschwieg
+  // einen Overrun, den die Kachel daneben offen auswies. `lengthM` ist jetzt
+  // die LDA, also bleibt nur noch die Klemmung zu entfernen: wer ueber die
+  // Bahn hinausrollt, soll das auch lesen.
   const bahnUsedPct =
     props.rollout_m != null && lengthM > 0
-      ? Math.min(100, ((props.td_distance_from_threshold_m + props.rollout_m) / lengthM) * 100)
+      ? (Math.max(
+          props.td_distance_from_threshold_m + props.rollout_m,
+          props.rollout_m,
+        ) /
+          lengthM) *
+        100
       : null;
 
   // Source-Label — neutral Wording per Spec §Akzeptanz (Lizenz-Vorsicht):
@@ -947,7 +960,11 @@ export function RunwayDiagramV2(props: RunwayDiagramV2Props) {
           <Pill
             label={t("runway_v2.pill_bahn_auslastung")}
             value={`${bahnUsedPct.toFixed(0)} %`}
-            tone={bahnUsedPct > 85 ? "warn" : "good"}
+            // v0.19.3: ueber 100 % heisst Overrun — das war vorher weggeklemmt
+            // und las sich als exakt volle Bahn.
+            tone={
+              bahnUsedPct > 100 ? "bad" : bahnUsedPct > 85 ? "warn" : "good"
+            }
           />
         )}
         {props.td_in_tdz != null && (

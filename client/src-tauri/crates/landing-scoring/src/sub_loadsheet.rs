@@ -46,7 +46,14 @@ pub fn sub_loadsheet(
     // wird tatsaechliche Mass-Schwellen einfuehren (zu schwer, ueber
     // MTOW etc.) sobald die Backend-Daten fuer actual TOW/LDW
     // gegen planned vorhanden sind.
-    let value = format!("ZFW {:.0} / TOW {:.0} kg", zfw, tow);
+    //
+    // v0.19.3: als "Plan" beschriftet. Diese Zahlen kommen aus dem OFP —
+    // sie sind die PLANUNG, nicht die Messung. Unbeschriftet las der Pilot
+    // sie als Fakt und verglich sie mit der gemessenen TOW aus dem ACARS-Log
+    // ("TOW was 70638" vs. Kachel "TOW 70747"). Das ist kein Rechenfehler,
+    // sondern das Taxi-Sprit-Delta — zwei verschiedene Groessen unter
+    // demselben Namen. Der Name sagt jetzt, welche gemeint ist.
+    let value = format!("Plan · ZFW {:.0} / TOW {:.0} kg", zfw, tow);
     SubScoreEntry::scored(
         "loadsheet",
         "landing.sub.loadsheet",
@@ -80,6 +87,9 @@ mod tests {
         let s = sub_loadsheet(Some(50000.0), Some(70000.0));
         assert!(!s.skipped);
         assert_eq!(s.score, 100);
-        assert_eq!(s.value.as_deref(), Some("ZFW 50000 / TOW 70000 kg"));
+        // Die Kachel muss "Plan" sagen — sonst vergleicht der Pilot sie mit
+        // der gemessenen TOW aus dem ACARS-Log und sieht einen Widerspruch,
+        // wo nur das Taxi-Sprit-Delta steht.
+        assert_eq!(s.value.as_deref(), Some("Plan · ZFW 50000 / TOW 70000 kg"));
     }
 }

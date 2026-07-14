@@ -2837,19 +2837,24 @@ function LandingDetail({
 
   // Personal-best comparison — best (closest to zero) landing rate
   // across ALL filed PIREPs. None when this is the only record yet.
+  //
+  // v0.19.3: ueber scoreBasisVs() statt landing_rate_fpm. Das Rohfeld ist der
+  // Streamer-Tick; gescort und angezeigt wird der Edge-Wert. Auf dem Rohfeld
+  // zu ranken kuert bei Alt-Datensaetzen die falsche "beste Landung" und
+  // stellt eine Zahl in die Kopfzeile, die neben der Kachel nicht aufgeht.
   const personalBest = useMemo(() => {
     const others = allRecords.filter((r) => r.pirep_id !== record.pirep_id);
     if (others.length === 0) return null;
     return others.reduce(
       (best, r) =>
-        Math.abs(r.landing_rate_fpm) < Math.abs(best.landing_rate_fpm) ? r : best,
+        Math.abs(scoreBasisVs(r)) < Math.abs(scoreBasisVs(best)) ? r : best,
       others[0],
     );
   }, [allRecords, record.pirep_id]);
 
   const isNewBest =
     personalBest != null &&
-    Math.abs(record.landing_rate_fpm) < Math.abs(personalBest.landing_rate_fpm);
+    Math.abs(scoreBasisVs(record)) < Math.abs(scoreBasisVs(personalBest));
 
   // v0.12.8-dev: PDF-Export-State. Sobald `printing` true wird, rendert
   // der Effect den <LandingReport> ins DOM, ruft `window.print()` und
@@ -2942,8 +2947,8 @@ function LandingDetail({
           )}
           {personalBest && !isNewBest && (
             <div className="landing-headline__pb">
-              {t("landing.this_landing")}: {record.landing_rate_fpm.toFixed(0)} fpm ·{" "}
-              {t("landing.personal_best")}: {personalBest.landing_rate_fpm.toFixed(0)}{" "}
+              {t("landing.this_landing")}: {scoreBasisVs(record).toFixed(0)} fpm ·{" "}
+              {t("landing.personal_best")}: {scoreBasisVs(personalBest).toFixed(0)}{" "}
               fpm ({personalBest.dpt_airport} → {personalBest.arr_airport})
             </div>
           )}
@@ -3863,9 +3868,11 @@ function HistoryStats({ records }: { records: LandingRecord[] }) {
     const total = records.length;
     const avgScore =
       records.reduce((s, r) => s + r.score_numeric, 0) / total;
+    // v0.19.3: scoreBasisVs() statt Rohfeld — sonst kuert die Statistik eine
+    // andere "beste Landung" als die Kacheln anzeigen.
     const bestRate = records.reduce(
       (best, r) =>
-        Math.abs(r.landing_rate_fpm) < Math.abs(best.landing_rate_fpm) ? r : best,
+        Math.abs(scoreBasisVs(r)) < Math.abs(scoreBasisVs(best)) ? r : best,
       records[0],
     );
     const aGrades = records.filter(
@@ -3894,7 +3901,7 @@ function HistoryStats({ records }: { records: LandingRecord[] }) {
       <div className="landing-stat">
         <div className="landing-stat__label">{t("landing.best_rate")}</div>
         <div className="landing-stat__value">
-          {stats.bestRate.landing_rate_fpm.toFixed(0)} fpm
+          {scoreBasisVs(stats.bestRate).toFixed(0)} fpm
         </div>
       </div>
       <div className="landing-stat">
@@ -4042,7 +4049,10 @@ export function LandingPanel() {
                 <td>
                   {r.aircraft_icao || r.aircraft_registration || r.aircraft_title || "—"}
                 </td>
-                <td>{r.landing_rate_fpm.toFixed(0)} fpm</td>
+                {/* v0.19.3: scoreBasisVs() — die Liste zeigte das Rohfeld,
+                    die Detail-Kachel den Edge-Wert. Gleiche Landung, zwei
+                    Zahlen, je nachdem wo der Pilot hinschaut. */}
+                <td>{scoreBasisVs(r).toFixed(0)} fpm</td>
                 <td>{r.score_numeric}</td>
               </tr>
             ))}

@@ -10,6 +10,7 @@ import type {
   TchClass,
 } from "../components/RunwayDiagramV2";
 import type { LandingRecord } from "../components/LandingPanel";
+import { rolloutLdaMeters } from "../components/LandingPanel";
 
 const FT_TO_M = 0.3048;
 
@@ -29,11 +30,22 @@ export function mapLandingRecordToV2Props(
     record.td_distance_from_threshold_m ??
     rw.touchdown_distance_from_threshold_ft * FT_TO_M;
 
+  // v0.19.3: `length_m` ist die LDA (Landing Distance Available), NICHT die
+  // physische Bahnlaenge. Das Diagramm definiert seinen `lengthM` selbst als
+  // "nutzbare LANDE-Bahn nach dem displaced threshold" und rechnet
+  // `totalVisualM = lengthM + ddsM` — bekam hier aber die physische Laenge.
+  // Folge bei versetzter Schwelle: die Bahn wurde um die DDS zu lang
+  // gezeichnet, und die Auslastungs-Pill rechnete gegen einen zu grossen
+  // Nenner (32 % statt 42 %), waehrend die Kachel daneben korrekt gegen die
+  // LDA rechnete. Dieselbe Bahn, dieselbe Landung, zwei Prozentzahlen.
+  // rolloutLdaMeters() ist die eine Formel — dieselbe, die die Kachel nutzt.
+  const ldaM = rolloutLdaMeters(rw) ?? rw.length_ft * FT_TO_M;
+
   return {
     airport_ident: rw.airport_ident,
     airport_name: null,
     runway_ident: rw.runway_ident,
-    length_m: rw.length_ft * FT_TO_M,
+    length_m: ldaM,
     surface: rw.surface ?? null,
     source,
     nav_cycle: rw.nav_cycle ?? null,

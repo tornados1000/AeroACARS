@@ -11751,6 +11751,28 @@ impl FlightStats {
         }
         self.landing_peak_vs_fpm.or(self.landing_rate_fpm)
     }
+
+    /// SSoT fuer die Bank-Streuung (sigma) im Anflug.
+    ///
+    /// v0.19.3: dieselbe Krankheit wie bei der Sinkrate. Die Bank-Streuung
+    /// wird ZWEIMAL gerechnet:
+    ///   * legacy `approach_bank_stddev_deg` — ungefiltert, Fenster bis
+    ///     1500 ft AGL. Zaehlt absichtliche Anflugkurven als "Instabilitaet"
+    ///     und ueberschaetzt sie dadurch.
+    ///   * v2 `approach_bank_stddev_filtered_deg` — vektor-gefiltert, Fenster
+    ///     bis 1000 ft HAT. Das ist der physikalisch gemeinte Wert.
+    ///
+    /// Bisher gewann je nach Oberflaeche ein anderer: das Stabilitaets-Gate
+    /// (Banner) rechnete aus v2, der Sub-Score und die Client-Kachel aus
+    /// legacy, die Webapp aus v2 (nur der ging an MQTT). Ergebnis: Banner
+    /// "instabil" neben einer Kachel, die harmlos aussah — und die Webapp
+    /// zeigte fuer dieselbe Landung eine dritte Zahl.
+    ///
+    /// v2 gewinnt, legacy bleibt Fallback fuer Alt-Datensaetze ohne v2-Feld.
+    pub fn canonical_bank_stddev_deg(&self) -> Option<f32> {
+        self.approach_bank_stddev_filtered_deg
+            .or(self.approach_bank_stddev_deg)
+    }
 }
 
 /// v0.7.17 → v0.7.21 Shim: leitet auf `FlightStats::canonical_landing_
@@ -12040,7 +12062,7 @@ fn build_pirep_payload(
         // v0.7.6 P2-B: zentraler Helper statt direkten Read.
         bounce_count: Some(scored_bounce_count_for_score(&stats)),
         approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
-        approach_bank_stddev_deg: stats.approach_bank_stddev_deg,
+        approach_bank_stddev_deg: stats.canonical_bank_stddev_deg(),
         rollout_distance_m: stats
             .rollout_distance_m
             .map(|m| m as f32),
@@ -12145,7 +12167,7 @@ fn build_pirep_payload(
         // F7: Stability-v2-Felder (P2.1-A: bestehende
         // Backend-Felder exponieren)
         approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
-        approach_bank_stddev_deg: stats.approach_bank_stddev_deg,
+        approach_bank_stddev_deg: stats.canonical_bank_stddev_deg(),
         approach_vs_jerk_fpm: stats.approach_vs_jerk_fpm,
         approach_ias_stddev_kt: stats.approach_ias_stddev_kt,
         approach_stable_config: stats.approach_stable_config,
@@ -12453,7 +12475,7 @@ fn compute_aggregate_master_score(
         // v0.7.6 P2-B: zentraler Helper statt direkten Read.
         bounce_count: Some(scored_bounce_count_for_score(stats)),
         approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
-        approach_bank_stddev_deg: stats.approach_bank_stddev_deg,
+        approach_bank_stddev_deg: stats.canonical_bank_stddev_deg(),
         rollout_distance_m: stats.rollout_distance_m.map(|m| m as f32),
         planned_burn_kg: stats.planned_burn_kg,
         actual_trip_burn_kg: actual_burn,
@@ -12758,7 +12780,7 @@ where
         // v0.7.6 P2-B: zentraler Helper statt direkten Read.
         bounce_count: Some(scored_bounce_count_for_score(stats)),
         approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
-        approach_bank_stddev_deg: stats.approach_bank_stddev_deg,
+        approach_bank_stddev_deg: stats.canonical_bank_stddev_deg(),
         rollout_distance_m: stats.rollout_distance_m.map(|m| m as f32),
         planned_burn_kg: stats.planned_burn_kg,
         actual_trip_burn_kg: actual_burn_for_record(stats),
@@ -12953,7 +12975,7 @@ where
         crosswind_kt: stats.landing_crosswind_kt,
 
         approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
-        approach_bank_stddev_deg: stats.approach_bank_stddev_deg,
+        approach_bank_stddev_deg: stats.canonical_bank_stddev_deg(),
         rollout_distance_m: stats.rollout_distance_m,
 
         planned_block_fuel_kg: stats.planned_block_fuel_kg,
@@ -20453,7 +20475,7 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                             planned_tow_kg: stats.planned_tow_kg,
                             rollout_distance_m: stats.rollout_distance_m.map(|d| d as f32),
                             approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
-                            approach_bank_stddev_deg: stats.approach_bank_stddev_deg,
+                            approach_bank_stddev_deg: stats.canonical_bank_stddev_deg(),
                             go_around_count: Some(stats.go_around_count),
                             arr_metar: stats.arr_metar_raw.clone(),
                             runway_match_icao: rwy_match.map(|m| m.airport_ident.clone()),
@@ -27703,7 +27725,7 @@ fn build_pirep_notes(
         // v0.7.6 P2-B: zentraler Helper statt direkten Read.
         bounce_count: Some(scored_bounce_count_for_score(stats)),
         approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
-        approach_bank_stddev_deg: stats.approach_bank_stddev_deg,
+        approach_bank_stddev_deg: stats.canonical_bank_stddev_deg(),
         rollout_distance_m: stats.rollout_distance_m.map(|m| m as f32),
         planned_burn_kg: stats.planned_burn_kg,
         actual_trip_burn_kg: actual_burn,
@@ -32137,6 +32159,33 @@ mod canonical_landing_rate_fpm_tests {
         // Score-Basis (Sinkrate-Punkte) == Log-Wert == PIREP-Wert.
         assert_eq!(score_basis_vs_fpm(&stats), Some(canonical));
         assert_eq!(canonical.round() as i32, -206);
+    }
+
+    #[test]
+    fn bank_stddev_kanonik_bevorzugt_den_gefilterten_v2_wert() {
+        // Dieselbe Krankheit wie bei der Sinkrate, nur mit der Bank-Streuung:
+        // legacy (ungefiltert, bis 1500 ft AGL) zaehlt absichtliche Anflug-
+        // kurven als Instabilitaet mit und ueberschaetzt sie. Das Stabilitaets-
+        // Gate rechnete laengst aus v2, Sub-Score und Client-Kachel aber aus
+        // legacy — Banner "instabil" neben harmloser Kachel.
+        let mut stats = FlightStats::default();
+        stats.approach_bank_stddev_deg = Some(7.4);
+        stats.approach_bank_stddev_filtered_deg = Some(2.1);
+        assert_eq!(
+            stats.canonical_bank_stddev_deg(),
+            Some(2.1),
+            "v2 (gefiltert) muss gewinnen, nicht der ungefilterte Legacy-Wert",
+        );
+
+        // Alt-Datensatz ohne v2-Feld: legacy bleibt Fallback, sonst verlieren
+        // bestehende Landungen ihre Stabilitaets-Anzeige.
+        let mut old = FlightStats::default();
+        old.approach_bank_stddev_deg = Some(7.4);
+        assert_eq!(old.canonical_bank_stddev_deg(), Some(7.4));
+
+        // Gar keine Daten → None, kein 0.0-Default (0.0 hiesse "perfekt
+        // stabil" und wuerde einen VFR-Anflug ohne Buffer voll punkten).
+        assert_eq!(FlightStats::default().canonical_bank_stddev_deg(), None);
     }
 
     #[test]
