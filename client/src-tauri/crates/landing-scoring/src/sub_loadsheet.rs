@@ -47,7 +47,7 @@ pub fn sub_loadsheet(
     // MTOW etc.) sobald die Backend-Daten fuer actual TOW/LDW
     // gegen planned vorhanden sind.
     //
-    // v0.19.3: als "Plan" beschriftet. Diese Zahlen kommen aus dem OFP —
+    // v0.20.0: als "Plan" beschriftet. Diese Zahlen kommen aus dem OFP —
     // sie sind die PLANUNG, nicht die Messung. Unbeschriftet las der Pilot
     // sie als Fakt und verglich sie mit der gemessenen TOW aus dem ACARS-Log
     // ("TOW was 70638" vs. Kachel "TOW 70747"). Das ist kein Rechenfehler,

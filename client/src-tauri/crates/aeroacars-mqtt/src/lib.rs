@@ -321,7 +321,7 @@ pub struct TouchdownPayload {
     pub headwind_kt: Option<f32>,
     pub crosswind_kt: Option<f32>,
     pub score: Option<i32>,
-    /// v0.19.3: Klasse und Note zum `score` — EINGEFROREN, nicht ableitbar.
+    /// v0.20.0: Klasse und Note zum `score` — EINGEFROREN, nicht ableitbar.
     ///
     /// Vorher trug `score` die diskrete Touchdown-Klasse (100/80/60/30/0) und
     /// die Webapp leitete das Label mit einer EIGENEN Schwellen-Leiter daraus
@@ -803,7 +803,7 @@ pub struct PirepPayload {
     pub peak_altitude_ft: Option<i32>,
     pub landing_vs_fpm: Option<i32>,
     pub landing_score: Option<i32>,
-    /// v0.19.3: Klasse und Note zum `landing_score` — eingefroren, damit die
+    /// v0.20.0: Klasse und Note zum `landing_score` — eingefroren, damit die
     /// Webapp sie nicht aus der Zahl nachrechnet. Spiegel der gleichnamigen
     /// Felder im `TouchdownPayload`; beide stammen aus demselben
     /// `canonical_landing_verdict()`-Aufruf. Additiv, `serde(default)`.

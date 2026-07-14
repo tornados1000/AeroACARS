@@ -11754,7 +11754,7 @@ impl FlightStats {
 
     /// SSoT fuer die Bank-Streuung (sigma) im Anflug.
     ///
-    /// v0.19.3: dieselbe Krankheit wie bei der Sinkrate. Die Bank-Streuung
+    /// v0.20.0: dieselbe Krankheit wie bei der Sinkrate. Die Bank-Streuung
     /// wird ZWEIMAL gerechnet:
     ///   * legacy `approach_bank_stddev_deg` — ungefiltert, Fenster bis
     ///     1500 ft AGL. Zaehlt absichtliche Anflugkurven als "Instabilitaet"
@@ -12124,7 +12124,7 @@ fn build_pirep_payload(
         // (Fuel/Loadsheet/Stability/Rollout fliessen ein),
         // mit Fallback auf Touchdown-Klassifikation.
         landing_score: payload_landing_score,
-        // v0.19.3: Klasse und Note EINGEFROREN zum Score mitgeben — dieselben
+        // v0.20.0: Klasse und Note EINGEFROREN zum Score mitgeben — dieselben
         // beiden Funktionen, die auch der Landungs-Tab und die PIREP-Notizen
         // benutzen. Die Webapp leitete das Wort bisher selbst aus der Zahl ab,
         // mit einer eigenen Leiter. Zwei Kopien einer Regel driften; hier
@@ -12297,7 +12297,7 @@ fn emit_landing_finalized(app: &AppHandle, flight: &ActiveFlight) {
     let (final_vs, final_score_label) = {
         let s = flight.stats.lock().expect("flight stats");
         (
-            // v0.19.3: kanonisch — dieses Forensik-Event ist die Zahl, gegen
+            // v0.20.0: kanonisch — dieses Forensik-Event ist die Zahl, gegen
             // die wir spaeter Pilot-Reports rekonstruieren. Sie MUSS die
             // gleiche sein wie in Log, Karte, Score und PIREP.
             s.canonical_landing_rate_fpm(),
@@ -12508,7 +12508,7 @@ fn compute_aggregate_master_score(
 /// score_label und score_numeric semantisch zueinander passen.
 /// Nutzt die gleichen Schwellen wie LandingScore::numeric()
 /// (100/80/60/30/0 → smooth/acceptable/firm/hard/severe).
-/// v0.19.3: Klassen-Schwellen liegen jetzt AUF den Noten-Schwellen von
+/// v0.20.0: Klassen-Schwellen liegen jetzt AUF den Noten-Schwellen von
 /// `letter_grade` (95/88/82/75/65/50). Vorher waren es zwei unabhaengige
 /// Leitern (90/70/45/15) — mit absurden Kombinationen als Folge: 88 Punkte
 /// ergaben "A (acceptable)", 47 Punkte "F (firm)". Note und Klasse
@@ -15217,7 +15217,7 @@ async fn flight_end_manual(
                 rounded.max(0)
             })
         });
-        // v0.19.3: die GEMESSENE Rate schlaegt die Pilot-Eingabe. Vorher gewann
+        // v0.20.0: die GEMESSENE Rate schlaegt die Pilot-Eingabe. Vorher gewann
         // `landing_rate_fpm` (vom Piloten getippt) — dann stand im phpVMS-
         // Logbuch seine Zahl, im Landungs-Tab und im Custom-Field aber die
         // gemessene. Die Messung ist die Wahrheit; die Eingabe bleibt Fallback,
@@ -15240,7 +15240,7 @@ async fn flight_end_manual(
             .filter(|s| !s.is_empty());
         let effective_arr =
             effective_arr_norm.as_deref().unwrap_or(&flight.arr_airport);
-        // v0.19.3: die phpVMS-`score`-Spalte bekommt die EINE Bewertung — nicht
+        // v0.20.0: die phpVMS-`score`-Spalte bekommt die EINE Bewertung — nicht
         // mehr die Touchdown-Klasse (nur 100/80/60/30/0). Vorher stand beim
         // manuellen Filen `100` in der Spalte, waehrend Custom-Field und
         // Landungs-Tab "B (acceptable) — 78/100" zeigten.
@@ -18908,7 +18908,7 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
                 let pg_500 = analysis.get("peak_g_post_500ms").and_then(|v| v.as_f64()).map(|x| x as f32);
                 {
                     let mut s = flight.stats.lock().expect("flight stats");
-                    // v0.19.3 (PIA3452): Edge gewinnt vor v2 — dieselbe
+                    // v0.20.0 (PIA3452): Edge gewinnt vor v2 — dieselbe
                     // Ordnung die `canonical_landing_rate_fpm` schon immer
                     // liest. Vorher schrieb v2 (= Fenster-MINIMUM ueber
                     // [contact-250ms, contact+100ms]) in `landing_rate_fpm` /
@@ -19052,7 +19052,7 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
                         s.landing_rate_fpm = Some(corrected);
                         s.landing_peak_vs_fpm = Some(corrected);
                     }
-                    // v0.19.3: ueber die Kanonik lesen, nicht das Rohfeld — die
+                    // v0.20.0: ueber die Kanonik lesen, nicht das Rohfeld — die
                     // Einstufung (SMOOTH/FIRM/HARD) muss auf DERSELBEN Zahl
                     // klassifizieren, die Score, Karte, Log und PIREP zeigen.
                     // (Vor dem Fix: Klasse aus v2s Fenster-Minimum, Punkte aus
@@ -20376,7 +20376,7 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                         // v0.8.0: identische Assessment-Werte wie
                         // im LandingRecord (single source: assess_touchdown).
                         let payload_assessed = assess_touchdown(&stats);
-                        // v0.19.3: EIN Verdict — Punkte, Klasse und Note stammen
+                        // v0.20.0: EIN Verdict — Punkte, Klasse und Note stammen
                         // aus demselben Aufruf. Die Webapp leitet nichts mehr ab.
                         let payload_verdict = canonical_landing_verdict(
                             flight.as_ref(),
@@ -20440,7 +20440,7 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                             // Composite propagiert der Recorder separat aus der
                             // PIREP-Zeile in die Spalte `landing_score`.
                             score: stats.landing_score.map(|s| s.numeric()),
-                            // v0.19.3: das EINGEFRORENE Urteil zum Composite —
+                            // v0.20.0: das EINGEFRORENE Urteil zum Composite —
                             // Klasse und Note, wie der Client sie zeigt. Die
                             // Webapp leitete das Wort bisher selbst aus einer
                             // Zahl ab, mit einer eigenen Leiter (90/70/45) neben
@@ -24373,7 +24373,7 @@ fn step_flight_at(
                     let event = TouchdownEvent {
                         timestamp: touchdown,
                         kind: TouchdownKind::FinalLanding,
-                        // v0.19.3: ueber die Kanonik. Hier, direkt am Touchdown,
+                        // v0.20.0: ueber die Kanonik. Hier, direkt am Touchdown,
                         // liefert sie denselben Wert (der 50-Hz-Puffer-Dump
                         // laeuft erst ~10 s spaeter, `landing_analysis` ist noch
                         // leer) — aber die Kaskade von Hand nachzubauen ist
@@ -27174,7 +27174,7 @@ fn build_pirep_fields(
     if let Some(sd) = stats.approach_vs_stddev_fpm {
         f.insert("Approach V/S Stddev".into(), format!("{:.0} fpm", sd));
     }
-    // v0.19.3: Kanonik — das Feld zeigte den rohen Legacy-Wert (ungefiltert,
+    // v0.20.0: Kanonik — das Feld zeigte den rohen Legacy-Wert (ungefiltert,
     // Fenster bis 1500 ft AGL), waehrend der Score den gefilterten bewertet.
     if let Some(sd) = stats.canonical_bank_stddev_deg() {
         f.insert("Approach Bank Stddev".into(), format!("{:.1}°", sd));
@@ -27474,7 +27474,7 @@ fn build_pirep_notes(
         if let Some(rate) = stats.canonical_landing_rate_fpm() {
             let _ = writeln!(s, "  Landing rate  {:.0} fpm", rate);
         }
-        // v0.19.3: der GESCORTE (EMA) G-Wert — derselbe, den Score-Karte,
+        // v0.20.0: der GESCORTE (EMA) G-Wert — derselbe, den Score-Karte,
         // ACARS-Log und das PIREP-Custom-Field "Landing G-Force" zeigen.
         // `landing_g_force` ist der Roh-Wert am Touchdown-Frame und wich
         // sichtbar ab (dritter G-Wert neben Roh-Peak und EMA).
@@ -27512,14 +27512,14 @@ fn build_pirep_notes(
         if let Some(sd) = stats.approach_vs_stddev_fpm {
             let _ = writeln!(s, "  Apr V/S σ     {:.0} fpm", sd);
         }
-        // v0.19.3: Kanonik (siehe build_pirep_fields).
+        // v0.20.0: Kanonik (siehe build_pirep_fields).
         if let Some(sd) = stats.canonical_bank_stddev_deg() {
             let _ = writeln!(s, "  Apr Bank σ    {:.1}°", sd);
         }
         if let Some(m) = stats.rollout_distance_m {
             let _ = writeln!(s, "  Rollout       {:.0} m", m);
         }
-        // v0.19.3: DIESELBE Bewertung wie das Custom-Field "Landing Score"
+        // v0.20.0: DIESELBE Bewertung wie das Custom-Field "Landing Score"
         // und der Landungs-Tab. Vorher baute dieser Block die Note aus der
         // Touchdown-KLASSE (numeric ∈ {100,80,60,30,0}) → auf derselben
         // phpVMS-Seite stand "A+ (SMOOTH, 100/100)" neben
@@ -27963,7 +27963,7 @@ fn announce_landing_score(app: &AppHandle, flight: &ActiveFlight) -> Option<Stri
         // Wenn sampler_touchdown_at None ist (= Sampler hat keinen Edge
         // detektiert, FSM-Pfad scored stattdessen) → sofort freigeben.
     }
-    // v0.19.3 (PIA3452): kanonisch lesen, nicht `landing_peak_vs_fpm` direkt.
+    // v0.20.0 (PIA3452): kanonisch lesen, nicht `landing_peak_vs_fpm` direkt.
     // Das Rohfeld konnte v2s Fenster-Minimum tragen, waehrend Karte, Score und
     // PIREP ueber die Kanonik den 50-Hz-Edge zeigten → Pilot sah "-233 fpm" im
     // ACARS-Log und "-206 fpm" auf der Landing-Karte fuer denselben Touchdown.
@@ -32157,7 +32157,7 @@ mod canonical_landing_rate_fpm_tests {
     /// EINEN Touchdown — ACARS-Log -233 fpm (touchdown_v2 `vs_at_impact_frame`
     /// = Fenster-MINIMUM), Landing-Karte/Score/PIREP -206 fpm (`vs_at_edge_fpm`
     /// = Interpolation am on_ground-Frame), und die Einstufung klassifizierte
-    /// auf -233 waehrend die Punkte aus -206 kamen. Seit v0.19.3 finalisiert
+    /// auf -233 waehrend die Punkte aus -206 kamen. Seit v0.20.0 finalisiert
     /// der Buffer-Dump auf den Edge-Wert, und Log + Klasse lesen die Kanonik.
     fn pia3452_live_stats() -> FlightStats {
         let mut stats = FlightStats::default();
@@ -32175,7 +32175,7 @@ mod canonical_landing_rate_fpm_tests {
     #[test]
     fn pia3452_log_score_and_pirep_all_read_the_same_vs() {
         // Die Log-Zeile ("Touchdown: V/S … fpm"), die Score-Basis und der
-        // PIREP-Wert gehen seit v0.19.3 alle durch dieselbe Kanonik — es darf
+        // PIREP-Wert gehen seit v0.20.0 alle durch dieselbe Kanonik — es darf
         // KEINE Konstellation geben in der sie auseinanderlaufen.
         let stats = pia3452_live_stats();
         let canonical = stats.canonical_landing_rate_fpm().expect("some");

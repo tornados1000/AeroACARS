@@ -10,7 +10,10 @@ import type {
   TchClass,
 } from "../components/RunwayDiagramV2";
 import type { LandingRecord } from "../components/LandingPanel";
-import { rolloutLdaMeters } from "../components/LandingPanel";
+// NICHT aus LandingPanel importieren — das waere ein zirkulaerer Laufzeit-
+// Import (LandingPanel importiert diesen Mapper). Der Typ-Import oben ist
+// unkritisch, weil er beim Kompilieren verschwindet; ein Wert-Import nicht.
+import { rolloutLdaMeters } from "../lib/runwayGeometry";
 
 const FT_TO_M = 0.3048;
 
@@ -30,7 +33,7 @@ export function mapLandingRecordToV2Props(
     record.td_distance_from_threshold_m ??
     rw.touchdown_distance_from_threshold_ft * FT_TO_M;
 
-  // v0.19.3: `length_m` ist die LDA (Landing Distance Available), NICHT die
+  // v0.20.0: `length_m` ist die LDA (Landing Distance Available), NICHT die
   // physische Bahnlaenge. Das Diagramm definiert seinen `lengthM` selbst als
   // "nutzbare LANDE-Bahn nach dem displaced threshold" und rechnet
   // `totalVisualM = lengthM + ddsM` — bekam hier aber die physische Laenge.

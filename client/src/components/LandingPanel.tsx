@@ -10,6 +10,7 @@ import { RunwayDiagramV2 } from "./RunwayDiagramV2";
 import { RunwayUtilizationHelpModal } from "./RunwayUtilizationHelpModal";
 import { ApproachStabilityCard } from "./ApproachStabilityCard";
 import { mapLandingRecordToV2Props } from "../dev/runwayDiagramV2Mapper";
+import { rolloutLdaMeters } from "../lib/runwayGeometry";
 // v0.5.47 — Score-Modul ist jetzt zentral, identisch zu webapp/src/
 // components/landingScoring.ts. Dieselben Schwellen, Bands, Coach-Tipps
 // für Pilot-App und Live-Monitor.
@@ -410,7 +411,7 @@ function getSubScores(r: LandingRecord): SubScore[] {
     });
   }
   // Legacy-Pfad fuer pre-v0.7.1-PIREPs (forward-compat)
-  // v0.19.3: ueber scoreBasisVs() statt handkopierter Kaskade — dieselbe
+  // v0.20.0: ueber scoreBasisVs() statt handkopierter Kaskade — dieselbe
   // Regel dreimal ausgeschrieben ist genau die Drift, aus der der
   // PIA3452-Split entstanden ist (Log -233 vs Karte -206).
   const peakVs = scoreBasisVs(r);
@@ -455,17 +456,12 @@ export function isRolloutV3(r: LandingRecord): boolean {
   return (r.score_algorithm_version ?? 0) >= ROLLOUT_ALGO_V3;
 }
 
-/**
- * LDA in Metern aus dem (nested) Pilot-Client `runway_match`.
- * Spec LE5: `LDA_m = (length_ft − displaced_threshold_ft) × 0.3048`.
- * Liefert null wenn die Geometrie unbrauchbar ist (length ≤ 0, LDA ≤ 0).
- */
-export function rolloutLdaMeters(rm: LandingRunwayMatch): number | null {
-  if (!Number.isFinite(rm.length_ft) || rm.length_ft <= 0) return null;
-  const displacedFt = rm.displaced_threshold_ft ?? 0;
-  const lda = (rm.length_ft - displacedFt) * 0.3048;
-  return lda > 0 ? lda : null;
-}
+// v0.20.0: `rolloutLdaMeters` lebt jetzt in `lib/runwayGeometry.ts` — der
+// RunwayDiagramV2-Mapper braucht dieselbe Formel, und ein Import von hier
+// waere ein zirkulaerer Laufzeit-Import (LandingPanel importiert den Mapper).
+// Re-Export, damit bestehende Aufrufer und Tests unveraendert bleiben; der
+// Import oben (Zeile 1-30) macht sie zusaetzlich lokal verfuegbar.
+export { rolloutLdaMeters };
 
 /**
  * v0.12.0 LE4 — sprach-lokalisiertes Value-Label für die rollout-Card.
@@ -1943,7 +1939,7 @@ function QuickFlags({ record }: { record: LandingRecord }) {
 
   // HARD LANDING — V/S oder Peak-G erreichen Hard/Severe-Schwellen
   // (gespiegelt aus landingScoring.ts T_VS_HARD_FPM / T_G_HARD).
-  // v0.19.3: ueber scoreBasisVs() statt handkopierter Kaskade (siehe oben).
+  // v0.20.0: ueber scoreBasisVs() statt handkopierter Kaskade (siehe oben).
   // v0.12.3 (LE9): G-Flag auf dem gescorten (EMA) Wert, nicht dem Roh-Peak.
   const peakVs = scoreBasisVs(record);
   const gForFlag = scoreG(record) ?? 0;
@@ -2456,7 +2452,7 @@ function LandingReport({ record }: { record: LandingRecord }) {
             />
             <ReportTile
               label={t("landing.g_force")}
-              /* v0.19.3: scoreG() — dieselbe Zahl, auf der der G-Balken
+              /* v0.20.0: scoreG() — dieselbe Zahl, auf der der G-Balken
                  bewertet. `landing_g_force` ist der Roh-Wert am Touchdown-
                  Frame und wich sichtbar vom bewerteten EMA-Wert ab. */
               value={fmtNumber(scoreG(record), 2, "G")}
@@ -2838,7 +2834,7 @@ function LandingDetail({
   // Personal-best comparison — best (closest to zero) landing rate
   // across ALL filed PIREPs. None when this is the only record yet.
   //
-  // v0.19.3: ueber scoreBasisVs() statt landing_rate_fpm. Das Rohfeld ist der
+  // v0.20.0: ueber scoreBasisVs() statt landing_rate_fpm. Das Rohfeld ist der
   // Streamer-Tick; gescort und angezeigt wird der Edge-Wert. Auf dem Rohfeld
   // zu ranken kuert bei Alt-Datensaetzen die falsche "beste Landung" und
   // stellt eine Zahl in die Kopfzeile, die neben der Kachel nicht aufgeht.
@@ -3086,7 +3082,7 @@ function LandingDetail({
             </div>
             <div>
               <dt>{t("landing.g_force")}</dt>
-              {/* v0.19.3: scoreG() statt Roh-G am Touchdown-Frame — sonst
+              {/* v0.20.0: scoreG() statt Roh-G am Touchdown-Frame — sonst
                   zeigt diese Kachel eine andere Zahl als der G-Balken
                   daneben, der auf dem EMA-Wert bewertet. */}
               <dd>{fmtNumber(scoreG(record), 2, "G")}</dd>
@@ -3868,7 +3864,7 @@ function HistoryStats({ records }: { records: LandingRecord[] }) {
     const total = records.length;
     const avgScore =
       records.reduce((s, r) => s + r.score_numeric, 0) / total;
-    // v0.19.3: scoreBasisVs() statt Rohfeld — sonst kuert die Statistik eine
+    // v0.20.0: scoreBasisVs() statt Rohfeld — sonst kuert die Statistik eine
     // andere "beste Landung" als die Kacheln anzeigen.
     const bestRate = records.reduce(
       (best, r) =>
@@ -4049,7 +4045,7 @@ export function LandingPanel() {
                 <td>
                   {r.aircraft_icao || r.aircraft_registration || r.aircraft_title || "—"}
                 </td>
-                {/* v0.19.3: scoreBasisVs() — die Liste zeigte das Rohfeld,
+                {/* v0.20.0: scoreBasisVs() — die Liste zeigte das Rohfeld,
                     die Detail-Kachel den Edge-Wert. Gleiche Landung, zwei
                     Zahlen, je nachdem wo der Pilot hinschaut. */}
                 <td>{scoreBasisVs(r).toFixed(0)} fpm</td>

@@ -181,7 +181,7 @@ export function RunwayDiagramV2(props: RunwayDiagramV2Props) {
 
   // Bahn-Auslastung.
   //
-  // v0.19.3: dieselbe Formel wie die rollout-Kachel in LandingPanel
+  // v0.20.0: dieselbe Formel wie die rollout-Kachel in LandingPanel
   // (`buildRolloutValueLabel`): used = max(td + rollout, rollout), Nenner ist
   // die LDA. Vorher wich das hier zweifach ab — Nenner war die physische
   // Laenge (siehe Mapper-Kommentar), und die Klemmung auf 100 % verschwieg
@@ -959,9 +959,14 @@ export function RunwayDiagramV2(props: RunwayDiagramV2Props) {
         {bahnUsedPct != null && (
           <Pill
             label={t("runway_v2.pill_bahn_auslastung")}
-            value={`${bahnUsedPct.toFixed(0)} %`}
-            // v0.19.3: ueber 100 % heisst Overrun — das war vorher weggeklemmt
-            // und las sich als exakt volle Bahn.
+            // v0.20.0: ueber 100 % heisst Overrun — das war vorher auf 100
+            // geklemmt und las sich als exakt volle Bahn. Jenseits von 200 %
+            // ist die Zahl aber keine Aussage mehr ueber die Landung, sondern
+            // ueber eine kaputte Bahn-Zuordnung (Buschflug, Fehl-Match) — dann
+            // lieber ">200 %" zeigen als eine praezise wirkende Absurditaet.
+            value={
+              bahnUsedPct > 200 ? "> 200 %" : `${bahnUsedPct.toFixed(0)} %`
+            }
             tone={
               bahnUsedPct > 100 ? "bad" : bahnUsedPct > 85 ? "warn" : "good"
             }
