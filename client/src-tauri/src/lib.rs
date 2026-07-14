@@ -2034,6 +2034,18 @@ struct PersistedFlightStats {
     approach_vs_stddev_fpm: Option<f32>,
     #[serde(default)]
     approach_bank_stddev_deg: Option<f32>,
+    /// v0.20.1: die GEFILTERTEN Werte muessen den Neustart ueberleben.
+    ///
+    /// Vorher wurden nur die Legacy-Felder persistiert. Stuerzte die App nach
+    /// dem Touchdown und vor dem Filing ab (der Stratos-Doppel-Submit-Fall),
+    /// waren die v2-Werte nach dem Restore weg — die Kanonik fiel auf das alte
+    /// Fenster zurueck und der PIREP wurde anders bewertet als der Landungs-Tab
+    /// es zeigte. Derselbe Flug, zwei Noten, je nachdem ob zwischendurch ein
+    /// Neustart lag. Genau die Krankheit, die dieses Release ausraeumt.
+    #[serde(default)]
+    approach_vs_stddev_filtered_fpm: Option<f32>,
+    #[serde(default)]
+    approach_bank_stddev_filtered_deg: Option<f32>,
     #[serde(default)]
     rollout_distance_m: Option<f64>,
     // ---- Landing Analyzer (Stage 2): SimBrief OFP plan ----
@@ -2217,6 +2229,8 @@ impl PersistedFlightStats {
             landing_crosswind_kt: stats.landing_crosswind_kt,
             approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
             approach_bank_stddev_deg: stats.approach_bank_stddev_deg,
+            approach_vs_stddev_filtered_fpm: stats.approach_vs_stddev_filtered_fpm,
+            approach_bank_stddev_filtered_deg: stats.approach_bank_stddev_filtered_deg,
             rollout_distance_m: stats.rollout_distance_m,
             planned_block_fuel_kg: stats.planned_block_fuel_kg,
             planned_burn_kg: stats.planned_burn_kg,
@@ -2336,6 +2350,8 @@ impl PersistedFlightStats {
         stats.landing_crosswind_kt = self.landing_crosswind_kt;
         stats.approach_vs_stddev_fpm = self.approach_vs_stddev_fpm;
         stats.approach_bank_stddev_deg = self.approach_bank_stddev_deg;
+        stats.approach_vs_stddev_filtered_fpm = self.approach_vs_stddev_filtered_fpm;
+        stats.approach_bank_stddev_filtered_deg = self.approach_bank_stddev_filtered_deg;
         stats.rollout_distance_m = self.rollout_distance_m;
         stats.planned_block_fuel_kg = self.planned_block_fuel_kg;
         stats.planned_burn_kg = self.planned_burn_kg;
@@ -4371,14 +4387,38 @@ const APPROACH_BANK_PLAUSIBILITY_CAP_DEG: f32 = 90.0;
 /// jede kuenftige Auswertung den Filter erneut richtig hinschreiben — und genau
 /// so entstehen die Risse, die uns PIA3452 eingebrockt hat.
 fn approach_sample_is_plausible(snap: &SimSnapshot) -> bool {
+    // `msl_ft` MUSS mitgeprueft werden: das v2-Gate rechnet mit HAT (Height
+    // Above Touchdown) aus genau diesem Feld. Ein NaN rutscht sonst durch, macht
+    // die HAT NaN, und jeder Vergleich damit ist false — das Sample verschwindet
+    // still aus dem Gate, statt sauber verworfen zu werden.
     let finite = snap.vertical_speed_fpm.is_finite()
         && snap.bank_deg.is_finite()
         && snap.altitude_agl_ft.is_finite()
+        && snap.altitude_msl_ft.is_finite()
         && snap.groundspeed_kt.is_finite()
         && snap.indicated_airspeed_kt.is_finite();
     finite
         && snap.vertical_speed_fpm.abs() <= APPROACH_VS_PLAUSIBILITY_CAP_FPM
         && snap.bank_deg.abs() <= APPROACH_BANK_PLAUSIBILITY_CAP_DEG
+}
+
+/// Standardabweichung einer Stabilitaets-Achse, oder `None` bei zu duenner
+/// Stichprobe.
+///
+/// v0.20.1: EINE Formel. Sie stand vorher zweimal im File (Legacy-Pfad und
+/// v2-Pfad) — in einem Commit, dessen Zweck es ist, doppelte Berechnungen
+/// derselben Groesse zu beseitigen. Beide Achsen und beide Pfade rufen jetzt
+/// hier an, damit Fenster, Filter und Mindest-Stichprobe nicht auseinander
+/// laufen koennen.
+fn stability_stddev(vals: impl Iterator<Item = f32>) -> Option<f32> {
+    let v: Vec<f64> = vals.map(f64::from).collect();
+    if v.len() < STABILITY_MIN_SAMPLES {
+        return None;
+    }
+    let n = v.len() as f64;
+    let mean = v.iter().sum::<f64>() / n;
+    let var = v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+    Some(var.sqrt() as f32)
 }
 
 fn push_approach_sample(stats: &mut FlightStats, snap: &SimSnapshot, now: DateTime<Utc>) {
@@ -5541,33 +5581,15 @@ fn compute_approach_stddev(
             in_agl_band && pre_flare
         })
         .collect();
-    let n = filtered.len();
-    // v0.20.1: war 3. Eine Streuung aus einer Handvoll Ticks ist keine Aussage
-    // ueber den Anflug — im VPS-Korpus kam genau daher der 12.810-fpm-Unsinn.
-    // Lieber kein Wert (Sub-Score wird uebersprungen) als eine erfundene Zahl,
-    // die als Note beim Piloten landet.
-    if n < STABILITY_MIN_SAMPLES {
-        return (None, None);
-    }
-    let mut sum_vs = 0.0_f64;
-    let mut sum_bank = 0.0_f64;
-    for s in &filtered {
-        sum_vs += s.vs_fpm as f64;
-        sum_bank += s.bank_deg as f64;
-    }
-    let mean_vs = sum_vs / n as f64;
-    let mean_bank = sum_bank / n as f64;
-    let mut sq_vs = 0.0_f64;
-    let mut sq_bank = 0.0_f64;
-    for s in &filtered {
-        let dv = s.vs_fpm as f64 - mean_vs;
-        let db = s.bank_deg as f64 - mean_bank;
-        sq_vs += dv * dv;
-        sq_bank += db * db;
-    }
-    let var_vs = sq_vs / n as f64;
-    let var_bank = sq_bank / n as f64;
-    (Some(var_vs.sqrt() as f32), Some(var_bank.sqrt() as f32))
+    // v0.20.1: EINE Formel (`stability_stddev`) — sie prueft auch die
+    // Mindest-Stichprobe (war hier 3; im VPS-Korpus kam genau aus solchen
+    // duennen Fenstern der 12.810-fpm-Unsinn). Lieber kein Wert, den der
+    // Sub-Score dann als "nicht bewertet" ueberspringt, als eine erfundene
+    // Zahl, die als Note beim Piloten landet.
+    (
+        stability_stddev(filtered.iter().map(|s| s.vs_fpm)),
+        stability_stddev(filtered.iter().map(|s| s.bank_deg)),
+    )
 }
 
 /// v0.5.26: ICAO-Kategorie-basierte Default-Limits fuer Wing-Strike +
@@ -5877,23 +5899,10 @@ fn compute_approach_stability_v2(
         .filter(|s| !in_vector_window(s.at))
         .copied()
         .collect();
-    let stddev_of = |vals: &[f32]| -> Option<f32> {
-        if vals.len() < STABILITY_MIN_SAMPLES {
-            return None;
-        }
-        let n = vals.len() as f64;
-        let mean = vals.iter().map(|&v| v as f64).sum::<f64>() / n;
-        let var = vals
-            .iter()
-            .map(|&v| (v as f64 - mean).powi(2))
-            .sum::<f64>()
-            / n;
-        Some(var.sqrt() as f32)
-    };
-    let banks: Vec<f32> = vector_filtered.iter().map(|s| s.bank_deg).collect();
-    let vss: Vec<f32> = vector_filtered.iter().map(|s| s.vs_fpm).collect();
-    out.bank_stddev_filtered_deg = stddev_of(&banks);
-    out.vs_stddev_filtered_fpm = stddev_of(&vss);
+    out.bank_stddev_filtered_deg =
+        stability_stddev(vector_filtered.iter().map(|s| s.bank_deg));
+    out.vs_stddev_filtered_fpm =
+        stability_stddev(vector_filtered.iter().map(|s| s.vs_fpm));
 
     // 9) Composite Stable-At-Gate Indikator.
     //    PRIMARY-Maße: jerk < 100 AND bank_sd < 5 AND ias_sd < 10
@@ -32365,6 +32374,36 @@ mod canonical_landing_rate_fpm_tests {
         let (vs_ok, bank_ok) = mk(STABILITY_MIN_SAMPLES + 5);
         assert!(vs_ok.is_some(), "ausreichende Stichprobe muss bewertet werden");
         assert!(bank_ok.is_some());
+    }
+
+    #[test]
+    fn gefilterte_stabilitaetswerte_ueberleben_einen_neustart() {
+        // Code-Review-Befund (betraf auch das schon veroeffentlichte v0.20.0):
+        // `PersistedFlightStats` sicherte nur die Legacy-Werte. Stuerzte die App
+        // nach dem Touchdown und vor dem Filing ab, waren die v2-Werte nach dem
+        // Restore weg — die Kanonik fiel auf das alte Fenster zurueck und der
+        // PIREP wurde anders bewertet als der Landungs-Tab es zeigte. Derselbe
+        // Flug, zwei Noten, je nachdem ob ein Neustart dazwischen lag.
+        let mut stats = FlightStats::default();
+        stats.approach_vs_stddev_fpm = Some(641.0);
+        stats.approach_bank_stddev_deg = Some(7.4);
+        stats.approach_vs_stddev_filtered_fpm = Some(180.0);
+        stats.approach_bank_stddev_filtered_deg = Some(1.0);
+
+        let persisted = PersistedFlightStats::snapshot_from(&stats);
+        let json = serde_json::to_string(&persisted).expect("serialisierbar");
+        let back: PersistedFlightStats =
+            serde_json::from_str(&json).expect("deserialisierbar");
+
+        let mut restored = FlightStats::default();
+        back.apply_to(&mut restored);
+
+        assert_eq!(
+            restored.canonical_vs_stddev_fpm(),
+            Some(180.0),
+            "nach dem Neustart muss die Bewertung aus DEMSELBEN Fenster kommen",
+        );
+        assert_eq!(restored.canonical_bank_stddev_deg(), Some(1.0));
     }
 
     #[test]
