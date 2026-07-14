@@ -508,7 +508,10 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
         },
       });
     }
-    // Hauptrollwege — gruen, kraeftig, darueber.
+    // Hauptrollwege — gruen. Farbcodierte Rollwege (Muenchen) in ihrer
+    // BODENFARBE: kraeftiges Blau bzw. Orange, damit man der Linie folgen kann
+    // wie am echten Platz ("folge der blauen Linie zum Gate"). Nur das Label zu
+    // faerben war zu unauffaellig — der Pilot orientiert sich an der Linie.
     if (!map.getLayer(LYR_GROUND_TAXI)) {
       map.addLayer({
         id: LYR_GROUND_TAXI,
@@ -518,9 +521,16 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
         filter: ["==", ["get", "k"], "taxiway"],
         layout: { "line-cap": "round", "line-join": "round" },
         paint: {
-          "line-color": "#4ade80",
+          "line-color": [
+            "case",
+            ["==", ["get", "c"], "blue"],
+            "#3b82f6",
+            ["==", ["get", "c"], "orange"],
+            "#f97316",
+            "#4ade80",
+          ],
           "line-width": ["interpolate", ["linear"], ["zoom"], 12, 1.2, 16, 3.5, 18, 6],
-          "line-opacity": 0.9,
+          "line-opacity": 0.95,
         },
       });
     }
