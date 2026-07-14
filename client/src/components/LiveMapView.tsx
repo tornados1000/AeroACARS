@@ -469,7 +469,7 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
     }
     // Zwei Kategorien, nach FUNKTION getrennt — nicht nach OSM-Tag.
     //
-    // v0.21.0-beta.4: Die Farbe nach dem Tag zu richten war doppelt falsch.
+    // Die Farbe nach dem Tag zu richten war doppelt falsch.
     // Erst waren Berlin (taxilane) gruen und Hamburg (parking_position) blau —
     // dieselbe Sache, zwei Farben. Dann habe ich ALLES gruen gemacht, und schon
     // war der Stand nicht mehr vom Rollweg zu unterscheiden.
@@ -622,11 +622,11 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
         },
       });
     }
-    // v0.21.0-beta.3: Der fruehere blaue Stand-LINIEN-Layer ist weg. Die
+    // Der fruehere separate blaue Stand-LINIEN-Layer ist weg. Die
     // parking_position-Linien sind die Zuwegung zum Stand — worauf man rollt.
-    // Die gehoeren jetzt zum gruenen Rollweg-Layer (siehe IS_ROLLWEG oben),
-    // sonst zeichneten wir dieselbe Linie doppelt: gruen UND blau. Blau bleibt
-    // allein die Stand-Markierung selbst — Punkt und Nummer.
+    // Sie werden jetzt vom blauen Stand-Bereich-Layer gezeichnet (IS_STAND_LANE
+    // oben), zusammen mit den taxilanes. So bleibt der Stand-Bereich klar vom
+    // gruenen Hauptrollweg getrennt und keine Linie wird doppelt gezeichnet.
     if (!map.getLayer(LYR_GROUND_STANDS)) {
       map.addLayer({
         id: LYR_GROUND_STANDS,
