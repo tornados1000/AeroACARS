@@ -675,9 +675,26 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
           "symbol-spacing": 220,
         },
         paint: {
-          "text-color": "#eaf5ec",
-          "text-halo-color": "#14532d",
-          "text-halo-width": 1.6,
+          // Farbcodierte Rollwege (Muenchen): das Label traegt die Bodenfarbe,
+          // damit man "W1 blau" von "W1 orange" unterscheidet — genau das, was
+          // der Pilot am Boden sieht. Ohne Farbe: das uebliche Gruen.
+          "text-color": [
+            "case",
+            ["==", ["get", "c"], "blue"],
+            "#93c5fd",
+            ["==", ["get", "c"], "orange"],
+            "#fdba74",
+            "#eaf5ec",
+          ],
+          "text-halo-color": [
+            "case",
+            ["==", ["get", "c"], "blue"],
+            "#1e3a8a",
+            ["==", ["get", "c"], "orange"],
+            "#7c2d12",
+            "#14532d",
+          ],
+          "text-halo-width": 1.8,
         },
       });
     }
