@@ -195,10 +195,10 @@ const LYR_GROUND_TAXI = "aa-ground-taxi";
 const LYR_GROUND_TAXI_LABELS = "aa-ground-taxi-labels";
 const LYR_GROUND_RWY = "aa-ground-runway";
 const LYR_GROUND_STANDS = "aa-ground-stands";
-const LYR_GROUND_STAND_LINES = "aa-ground-stand-lines";
 const LYR_GROUND_STAND_LABELS = "aa-ground-stand-labels";
 const LYR_GROUND_TERMINAL = "aa-ground-terminal";
 const LYR_GROUND_HOLD = "aa-ground-holding";
+const LYR_GROUND_RWY_LABELS = "aa-ground-runway-labels";
 const GROUND_MIN_ZOOM = 12;
 
 interface Props {
@@ -466,31 +466,59 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
         },
       });
     }
+    // Alles, worauf man ROLLT, ist gruen — Hauptrollwege kraeftig, Vorfeld duenn.
+    //
+    // v0.21.0-beta.3: Vorher richtete sich die Farbe nach dem OSM-Tag, und das
+    // ergab Unsinn. Berlin taggt die Zuwege auf dem Vorfeld als `taxilane`
+    // (109 Stueck), Hamburg kennt gar keine — dort tragen DIESELBEN Linien den
+    // Tag `parking_position`. Ergebnis: in Berlin gruen, in Hamburg blau. Ein
+    // Pilot, der beides fliegt, sieht dieselbe Sache in zwei Farben, je nachdem
+    // wer den Flughafen gemappt hat.
+    //
+    // Also nach der FRAGE einfaerben, die der Pilot stellt — "worauf rolle ich?"
+    // — und nicht danach, wie OSM es zufaellig benannt hat. Blau bleibt allein
+    // die Standplatz-Markierung: Punkt und Nummer.
+    const IS_ROLLWEG: maplibregl.FilterSpecification = [
+      "any",
+      ["in", ["get", "k"], ["literal", ["taxiway", "taxilane"]]],
+      // parking_position als LINIE ist die Zuwegung zum Stand — da rollt man.
+      // Als Punkt ist es der Stand selbst; der gehoert zu den blauen.
+      [
+        "all",
+        ["==", ["get", "k"], "parking_position"],
+        ["==", ["geometry-type"], "LineString"],
+      ],
+    ];
+    /** Hauptrollweg (dick) oder Vorfeld-Zuwegung (duenn)? */
+    const IS_APRON_LANE: maplibregl.ExpressionSpecification = [
+      "!=",
+      ["get", "k"],
+      "taxiway",
+    ];
     if (!map.getLayer(LYR_GROUND_TAXI)) {
       map.addLayer({
         id: LYR_GROUND_TAXI,
         type: "line",
         source: SRC_GROUND,
         minzoom: GROUND_MIN_ZOOM,
-        filter: ["in", ["get", "k"], ["literal", ["taxiway", "taxilane"]]],
+        filter: IS_ROLLWEG,
         layout: { "line-cap": "round", "line-join": "round" },
         paint: {
           "line-color": "#4ade80",
-          // Vorfeld-Rollmarkierungen duenner als die Hauptrollwege — auf dem
-          // Vorfeld liegen sie dicht an dicht und wuerden sonst zu einem
-          // gruenen Teppich verschmelzen.
+          // Vorfeld-Zuwegungen duenner als die Hauptrollwege — sie liegen dicht
+          // an dicht und wuerden sonst zu einem gruenen Teppich verschmelzen.
           "line-width": [
             "interpolate",
             ["linear"],
             ["zoom"],
             12,
-            ["case", ["==", ["get", "k"], "taxilane"], 0.5, 1.2],
+            ["case", IS_APRON_LANE, 0.5, 1.2],
             16,
-            ["case", ["==", ["get", "k"], "taxilane"], 1.5, 3.5],
+            ["case", IS_APRON_LANE, 1.5, 3.5],
             18,
-            ["case", ["==", ["get", "k"], "taxilane"], 2.5, 6],
+            ["case", IS_APRON_LANE, 2.5, 6],
           ],
-          "line-opacity": ["case", ["==", ["get", "k"], "taxilane"], 0.55, 0.9],
+          "line-opacity": ["case", IS_APRON_LANE, 0.6, 0.9],
         },
       });
     }
@@ -506,6 +534,34 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
           "line-color": sat ? "#e8edf2" : "#c9ccd1",
           "line-width": ["interpolate", ["linear"], ["zoom"], 12, 3, 16, 12, 18, 24],
           "line-opacity": sat ? 0.75 : 0.9,
+        },
+      });
+    }
+    // Bahn-Bezeichnung ("05/23") entlang der Bahn. OSM hat sie im `r`-Feld — wir
+    // luden sie ohnehin schon mit, zeigten sie nur nicht. Weiss auf schwarzem
+    // Halo, damit sie auf dem hellen Bahn-Beton (Satellit) UND auf der dunklen
+    // Karte lesbar bleibt.
+    if (!map.getLayer(LYR_GROUND_RWY_LABELS)) {
+      map.addLayer({
+        id: LYR_GROUND_RWY_LABELS,
+        type: "symbol",
+        source: SRC_GROUND,
+        minzoom: GROUND_MIN_ZOOM,
+        filter: ["all", ["==", ["get", "k"], "runway"], ["has", "r"]],
+        layout: {
+          "symbol-placement": "line",
+          "text-field": ["get", "r"],
+          "text-font": ["Open Sans Bold", "Arial Unicode MS Bold"],
+          "text-size": ["interpolate", ["linear"], ["zoom"], 12, 11, 16, 16, 18, 20],
+          "text-letter-spacing": 0.1,
+          "text-allow-overlap": false,
+          "symbol-spacing": 400,
+          "text-keep-upright": true,
+        },
+        paint: {
+          "text-color": "#ffffff",
+          "text-halo-color": "#0b0f16",
+          "text-halo-width": 2,
         },
       });
     }
@@ -526,32 +582,11 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
         },
       });
     }
-    // Standplaetze — MIT den Linien.
-    //
-    // In OSM liegt ein Standplatz meist als LINIE vor (die Rollmarkierung zum
-    // Stand), nicht als Punkt: in EDDF sind es 436 Linien gegen 111 Punkte.
-    // Der erste Wurf filterte auf `geometry-type == Point` und liess damit vier
-    // Fuenftel der Staende verschwinden — ausgerechnet auf dem Vorfeld, wo die
-    // Karte am meisten helfen soll.
-    if (!map.getLayer(LYR_GROUND_STAND_LINES)) {
-      map.addLayer({
-        id: LYR_GROUND_STAND_LINES,
-        type: "line",
-        source: SRC_GROUND,
-        minzoom: 14,
-        filter: [
-          "all",
-          ["==", ["get", "k"], "parking_position"],
-          ["==", ["geometry-type"], "LineString"],
-        ],
-        layout: { "line-cap": "round" },
-        paint: {
-          "line-color": "#60a5fa",
-          "line-width": ["interpolate", ["linear"], ["zoom"], 14, 0.8, 18, 2.5],
-          "line-opacity": 0.75,
-        },
-      });
-    }
+    // v0.21.0-beta.3: Der fruehere blaue Stand-LINIEN-Layer ist weg. Die
+    // parking_position-Linien sind die Zuwegung zum Stand — worauf man rollt.
+    // Die gehoeren jetzt zum gruenen Rollweg-Layer (siehe IS_ROLLWEG oben),
+    // sonst zeichneten wir dieselbe Linie doppelt: gruen UND blau. Blau bleibt
+    // allein die Stand-Markierung selbst — Punkt und Nummer.
     if (!map.getLayer(LYR_GROUND_STANDS)) {
       map.addLayer({
         id: LYR_GROUND_STANDS,
