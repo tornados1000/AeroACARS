@@ -206,6 +206,105 @@ pub async fn get_airport(
         .map_err(|e| NavdataError::BadResponse(format!("parse NavAirport: {e}")))
 }
 
+fn ground_url(base: &str, icao: &str) -> String {
+    format!(
+        "{}/api/airports/{}/ground",
+        base.trim_end_matches('/'),
+        icao.trim().to_uppercase()
+    )
+}
+
+/// Bodendaten eines Flughafens fuer die Taxi-Karte (GeoJSON, roh).
+///
+/// v0.21: Rollwege, Vorfeld-Rollmarkierungen, Bahnen, Haltepunkte und
+/// Standplaetze — Quelle OpenStreetMap (ODbL), auf dem VPS gespiegelt.
+///
+/// Wird als **roher String** zurueckgegeben und nicht geparst: Rust muss die
+/// Geometrie nicht verstehen, die Karte im Frontend zeichnet sie direkt. Ein
+/// Parse hier waere reine Arbeit ohne Nutzen — und eine weitere Stelle, an der
+/// sich das Format einschleichen koennte.
+///
+/// `etag` erspart den Neu-Download: der Aufrufer schickt den ETag der Fassung,
+/// die er schon hat. Antwortet der Server mit 304, ist die lokale Kopie aktuell
+/// (`Ok(None)`). Ein Flughafen ist zwar klein (EDDF = 71 kB gzip), aber ihn bei
+/// jedem Flugstart erneut zu ziehen waere Verschwendung — und ohne Netz waere
+/// die Karte dann weg.
+pub async fn get_airport_ground(
+    icao: &str,
+    base: Option<&str>,
+    auth_token: Option<&str>,
+    known_etag: Option<&str>,
+) -> std::result::Result<Option<AirportGround>, NavdataError> {
+    let base = base.unwrap_or(DEFAULT_NAVDATA_BASE);
+    let url = ground_url(base, icao);
+    let client = build_client().map_err(|e| NavdataError::Network(e.to_string()))?;
+
+    let mut req = client.get(&url);
+    if let Some(token) = auth_token {
+        req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    if let Some(tag) = known_etag {
+        req = req.header(reqwest::header::IF_NONE_MATCH, tag);
+    }
+
+    let response = req.send().await?;
+    let status = response.status();
+
+    // 304 = unsere lokale Kopie ist noch aktuell.
+    if status.as_u16() == 304 {
+        return Ok(None);
+    }
+    if status.as_u16() == 404 {
+        return Err(NavdataError::NotFound(icao.to_uppercase()));
+    }
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        return Err(NavdataError::Unauthorized);
+    }
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(NavdataError::Server {
+            status: status.as_u16(),
+            body: body.chars().take(400).collect(),
+        });
+    }
+
+    let etag = response
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    let geojson = response
+        .text()
+        .await
+        .map_err(|e| NavdataError::BadResponse(format!("read body: {e}")))?;
+
+    // Nur die grobe Form pruefen — nicht die Geometrie. Wenn hier kein
+    // GeoJSON ankommt, soll das auffallen, bevor die Karte es zu zeichnen
+    // versucht.
+    if !geojson.contains("\"FeatureCollection\"") {
+        return Err(NavdataError::BadResponse(
+            "keine FeatureCollection".to_string(),
+        ));
+    }
+
+    Ok(Some(AirportGround {
+        icao: icao.trim().to_uppercase(),
+        geojson,
+        etag,
+    }))
+}
+
+/// Bodendaten eines Flughafens, wie sie der Client zwischenspeichert.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AirportGround {
+    pub icao: String,
+    /// Rohes GeoJSON — die Karte zeichnet es direkt.
+    pub geojson: String,
+    /// Fassung, die wir haben. Beim naechsten Mal mitschicken → 304 statt 71 kB.
+    pub etag: Option<String>,
+}
+
 /// One VPS-managed aircraft-type-alias mapping (one Bid-ICAO to one
 /// substring the sim might report). v0.8.0 Erweiterung — bisher waren
 /// Aliases hardcoded in `runway::aircraft_aliases`; jetzt kann der

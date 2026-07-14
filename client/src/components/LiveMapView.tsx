@@ -181,6 +181,23 @@ const LYR_TRACK = "aa-flown-track-line";
 const LYR_TRACK_DOTS = "aa-flown-track-dots-circles";
 const LYR_ROUTE_CASING = "aa-planned-route-casing"; // dunkle Unterlage nur auf Satellit
 
+// ─── v0.21: Taxi-Karte (Flughafen-Bodendaten) ────────────────────────────
+//
+// Rollwege, Haltepunkte und Standplaetze aus OpenStreetMap (ODbL), auf dem VPS
+// gespiegelt. Der Layer liegt UNTER Route und Track — die Taxi-Karte ist der
+// Untergrund, auf dem man rollt, nicht die Hauptsache.
+//
+// Sichtbar erst ab Zoom 12: darueber ist man im Anflug oder Reiseflug, da
+// stoert das Rollweg-Gewirr nur. Beim Rollen zoomt man ohnehin nah heran.
+const SRC_GROUND = "aa-ground";
+const LYR_GROUND_APRON = "aa-ground-apron";
+const LYR_GROUND_TAXI = "aa-ground-taxi";
+const LYR_GROUND_TAXI_LABELS = "aa-ground-taxi-labels";
+const LYR_GROUND_RWY = "aa-ground-runway";
+const LYR_GROUND_STANDS = "aa-ground-stands";
+const LYR_GROUND_HOLD = "aa-ground-holding";
+const GROUND_MIN_ZOOM = 12;
+
 interface Props {
   activeFlight: ActiveFlightInfo | null;
   simSnapshot: SimSnapshot | null;
@@ -189,6 +206,10 @@ interface Props {
 export function LiveMapView({ activeFlight, simSnapshot }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
+  // v0.21: Bodendaten der Taxi-Karte. Ref (nicht State), weil `addOverlays`
+  // sie beim Basemap-Wechsel braucht — und das laeuft ausserhalb des Renders.
+  const groundRef = useRef<GeoJSON.FeatureCollection | null>(null);
+  const [groundLoaded, setGroundLoaded] = useState<string[]>([]);
   const acMarkerRef = useRef<maplibregl.Marker | null>(null);
   const pinMarkersRef = useRef<maplibregl.Marker[]>([]);
   const vaMarkersRef = useRef<maplibregl.Marker[]>([]);
@@ -408,6 +429,147 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
     const textColor = sat ? "#f4f7fc" : cssVar("--text", "#e8edf2");
     const warning = cssVar("--warning", "#ff9f0a");
     const empty: GeoJSON.FeatureCollection = { type: "FeatureCollection", features: [] };
+
+    // ── Taxi-Karte ────────────────────────────────────────────────────────
+    //
+    // ZUERST hinzufuegen: MapLibre stapelt in Reihenfolge, und die Bodendaten
+    // sind der Untergrund. Route, Track und das eigene Flugzeug gehoeren
+    // darueber.
+    //
+    // Farben: auf Satellit dieselbe Behandlung wie auf der dunklen Karte (siehe
+    // `sat` oben) — helle Linien, dunkle Halos. Das Rollweg-Gruen ist bewusst
+    // kraeftig: es muss sowohl auf grauem Beton (Satellit) als auch auf der
+    // dunklen Karte stehen.
+    if (!map.getSource(SRC_GROUND)) {
+      map.addSource(SRC_GROUND, {
+        type: "geojson",
+        data: groundRef.current ?? empty,
+        // ODbL verlangt Namensnennung. An der Quelle statt irgendwo im UI:
+        // so kann sie nicht vergessen werden, wenn jemand die Karte umbaut.
+        attribution: "Bodendaten © OpenStreetMap contributors (ODbL)",
+      });
+    }
+    if (!map.getLayer(LYR_GROUND_APRON)) {
+      map.addLayer({
+        id: LYR_GROUND_APRON,
+        type: "line",
+        source: SRC_GROUND,
+        minzoom: GROUND_MIN_ZOOM,
+        filter: ["==", ["get", "k"], "apron"],
+        paint: {
+          "line-color": sat ? "#8aa0b4" : "#3a4a5c",
+          "line-width": 1,
+          "line-opacity": sat ? 0.5 : 0.7,
+        },
+      });
+    }
+    if (!map.getLayer(LYR_GROUND_TAXI)) {
+      map.addLayer({
+        id: LYR_GROUND_TAXI,
+        type: "line",
+        source: SRC_GROUND,
+        minzoom: GROUND_MIN_ZOOM,
+        filter: ["in", ["get", "k"], ["literal", ["taxiway", "taxilane"]]],
+        layout: { "line-cap": "round", "line-join": "round" },
+        paint: {
+          "line-color": "#4ade80",
+          // Vorfeld-Rollmarkierungen duenner als die Hauptrollwege — auf dem
+          // Vorfeld liegen sie dicht an dicht und wuerden sonst zu einem
+          // gruenen Teppich verschmelzen.
+          "line-width": [
+            "interpolate",
+            ["linear"],
+            ["zoom"],
+            12,
+            ["case", ["==", ["get", "k"], "taxilane"], 0.5, 1.2],
+            16,
+            ["case", ["==", ["get", "k"], "taxilane"], 1.5, 3.5],
+            18,
+            ["case", ["==", ["get", "k"], "taxilane"], 2.5, 6],
+          ],
+          "line-opacity": ["case", ["==", ["get", "k"], "taxilane"], 0.55, 0.9],
+        },
+      });
+    }
+    if (!map.getLayer(LYR_GROUND_RWY)) {
+      map.addLayer({
+        id: LYR_GROUND_RWY,
+        type: "line",
+        source: SRC_GROUND,
+        minzoom: GROUND_MIN_ZOOM,
+        filter: ["==", ["get", "k"], "runway"],
+        layout: { "line-cap": "butt" },
+        paint: {
+          "line-color": sat ? "#e8edf2" : "#c9ccd1",
+          "line-width": ["interpolate", ["linear"], ["zoom"], 12, 3, 16, 12, 18, 24],
+          "line-opacity": sat ? 0.75 : 0.9,
+        },
+      });
+    }
+    if (!map.getLayer(LYR_GROUND_STANDS)) {
+      map.addLayer({
+        id: LYR_GROUND_STANDS,
+        type: "circle",
+        source: SRC_GROUND,
+        minzoom: 14,
+        filter: [
+          "all",
+          ["in", ["get", "k"], ["literal", ["gate", "parking_position"]]],
+          ["==", ["geometry-type"], "Point"],
+        ],
+        paint: {
+          "circle-radius": ["interpolate", ["linear"], ["zoom"], 14, 1.5, 18, 4],
+          "circle-color": "#60a5fa",
+          "circle-opacity": 0.8,
+        },
+      });
+    }
+    // Haltepunkte vor der Bahn — beim Rollen das Wichtigste ueberhaupt.
+    // Deshalb gelb und mit Rand, damit sie auf jedem Untergrund herausstechen.
+    if (!map.getLayer(LYR_GROUND_HOLD)) {
+      map.addLayer({
+        id: LYR_GROUND_HOLD,
+        type: "circle",
+        source: SRC_GROUND,
+        minzoom: 13,
+        filter: ["==", ["get", "k"], "holding_position"],
+        paint: {
+          "circle-radius": ["interpolate", ["linear"], ["zoom"], 13, 2, 18, 6],
+          "circle-color": "#facc15",
+          "circle-stroke-color": "#0b0f16",
+          "circle-stroke-width": 1,
+          "circle-opacity": 0.95,
+        },
+      });
+    }
+    if (!map.getLayer(LYR_GROUND_TAXI_LABELS)) {
+      map.addLayer({
+        id: LYR_GROUND_TAXI_LABELS,
+        type: "symbol",
+        source: SRC_GROUND,
+        minzoom: 14,
+        filter: [
+          "all",
+          ["==", ["get", "k"], "taxiway"],
+          ["has", "r"],
+        ],
+        layout: {
+          "symbol-placement": "line",
+          "text-field": ["get", "r"],
+          "text-font": ["Open Sans Regular", "Arial Unicode MS Regular"],
+          "text-size": ["interpolate", ["linear"], ["zoom"], 14, 9, 18, 14],
+          "text-allow-overlap": false,
+          "text-padding": 4,
+          "symbol-spacing": 220,
+        },
+        paint: {
+          "text-color": "#eaf5ec",
+          "text-halo-color": "#14532d",
+          "text-halo-width": 1.6,
+        },
+      });
+    }
+
     if (!map.getSource(SRC_ROUTE)) map.addSource(SRC_ROUTE, { type: "geojson", data: empty });
     if (!map.getSource(SRC_WPTS)) map.addSource(SRC_WPTS, { type: "geojson", data: empty });
     if (!map.getSource(SRC_TRACK)) map.addSource(SRC_TRACK, { type: "geojson", data: empty });
@@ -662,6 +824,62 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
       cancelled = true;
     };
   }, [activeFlight?.dpt_airport, activeFlight?.arr_airport, activeFlight]);
+
+  // ---- Taxi-Karte: Bodendaten fuer Start- und Zielflughafen laden ----
+  //
+  // v0.21. Geladen wird beim Flugstart — beide Flughaefen auf einmal, damit die
+  // Karte auch nach der Landung sofort steht (da will man sie am dringendsten,
+  // beim Rollen zum Gate an einem fremden Platz).
+  //
+  // Rust cached lokal: beim zweiten Mal kommt ein 304 und es wird nichts
+  // uebertragen; ohne Netz kommt die Karte aus der Kopie auf der Platte. Fehlt
+  // der Flughafen auf dem VPS, ist das kein Fehler — bisher sind nur eine
+  // Handvoll importiert. Dann bleibt die Karte einfach ohne Rollwege, statt
+  // eine Fehlermeldung ins Cockpit zu werfen.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+
+    const icaos = [activeFlight?.dpt_airport, activeFlight?.arr_airport]
+      .map((s) => (s ?? "").trim().toUpperCase())
+      .filter((s) => s.length >= 3 && s.length <= 5);
+    if (icaos.length === 0) return;
+
+    let cancelled = false;
+    void (async () => {
+      const features: GeoJSON.Feature[] = [];
+      const got: string[] = [];
+      for (const icao of Array.from(new Set(icaos))) {
+        try {
+          const r = await invoke<{ icao: string; geojson: string } | null>(
+            "airport_ground_get",
+            { icao },
+          );
+          if (!r?.geojson) continue;
+          const fc = JSON.parse(r.geojson) as GeoJSON.FeatureCollection;
+          if (Array.isArray(fc.features)) {
+            features.push(...fc.features);
+            got.push(r.icao);
+          }
+        } catch {
+          // Kein Netz, kein Token, Flughafen nicht importiert: kein Drama.
+        }
+      }
+      if (cancelled) return;
+      const fc: GeoJSON.FeatureCollection = {
+        type: "FeatureCollection",
+        features,
+      };
+      groundRef.current = fc;
+      setGroundLoaded(got);
+      const src = map.getSource(SRC_GROUND) as maplibregl.GeoJSONSource | undefined;
+      src?.setData(fc);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeFlight?.dpt_airport, activeFlight?.arr_airport, mapReady]);
 
   // ---- Redraw: eigener Flug (Quellen + Flugzeug-Marker + Pins) ----
   // Läuft immer; VA-Flieger liegen als zusätzliche Marker mit drauf (eigene Effekte).
@@ -954,6 +1172,13 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
             <Stat label="ETA" value={nav.eta} />
             <Stat label="PHASE" value={phaseLabel} />
             <Stat label="POS" value={effAircraft ? `${effAircraft.lat.toFixed(2)}/${effAircraft.lon.toFixed(2)}` : "—"} />
+            {/* v0.21: Ist die Taxi-Karte fuer diesen Platz ueberhaupt da? Der
+                Pilot soll das WISSEN und nicht raten muessen, wenn beim
+                Reinzoomen keine Rollwege auftauchen — bisher sind nur eine
+                Handvoll Flughaefen importiert. */}
+            {groundLoaded.length > 0 && (
+              <Stat label="TAXI" value={groundLoaded.join(" · ")} />
+            )}
           </div>
         )}
 

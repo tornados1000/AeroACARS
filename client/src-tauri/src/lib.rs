@@ -8878,6 +8878,84 @@ pub struct AirportInfo {
     lon: Option<f64>,
 }
 
+/// Bodendaten eines Flughafens fuer die Taxi-Karte.
+///
+/// v0.21: Rollwege, Haltepunkte und Standplaetze aus OpenStreetMap (ODbL), auf
+/// dem VPS gespiegelt. Die Karte im Frontend zeichnet das GeoJSON direkt — Rust
+/// reicht es nur durch und legt es auf die Platte.
+///
+/// **Der Cache ist der Punkt.** Ein Flughafen ist klein (EDDF = 71 kB gzip),
+/// aber:
+///   * Beim zweiten Start schickt der Client den ETag mit; antwortet der Server
+///     mit 304, wird nichts uebertragen.
+///   * Ohne Netz kommt die Karte aus der lokalen Kopie. Genau dann, im Cockpit
+///     mit wackligem WLAN, will man sie nicht verlieren.
+///
+/// Fehlt der Flughafen auf dem VPS (404), ist das kein Fehler, sondern die
+/// Regel: bisher sind nur eine Handvoll importiert. Die Karte zeigt dann
+/// schlicht keine Rollwege, statt eine Fehlermeldung ins Cockpit zu werfen.
+#[tauri::command]
+async fn airport_ground_get(
+    app: AppHandle,
+    icao: String,
+) -> Result<Option<aeroacars_mqtt::navdata::AirportGround>, UiError> {
+    let key = icao.trim().to_uppercase();
+    if key.len() < 3 || key.len() > 5 {
+        return Err(UiError::new("invalid_icao", "ungueltiger ICAO-Code"));
+    }
+
+    let cache_path = app
+        .path()
+        .app_data_dir()
+        .map(|d| d.join("ground").join(format!("{key}.json")))
+        .ok();
+
+    // Was liegt lokal? Der ETag daraus erspart den Neu-Download.
+    let cached: Option<aeroacars_mqtt::navdata::AirportGround> = cache_path
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok());
+
+    let token = secrets::load_api_key(MQTT_KEYRING_PASSWORD)
+        .ok()
+        .flatten();
+    let known_etag = cached.as_ref().and_then(|c| c.etag.clone());
+
+    match aeroacars_mqtt::navdata::get_airport_ground(
+        &key,
+        None,
+        token.as_deref(),
+        known_etag.as_deref(),
+    )
+    .await
+    {
+        // 304 → unsere Kopie ist aktuell.
+        Ok(None) => Ok(cached),
+        Ok(Some(fresh)) => {
+            if let Some(p) = cache_path {
+                if let Some(dir) = p.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                if let Ok(s) = serde_json::to_string(&fresh) {
+                    let _ = std::fs::write(&p, s);
+                }
+            }
+            Ok(Some(fresh))
+        }
+        // Kein Netz, kein Token, Server weg: die lokale Kopie ist besser als
+        // nichts. Nur wenn wir auch die nicht haben, gibt es keine Karte.
+        Err(e) => {
+            if cached.is_some() {
+                tracing::debug!(icao = %key, error = %e, "Bodendaten: nutze lokale Kopie");
+                Ok(cached)
+            } else {
+                tracing::debug!(icao = %key, error = %e, "Bodendaten nicht verfuegbar");
+                Ok(None)
+            }
+        }
+    }
+}
+
 /// Fetch an airport by ICAO, caching the result so we don't re-hit the network
 /// on each sim snapshot.
 #[tauri::command]
@@ -31991,6 +32069,7 @@ pub fn run() {
             sim_force_resync,
             pmdg_status,
             airport_get,
+            airport_ground_get,
             flight_status,
             flight_get_route_fixes,
             flight_get_track,
