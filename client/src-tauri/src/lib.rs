@@ -2939,6 +2939,9 @@ struct FlightStats {
     /// Bank-Stddev ueber 1000-ft-Gate, gefiltert: Samples aus Vector-
     /// Windows (= 5 sec nach RWY-Change) ausgenommen.
     approach_bank_stddev_filtered_deg: Option<f32>,
+    /// v0.20.1: Gegenstueck zur gefilterten Bank-Streuung — dasselbe Fenster,
+    /// derselbe Vektor-Filter, dieselbe Mindest-Stichprobe.
+    approach_vs_stddev_filtered_fpm: Option<f32>,
     /// True wenn waehrend Approach/Final eine RWY-Aenderung beobachtet
     /// wurde mit AGL < 1500 ft (= "late RWY change", Pilot wurde zu
     /// Maneuver gezwungen, score-relevante Beruecksichtigung).
@@ -4344,7 +4347,50 @@ pub struct ApproachBufferSample {
     pub stall_warning: bool,
 }
 
+/// Obergrenze fuer eine physikalisch moegliche Sinkrate im Anflug.
+///
+/// Ein Verkehrsflugzeug im Landeanflug sinkt mit 600-1500 fpm; selbst ein
+/// bewusst steiler Sinkflug bleibt unter 6000. Alles darueber ist kein
+/// Flugzustand, sondern ein Sim-Artefakt: Pause, Slew, Teleport, Ladebild,
+/// Positions-Sprung. Grosszuegig auf 10000 gesetzt — es geht nicht darum,
+/// schlechtes Fliegen wegzufiltern, sondern Werte, die keine Fluglage sind.
+const APPROACH_VS_PLAUSIBILITY_CAP_FPM: f32 = 10_000.0;
+
+/// Bank jenseits davon ist im Anflug ebenfalls kein Flugzustand mehr.
+const APPROACH_BANK_PLAUSIBILITY_CAP_DEG: f32 = 90.0;
+
+/// Ein Sample, das keine Fluglage beschreibt, gehoert nicht in den Puffer.
+///
+/// v0.20.1: Der Anflug-Puffer nahm bisher JEDES Sample ungefiltert. Ein
+/// einziger Glitch-Wert vergiftet danach alles, was daraus rechnet — Streuung,
+/// Jerk, Gleitpfad-Abweichung, Stabilitaets-Gate. Im VPS-Korpus (678 Landungen)
+/// stand deshalb eine Sinkraten-Streuung von **12.810 fpm**; solche Ausreisser
+/// ziehen einen Piloten grundlos auf 0 Punkte in der Anflug-Stabilitaet.
+///
+/// Gefiltert wird an der QUELLE, nicht in den einzelnen Formeln: sonst muesste
+/// jede kuenftige Auswertung den Filter erneut richtig hinschreiben — und genau
+/// so entstehen die Risse, die uns PIA3452 eingebrockt hat.
+fn approach_sample_is_plausible(snap: &SimSnapshot) -> bool {
+    let finite = snap.vertical_speed_fpm.is_finite()
+        && snap.bank_deg.is_finite()
+        && snap.altitude_agl_ft.is_finite()
+        && snap.groundspeed_kt.is_finite()
+        && snap.indicated_airspeed_kt.is_finite();
+    finite
+        && snap.vertical_speed_fpm.abs() <= APPROACH_VS_PLAUSIBILITY_CAP_FPM
+        && snap.bank_deg.abs() <= APPROACH_BANK_PLAUSIBILITY_CAP_DEG
+}
+
 fn push_approach_sample(stats: &mut FlightStats, snap: &SimSnapshot, now: DateTime<Utc>) {
+    if !approach_sample_is_plausible(snap) {
+        tracing::debug!(
+            vs_fpm = snap.vertical_speed_fpm,
+            bank_deg = snap.bank_deg,
+            agl_ft = snap.altitude_agl_ft,
+            "approach sample verworfen — keine plausible Fluglage (Sim-Artefakt)"
+        );
+        return;
+    }
     stats.approach_buffer.push_back(ApproachBufferSample {
         // Tick-Zeit vom Caller (step_flight_at) — nicht Utc::now(): sonst
         // trügen Replay-Läufe Wall-Clock-Timestamps im Approach-Buffer,
@@ -5425,6 +5471,17 @@ fn estimate_xplane_touchdown_vs_lua_style(
 const APPROACH_STABILITY_AGL_CAP_FT: f32 = 1500.0;
 const APPROACH_FLARE_CUTOFF_MS: i64 = 3000;
 
+/// Mindest-Stichprobe fuer eine Stabilitaets-Streuung.
+///
+/// v0.20.1: Vorher reichten 3 Samples. Im VPS-Korpus (678 Landungen) lieferten
+/// genau die duennen Fenster den Unsinn: bei 1-9 Samples war jede zweite
+/// V/S-Streuung ueber 1000 fpm, bei einem Flug 12.810. Eine Streuung aus einer
+/// Handvoll Ticks ist keine Aussage ueber den Anflug — sie ist Rauschen, das
+/// als Note beim Piloten ankommt. Unter dieser Grenze gibt es lieber KEINEN
+/// Wert (der Sub-Score wird dann als "nicht bewertet" uebersprungen) als eine
+/// erfundene Zahl.
+const STABILITY_MIN_SAMPLES: usize = 10;
+
 /// v0.16.6: sampler-path stability-evaluation window. When a validated 50 Hz
 /// sampler touchdown evaluates approach stability (bush flights — the FSM
 /// never reaches Landing), only approach-buffer samples within this many
@@ -5485,7 +5542,11 @@ fn compute_approach_stddev(
         })
         .collect();
     let n = filtered.len();
-    if n < 3 {
+    // v0.20.1: war 3. Eine Streuung aus einer Handvoll Ticks ist keine Aussage
+    // ueber den Anflug — im VPS-Korpus kam genau daher der 12.810-fpm-Unsinn.
+    // Lieber kein Wert (Sub-Score wird uebersprungen) als eine erfundene Zahl,
+    // die als Note beim Piloten landet.
+    if n < STABILITY_MIN_SAMPLES {
         return (None, None);
     }
     let mut sum_vs = 0.0_f64;
@@ -5578,6 +5639,10 @@ pub struct ApproachStabilityV2 {
     pub vs_deviation_fpm: Option<f32>,
     pub max_vs_deviation_below_500_fpm: Option<f32>,
     pub bank_stddev_filtered_deg: Option<f32>,
+    /// v0.20.1: V/S-Streuung aus DEMSELBEN Fenster wie `bank_stddev_filtered_deg`.
+    /// Der Stabilitaets-Sub-Score bewertet beide Achsen — sie muessen dieselbe
+    /// Messung sein, sonst ist die Note aus zwei Wirklichkeiten gemischt.
+    pub vs_stddev_filtered_fpm: Option<f32>,
     pub runway_changed_late: bool,
     pub stable_at_gate: Option<bool>,
     pub window_sample_count: u32,
@@ -5798,20 +5863,37 @@ fn compute_approach_stability_v2(
         out.max_vs_deviation_below_500_fpm = Some(max_dev_below_500);
     }
 
-    // 8) Bank-Stddev filtered.
-    let bank_filtered: Vec<f32> = gate_samples
+    // 8) Stddevs filtered — Bank UND V/S aus DEMSELBEN Fenster.
+    //
+    // v0.20.1: Die V/S-Streuung wurde bisher nur im Legacy-Pfad gerechnet —
+    // anderes Fenster (bis 1500 ft AGL statt 1000 ft HAT), ohne Vektor-Filter.
+    // Beide Werte flossen aber in DENSELBEN Stabilitaets-Sub-Score. Eine Formel
+    // aus zwei unvergleichbaren Messungen: im VPS-Korpus hatten 18 Landungen
+    // null Samples im v2-Fenster und trotzdem eine Legacy-V/S-Streuung.
+    //
+    // Beide Achsen teilen sich jetzt Fenster, Filter und Mindest-Stichprobe.
+    let vector_filtered: Vec<&ApproachBufferSample> = gate_samples
         .iter()
         .filter(|s| !in_vector_window(s.at))
-        .map(|s| s.bank_deg)
+        .copied()
         .collect();
-    if bank_filtered.len() >= 3 {
-        let n = bank_filtered.len() as f64;
-        let mean = bank_filtered.iter().map(|&b| b as f64).sum::<f64>() / n;
-        let var = bank_filtered.iter()
-            .map(|&b| (b as f64 - mean).powi(2))
-            .sum::<f64>() / n;
-        out.bank_stddev_filtered_deg = Some(var.sqrt() as f32);
-    }
+    let stddev_of = |vals: &[f32]| -> Option<f32> {
+        if vals.len() < STABILITY_MIN_SAMPLES {
+            return None;
+        }
+        let n = vals.len() as f64;
+        let mean = vals.iter().map(|&v| v as f64).sum::<f64>() / n;
+        let var = vals
+            .iter()
+            .map(|&v| (v as f64 - mean).powi(2))
+            .sum::<f64>()
+            / n;
+        Some(var.sqrt() as f32)
+    };
+    let banks: Vec<f32> = vector_filtered.iter().map(|s| s.bank_deg).collect();
+    let vss: Vec<f32> = vector_filtered.iter().map(|s| s.vs_fpm).collect();
+    out.bank_stddev_filtered_deg = stddev_of(&banks);
+    out.vs_stddev_filtered_fpm = stddev_of(&vss);
 
     // 9) Composite Stable-At-Gate Indikator.
     //    PRIMARY-Maße: jerk < 100 AND bank_sd < 5 AND ias_sd < 10
@@ -11773,6 +11855,24 @@ impl FlightStats {
         self.approach_bank_stddev_filtered_deg
             .or(self.approach_bank_stddev_deg)
     }
+
+    /// SSoT fuer die V/S-Streuung im Anflug — das Gegenstueck zu
+    /// `canonical_bank_stddev_deg()`.
+    ///
+    /// v0.20.1: Beide Achsen fliessen in DENSELBEN Stabilitaets-Sub-Score. Bis
+    /// v0.20.0 kam die Bank-Achse aus dem v2-Fenster (gefiltert, <= 1000 ft HAT)
+    /// und die V/S-Achse aus dem Legacy-Fenster (ungefiltert, <= 1500 ft AGL) —
+    /// eine Note, zusammengesetzt aus zwei nicht vergleichbaren Messungen.
+    ///
+    /// Gemessen am VPS-Korpus (224 rekonstruierte Anfluege): die Vereinheitlichung
+    /// verschiebt die V/S-Achse im Mittel um -1,4 Punkte, 83 % der Landungen
+    /// bleiben im selben Band. Es ist also KEIN Bugfix an der Bewertung — die
+    /// Bewertung war schon richtig. Es beseitigt, dass eine einzige Formel aus
+    /// zwei Wirklichkeiten rechnet.
+    pub fn canonical_vs_stddev_fpm(&self) -> Option<f32> {
+        self.approach_vs_stddev_filtered_fpm
+            .or(self.approach_vs_stddev_fpm)
+    }
 }
 
 /// v0.7.17 → v0.7.21 Shim: leitet auf `FlightStats::canonical_landing_
@@ -12061,7 +12161,7 @@ fn build_pirep_payload(
         scored_g_load: Some(score_g_for_stats(&stats).scored_g),
         // v0.7.6 P2-B: zentraler Helper statt direkten Read.
         bounce_count: Some(scored_bounce_count_for_score(&stats)),
-        approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
+        approach_vs_stddev_fpm: stats.canonical_vs_stddev_fpm(),
         approach_bank_stddev_deg: stats.canonical_bank_stddev_deg(),
         rollout_distance_m: stats
             .rollout_distance_m
@@ -12175,7 +12275,7 @@ fn build_pirep_payload(
             .map(|x| x.clamp(0, 100) as u8),
         // F7: Stability-v2-Felder (P2.1-A: bestehende
         // Backend-Felder exponieren)
-        approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
+        approach_vs_stddev_fpm: stats.canonical_vs_stddev_fpm(),
         approach_bank_stddev_deg: stats.canonical_bank_stddev_deg(),
         approach_vs_jerk_fpm: stats.approach_vs_jerk_fpm,
         approach_ias_stddev_kt: stats.approach_ias_stddev_kt,
@@ -12483,7 +12583,7 @@ fn compute_aggregate_master_score(
         scored_g_load: Some(score_g_for_stats(stats).scored_g),
         // v0.7.6 P2-B: zentraler Helper statt direkten Read.
         bounce_count: Some(scored_bounce_count_for_score(stats)),
-        approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
+        approach_vs_stddev_fpm: stats.canonical_vs_stddev_fpm(),
         approach_bank_stddev_deg: stats.canonical_bank_stddev_deg(),
         rollout_distance_m: stats.rollout_distance_m.map(|m| m as f32),
         planned_burn_kg: stats.planned_burn_kg,
@@ -12788,7 +12888,7 @@ where
         scored_g_load: Some(score_g_for_stats(stats).scored_g),
         // v0.7.6 P2-B: zentraler Helper statt direkten Read.
         bounce_count: Some(scored_bounce_count_for_score(stats)),
-        approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
+        approach_vs_stddev_fpm: stats.canonical_vs_stddev_fpm(),
         approach_bank_stddev_deg: stats.canonical_bank_stddev_deg(),
         rollout_distance_m: stats.rollout_distance_m.map(|m| m as f32),
         planned_burn_kg: stats.planned_burn_kg,
@@ -12983,7 +13083,7 @@ where
         headwind_kt: stats.landing_headwind_kt,
         crosswind_kt: stats.landing_crosswind_kt,
 
-        approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
+        approach_vs_stddev_fpm: stats.canonical_vs_stddev_fpm(),
         approach_bank_stddev_deg: stats.canonical_bank_stddev_deg(),
         rollout_distance_m: stats.rollout_distance_m,
 
@@ -18544,6 +18644,8 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
                                         stab_v2.max_vs_deviation_below_500_fpm;
                                     stats.approach_bank_stddev_filtered_deg =
                                         stab_v2.bank_stddev_filtered_deg;
+                                    stats.approach_vs_stddev_filtered_fpm =
+                                        stab_v2.vs_stddev_filtered_fpm;
                                     stats.approach_runway_changed_late =
                                         stab_v2.runway_changed_late;
                                     stats.approach_stable_at_gate = stab_v2.stable_at_gate;
@@ -20496,7 +20598,7 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                             planned_zfw_kg: stats.planned_zfw_kg,
                             planned_tow_kg: stats.planned_tow_kg,
                             rollout_distance_m: stats.rollout_distance_m.map(|d| d as f32),
-                            approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
+                            approach_vs_stddev_fpm: stats.canonical_vs_stddev_fpm(),
                             approach_bank_stddev_deg: stats.canonical_bank_stddev_deg(),
                             go_around_count: Some(stats.go_around_count),
                             arr_metar: stats.arr_metar_raw.clone(),
@@ -22554,6 +22656,7 @@ fn clear_approach_stability_and_rollout(stats: &mut FlightStats) {
     stats.approach_vs_deviation_fpm = None;
     stats.approach_max_vs_deviation_below_500_fpm = None;
     stats.approach_bank_stddev_filtered_deg = None;
+    stats.approach_vs_stddev_filtered_fpm = None;
     stats.approach_runway_changed_late = false;
     stats.approach_stable_at_gate = None;
     stats.approach_vs_jerk_fpm = None;
@@ -23995,6 +24098,7 @@ fn step_flight_at(
                 stats.approach_vs_deviation_fpm = stab_v2.vs_deviation_fpm;
                 stats.approach_max_vs_deviation_below_500_fpm = stab_v2.max_vs_deviation_below_500_fpm;
                 stats.approach_bank_stddev_filtered_deg = stab_v2.bank_stddev_filtered_deg;
+                stats.approach_vs_stddev_filtered_fpm = stab_v2.vs_stddev_filtered_fpm;
                 stats.approach_runway_changed_late = stab_v2.runway_changed_late;
                 stats.approach_stable_at_gate = stab_v2.stable_at_gate;
                 stats.approach_vs_jerk_fpm = stab_v2.vs_jerk_fpm;
@@ -27171,7 +27275,7 @@ fn build_pirep_fields(
     }
 
     // ---- Approach Stability + Rollout (Landing Analyzer Stage 1) ----
-    if let Some(sd) = stats.approach_vs_stddev_fpm {
+    if let Some(sd) = stats.canonical_vs_stddev_fpm() {
         f.insert("Approach V/S Stddev".into(), format!("{:.0} fpm", sd));
     }
     // v0.20.0: Kanonik — das Feld zeigte den rohen Legacy-Wert (ungefiltert,
@@ -27509,7 +27613,7 @@ fn build_pirep_notes(
             let _ = writeln!(s, "  Crosswind     {:.0} kt {}", xw.abs(), side);
         }
         let _ = writeln!(s, "  Bounces       {}", stats.bounce_count);
-        if let Some(sd) = stats.approach_vs_stddev_fpm {
+        if let Some(sd) = stats.canonical_vs_stddev_fpm() {
             let _ = writeln!(s, "  Apr V/S σ     {:.0} fpm", sd);
         }
         // v0.20.0: Kanonik (siehe build_pirep_fields).
@@ -27751,7 +27855,7 @@ fn build_pirep_notes(
         scored_g_load: Some(score_g_for_stats(stats).scored_g),
         // v0.7.6 P2-B: zentraler Helper statt direkten Read.
         bounce_count: Some(scored_bounce_count_for_score(stats)),
-        approach_vs_stddev_fpm: stats.approach_vs_stddev_fpm,
+        approach_vs_stddev_fpm: stats.canonical_vs_stddev_fpm(),
         approach_bank_stddev_deg: stats.canonical_bank_stddev_deg(),
         rollout_distance_m: stats.rollout_distance_m.map(|m| m as f32),
         planned_burn_kg: stats.planned_burn_kg,
@@ -32189,6 +32293,106 @@ mod canonical_landing_rate_fpm_tests {
     }
 
     #[test]
+    fn glitch_samples_kommen_nicht_in_den_anflug_puffer() {
+        // VPS-Korpus, Flug 127 (MSFS): Sinkraten-Streuung 12.810 fpm aus 7
+        // Samples. Kein Flugzustand, sondern ein Sim-Artefakt (Pause/Slew/
+        // Ladebild). Ein einziges solches Sample vergiftet Streuung, Jerk,
+        // Gleitpfad-Abweichung und Stabilitaets-Gate zugleich — deshalb wird
+        // an der QUELLE gefiltert, nicht in den einzelnen Formeln.
+        let mut snap = SimSnapshot::default();
+        snap.altitude_agl_ft = 800.0;
+        snap.groundspeed_kt = 140.0;
+        snap.indicated_airspeed_kt = 145.0;
+        snap.bank_deg = 2.0;
+
+        snap.vertical_speed_fpm = -750.0;
+        assert!(approach_sample_is_plausible(&snap), "normaler Anflug muss rein");
+
+        snap.vertical_speed_fpm = -30_000.0;
+        assert!(!approach_sample_is_plausible(&snap), "Slew/Teleport muss raus");
+
+        snap.vertical_speed_fpm = f32::NAN;
+        assert!(!approach_sample_is_plausible(&snap), "NaN muss raus");
+
+        snap.vertical_speed_fpm = f32::INFINITY;
+        assert!(!approach_sample_is_plausible(&snap), "Inf muss raus");
+
+        // Ein steiler, aber echter Sinkflug bleibt drin — wir filtern
+        // Artefakte, nicht schlechtes Fliegen. (Der LFMN-Flug mit -2000 fpm
+        // bis 750 ft SOLL seine schlechte Stabilitaets-Note bekommen.)
+        snap.vertical_speed_fpm = -2036.0;
+        assert!(
+            approach_sample_is_plausible(&snap),
+            "ein genuin steiler Anflug darf NICHT weggefiltert werden",
+        );
+
+        snap.vertical_speed_fpm = -750.0;
+        snap.bank_deg = 179.0;
+        assert!(!approach_sample_is_plausible(&snap), "Rueckenlage im Anflug = Artefakt");
+    }
+
+    #[test]
+    fn stabilitaets_streuung_braucht_eine_echte_stichprobe() {
+        // Im Korpus lieferten die duennen Fenster den Unsinn: bei 1-9 Samples
+        // war jede zweite V/S-Streuung ueber 1000 fpm. Unter der Mindest-
+        // Stichprobe gibt es KEINEN Wert — der Sub-Score wird uebersprungen,
+        // statt eine erfundene Zahl als Note auszuliefern.
+        let mk = |n: usize| {
+            let mut buf = std::collections::VecDeque::new();
+            let t0 = Utc::now();
+            for i in 0..n {
+                buf.push_back(ApproachBufferSample {
+                    at: t0 + chrono::Duration::seconds(i as i64),
+                    agl_ft: 900.0,
+                    msl_ft: 900.0,
+                    gs_kt: 140.0,
+                    ias_kt: 145.0,
+                    vs_fpm: -700.0 + (i % 3) as f32 * 20.0,
+                    bank_deg: 1.0,
+                    heading_true_deg: 90.0,
+                    gear_position: 1.0,
+                    flaps_position: 1.0,
+                    selected_runway: None,
+                    stall_warning: false,
+                });
+            }
+            compute_approach_stddev(&buf, None)
+        };
+        let (vs_thin, bank_thin) = mk(STABILITY_MIN_SAMPLES - 1);
+        assert_eq!(vs_thin, None, "zu duenne Stichprobe darf keinen Wert liefern");
+        assert_eq!(bank_thin, None);
+
+        let (vs_ok, bank_ok) = mk(STABILITY_MIN_SAMPLES + 5);
+        assert!(vs_ok.is_some(), "ausreichende Stichprobe muss bewertet werden");
+        assert!(bank_ok.is_some());
+    }
+
+    #[test]
+    fn vs_und_bank_streuung_kommen_aus_demselben_fenster() {
+        // Der Stabilitaets-Sub-Score bewertet beide Achsen. Bis v0.20.0 kam die
+        // Bank aus dem v2-Fenster (gefiltert, <= 1000 ft HAT) und die V/S aus dem
+        // Legacy-Fenster (ungefiltert, <= 1500 ft AGL) — eine Note aus zwei
+        // Wirklichkeiten. Im Korpus hatten 18 Landungen NULL Samples im v2-Fenster
+        // und trotzdem eine Legacy-V/S-Streuung.
+        let mut stats = FlightStats::default();
+        stats.approach_vs_stddev_fpm = Some(641.0); // legacy
+        stats.approach_bank_stddev_deg = Some(7.4);
+        stats.approach_vs_stddev_filtered_fpm = Some(180.0); // v2, dasselbe Fenster
+        stats.approach_bank_stddev_filtered_deg = Some(1.0);
+
+        assert_eq!(stats.canonical_vs_stddev_fpm(), Some(180.0));
+        assert_eq!(stats.canonical_bank_stddev_deg(), Some(1.0));
+
+        // Alt-Datensatz ohne v2-Felder: BEIDE fallen gemeinsam auf Legacy
+        // zurueck — niemals die eine Achse v2 und die andere legacy.
+        let mut old = FlightStats::default();
+        old.approach_vs_stddev_fpm = Some(641.0);
+        old.approach_bank_stddev_deg = Some(7.4);
+        assert_eq!(old.canonical_vs_stddev_fpm(), Some(641.0));
+        assert_eq!(old.canonical_bank_stddev_deg(), Some(7.4));
+    }
+
+    #[test]
     fn bank_stddev_kanonik_bevorzugt_den_gefilterten_v2_wert() {
         // Dieselbe Krankheit wie bei der Sinkrate, nur mit der Bank-Streuung:
         // legacy (ungefiltert, bis 1500 ft AGL) zaehlt absichtliche Anflug-
@@ -32298,19 +32502,29 @@ mod canonical_landing_rate_fpm_tests {
         // AGL) vs. v2 (vektor-gefiltert, bis 1000 ft HAT). Das Stabilitaets-Gate
         // rechnete aus v2, die PIREP-Felder zeigten legacy — Banner "instabil"
         // neben einer harmlos aussehenden Zahl.
+        // v0.20.1: BEIDE Achsen. Die Schranke deckte nur die Bank ab — deshalb
+        // konnte die V/S-Streuung munter aus einem anderen Fenster kommen, ohne
+        // dass ein Test umfiel. Eine Schranke, die nur die halbe Formel schuetzt,
+        // schuetzt die Formel nicht.
         for needle in [
             "fn build_pirep_fields(",
             "fn build_pirep_notes(",
             "fn build_pirep_payload(",
+            "fn compute_aggregate_master_score(",
         ] {
             let body = body_of(SRC, needle);
-            assert!(
-                !body.contains("stats.approach_bank_stddev_deg"),
-                "{needle} liest das Legacy-Rohfeld `approach_bank_stddev_deg` \
-                 direkt. Der Score bewertet den GEFILTERTEN Wert — eine Zahl \
-                 anzuzeigen, die nicht die bewertete ist, ist genau der Riss \
-                 aus PIA3452. Nutze `stats.canonical_bank_stddev_deg()`.",
-            );
+            for (raw, canonical) in [
+                ("stats.approach_bank_stddev_deg", "canonical_bank_stddev_deg()"),
+                ("stats.approach_vs_stddev_fpm", "canonical_vs_stddev_fpm()"),
+            ] {
+                assert!(
+                    !body.contains(raw),
+                    "{needle} liest das Legacy-Rohfeld `{raw}` direkt. Bank- und \
+                     V/S-Streuung fliessen in DENSELBEN Stabilitaets-Sub-Score — \
+                     sie muessen aus demselben Fenster kommen, sonst ist die Note \
+                     aus zwei Wirklichkeiten gemischt. Nutze `stats.{canonical}`.",
+                );
+            }
         }
 
         // ── Bewertung (Punkte, Klasse, Note) ────────────────────────────────
