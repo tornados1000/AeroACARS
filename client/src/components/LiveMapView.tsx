@@ -551,7 +551,7 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
         layout: {
           "symbol-placement": "line",
           "text-field": ["get", "r"],
-          "text-font": ["Open Sans Bold", "Arial Unicode MS Bold"],
+          "text-font": ["Open Sans Regular", "Arial Unicode MS Regular"],
           "text-size": ["interpolate", ["linear"], ["zoom"], 12, 11, 16, 16, 18, 20],
           "text-letter-spacing": 0.1,
           "text-allow-overlap": false,
