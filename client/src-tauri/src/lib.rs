@@ -24373,10 +24373,12 @@ fn step_flight_at(
                     let event = TouchdownEvent {
                         timestamp: touchdown,
                         kind: TouchdownKind::FinalLanding,
-                        peak_vs_fpm: stats
-                            .landing_peak_vs_fpm
-                            .or(stats.landing_rate_fpm)
-                            .unwrap_or(0.0),
+                        // v0.19.3: ueber die Kanonik. Hier, direkt am Touchdown,
+                        // liefert sie denselben Wert (der 50-Hz-Puffer-Dump
+                        // laeuft erst ~10 s spaeter, `landing_analysis` ist noch
+                        // leer) — aber die Kaskade von Hand nachzubauen ist
+                        // genau das Muster, aus dem der PIA3452-Split entstand.
+                        peak_vs_fpm: stats.canonical_landing_rate_fpm().unwrap_or(0.0),
                         peak_g: stats.landing_peak_g_force.unwrap_or(0.0),
                         lat: stats.landing_lat.unwrap_or(snap.lat),
                         lon: stats.landing_lon.unwrap_or(snap.lon),
@@ -27172,7 +27174,9 @@ fn build_pirep_fields(
     if let Some(sd) = stats.approach_vs_stddev_fpm {
         f.insert("Approach V/S Stddev".into(), format!("{:.0} fpm", sd));
     }
-    if let Some(sd) = stats.approach_bank_stddev_deg {
+    // v0.19.3: Kanonik — das Feld zeigte den rohen Legacy-Wert (ungefiltert,
+    // Fenster bis 1500 ft AGL), waehrend der Score den gefilterten bewertet.
+    if let Some(sd) = stats.canonical_bank_stddev_deg() {
         f.insert("Approach Bank Stddev".into(), format!("{:.1}°", sd));
     }
     if let Some(meters) = stats.rollout_distance_m {
@@ -27508,7 +27512,8 @@ fn build_pirep_notes(
         if let Some(sd) = stats.approach_vs_stddev_fpm {
             let _ = writeln!(s, "  Apr V/S σ     {:.0} fpm", sd);
         }
-        if let Some(sd) = stats.approach_bank_stddev_deg {
+        // v0.19.3: Kanonik (siehe build_pirep_fields).
+        if let Some(sd) = stats.canonical_bank_stddev_deg() {
             let _ = writeln!(s, "  Apr Bank σ    {:.1}°", sd);
         }
         if let Some(m) = stats.rollout_distance_m {
@@ -32246,29 +32251,30 @@ mod canonical_landing_rate_fpm_tests {
     #[test]
     fn display_and_filing_paths_never_read_raw_vs_fields() {
         const SRC: &str = include_str!("lib.rs");
-        /// Funktionen, die eine V/S-Zahl nach aussen geben (Pilot-UI, ACARS-
-        /// Log, Flight-Log-Forensik). Neue Ausgabe-Pfade hier eintragen.
-        const OUTPUT_FNS: [&str; 2] = [
-            "fn announce_landing_score(",
-            "fn emit_landing_finalized(",
-        ];
-        for needle in OUTPUT_FNS {
-            let start = SRC
-                .find(needle)
-                .unwrap_or_else(|| panic!("Ausgabe-Funktion nicht mehr gefunden: {needle} — Test anpassen, nicht loeschen"));
-            // Body bis zur naechsten Top-Level-Funktion.
-            let rest = &SRC[start..];
+
+        /// Body einer Funktion, ohne Kommentarzeilen. Kommentare DUERFEN die
+        /// Rohfelder benennen — sie erklaeren ja gerade, warum man sie nicht
+        /// liest.
+        fn body_of(src: &str, needle: &str) -> String {
+            let start = src.find(needle).unwrap_or_else(|| {
+                panic!("Ausgabe-Funktion nicht mehr gefunden: {needle} — Test anpassen, nicht loeschen")
+            });
+            let rest = &src[start..];
             let end = rest[1..].find("\nfn ").map(|i| i + 1).unwrap_or(rest.len());
-            // Kommentare raus — die DUERFEN die Rohfelder benennen (sie
-            // erklaeren ja gerade, warum man sie nicht liest).
-            let body: String = rest[..end]
+            rest[..end]
                 .lines()
                 .filter(|l| !l.trim_start().starts_with("//"))
                 .collect::<Vec<_>>()
-                .join("\n");
-            let body = body.as_str();
-            // Punkt-Praefix, sonst matcht `.canonical_landing_rate_fpm()`
-            // auf sein eigenes Suffix `landing_rate_fpm`.
+                .join("\n")
+        }
+
+        // ── Sinkrate ────────────────────────────────────────────────────────
+        // Funktionen, die eine V/S-Zahl nach aussen geben (Pilot-UI, ACARS-Log,
+        // Flight-Log-Forensik). Neue Ausgabe-Pfade hier eintragen.
+        for needle in ["fn announce_landing_score(", "fn emit_landing_finalized("] {
+            let body = body_of(SRC, needle);
+            // Punkt-Praefix, sonst matcht `.canonical_landing_rate_fpm()` auf
+            // sein eigenes Suffix `landing_rate_fpm`.
             for raw in [".landing_peak_vs_fpm", ".landing_rate_fpm"] {
                 assert!(
                     !body.contains(raw),
@@ -32284,6 +32290,45 @@ mod canonical_landing_rate_fpm_tests {
                 "{needle} gibt eine V/S-Zahl aus, holt sie aber nicht ueber \
                  `canonical_landing_rate_fpm()` — genau so ist der PIA3452-Split \
                  entstanden.",
+            );
+        }
+
+        // ── Bank-Streuung ───────────────────────────────────────────────────
+        // Dieselbe Krankheit, andere Kennzahl: legacy (ungefiltert, bis 1500 ft
+        // AGL) vs. v2 (vektor-gefiltert, bis 1000 ft HAT). Das Stabilitaets-Gate
+        // rechnete aus v2, die PIREP-Felder zeigten legacy — Banner "instabil"
+        // neben einer harmlos aussehenden Zahl.
+        for needle in [
+            "fn build_pirep_fields(",
+            "fn build_pirep_notes(",
+            "fn build_pirep_payload(",
+        ] {
+            let body = body_of(SRC, needle);
+            assert!(
+                !body.contains("stats.approach_bank_stddev_deg"),
+                "{needle} liest das Legacy-Rohfeld `approach_bank_stddev_deg` \
+                 direkt. Der Score bewertet den GEFILTERTEN Wert — eine Zahl \
+                 anzuzeigen, die nicht die bewertete ist, ist genau der Riss \
+                 aus PIA3452. Nutze `stats.canonical_bank_stddev_deg()`.",
+            );
+        }
+
+        // ── Bewertung (Punkte, Klasse, Note) ────────────────────────────────
+        // Die Touchdown-Klasse (`stats.landing_score`, nur 100/80/60/30/0) ist
+        // NICHT die Bewertung — sie ist ein Teil davon. Wer sie direkt ausgibt,
+        // schreibt "A+ (SMOOTH, 100/100)" neben ein Feld, in dem "A (smooth) —
+        // 92/100" steht. Genau das stand auf Thomas' phpVMS-Seite.
+        for needle in [
+            "fn build_pirep_notes(",
+            "fn build_pirep_fields(",
+        ] {
+            let body = body_of(SRC, needle);
+            assert!(
+                body.contains("canonical_landing_verdict(")
+                    || body.contains("compute_aggregate_master_score("),
+                "{needle} gibt eine Note oder Klasse aus, ohne sie ueber die \
+                 EINE Bewertung zu holen (`canonical_landing_verdict()`). \
+                 Die Touchdown-Klasse allein ist nicht das Urteil.",
             );
         }
     }
