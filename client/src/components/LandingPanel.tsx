@@ -2456,7 +2456,10 @@ function LandingReport({ record }: { record: LandingRecord }) {
             />
             <ReportTile
               label={t("landing.g_force")}
-              value={fmtNumber(record.landing_g_force, 2, "G")}
+              /* v0.19.3: scoreG() — dieselbe Zahl, auf der der G-Balken
+                 bewertet. `landing_g_force` ist der Roh-Wert am Touchdown-
+                 Frame und wich sichtbar vom bewerteten EMA-Wert ab. */
+              value={fmtNumber(scoreG(record), 2, "G")}
             />
             <ReportTile
               label={t("landing.pitch")}
@@ -3078,7 +3081,10 @@ function LandingDetail({
             </div>
             <div>
               <dt>{t("landing.g_force")}</dt>
-              <dd>{fmtNumber(record.landing_g_force, 2, "G")}</dd>
+              {/* v0.19.3: scoreG() statt Roh-G am Touchdown-Frame — sonst
+                  zeigt diese Kachel eine andere Zahl als der G-Balken
+                  daneben, der auf dem EMA-Wert bewertet. */}
+              <dd>{fmtNumber(scoreG(record), 2, "G")}</dd>
             </div>
             {/* v0.12.8-dev: ROH-PEAK G aus der Touchdown-Headline
                 entfernt — war ~immer identisch mit G-Kraft (Doppel-

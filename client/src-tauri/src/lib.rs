@@ -12477,18 +12477,71 @@ fn compute_aggregate_master_score(
 /// score_label und score_numeric semantisch zueinander passen.
 /// Nutzt die gleichen Schwellen wie LandingScore::numeric()
 /// (100/80/60/30/0 → smooth/acceptable/firm/hard/severe).
+/// v0.19.3: Klassen-Schwellen liegen jetzt AUF den Noten-Schwellen von
+/// `letter_grade` (95/88/82/75/65/50). Vorher waren es zwei unabhaengige
+/// Leitern (90/70/45/15) — mit absurden Kombinationen als Folge: 88 Punkte
+/// ergaben "A (acceptable)", 47 Punkte "F (firm)". Note und Klasse
+/// beschreiben dieselbe Landung, also duerfen sie sich nicht widersprechen.
+///
+/// Mapping jetzt: A+/A → smooth · B+/B → acceptable · C/D → firm ·
+/// F → hard (bzw. severe unter 15). Die PUNKTE aendern sich nicht, nur
+/// das Wort daneben.
 fn aggregate_score_label(aggregate: u8) -> &'static str {
-    if aggregate >= 90 {
+    if aggregate >= 88 {
         "smooth"
-    } else if aggregate >= 70 {
+    } else if aggregate >= 75 {
         "acceptable"
-    } else if aggregate >= 45 {
+    } else if aggregate >= 50 {
         "firm"
     } else if aggregate >= 15 {
         "hard"
     } else {
         "severe"
     }
+}
+
+/// Die EINE Landungsbewertung.
+///
+/// Punkte, Klasse und Note fuer genau eine Landung — an einer Stelle
+/// gerechnet, von allen Ausgaben gelesen. Vorher baute sich jede Oberflaeche
+/// ihr Urteil selbst zusammen, teils aus dem Gesamt-Score, teils aus der
+/// Touchdown-Klasse (`LandingScore`, nur 100/80/60/30/0). Ergebnis auf EINER
+/// phpVMS-Seite: Custom-Field "A (smooth) — 92/100" neben Notiz-Block
+/// "A+ (SMOOTH, 100/100)".
+///
+/// Die Touchdown-Klasse bleibt der Fallback, wenn kein Aggregate berechenbar
+/// ist (kein Buffer, Alt-Datensatz) — aber dann fuer ALLE Ausgaben gleich.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LandingVerdict {
+    pub numeric: i32,
+    pub label: &'static str,
+    pub grade: &'static str,
+}
+
+impl LandingVerdict {
+    /// "A (smooth) — 92/100" — das Format, das phpVMS-Feld und Notizen teilen.
+    fn headline(&self) -> String {
+        format!("{} ({}) — {}/100", self.grade, self.label, self.numeric)
+    }
+}
+
+fn canonical_landing_verdict(
+    flight: &ActiveFlight,
+    stats: &FlightStats,
+    effective_arr_icao: &str,
+) -> Option<LandingVerdict> {
+    let touchdown_class = stats.landing_score?;
+    let aggregate =
+        compute_aggregate_master_score(stats, Some(&flight.aircraft_icao), effective_arr_icao);
+    let (label, numeric) = match aggregate {
+        Some(m) => (aggregate_score_label(m), m as i32),
+        None => (touchdown_class.label(), touchdown_class.numeric()),
+    };
+    Some(LandingVerdict {
+        numeric,
+        label,
+        grade: letter_grade(numeric),
+    })
 }
 
 /// v0.7.1 Round-2: leitet GateWindow-Werte aus den ApproachSamples ab.
@@ -15133,11 +15186,15 @@ async fn flight_end_manual(
                 rounded.max(0)
             })
         });
-        // v0.7.21 (MS713-QS): canonical_landing_rate_fpm() statt direkt.
-        let landing_rate = landing_rate_fpm
+        // v0.19.3: die GEMESSENE Rate schlaegt die Pilot-Eingabe. Vorher gewann
+        // `landing_rate_fpm` (vom Piloten getippt) — dann stand im phpVMS-
+        // Logbuch seine Zahl, im Landungs-Tab und im Custom-Field aber die
+        // gemessene. Die Messung ist die Wahrheit; die Eingabe bleibt Fallback,
+        // wenn wir gar keinen Touchdown erfasst haben.
+        let landing_rate = stats
+            .canonical_landing_rate_fpm()
             .map(|v| v as f64)
-            .or_else(|| stats.canonical_landing_rate_fpm().map(|v| v as f64));
-        let score = stats.landing_score.map(|s| s.numeric());
+            .or_else(|| landing_rate_fpm.map(|v| v as f64));
         let resolved_distance = distance_nm
             .filter(|d| *d > 0.0)
             .unwrap_or(stats.distance_nm);
@@ -15152,6 +15209,11 @@ async fn flight_end_manual(
             .filter(|s| !s.is_empty());
         let effective_arr =
             effective_arr_norm.as_deref().unwrap_or(&flight.arr_airport);
+        // v0.19.3: die phpVMS-`score`-Spalte bekommt die EINE Bewertung — nicht
+        // mehr die Touchdown-Klasse (nur 100/80/60/30/0). Vorher stand beim
+        // manuellen Filen `100` in der Spalte, waehrend Custom-Field und
+        // Landungs-Tab "B (acceptable) — 78/100" zeigten.
+        let score = canonical_landing_verdict(&flight, &stats, effective_arr).map(|v| v.numeric);
         let fields = build_pirep_fields(&flight, &stats, effective_arr);
         let mut notes = build_pirep_notes(&flight, &stats, effective_arr);
         notes.push_str("\n\n[MANUAL FILE — auto-validation bypassed by pilot.]");
@@ -20334,7 +20396,19 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                             sideslip_deg: stats.touchdown_sideslip_deg,
                             headwind_kt: stats.landing_headwind_kt,
                             crosswind_kt: stats.landing_crosswind_kt,
-                            score: stats.landing_score.map(|s| s.numeric()),
+                            // v0.19.3: die EINE Bewertung — nicht mehr die
+                            // Touchdown-Klasse (100/80/60/30/0). Vorher trug die
+                            // Live-Map/Recorder-Touchdown-Zeile `100`, waehrend
+                            // dieselbe Landung im PIREP mit `92` ankam.
+                            // `td_actual_icao` ist der tatsaechliche Landeplatz
+                            // (Divert eingeschlossen), also dieselbe Geometrie-
+                            // Basis wie im LandingRecord.
+                            score: canonical_landing_verdict(
+                                flight.as_ref(),
+                                &stats,
+                                td_actual_icao.as_deref().unwrap_or(&flight.arr_airport),
+                            )
+                            .map(|v| v.numeric),
                             bounce: Some(stats.bounce_count > 0),
                             bounce_count: Some(stats.bounce_count),
                             // v0.16.6 (Daten-Audit 2026-06-11): `approach_runway`
@@ -26934,17 +27008,8 @@ fn build_pirep_fields(
     // Zahlen ("Score: 77/100" oben, "Landing Score: A+ (smooth) —
     // 100/100" unten). Fallback auf Touchdown-Klassifikation wenn
     // Crate keinen Aggregate liefert.
-    if let Some(touchdown_class) = stats.landing_score {
-        let aggregate = compute_aggregate_master_score(stats, Some(&flight.aircraft_icao), effective_arr_icao);
-        let (label, numeric) = match aggregate {
-            Some(m) => (aggregate_score_label(m), m as i32),
-            None => (touchdown_class.label(), touchdown_class.numeric()),
-        };
-        let grade = letter_grade(numeric);
-        f.insert(
-            "Landing Score".into(),
-            format!("{} ({}) — {}/100", grade, label, numeric),
-        );
+    if let Some(verdict) = canonical_landing_verdict(flight, stats, effective_arr_icao) {
+        f.insert("Landing Score".into(), verdict.headline());
     }
     // v0.7.21 (MS713-QS): canonical_landing_rate_fpm() — sonst zeigt
     // das PIREP-Custom-Feld "Landing Rate" einen anderen Wert als das
@@ -27361,8 +27426,16 @@ fn build_pirep_notes(
         if let Some(rate) = stats.canonical_landing_rate_fpm() {
             let _ = writeln!(s, "  Landing rate  {:.0} fpm", rate);
         }
-        if let Some(g) = stats.landing_g_force {
-            let _ = writeln!(s, "  G-force       {:.2} G", g);
+        // v0.19.3: der GESCORTE (EMA) G-Wert — derselbe, den Score-Karte,
+        // ACARS-Log und das PIREP-Custom-Field "Landing G-Force" zeigen.
+        // `landing_g_force` ist der Roh-Wert am Touchdown-Frame und wich
+        // sichtbar ab (dritter G-Wert neben Roh-Peak und EMA).
+        if stats.landing_g_force.is_some() || stats.landing_peak_g_force.is_some() {
+            let _ = writeln!(
+                s,
+                "  G-force       {:.2} G",
+                score_g_for_stats(stats).scored_g
+            );
         }
         if let Some(p) = stats.landing_pitch_deg {
             let _ = writeln!(s, "  Pitch         {:+.1}°", p);
@@ -27397,14 +27470,18 @@ fn build_pirep_notes(
         if let Some(m) = stats.rollout_distance_m {
             let _ = writeln!(s, "  Rollout       {:.0} m", m);
         }
-        if let Some(score) = stats.landing_score {
-            let grade = letter_grade(score.numeric());
+        // v0.19.3: DIESELBE Bewertung wie das Custom-Field "Landing Score"
+        // und der Landungs-Tab. Vorher baute dieser Block die Note aus der
+        // Touchdown-KLASSE (numeric ∈ {100,80,60,30,0}) → auf derselben
+        // phpVMS-Seite stand "A+ (SMOOTH, 100/100)" neben
+        // "A (smooth) — 92/100".
+        if let Some(verdict) = canonical_landing_verdict(flight, stats, effective_arr_icao) {
             let _ = writeln!(
                 s,
                 "  Grade         {} ({}, {}/100)",
-                grade,
-                score.label().to_uppercase(),
-                score.numeric()
+                verdict.grade,
+                verdict.label.to_uppercase(),
+                verdict.numeric
             );
         }
     }
