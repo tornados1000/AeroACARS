@@ -8942,8 +8942,21 @@ async fn airport_ground_get(
             }
             Ok(Some(fresh))
         }
+        // 404 heisst: die Bodendaten sind auf dem VPS NICHT (mehr) da. Eine
+        // alte lokale Kopie weiterzubenutzen waere falsch — wir haetten sie
+        // womoeglich zurueckgezogen, weil die Daten kaputt waren. Also weg
+        // damit. Das ist der Unterschied zu einem Netzfehler, wo die Kopie
+        // genau richtig ist.
+        Err(aeroacars_mqtt::navdata::NavdataError::NotFound(_)) => {
+            if let Some(p) = cache_path {
+                let _ = std::fs::remove_file(&p);
+            }
+            tracing::debug!(icao = %key, "keine Bodendaten fuer diesen Flughafen");
+            Ok(None)
+        }
         // Kein Netz, kein Token, Server weg: die lokale Kopie ist besser als
-        // nichts. Nur wenn wir auch die nicht haben, gibt es keine Karte.
+        // nichts. Genau dann, im Cockpit mit wackligem WLAN, will man sie
+        // nicht verlieren.
         Err(e) => {
             if cached.is_some() {
                 tracing::debug!(icao = %key, error = %e, "Bodendaten: nutze lokale Kopie");

@@ -195,6 +195,9 @@ const LYR_GROUND_TAXI = "aa-ground-taxi";
 const LYR_GROUND_TAXI_LABELS = "aa-ground-taxi-labels";
 const LYR_GROUND_RWY = "aa-ground-runway";
 const LYR_GROUND_STANDS = "aa-ground-stands";
+const LYR_GROUND_STAND_LINES = "aa-ground-stand-lines";
+const LYR_GROUND_STAND_LABELS = "aa-ground-stand-labels";
+const LYR_GROUND_TERMINAL = "aa-ground-terminal";
 const LYR_GROUND_HOLD = "aa-ground-holding";
 const GROUND_MIN_ZOOM = 12;
 
@@ -506,6 +509,49 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
         },
       });
     }
+    // Terminals: beim Rollen die wichtigste Orientierung ueberhaupt ("ich muss
+    // zu Terminal 2"). Sie liegen in OSM als Flaeche vor, der Import speichert
+    // sie als Umriss-Linie — als dezente Kontur reicht das voellig.
+    if (!map.getLayer(LYR_GROUND_TERMINAL)) {
+      map.addLayer({
+        id: LYR_GROUND_TERMINAL,
+        type: "line",
+        source: SRC_GROUND,
+        minzoom: 13,
+        filter: ["==", ["get", "k"], "terminal"],
+        paint: {
+          "line-color": sat ? "#c4b5fd" : "#8b7fd4",
+          "line-width": 1.4,
+          "line-opacity": 0.85,
+        },
+      });
+    }
+    // Standplaetze — MIT den Linien.
+    //
+    // In OSM liegt ein Standplatz meist als LINIE vor (die Rollmarkierung zum
+    // Stand), nicht als Punkt: in EDDF sind es 436 Linien gegen 111 Punkte.
+    // Der erste Wurf filterte auf `geometry-type == Point` und liess damit vier
+    // Fuenftel der Staende verschwinden — ausgerechnet auf dem Vorfeld, wo die
+    // Karte am meisten helfen soll.
+    if (!map.getLayer(LYR_GROUND_STAND_LINES)) {
+      map.addLayer({
+        id: LYR_GROUND_STAND_LINES,
+        type: "line",
+        source: SRC_GROUND,
+        minzoom: 14,
+        filter: [
+          "all",
+          ["==", ["get", "k"], "parking_position"],
+          ["==", ["geometry-type"], "LineString"],
+        ],
+        layout: { "line-cap": "round" },
+        paint: {
+          "line-color": "#60a5fa",
+          "line-width": ["interpolate", ["linear"], ["zoom"], 14, 0.8, 18, 2.5],
+          "line-opacity": 0.75,
+        },
+      });
+    }
     if (!map.getLayer(LYR_GROUND_STANDS)) {
       map.addLayer({
         id: LYR_GROUND_STANDS,
@@ -521,6 +567,34 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
           "circle-radius": ["interpolate", ["linear"], ["zoom"], 14, 1.5, 18, 4],
           "circle-color": "#60a5fa",
           "circle-opacity": 0.8,
+        },
+      });
+    }
+    // Stand-Nummern erst weit drin (Zoom 16): frueher waere es Zahlensalat.
+    if (!map.getLayer(LYR_GROUND_STAND_LABELS)) {
+      map.addLayer({
+        id: LYR_GROUND_STAND_LABELS,
+        type: "symbol",
+        source: SRC_GROUND,
+        minzoom: 16,
+        filter: [
+          "all",
+          ["in", ["get", "k"], ["literal", ["gate", "parking_position"]]],
+          ["has", "r"],
+        ],
+        layout: {
+          "symbol-placement": "point",
+          "text-field": ["get", "r"],
+          "text-font": ["Open Sans Regular", "Arial Unicode MS Regular"],
+          "text-size": ["interpolate", ["linear"], ["zoom"], 16, 9, 18, 12],
+          "text-allow-overlap": false,
+          "text-padding": 3,
+          "text-offset": [0, 0.8],
+        },
+        paint: {
+          "text-color": "#dbeafe",
+          "text-halo-color": "#1e3a5f",
+          "text-halo-width": 1.4,
         },
       });
     }
@@ -843,7 +917,17 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
     const icaos = [activeFlight?.dpt_airport, activeFlight?.arr_airport]
       .map((s) => (s ?? "").trim().toUpperCase())
       .filter((s) => s.length >= 3 && s.length <= 5);
-    if (icaos.length === 0) return;
+
+    // Kein Flug (mehr) → Karte leeren. Sonst liegen die Rollwege des letzten
+    // Flughafens weiter auf der Karte, und beim naechsten Flug ab einem Platz
+    // OHNE Bodendaten schweben Frankfurts Rollwege ueber fremder Landschaft.
+    if (icaos.length === 0) {
+      groundRef.current = null;
+      setGroundLoaded([]);
+      const src = map.getSource(SRC_GROUND) as maplibregl.GeoJSONSource | undefined;
+      src?.setData({ type: "FeatureCollection", features: [] });
+      return;
+    }
 
     let cancelled = false;
     void (async () => {
