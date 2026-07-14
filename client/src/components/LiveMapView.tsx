@@ -899,71 +899,107 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
     };
   }, [activeFlight?.dpt_airport, activeFlight?.arr_airport, activeFlight]);
 
-  // ---- Taxi-Karte: Bodendaten fuer Start- und Zielflughafen laden ----
+  // ---- Taxi-Karte: laden, was gerade im Bild ist ----
   //
-  // v0.21. Geladen wird beim Flugstart — beide Flughaefen auf einmal, damit die
-  // Karte auch nach der Landung sofort steht (da will man sie am dringendsten,
-  // beim Rollen zum Gate an einem fremden Platz).
+  // v0.21.0-beta.2 — DAS IST DER FIX, den Thomas in Berlin gefunden hat.
   //
-  // Rust cached lokal: beim zweiten Mal kommt ein 304 und es wird nichts
-  // uebertragen; ohne Netz kommt die Karte aus der Kopie auf der Platte. Fehlt
-  // der Flughafen auf dem VPS, ist das kein Fehler — bisher sind nur eine
-  // Handvoll importiert. Dann bleibt die Karte einfach ohne Rollwege, statt
-  // eine Fehlermeldung ins Cockpit zu werfen.
+  // Der erste Wurf lud die Rollwege nur fuer Start- und Zielflughafen eines
+  // LAUFENDEN Flugs. Steht man ohne Bid am Gate — genau der Moment, in dem man
+  // auf die Karte schaut — blieb sie leer. Dasselbe nach einem Ausweichflug:
+  // ausgerechnet der fremde Platz, an dem man tatsaechlich landet, hatte keine
+  // Karte.
+  //
+  // Jetzt zaehlt, was im BILD ist: schiebt man die Karte woandershin, erscheinen
+  // dort die Rollwege. Kein Flug noetig, kein Bid, kein Sim.
+  //
+  // Ab Zoom 11, sonst waeren beim Herauszoomen auf halb Europa hunderte
+  // Flughaefen im Bild — und die Layer sind ohnehin erst ab Zoom 12 sichtbar.
+  //
+  // Der Index ist winzig (ICAO + zwei Zahlen). Die eigentlichen Daten kommen
+  // erst, wenn ein Flughafen wirklich sichtbar wird, und liegen danach im
+  // lokalen Zwischenspeicher: beim zweiten Mal antwortet der Server mit 304, und
+  // ohne Netz kommt die Karte von der Platte.
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapReady) return;
 
-    const icaos = [activeFlight?.dpt_airport, activeFlight?.arr_airport]
-      .map((s) => (s ?? "").trim().toUpperCase())
-      .filter((s) => s.length >= 3 && s.length <= 5);
-
-    // Kein Flug (mehr) → Karte leeren. Sonst liegen die Rollwege des letzten
-    // Flughafens weiter auf der Karte, und beim naechsten Flug ab einem Platz
-    // OHNE Bodendaten schweben Frankfurts Rollwege ueber fremder Landschaft.
-    if (icaos.length === 0) {
-      groundRef.current = null;
-      setGroundLoaded([]);
-      const src = map.getSource(SRC_GROUND) as maplibregl.GeoJSONSource | undefined;
-      src?.setData({ type: "FeatureCollection", features: [] });
-      return;
-    }
-
     let cancelled = false;
-    void (async () => {
+    // ICAO → Features. Einmal geladen, bleibt geladen: der Pilot schiebt die
+    // Karte hin und her, das darf nicht jedes Mal neu ziehen.
+    const loaded = new Map<string, GeoJSON.Feature[]>();
+    let index: Array<{ icao: string; lat: number; lon: number }> = [];
+
+    const redraw = () => {
       const features: GeoJSON.Feature[] = [];
-      const got: string[] = [];
-      for (const icao of Array.from(new Set(icaos))) {
+      for (const fs of loaded.values()) features.push(...fs);
+      const fc: GeoJSON.FeatureCollection = { type: "FeatureCollection", features };
+      groundRef.current = fc;
+      setGroundLoaded(Array.from(loaded.keys()).sort());
+      const src = map.getSource(SRC_GROUND) as maplibregl.GeoJSONSource | undefined;
+      src?.setData(fc);
+    };
+
+    const syncViewport = async () => {
+      if (cancelled || index.length === 0) return;
+      if (map.getZoom() < GROUND_MIN_ZOOM - 1) return;
+
+      const b = map.getBounds();
+      const visible = index.filter(
+        (a) =>
+          a.lat >= b.getSouth() &&
+          a.lat <= b.getNorth() &&
+          a.lon >= b.getWest() &&
+          a.lon <= b.getEast(),
+      );
+
+      for (const a of visible) {
+        if (loaded.has(a.icao)) continue;
+        // Platzhalter, damit ein zweites moveend nicht dasselbe nochmal zieht.
+        loaded.set(a.icao, []);
         try {
           const r = await invoke<{ icao: string; geojson: string } | null>(
             "airport_ground_get",
-            { icao },
+            { icao: a.icao },
           );
-          if (!r?.geojson) continue;
-          const fc = JSON.parse(r.geojson) as GeoJSON.FeatureCollection;
-          if (Array.isArray(fc.features)) {
-            features.push(...fc.features);
-            got.push(r.icao);
+          if (cancelled) return;
+          const fc = r?.geojson
+            ? (JSON.parse(r.geojson) as GeoJSON.FeatureCollection)
+            : null;
+          if (fc && Array.isArray(fc.features)) {
+            loaded.set(a.icao, fc.features);
+            redraw();
+          } else {
+            loaded.delete(a.icao);
           }
         } catch {
           // Kein Netz, kein Token, Flughafen nicht importiert: kein Drama.
+          loaded.delete(a.icao);
         }
       }
+    };
+
+    void (async () => {
+      try {
+        index = await invoke<Array<{ icao: string; lat: number; lon: number }>>(
+          "airport_ground_index",
+        );
+      } catch {
+        index = [];
+      }
       if (cancelled) return;
-      const fc: GeoJSON.FeatureCollection = {
-        type: "FeatureCollection",
-        features,
-      };
-      groundRef.current = fc;
-      setGroundLoaded(got);
-      const src = map.getSource(SRC_GROUND) as maplibregl.GeoJSONSource | undefined;
-      src?.setData(fc);
+      void syncViewport();
     })();
+
+    const onMoveEnd = () => void syncViewport();
+    map.on("moveend", onMoveEnd);
+    map.on("zoomend", onMoveEnd);
 
     return () => {
       cancelled = true;
+      map.off("moveend", onMoveEnd);
+      map.off("zoomend", onMoveEnd);
     };
-  }, [activeFlight?.dpt_airport, activeFlight?.arr_airport, mapReady]);
+  }, [mapReady]);
 
   // ---- Redraw: eigener Flug (Quellen + Flugzeug-Marker + Pins) ----
   // Läuft immer; VA-Flieger liegen als zusätzliche Marker mit drauf (eigene Effekte).

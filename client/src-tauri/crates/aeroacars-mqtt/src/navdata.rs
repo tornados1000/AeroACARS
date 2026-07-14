@@ -214,6 +214,54 @@ fn ground_url(base: &str, icao: &str) -> String {
     )
 }
 
+/// Ein Flughafen im Bodendaten-Index (nur ICAO + Position).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroundIndexEntry {
+    pub icao: String,
+    pub lat: f64,
+    pub lon: f64,
+}
+
+/// Welche Flughaefen haben ueberhaupt Bodendaten — und wo liegen sie?
+///
+/// v0.21.0-beta.2: Der erste Wurf lud die Taxi-Karte nur fuer Start- und
+/// Zielflughafen eines LAUFENDEN Flugs. Steht der Pilot ohne Bid am Gate (oder
+/// weicht auf einen dritten Platz aus), blieb die Karte leer — ausgerechnet
+/// dann, wenn er sie braucht. Mit diesem Index findet der Client den Flughafen,
+/// auf dem er tatsaechlich STEHT.
+///
+/// Die Liste ist winzig (ICAO + zwei Zahlen pro Flughafen).
+pub async fn get_ground_index(
+    base: Option<&str>,
+    auth_token: Option<&str>,
+) -> std::result::Result<Vec<GroundIndexEntry>, NavdataError> {
+    let base = base.unwrap_or(DEFAULT_NAVDATA_BASE);
+    let url = format!("{}/api/airports/ground/index", base.trim_end_matches('/'));
+    let client = build_client().map_err(|e| NavdataError::Network(e.to_string()))?;
+
+    let mut req = client.get(&url);
+    if let Some(token) = auth_token {
+        req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    let response = req.send().await?;
+    if !response.status().is_success() {
+        return Err(NavdataError::Server {
+            status: response.status().as_u16(),
+            body: String::new(),
+        });
+    }
+
+    #[derive(Deserialize)]
+    struct Wrapper {
+        airports: Vec<GroundIndexEntry>,
+    }
+    let w: Wrapper = response
+        .json()
+        .await
+        .map_err(|e| NavdataError::BadResponse(format!("parse index: {e}")))?;
+    Ok(w.airports)
+}
+
 /// Bodendaten eines Flughafens fuer die Taxi-Karte (GeoJSON, roh).
 ///
 /// v0.21: Rollwege, Vorfeld-Rollmarkierungen, Bahnen, Haltepunkte und

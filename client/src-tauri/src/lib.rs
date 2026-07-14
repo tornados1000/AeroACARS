@@ -8969,6 +8969,34 @@ async fn airport_ground_get(
     }
 }
 
+/// Welche Flughaefen haben eine Taxi-Karte — und wo liegen sie?
+///
+/// v0.21.0-beta.2: Der erste Wurf lud die Karte nur fuer Start- und Ziel-
+/// flughafen eines LAUFENDEN Flugs. Steht der Pilot ohne Bid am Gate — genau der
+/// Fall, in dem er auf die Karte schaut — blieb sie leer. Auch nach einem
+/// Ausweichflug fehlte die Karte des Platzes, an dem man tatsaechlich landet.
+///
+/// Jetzt zieht die Karte diesen Index und laedt die Rollwege fuer JEDEN
+/// Flughafen, der gerade im Bild ist. Schiebt der Pilot die Karte woandershin,
+/// erscheinen dort die Rollwege. Die Liste ist winzig (ICAO + zwei Zahlen), die
+/// eigentlichen Daten kommen erst, wenn ein Flughafen wirklich sichtbar wird —
+/// und liegen danach im lokalen Zwischenspeicher.
+#[tauri::command]
+async fn airport_ground_index() -> Result<Vec<aeroacars_mqtt::navdata::GroundIndexEntry>, UiError> {
+    let token = secrets::load_api_key(MQTT_KEYRING_PASSWORD)
+        .ok()
+        .flatten();
+    match aeroacars_mqtt::navdata::get_ground_index(None, token.as_deref()).await {
+        Ok(i) => Ok(i),
+        // Kein Netz, kein Token: dann eben keine Karte. Kein Grund, das Cockpit
+        // mit einer Fehlermeldung zu stoeren.
+        Err(e) => {
+            tracing::debug!(error = %e, "Bodendaten-Index nicht abrufbar");
+            Ok(Vec::new())
+        }
+    }
+}
+
 /// Fetch an airport by ICAO, caching the result so we don't re-hit the network
 /// on each sim snapshot.
 #[tauri::command]
@@ -32083,6 +32111,7 @@ pub fn run() {
             pmdg_status,
             airport_get,
             airport_ground_get,
+            airport_ground_index,
             flight_status,
             flight_get_route_fixes,
             flight_get_track,

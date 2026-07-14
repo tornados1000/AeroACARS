@@ -51,6 +51,22 @@ vi.mock("maplibre-gl", () => {
       (h.mapHandlers[ev] ||= []).push(cb);
       return this;
     }
+    // v0.21: die Taxi-Karte haengt sich an moveend/zoomend und meldet sich beim
+    // Aufraeumen wieder ab. Ohne off() kracht der Unmount.
+    off(ev: string, cb: (e?: unknown) => void) {
+      const list = h.mapHandlers[ev];
+      if (list) h.mapHandlers[ev] = list.filter((f) => f !== cb);
+      return this;
+    }
+    // Sichtbereich — die Taxi-Karte laedt, was gerade im Bild ist.
+    getBounds() {
+      return {
+        getSouth: () => this.center.lat - 1,
+        getNorth: () => this.center.lat + 1,
+        getWest: () => this.center.lng - 1,
+        getEast: () => this.center.lng + 1,
+      };
+    }
     getCenter() { return this.center; }
     getZoom() { return this.zoom; }
     isStyleLoaded() { return true; }
@@ -94,6 +110,8 @@ vi.mock("../lib/ipc", () => ({
     if (cmd === "flight_get_route_fixes") return [];
     if (cmd === "va_live_flights") return { data: [] };
     if (cmd === "airport_get") return { lat: null, lon: null };
+    if (cmd === "airport_ground_index") return [];
+    if (cmd === "airport_ground_get") return null;
     return null;
   }),
   listen: vi.fn(async () => () => {}),
