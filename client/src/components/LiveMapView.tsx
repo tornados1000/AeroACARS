@@ -195,6 +195,7 @@ const LYR_GROUND_TAXI = "aa-ground-taxi";
 const LYR_GROUND_TAXI_LABELS = "aa-ground-taxi-labels";
 const LYR_GROUND_RWY = "aa-ground-runway";
 const LYR_GROUND_STANDS = "aa-ground-stands";
+const LYR_GROUND_STAND_LANES = "aa-ground-stand-lanes";
 const LYR_GROUND_STAND_LABELS = "aa-ground-stand-labels";
 const LYR_GROUND_TERMINAL = "aa-ground-terminal";
 const LYR_GROUND_HOLD = "aa-ground-holding";
@@ -466,59 +467,88 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
         },
       });
     }
-    // Alles, worauf man ROLLT, ist gruen — Hauptrollwege kraeftig, Vorfeld duenn.
+    // Zwei Kategorien, nach FUNKTION getrennt — nicht nach OSM-Tag.
     //
-    // v0.21.0-beta.3: Vorher richtete sich die Farbe nach dem OSM-Tag, und das
-    // ergab Unsinn. Berlin taggt die Zuwege auf dem Vorfeld als `taxilane`
-    // (109 Stueck), Hamburg kennt gar keine — dort tragen DIESELBEN Linien den
-    // Tag `parking_position`. Ergebnis: in Berlin gruen, in Hamburg blau. Ein
-    // Pilot, der beides fliegt, sieht dieselbe Sache in zwei Farben, je nachdem
-    // wer den Flughafen gemappt hat.
+    // v0.21.0-beta.4: Die Farbe nach dem Tag zu richten war doppelt falsch.
+    // Erst waren Berlin (taxilane) gruen und Hamburg (parking_position) blau —
+    // dieselbe Sache, zwei Farben. Dann habe ich ALLES gruen gemacht, und schon
+    // war der Stand nicht mehr vom Rollweg zu unterscheiden.
     //
-    // Also nach der FRAGE einfaerben, die der Pilot stellt — "worauf rolle ich?"
-    // — und nicht danach, wie OSM es zufaellig benannt hat. Blau bleibt allein
-    // die Standplatz-Markierung: Punkt und Nummer.
-    const IS_ROLLWEG: maplibregl.FilterSpecification = [
+    // Richtig: Es gibt genau ZWEI Dinge, und die Funktion entscheidet die Farbe.
+    //   * HAUPTROLLWEG (`taxiway`) — worauf ATC dich schickt, "taxi via A, T".
+    //     Gruen, kraeftig.
+    //   * STAND-BEREICH — die Vorfeld-Zuwege UND die Standplaetze. Blau.
+    //     Dazu zaehlen `taxilane` (so nennt Berlin es), `parking_position` als
+    //     Linie (so nennt Hamburg es) und die Stand-Punkte.
+    //
+    // Weil beide Tags gleich (blau) behandelt werden, sehen Berlin und Hamburg
+    // endlich GLEICH aus — und der Stand hebt sich klar vom Rollweg ab.
+    const IS_STAND_LANE: maplibregl.FilterSpecification = [
       "any",
-      ["in", ["get", "k"], ["literal", ["taxiway", "taxilane"]]],
-      // parking_position als LINIE ist die Zuwegung zum Stand — da rollt man.
-      // Als Punkt ist es der Stand selbst; der gehoert zu den blauen.
+      ["==", ["get", "k"], "taxilane"],
       [
         "all",
         ["==", ["get", "k"], "parking_position"],
         ["==", ["geometry-type"], "LineString"],
       ],
     ];
-    /** Hauptrollweg (dick) oder Vorfeld-Zuwegung (duenn)? */
-    const IS_APRON_LANE: maplibregl.ExpressionSpecification = [
-      "!=",
-      ["get", "k"],
-      "taxiway",
-    ];
+    // Stand-Bereich ZUERST (liegt unter dem Hauptrollweg).
+    if (!map.getLayer(LYR_GROUND_STAND_LANES)) {
+      map.addLayer({
+        id: LYR_GROUND_STAND_LANES,
+        type: "line",
+        source: SRC_GROUND,
+        minzoom: 13,
+        filter: IS_STAND_LANE,
+        layout: { "line-cap": "round" },
+        paint: {
+          "line-color": "#60a5fa",
+          "line-width": ["interpolate", ["linear"], ["zoom"], 13, 0.5, 16, 1.6, 18, 3],
+          "line-opacity": 0.7,
+        },
+      });
+    }
+    // Hauptrollwege — gruen, kraeftig, darueber.
     if (!map.getLayer(LYR_GROUND_TAXI)) {
       map.addLayer({
         id: LYR_GROUND_TAXI,
         type: "line",
         source: SRC_GROUND,
         minzoom: GROUND_MIN_ZOOM,
-        filter: IS_ROLLWEG,
+        filter: ["==", ["get", "k"], "taxiway"],
         layout: { "line-cap": "round", "line-join": "round" },
         paint: {
           "line-color": "#4ade80",
-          // Vorfeld-Zuwegungen duenner als die Hauptrollwege — sie liegen dicht
-          // an dicht und wuerden sonst zu einem gruenen Teppich verschmelzen.
-          "line-width": [
-            "interpolate",
-            ["linear"],
-            ["zoom"],
-            12,
-            ["case", IS_APRON_LANE, 0.5, 1.2],
-            16,
-            ["case", IS_APRON_LANE, 1.5, 3.5],
-            18,
-            ["case", IS_APRON_LANE, 2.5, 6],
-          ],
-          "line-opacity": ["case", IS_APRON_LANE, 0.6, 0.9],
+          "line-width": ["interpolate", ["linear"], ["zoom"], 12, 1.2, 16, 3.5, 18, 6],
+          "line-opacity": 0.9,
+        },
+      });
+    }
+    // Stand-Nummern — die stehen im `r`-Feld der parking_position-Linien und
+    // gate-Punkte. Erst ab Zoom 15, sonst Zahlensalat auf dem Vorfeld.
+    if (!map.getLayer(LYR_GROUND_STAND_LABELS)) {
+      map.addLayer({
+        id: LYR_GROUND_STAND_LABELS,
+        type: "symbol",
+        source: SRC_GROUND,
+        minzoom: 15,
+        filter: [
+          "all",
+          ["in", ["get", "k"], ["literal", ["parking_position", "gate"]]],
+          ["has", "r"],
+        ],
+        layout: {
+          "symbol-placement": "point",
+          "text-field": ["get", "r"],
+          "text-font": ["Open Sans Regular", "Arial Unicode MS Regular"],
+          "text-size": ["interpolate", ["linear"], ["zoom"], 15, 8, 18, 12],
+          "text-allow-overlap": false,
+          "text-padding": 2,
+        },
+        paint: {
+          "text-color": "#dbeafe",
+          "text-halo-color": "#1e3a5f",
+          "text-halo-width": 1.4,
         },
       });
     }
@@ -605,34 +635,7 @@ export function LiveMapView({ activeFlight, simSnapshot }: Props) {
         },
       });
     }
-    // Stand-Nummern erst weit drin (Zoom 16): frueher waere es Zahlensalat.
-    if (!map.getLayer(LYR_GROUND_STAND_LABELS)) {
-      map.addLayer({
-        id: LYR_GROUND_STAND_LABELS,
-        type: "symbol",
-        source: SRC_GROUND,
-        minzoom: 16,
-        filter: [
-          "all",
-          ["in", ["get", "k"], ["literal", ["gate", "parking_position"]]],
-          ["has", "r"],
-        ],
-        layout: {
-          "symbol-placement": "point",
-          "text-field": ["get", "r"],
-          "text-font": ["Open Sans Regular", "Arial Unicode MS Regular"],
-          "text-size": ["interpolate", ["linear"], ["zoom"], 16, 9, 18, 12],
-          "text-allow-overlap": false,
-          "text-padding": 3,
-          "text-offset": [0, 0.8],
-        },
-        paint: {
-          "text-color": "#dbeafe",
-          "text-halo-color": "#1e3a5f",
-          "text-halo-width": 1.4,
-        },
-      });
-    }
+    // (Stand-Nummern werden oben zusammen mit den Stand-Bereichen gezeichnet.)
     // Haltepunkte vor der Bahn — beim Rollen das Wichtigste ueberhaupt.
     // Deshalb gelb und mit Rand, damit sie auf jedem Untergrund herausstechen.
     if (!map.getLayer(LYR_GROUND_HOLD)) {
