@@ -2803,6 +2803,15 @@ struct FlightStats {
     /// Reset sobald die GS wieder über die Schwelle steigt oder die Phase
     /// wechselt; nicht persistiert (überlebt keinen Restart).
     takeoff_roll_slow_since: Option<DateTime<Utc>>,
+    /// v0.21.x (Backtrack-Erkennung): höchste bisher in DIESER TakeoffRoll-
+    /// Rolle gesehene Groundspeed. Beim Eintritt auf die aktuelle GS gesetzt.
+    /// Erreicht der Peak nie `TAKEOFF_ROLL_CONFIRM_KT`, greift die Plateau-
+    /// Rückkante. Nicht persistiert. Siehe [`takeoff_roll_stall_check`].
+    takeoff_roll_peak_kt: f32,
+    /// v0.21.x (Backtrack-Erkennung): Dwell-Start der Plateau-Rückkante —
+    /// wann die GS zuletzt aufhörte, neue Höchstwerte zu setzen (unter
+    /// CONFIRM_KT). Reset bei jedem neuen Peak. Nicht persistiert.
+    takeoff_roll_stall_since: Option<DateTime<Utc>>,
 
     // ---- Capture at takeoff ----
     takeoff_weight_kg: Option<f64>,
@@ -10418,6 +10427,15 @@ async fn flight_start(
         stats.planned_zfw_kg = Some(ofp.planned_zfw_kg).filter(|&v| v > 0.0);
         stats.planned_tow_kg = Some(ofp.planned_tow_kg).filter(|&v| v > 0.0);
         stats.planned_ldw_kg = Some(ofp.planned_ldw_kg).filter(|&v| v > 0.0);
+        // v0.21.x (#phase-v2 Fix A): SimBrief-Reiseflughöhe als Cruise-Ref
+        // für die Phasen-v2-Engine — aber NUR als Fallback. Das explizite
+        // Bid-Level (oben aus `bid.flight.level` gesetzt) hat Vorrang, und
+        // die live PMDG-FMC-Höhe übersteuert erst im Streamer beides. So
+        // bleibt die Referenz-Hierarchie sauber:
+        // live PMDG-FMC > Bid-Level > SimBrief-OFP > 240s-Zeitgeber.
+        if stats.planned_cruise_alt_ft.is_none() {
+            stats.planned_cruise_alt_ft = ofp.planned_cruise_alt_ft;
+        }
         stats.planned_route = ofp.route;
         // v0.8.0: OFP-Alternate kann sich vom Bid-Alternate
         // unterscheiden — wenn ja, fetch ihn jetzt nach. Der
@@ -22852,6 +22870,21 @@ const TAKEOFF_ROLL_ABORT_KT: f32 = 20.0;
 /// (frisst GS-Einzeltick-Glitches; braucht ≥ 2 Ticks über ≥ 3 s).
 const TAKEOFF_ROLL_ABORT_DWELL_SECS: i64 = 3;
 
+/// „Committed-Takeoff"-Schwelle (v0.21.x, Backtrack-Erkennung): Peak-GS,
+/// ab der eine Rolle zweifelsfrei eine echte Startrolle ist. Über 673
+/// GSG-Flüge erreicht JEDE echte Startrolle ≥ 52 kt Peak (min), während
+/// die 4 Backtrack-/Fehl-Trips bei ≤ 33 kt plateauisieren — 45 kt liegt
+/// sauber in der Lücke. Hat der Peak diese Marke erreicht, ist die Plateau-
+/// Rückkante deaktiviert (nur noch die GS<20-Abbruchkante greift).
+const TAKEOFF_ROLL_CONFIRM_KT: f32 = 45.0;
+/// Dwell für die Plateau-Rückkante: bleibt der Peak-GS unter
+/// `TAKEOFF_ROLL_CONFIRM_KT` UND setzt die GS keine neuen Höchstwerte mehr
+/// (Rolle entwickelt sich nicht weiter = Backtrack/fast-Taxi), so lange →
+/// zurück zu TaxiOut. Eine echte Startrolle setzt laufend neue GS-Höchst-
+/// werte → der Dwell wird nie voll (Reset bei jedem neuen Peak), unabhängig
+/// davon, wie zügig sie beschleunigt.
+const TAKEOFF_ROLL_STALL_DWELL_SECS: i64 = 12;
+
 /// Rückkante der TakeoffRoll-Phase — behebt den flottenweiten
 /// TAKEOFF_ROLL_STUCK (5 % der Flüge, 614-Flug-Scan 2026-07-05).
 ///
@@ -22883,6 +22916,50 @@ fn takeoff_roll_demote(
         }
     } else {
         (None, None) // GS zurück über Schwelle / airborne → Dwell verwerfen
+    }
+}
+
+/// Zweite Rückkante der TakeoffRoll-Phase (v0.21.x) — BACKTRACK-ERKENNUNG.
+///
+/// Die GS<20-Abbruchkante ([`takeoff_roll_demote`]) fängt nur den vollen
+/// Stillstand. Ein schneller BACKTRACK / Fehl-Trip plateauisiert aber bei
+/// Taxi-Speed (~30 kt, ÜBER der 20-kt-Schwelle) und hing dadurch lange auf
+/// „TakeoffRoll" (Feld: 39–131 s). Über 673 Flüge trennt sich echt vs.
+/// falsch sauber am Peak-GS: echte Startrollen ≥ 52 kt, Fehl-Trips ≤ 33 kt.
+///
+/// Diese Kante demotet, wenn der Peak-GS `TAKEOFF_ROLL_CONFIRM_KT` NIE
+/// erreicht UND die GS keine neuen Höchstwerte mehr setzt (Plateau) für
+/// `TAKEOFF_ROLL_STALL_DWELL_SECS`. Bulletproof gegen echte (auch träge)
+/// Startrollen: die setzen monoton neue GS-Höchstwerte → `stall_since` wird
+/// bei JEDEM neuen Peak zurückgesetzt, der Dwell also nie voll; und sobald
+/// der Peak ≥ CONFIRM_KT war, ist die Kante ganz aus („committed").
+///
+/// Pur + uhrlos → direkt testbar. Rückgabe:
+/// (Ziel-Phase falls demotet, neuer Peak-GS, neuer `stall_since`).
+fn takeoff_roll_stall_check(
+    on_ground: bool,
+    groundspeed_kt: f32,
+    peak_kt: f32,
+    stall_since: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> (Option<FlightPhase>, f32, Option<DateTime<Utc>>) {
+    let new_peak = peak_kt.max(groundspeed_kt);
+    // Airborne oder bereits echte Startgeschwindigkeit gesehen → committed,
+    // keine Plateau-Demote mehr (die GS<20-Abbruchkante bleibt aktiv).
+    if !on_ground || new_peak >= TAKEOFF_ROLL_CONFIRM_KT {
+        return (None, new_peak, None);
+    }
+    if groundspeed_kt > peak_kt {
+        // Frischer Höchstwert → Rolle entwickelt sich → Dwell verwerfen.
+        (None, new_peak, None)
+    } else {
+        // Plateau unter CONFIRM_KT → Dwell zählen.
+        let since = stall_since.unwrap_or(now);
+        if (now - since).num_seconds() >= TAKEOFF_ROLL_STALL_DWELL_SECS {
+            (Some(FlightPhase::TaxiOut), new_peak, None) // Backtrack erkannt
+        } else {
+            (None, new_peak, Some(since))
+        }
     }
 }
 
@@ -23469,6 +23546,10 @@ fn step_flight_at(
             // "Fuel & Weight @ Block-off" landed in the pilot's log three times.
             if takeoff_roll_detected(&mut stats, snap, now) {
                 next_phase = FlightPhase::TakeoffRoll;
+                // Peak-/Plateau-State dieser Rolle frisch initialisieren
+                // (Backtrack-Rückkante, s. takeoff_roll_stall_check).
+                stats.takeoff_roll_peak_kt = snap.groundspeed_kt;
+                stats.takeoff_roll_stall_since = None;
             }
             // v0.5.10/11: helicopter / VTOL / glider / seaplane
             // escape hatch.
@@ -23567,7 +23648,19 @@ fn step_flight_at(
                     now,
                 );
                 stats.takeoff_roll_slow_since = slow_since;
-                if let Some(target) = demote {
+                // Zweite Rückkante: Backtrack/Fehl-Trip plateauisiert bei
+                // Taxi-Speed (nie ≥ 45 kt) → zurück zu TaxiOut, lange bevor
+                // die GS<20-Kante greifen würde. Siehe takeoff_roll_stall_check.
+                let (stall_demote, peak, stall_since) = takeoff_roll_stall_check(
+                    snap.on_ground,
+                    snap.groundspeed_kt,
+                    stats.takeoff_roll_peak_kt,
+                    stats.takeoff_roll_stall_since,
+                    now,
+                );
+                stats.takeoff_roll_peak_kt = peak;
+                stats.takeoff_roll_stall_since = stall_since;
+                if let Some(target) = demote.or(stall_demote) {
                     next_phase = target;
                 }
             }
@@ -32296,6 +32389,83 @@ mod takeoff_roll_demote_tests {
     }
 }
 
+/// v0.21.x — Plateau-Rückkante (Backtrack-Erkennung). Belegt an 673 Flügen:
+/// echte Startrollen ≥ 52 kt Peak, Fehl-Trips ≤ 33 kt.
+#[cfg(test)]
+mod takeoff_roll_stall_tests {
+    use super::*;
+    use chrono::Duration;
+
+    /// Backtrack/Fehl-Trip: plateauisiert bei ~30 kt (über der GS<20-Kante),
+    /// erreicht nie 45 kt → nach dem Dwell zurück zu TaxiOut.
+    #[test]
+    fn backtrack_plateau_demotes_after_dwell() {
+        let t0 = Utc::now();
+        let peak = 30.0f32; // Eintritt bei 30 kt
+        // Plateau: GS setzt keine neuen Höchstwerte → Dwell startet.
+        let (d, peak, stall) = takeoff_roll_stall_check(true, 29.0, peak, None, t0);
+        assert_eq!(d, None, "erster Plateau-Tick demotet nicht sofort");
+        assert!(stall.is_some(), "Plateau startet den Dwell");
+        // Innerhalb des Dwells: weiter TakeoffRoll.
+        let (d, peak, stall) =
+            takeoff_roll_stall_check(true, 30.0, peak, stall, t0 + Duration::seconds(6));
+        assert_eq!(d, None);
+        // Nach dem Dwell (12 s) ohne neuen Peak → Backtrack erkannt.
+        let (d, _p, _s) =
+            takeoff_roll_stall_check(true, 30.0, peak, stall, t0 + Duration::seconds(12));
+        assert_eq!(d, Some(FlightPhase::TaxiOut), "Backtrack nach Dwell → TaxiOut");
+    }
+
+    /// Echte Startrolle: jeder Tick ein neuer GS-Höchstwert → Dwell wird nie
+    /// voll; ab 45 kt committed → Kante ganz aus. NIE demote.
+    #[test]
+    fn real_takeoff_new_peaks_never_demote() {
+        let t0 = Utc::now();
+        let mut peak = 30.0f32;
+        let mut stall = None;
+        for (i, gs) in [32.0f32, 36.0, 41.0, 47.0].iter().enumerate() {
+            let (d, p, s) =
+                takeoff_roll_stall_check(true, *gs, peak, stall, t0 + Duration::seconds(i as i64));
+            assert_eq!(d, None, "Startrolle darf nie plateau-demoten (gs={gs})");
+            peak = p;
+            stall = s;
+        }
+        assert!(peak >= TAKEOFF_ROLL_CONFIRM_KT, "Peak hat CONFIRM erreicht");
+        // Committed: ein späterer GS-Dip demotet NICHT mehr über diese Kante
+        // (dafür ist die GS<20-Abbruchkante zuständig).
+        let (d, _p, _s) =
+            takeoff_roll_stall_check(true, 25.0, peak, None, t0 + Duration::seconds(30));
+        assert_eq!(d, None, "nach CONFIRM ist die Plateau-Kante aus");
+    }
+
+    /// Bulletproof gegen TRÄGE echte Starts: nur ~1 kt/s, 15 s unter 45 kt —
+    /// aber stetig neue Höchstwerte → Dwell wird nie voll, nie demote.
+    #[test]
+    fn slow_but_steady_takeoff_never_demotes() {
+        let t0 = Utc::now();
+        let mut peak = 30.0f32;
+        let mut stall = None;
+        for i in 1..=15i64 {
+            let gs = 30.0 + i as f32; // 31,32,…,45
+            let (d, p, s) =
+                takeoff_roll_stall_check(true, gs, peak, stall, t0 + Duration::seconds(i));
+            assert_eq!(d, None, "träge aber stetige Startrolle darf nie demoten (t={i}s)");
+            peak = p;
+            stall = s;
+        }
+    }
+
+    /// Airborne verwirft die Plateau-Kante (Vorwärtskante zu Takeoff greift).
+    #[test]
+    fn airborne_disables_plateau_demote() {
+        let t0 = Utc::now();
+        let (d, _p, s) =
+            takeoff_roll_stall_check(false, 30.0, 30.0, Some(t0), t0 + Duration::seconds(60));
+        assert_eq!(d, None);
+        assert_eq!(s, None);
+    }
+}
+
 #[cfg(test)]
 mod final_landing_push_condition_tests {
     use super::*;
@@ -39679,6 +39849,9 @@ mod v0_16_23_route_only_refresh_tests {
             max_ldw_kg: 66000.0,
             route: route.map(|s| s.to_string()),
             alternate: alternate.map(|s| s.to_string()),
+            // bewusst gesetzt — der Route-Only-Pfad darf die Cruise-Ref
+            // ebenso wenig in die FlightStats schreiben wie die *_kg-Felder.
+            planned_cruise_alt_ft: Some(35000.0),
             waypoints,
             ofp_flight_number: "GSG100".to_string(),
             ofp_origin_icao: "EDDF".to_string(),

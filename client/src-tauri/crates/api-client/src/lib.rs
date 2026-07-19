@@ -492,6 +492,15 @@ pub struct SimBriefOfp {
     pub route: Option<String>,
     /// Alternate airport ICAO, if planned.
     pub alternate: Option<String>,
+    /// v0.21.x (#phase-v2 Fix A): planned initial cruise altitude in FEET,
+    /// from `<general><initial_altitude>`. Feeds the Phase-v2 engine's
+    /// cruise reference so ref-less flights (GSG `flights.level` is almost
+    /// always empty) show "Cruise" immediately at level-off instead of
+    /// waiting the ~240 s duration fallback. `None` when the tag is absent
+    /// or non-numeric. This is the FIRST cruise level; later step climbs
+    /// are covered by the higher-priority live PMDG-FMC source.
+    #[serde(default)]
+    pub planned_cruise_alt_ft: Option<f64>,
     /// Ordered waypoints from the OFP `<navlog>`. Posted to phpVMS via
     /// `POST /pireps/{id}/route` after prefile so the live map can show
     /// the planned track alongside the actually flown one.
@@ -2038,6 +2047,26 @@ fn parse_simbrief_ofp(xml: &str) -> Option<SimBriefOfp> {
         .filter(|s| !s.is_empty());
     let waypoints = extract_navlog_fixes(xml);
 
+    // v0.21.x (#phase-v2 Fix A): geplante Reiseflughöhe aus
+    // `<general><initial_altitude>` — SimBrief liefert das immer in FUSS
+    // (z.B. 36000), unabhängig von der Gewichtseinheit. KEINE FL-×100-
+    // Heuristik wie beim Bid-Level: initial_altitude ist dokumentiert in
+    // Fuß, ein echter Tiefflug-Wert (z.B. 9000) darf nicht fälschlich
+    // hochskaliert werden. Auf <general> begrenzt, damit kein anderes
+    // gleichnamiges Tag getroffen wird. None wenn Tag fehlt/nicht numerisch.
+    //
+    // v1.0.0-Härtung (Code-Review): >= 1000 ft als Plausibilitäts-FLOOR.
+    // Sollte SimBrief je einen FL-artigen Wert liefern ("360" statt "36000"),
+    // wäre near_or_above_ref(alt) = alt >= 360 - 1000 IMMER wahr → das erste
+    // Level-Off im Steig würde fälschlich sofort Cruise (genau die Premature-
+    // Cruise-Falle, die Fix A verhindern soll). Ein echter Reiseflug in Fuß
+    // liegt immer >= 1000; bare Flight-Level (<= ~600) fallen sauber darunter
+    // raus → Fallback auf obsref/240 s.
+    let planned_cruise_alt_ft = extract_tag(xml, "general")
+        .and_then(|inner| extract_tag(inner, "initial_altitude"))
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|&ft| ft >= 1000.0);
+
     // v0.7.12: Pax + Cargo aus <weights>. SimBrief liefert pax_count als
     // Integer + cargo als float (in kg wenn die XML mit units_set=kgs
     // angefordert wurde — was wir tun). Bei Cargo-Only-Flights ist
@@ -2067,6 +2096,7 @@ fn parse_simbrief_ofp(xml: &str) -> Option<SimBriefOfp> {
         planned_ldw_kg: ldw,
         route,
         alternate,
+        planned_cruise_alt_ft,
         waypoints,
         max_zfw_kg: max_zfw,
         max_tow_kg: max_tow,
@@ -2323,6 +2353,76 @@ mod tests {
         "#;
         let ofp = parse_simbrief_ofp(xml).expect("parses");
         assert_eq!(ofp.request_id, "");
+    }
+
+    /// v0.21.x (#phase-v2 Fix A): geplante Cruise-Höhe aus
+    /// <general><initial_altitude> (in Fuß) → Cruise-Ref der Phasen-Engine.
+    #[test]
+    fn simbrief_parser_extracts_initial_cruise_altitude() {
+        let xml = r#"
+            <ofp>
+                <general>
+                    <initial_altitude>36000</initial_altitude>
+                    <stepclimb_string>FL360/FL380</stepclimb_string>
+                </general>
+                <weights>
+                    <est_zfw>71242</est_zfw>
+                </weights>
+            </ofp>
+        "#;
+        let ofp = parse_simbrief_ofp(xml).expect("parses");
+        assert_eq!(ofp.planned_cruise_alt_ft, Some(36000.0));
+    }
+
+    /// Fehlt der Tag, bleibt es None (→ Engine nutzt Bid-Level/240s-Fallback).
+    #[test]
+    fn simbrief_parser_cruise_altitude_absent_is_none() {
+        let xml = r#"
+            <ofp>
+                <weights>
+                    <est_zfw>71242</est_zfw>
+                </weights>
+            </ofp>
+        "#;
+        let ofp = parse_simbrief_ofp(xml).expect("parses");
+        assert_eq!(ofp.planned_cruise_alt_ft, None);
+    }
+
+    /// initial_altitude ist dokumentiert in FUSS — ein echter Tiefflug-Wert
+    /// darf NICHT wie ein Flight-Level (×100) hochskaliert werden.
+    #[test]
+    fn simbrief_parser_cruise_altitude_low_value_is_feet_not_flight_level() {
+        let xml = r#"
+            <ofp>
+                <general>
+                    <initial_altitude>9000</initial_altitude>
+                </general>
+                <weights>
+                    <est_zfw>71242</est_zfw>
+                </weights>
+            </ofp>
+        "#;
+        let ofp = parse_simbrief_ofp(xml).expect("parses");
+        assert_eq!(ofp.planned_cruise_alt_ft, Some(9000.0));
+    }
+
+    /// v1.0.0-Härtung: ein FL-artiger Wert (< 1000, z.B. "360" statt
+    /// "36000") wird als unplausibel verworfen → None, damit er nicht die
+    /// Premature-Cruise-Falle auslöst (near_or_above_ref immer wahr).
+    #[test]
+    fn simbrief_parser_cruise_altitude_flight_level_style_is_rejected() {
+        let xml = r#"
+            <ofp>
+                <general>
+                    <initial_altitude>360</initial_altitude>
+                </general>
+                <weights>
+                    <est_zfw>71242</est_zfw>
+                </weights>
+            </ofp>
+        "#;
+        let ofp = parse_simbrief_ofp(xml).expect("parses");
+        assert_eq!(ofp.planned_cruise_alt_ft, None);
     }
 
     // ── v0.7.18 (B-011 / R2-3): PirepSummary Regression-Guards ───────

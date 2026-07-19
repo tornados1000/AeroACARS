@@ -104,6 +104,19 @@ pub const CRUISE_REF_BAND_FT: f64 = 1000.0;
 /// Wird im SINKFLUG durch die Observed-Cruise-Ref (s. u.) ersetzt und
 /// greift dort nur noch, wenn noch keine Referenz-Höhe beobachtet wurde.
 pub const LEVEL_TO_CRUISE_FALLBACK_SECS: i64 = 240;
+/// Backstop bei VORHANDENER `cruise_ref`, wenn das Level-Segment im Steig
+/// klar UNTER der Referenz liegt (v0.21.x, #phase-v2 Fix A): dann ist das
+/// entweder ein echter Tief-Reiseflug (der ganze Enroute unter der Planhöhe,
+/// z. B. ATC hält tief) oder eine lange Zwischen-Reiseflughöhe. Ohne diesen
+/// Backstop bliebe ein solcher Flug mit gesetzter ref dauerhaft „Level/Climb"
+/// (der `Some(false)`-Zweig hatte keinen Dauer-Fallback). Bewusst DEUTLICH
+/// länger als `LEVEL_TO_CRUISE_FALLBACK_SECS` (240 s): typische ATC-
+/// Restriktionen im Steig sind kürzer als 10 min → der Premature-Cruise-
+/// Schutz bleibt intakt, nur echte Tief-/Zwischen-Reiseflüge kippen zu Cruise.
+/// NUR im Steig-Zweig (Climb→Level); im Sinkflug bleibt ein Level-Off unter
+/// der ref eine Restriktion (Descent), sonst kämen die Descent→Cruise-Flaps
+/// zurück.
+pub const LEVEL_BELOW_REF_TO_CRUISE_FALLBACK_SECS: i64 = 600;
 /// Observed-Cruise-Ref-Band (2026-07-06): das höchste je im En-Route-Band
 /// erreichte Level (`obsref`) ist eine ref-lose, aus dem Höhenstrom selbst
 /// abgeleitete Cruise-Referenz — verfügbar für 100 % der Flüge (im
@@ -622,13 +635,20 @@ impl ShadowPhaseEngine {
                 // nie ein Descending-Segment.
                 Segment::Descending => FlightPhase::Descent,
                 Segment::Level => {
-                    let at_ref = near_or_above_ref(alt_msl_ft);
-                    let cruise = match at_ref {
-                        // ref bekannt: nur am/über dem geplanten Level
-                        // ist Level == Cruise. Darunter ist es eine
-                        // Level-RESTRICTION → Climb + Label Level
-                        // (killt die 69 Premature-Cruise-Flüge).
-                        Some(at) => at,
+                    let cruise = match near_or_above_ref(alt_msl_ft) {
+                        // ref bekannt + am/über dem geplanten Level →
+                        // sofort Cruise (Schnellpfad; Kern von Fix A).
+                        Some(true) => true,
+                        // ref bekannt aber DARUNTER: erst mal eine Level-
+                        // RESTRICTION → Climb + Label Level (killt die 69
+                        // Premature-Cruise-Flüge). ABER: hält das Level
+                        // sehr lange an (LEVEL_BELOW_REF_TO_CRUISE_
+                        // FALLBACK_SECS), ist es ein echter Tief-/Zwischen-
+                        // Reiseflug → doch Cruise. Kurze ATC-Restriktionen
+                        // (< 10 min) bleiben Climb.
+                        Some(false) => {
+                            seg_held_secs >= LEVEL_BELOW_REF_TO_CRUISE_FALLBACK_SECS
+                        }
                         // ref unbekannt: Dauer-Heuristik. BEWUSST NICHT
                         // obsref — im Steigflug ist obsref == aktuelle Höhe,
                         // das würde jede Level-Restriction sofort fälschlich
@@ -1056,6 +1076,49 @@ mod tests {
         // Steigen wird wieder aufgenommen → Climbing sustained → Climb.
         let (p, _) = sim.fly(240, 2200.0, FlightPhase::Cruise);
         assert_eq!(p, FlightPhase::Climb);
+    }
+
+    /// v0.21.x (#phase-v2 Fix A): Tief-Reiseflug UNTER der geplanten ref.
+    /// Kurzes Level unter ref bleibt Climb (Restriktion), aber ein sehr
+    /// langes Level (> LEVEL_BELOW_REF_TO_CRUISE_FALLBACK_SECS) kippt über
+    /// den Backstop doch zu Cruise — sonst hinge ein ganzer Flug unter der
+    /// Planhöhe dauerhaft in „Climb/Level".
+    #[test]
+    fn low_cruise_below_ref_uses_long_backstop() {
+        let mut sim = Sim::new(Some(34000.0));
+        sim.depart();
+        // Natürlicher Steigflug bis ~FL205 — klar unter ref (FL340).
+        let (p, _) = sim.fly(600, 2000.0, FlightPhase::Climb);
+        assert_eq!(p, FlightPhase::Climb);
+        // Level-Off unter ref, kurze Dauer → bleibt Climb (kurze ATC-
+        // Restriktion darf NICHT verfrüht Cruise werden).
+        let (p, _) = sim.fly(240, 0.0, FlightPhase::Cruise);
+        assert_eq!(
+            p,
+            FlightPhase::Climb,
+            "kurzes Level unter ref muss Climb bleiben"
+        );
+        // Level hält sehr lange an → echter Tief-Reiseflug → Backstop.
+        let (p, _) = sim.fly(480, 0.0, FlightPhase::Cruise);
+        assert_eq!(
+            p,
+            FlightPhase::Cruise,
+            "langes Level unter ref muss über den Backstop zu Cruise werden"
+        );
+    }
+
+    /// Gegenprobe: MIT ref am/über dem Level greift der Schnellpfad sofort
+    /// (kein Warten auf den Backstop) — Fix-A-Kernverhalten unverändert.
+    #[test]
+    fn level_off_at_ref_is_immediate_cruise() {
+        let mut sim = Sim::new(Some(20000.0));
+        sim.depart();
+        let (p, _) = sim.fly(600, 2000.0, FlightPhase::Climb);
+        assert_eq!(p, FlightPhase::Climb);
+        // Level-Off auf ~FL205, am/über ref → nach Fenster-Etablierung
+        // sofort Cruise, lange bevor der 600s-Backstop je zählen würde.
+        let (p, _) = sim.fly(120, 0.0, FlightPhase::Climb);
+        assert_eq!(p, FlightPhase::Cruise);
     }
 
     /// Drift-Down (Engine-Out): Cruise FL380 → Descent → Level FL240 =
