@@ -1,4 +1,4 @@
-//! Auto-Provisioning gegen live.kant.ovh — gibt phpVMS-API-Key durch,
+//! Auto-Provisioning gegen live.nexusairva.org — gibt phpVMS-API-Key durch,
 //! kriegt MQTT-Credentials zurück. Idempotent serverseitig (DB-cached
 //! per phpVMS-Pilot-ID). Re-Install des Clients = identische
 //! Credentials, kein Race.
@@ -9,7 +9,7 @@ use std::time::Duration;
 
 /// Default-URL — kann via Override-Parameter überschrieben werden für
 /// Test-VPS / Dev-Setups.
-pub const DEFAULT_PROVISION_URL: &str = "https://live.kant.ovh/api/provision";
+pub const DEFAULT_PROVISION_URL: &str = "https://live.nexusairva.org/api/provision";
 
 #[derive(Serialize)]
 struct ProvisionRequest<'a> {

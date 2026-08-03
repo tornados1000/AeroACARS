@@ -106,8 +106,8 @@ export function SettingsPanel({
   } | null>(null);
 
   // v0.7.14: Discord-Webhook-UI entfernt. Discord-Posts macht ab v0.7.14
-  // der Recorder auf live.kant.ovh zentral — VA-Owner setzt die URL einmal
-  // im Webapp-Admin (https://live.kant.ovh/admin/ → Settings → Discord),
+  // der Recorder auf live.nexusairva.org zentral — VA-Owner setzt die URL einmal
+  // im Webapp-Admin (https://live.nexusairva.org/admin/ → Settings → Discord),
   // Pilots tun nichts. Audit C1.
 
   // v0.7.8: Auto-clear verify-status nach 8s.

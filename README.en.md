@@ -1,4 +1,4 @@
-# AeroACARS
+# NexusAir ACARS
 
 > Modern, open-source ACARS client for [phpVMS 7](https://phpvms.net) — Tauri 2 + Rust + React.
 > Made with ❤️ in Gifhorn — by Thomas Kant.
@@ -9,7 +9,7 @@
 
 ---
 
-## What is AeroACARS?
+## What is NexusAir ACARS?
 
 A modern, cross-platform ACARS client for phpVMS 7. It captures telemetry from
 flight simulators, scores landings against industry-validated thresholds,
@@ -25,11 +25,11 @@ your phpVMS server.
 
 ---
 
-## Who can run AeroACARS?
+## Who can run NexusAir ACARS?
 
 🇬🇧 **The source is free — the official apps only run for German Sky Group.**
 
-AeroACARS is open source (MIT license). Any virtual airline is welcome to clone,
+NexusAir ACARS is open source (MIT license). Any virtual airline is welcome to clone,
 adapt and build the code for its **own** phpVMS 7 instance — that is explicitly
 encouraged.
 
@@ -37,7 +37,7 @@ The **officially released builds** (the installers from the
 [GitHub releases](https://github.com/MANFahrer-GF/AeroACARS/releases)) are, by
 contrast, hard-wired to the German Sky Group: login, live tracking and PIREP
 submission only work with a GSG pilot account — an account of another VA is
-rejected. Anyone who wants to use AeroACARS for a different VA builds their own
+rejected. Anyone who wants to use NexusAir ACARS for a different VA builds their own
 client from source against their own infrastructure.
 
 ---
@@ -48,20 +48,20 @@ Download the package for your platform from the [Latest Release](https://github.
 
 ### Windows (10 / 11, x64)
 
-1. Download and run `AeroACARS_<version>_x64-setup.exe` (NSIS installer)
+1. Download and run `NexusAir ACARS_<version>_x64-setup.exe` (NSIS installer)
 2. Dismiss the SmartScreen warning: "More info" → "Run anyway" — we are not yet code-signed
-3. AeroACARS starts automatically after installation
+3. NexusAir ACARS starts automatically after installation
 4. Log in with your phpVMS API key
 
 ### macOS (Apple Silicon — M1 / M2 / M3 / M4)
 
-1. Download `AeroACARS_<version>_aarch64.dmg`
-2. Open the DMG → drag the AeroACARS icon into the Applications folder
+1. Download `NexusAir ACARS_<version>_aarch64.dmg`
+2. Open the DMG → drag the NexusAir ACARS icon into the Applications folder
 3. **On first launch:** Gatekeeper blocks the app because it hasn't gone through Apple Notarization. You have two options:
-   - **Via right-click:** In Finder, right-click AeroACARS → "Open" → confirm "Open" in the dialog. macOS then remembers the permission and launches the app normally from then on.
+   - **Via right-click:** In Finder, right-click NexusAir ACARS → "Open" → confirm "Open" in the dialog. macOS then remembers the permission and launches the app normally from then on.
    - **Via Terminal** (if right-click doesn't show the option — happens with stricter Gatekeeper settings):
      ```bash
-     xattr -dr com.apple.quarantine /Applications/AeroACARS.app
+     xattr -dr com.apple.quarantine "/Applications/NexusAir ACARS.app"
      ```
 4. Log in with your phpVMS API key
 
@@ -73,7 +73,7 @@ From v0.1.0+, new versions appear directly as an update banner in the app — no
 
 ---
 
-## What can AeroACARS do?
+## What can NexusAir ACARS do?
 
 ### Live telemetry + flight tracking
 - Phase-detection FSM (16 phases: Boarding → Pushback → TaxiOut → Takeoff → Climb → Cruise → Descent → Approach → Final → Landing → TaxiIn → BlocksOn → Arrived → PIREP)
@@ -116,7 +116,7 @@ From v0.1.0+, new versions appear directly as an update banner in the app — no
 
 ---
 
-## Shoulders AeroACARS stands on
+## Shoulders NexusAir ACARS stands on
 
 - **OurAirports** — Public-domain runway dataset
 - **BeatMyLanding** — Touchdown-window calibration and bounce-detection pattern
@@ -144,8 +144,8 @@ npm run tauri build -- --bundles nsis   # Build the release installer
 
 Deep study-level aircraft in X-Plane often drive cockpit and system functions
 through their **own DataRefs** instead of the standard `sim/...` DataRefs.
-AeroACARS reads the standard DataRefs — if an add-on doesn't populate them,
-AeroACARS can't "see" the flap setting, for example (consequence:
+NexusAir ACARS reads the standard DataRefs — if an add-on doesn't populate them,
+NexusAir ACARS can't "see" the flap setting, for example (consequence:
 `LANDING CONFIG: INCOMPLETE` even though flaps were set).
 
 From **v0.12.1**, an unreadable value is handled fairly — shown as "not
@@ -164,10 +164,10 @@ aircraft can get a matching DataRef profile.
 
 ## Troubleshooting / logs
 
-If AeroACARS behaves oddly and you want to send something substantial to the
+If NexusAir ACARS behaves oddly and you want to send something substantial to the
 issue tracker — here's what lives where.
 
-### Where AeroACARS stores data
+### Where NexusAir ACARS stores data
 
 All files live under the Tauri-standard `app_data_dir` with bundle ID
 `com.aeroacars.app`:
@@ -199,17 +199,17 @@ The Rust tracing output (HTTP requests, SimConnect status, detailed phase
 computation) currently goes only to **stderr** — it does **not** land on disk.
 If you need it:
 
-- **Windows:** Start AeroACARS from a PowerShell console: `& "C:\Program Files\AeroACARS\AeroACARS.exe"` — the tracing lines then appear in the terminal.
-- **macOS:** From the terminal: `/Applications/AeroACARS.app/Contents/MacOS/AeroACARS`
+- **Windows:** Start NexusAir ACARS from a PowerShell console: `& "C:\Program Files\NexusAir ACARS\NexusAir ACARS.exe"` — the tracing lines then appear in the terminal.
+- **macOS:** From the terminal: `/Applications/NexusAir\ ACARS.app/Contents/MacOS/NexusAir\ ACARS`
 
 Control the verbosity level via `RUST_LOG`:
 
 ```bash
 # Standard mode (info)
-RUST_LOG=info  ./AeroACARS
+RUST_LOG=info  ./NexusAir\ ACARS
 
 # Full debug for our code, info for everything else
-RUST_LOG=info,aeroacars=debug  ./AeroACARS
+RUST_LOG=info,aeroacars=debug  ./NexusAir\ ACARS
 ```
 
 ### Reporting an issue

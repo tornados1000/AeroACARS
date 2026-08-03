@@ -43,7 +43,7 @@ export function AboutPanel({ onShowReleaseNotes }: Props) {
   return (
     <section className="about">
       <header className="about__hero">
-        <h2 className="about__title">AeroACARS</h2>
+        <h2 className="about__title">NexusAir ACARS</h2>
         <p className="about__tagline">{t("about.tagline")}</p>
         {info && (
           <p className="about__version">
@@ -140,7 +140,7 @@ export function AboutPanel({ onShowReleaseNotes }: Props) {
       </div>
 
       <footer className="about__footer">
-        <p>© {new Date().getFullYear()} AeroACARS Project · MIT License</p>
+        <p>© {new Date().getFullYear()} NexusAir ACARS Project · MIT License</p>
         <p>{info?.credit}</p>
       </footer>
     </section>

@@ -33,7 +33,7 @@ export function useV2Skin(): V2Skin {
 
 interface SkinProviderProps {
   children: ReactNode;
-  /** VPS-Endpoint. Default: live.kant.ovh. Für Tests/Dev überschreibbar. */
+  /** VPS-Endpoint. Default: live.nexusairva.org. Für Tests/Dev überschreibbar. */
   endpoint?: string;
   /**
    * Auth-Token (Bearer). Optional — wenn der VPS-Endpoint Pilot-Auth
@@ -45,7 +45,7 @@ interface SkinProviderProps {
 
 export function SkinProvider({
   children,
-  endpoint = "https://live.kant.ovh/api/v2-skin",
+  endpoint = "https://live.nexusairva.org/api/v2-skin",
   authToken,
 }: SkinProviderProps) {
   // Initial: Cache aus localStorage probieren, sonst DEFAULT.

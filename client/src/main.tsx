@@ -103,7 +103,7 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
         <div style={{ padding: 24, fontFamily: "system-ui, sans-serif" }}>
           <h2 style={{ marginTop: 0 }}>Etwas ist schiefgegangen</h2>
           <p>
-            AeroACARS hat einen unerwarteten Fehler abgefangen. Wenn die
+            NexusAir ACARS hat einen unerwarteten Fehler abgefangen. Wenn die
             anonyme Fehler-Telemetrie aktiv ist, wurde der Fehler bereits
             gemeldet — anderenfalls passiert nichts.
           </p>

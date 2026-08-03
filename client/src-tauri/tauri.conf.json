@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "AeroACARS",
+  "productName": "NexusAir ACARS",
   "version": "1.3.2",
   "identifier": "com.aeroacars.app",
   "build": {
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "AeroACARS",
+        "title": "NexusAir ACARS",
         "width": 1200,
         "height": 800,
         "minWidth": 900,
@@ -23,7 +23,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self' ipc: http://ipc.localhost; connect-src 'self' ipc: http://ipc.localhost https://german-sky-group.eu https://www.german-sky-group.eu https://www.simbrief.com https://*.simbrief.com https://live.kant.ovh wss://live.kant.ovh https://github.com https://*.cartocdn.com https://server.arcgisonline.com https://ourairports.com; img-src 'self' data: blob: https://german-sky-group.eu https://www.german-sky-group.eu https://*.cartocdn.com https://server.arcgisonline.com; style-src 'self' 'unsafe-inline'; script-src 'self' blob:; worker-src 'self' blob:; child-src 'self' blob:; font-src 'self' data:"
+      "csp": "default-src 'self' ipc: http://ipc.localhost; connect-src 'self' ipc: http://ipc.localhost https://crew.nexusairva.org https://www.simbrief.com https://*.simbrief.com https://live.nexusairva.org wss://live.nexusairva.org https://github.com https://*.cartocdn.com https://server.arcgisonline.com https://ourairports.com; img-src 'self' data: blob: https://crew.nexusairva.org https://*.cartocdn.com https://server.arcgisonline.com; style-src 'self' 'unsafe-inline'; script-src 'self' blob:; worker-src 'self' blob:; child-src 'self' blob:; font-src 'self' data:"
     }
   },
   "bundle": {
@@ -40,9 +40,9 @@
       "crates/sim-msfs/ffi/lib/SimConnect.dll": "SimConnect.dll"
     },
     "createUpdaterArtifacts": true,
-    "publisher": "AeroACARS Project",
+    "publisher": "NexusAir ACARS Project",
     "shortDescription": "Cross-platform ACARS client for phpVMS 7",
-    "longDescription": "AeroACARS connects phpVMS 7 with MSFS 2020/2024 and X-Plane 11/12, recording flights, streaming live position data, and submitting full PIREPs with detailed runway and landing analysis."
+    "longDescription": "NexusAir ACARS connects phpVMS 7 with MSFS 2020/2024 and X-Plane 11/12, recording flights, streaming live position data, and submitting full PIREPs with detailed runway and landing analysis."
   },
   "plugins": {
     "updater": {

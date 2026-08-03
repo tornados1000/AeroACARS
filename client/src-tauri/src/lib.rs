@@ -6,7 +6,7 @@
 //! never on disk in plaintext.
 
 // v0.7.14: `mod discord` entfernt — Pilot-Client postet keine Discord-Events
-// mehr. Recorder auf live.kant.ovh macht das jetzt zentral (eine Quelle,
+// mehr. Recorder auf live.nexusairva.org macht das jetzt zentral (eine Quelle,
 // VA-Owner-kontrolliert via Webapp-Admin-Settings). Audit Q4-2026-05 (C1).
 mod accident;
 mod arrival;
@@ -1389,7 +1389,7 @@ struct AppState {
     /// SimBrief-direct-Match-Verifikation (Spec §6.1).
     cached_pilot_callsign: Mutex<Option<String>>,
     /// v0.5.11: MQTT live-tracking publisher handle. Connects to
-    /// the aeroacars-live VPS (live.kant.ovh) via auto-provisioning
+    /// the aeroacars-live VPS (live.nexusairva.org) via auto-provisioning
     /// the first time AeroACARS sees a logged-in pilot's API key.
     /// Pure background feature — pilot-invisible, no UI. Failure is
     /// non-fatal: AeroACARS works exactly as before if MQTT is
@@ -7161,7 +7161,7 @@ pub struct AppInfo {
 #[tauri::command]
 fn app_info() -> AppInfo {
     AppInfo {
-        name: "AeroACARS",
+        name: "NexusAir ACARS",
         version: env!("CARGO_PKG_VERSION"),
         commit: option_env!("AEROACARS_GIT_SHA"),
         credit: "Made with ❤️ in Gifhorn — by Thomas Kant",
@@ -7169,12 +7169,12 @@ fn app_info() -> AppInfo {
 }
 
 /// Hardcoded phpVMS host this build is locked to. Pre-1.0 we ship
-/// AeroACARS as a German Sky Group internal beta; opening the
+/// NexusAir ACARS as a NexusAir internal beta; opening the
 /// app to other VAs (config-driven URL) is a Phase-3 task once
 /// the core is hardened. The login UI ignores whatever URL the
 /// user types and always uses this — the input field stays for
 /// continuity but the value is overwritten before validation.
-const ALLOWED_PHPVMS_HOST: &str = "german-sky-group.eu";
+const ALLOWED_PHPVMS_HOST: &str = "crew.nexusairva.org";
 
 /// v0.12.1 (Stream B) — phpVMS 7 `UserState::ACTIVE`. Verified against
 /// the official phpVMS source (`app/Enums/UserState.php`): the enum is
@@ -7360,7 +7360,7 @@ const MQTT_KEYRING_BROKER: &str = "mqtt-broker-url";
 ///      a previous successful provision), use them directly.
 ///   2. Otherwise, read the phpVMS API key from the keyring (must be
 ///      present — the user has logged in at least once) and call
-///      live.kant.ovh's `/api/provision` endpoint with it. The
+///      live.nexusairva.org's `/api/provision` endpoint with it. The
 ///      server returns MQTT credentials which we cache and use.
 ///
 /// All failures are logged via `tracing::warn!` and ignored — this
@@ -7575,7 +7575,7 @@ async fn phpvms_load_session(
                 log_activity_handle(
                     &app,
                     ActivityLevel::Warn,
-                    "AeroACARS-Sitzung beendet — GSG-Account nicht aktiv"
+                    "NexusAir ACARS-Sitzung beendet — GSG-Account nicht aktiv"
                         .to_string(),
                     Some(format!(
                         "Status-Gate: {reason}. Bitte neu einloggen oder \
@@ -7718,7 +7718,7 @@ fn error_reporting_set_consent(enabled: bool) -> Result<(), UiError> {
 // die alte Pilot-Local-Datei `<app_data_dir>/discord-webhook.txt` wird beim
 // App-Start geloescht (siehe `migrate_remove_discord_webhook_file` weiter
 // unten + Call im Setup-Hook). Discord-Posts macht ab v0.7.14 ausschliesslich
-// der Recorder auf live.kant.ovh, konfigurierbar via Webapp-Admin-Settings.
+// der Recorder auf live.nexusairva.org, konfigurierbar via Webapp-Admin-Settings.
 
 /// v0.7.14: Migration — alte Pilot-Local-Webhook-Datei (`<app_data_dir>/
 /// discord-webhook.txt`) aus v0.7.13 loeschen. Der Pilot-Client postet ab
@@ -18224,7 +18224,7 @@ fn spawn_flight_log_upload(app: &AppHandle, pirep_id: String) {
             &pirep_id,
             &username,
             &password,
-            None, // default endpoint = https://live.kant.ovh/api/flight-logs/upload
+            None, // default endpoint = https://live.nexusairva.org/api/flight-logs/upload
         ).await {
             Ok(stats) => {
                 tracing::info!(
@@ -20937,7 +20937,7 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                         log_activity_handle(
                             &app,
                             ActivityLevel::Info,
-                            "⏸ Simulator pausiert — AeroACARS pausiert die Aufzeichnung.".to_string(),
+                            "⏸ Simulator pausiert — NexusAir ACARS pausiert die Aufzeichnung.".to_string(),
                             Some(detail),
                         );
                         save_active_flight(&app, &flight);
@@ -29247,7 +29247,7 @@ fn build_pirep_notes(
     }
     let _ = write!(
         s,
-        "AeroACARS {} · Forensik v{}",
+        "NexusAir ACARS {} · Forensik v{}",
         env!("CARGO_PKG_VERSION"),
         touchdown_v2::FORENSICS_VERSION
     );
@@ -32226,7 +32226,7 @@ fn spawn_auto_start_watcher(app: AppHandle) {
                 if title_missing && matches!(snap.simulator, sim_core::Simulator::XPlane11 | sim_core::Simulator::XPlane12) {
                     Some((
                         "title_missing_xplane",
-                        "Auto-Start wartet auf Sim-Daten: Aircraft-Titel fehlt. In X-Plane Settings → Network → Web API einschalten, damit AeroACARS den Flugzeug-Namen lesen kann.",
+                        "Auto-Start wartet auf Sim-Daten: Aircraft-Titel fehlt. In X-Plane Settings → Network → Web API einschalten, damit NexusAir ACARS den Flugzeug-Namen lesen kann.",
                     ))
                 } else if title_missing {
                     Some((
@@ -32768,7 +32768,7 @@ fn compute_tray_display(app: &AppHandle) -> TrayDisplay {
     let Some(flight) = guard.as_ref() else {
         return TrayDisplay {
             state: TrayState::Idle,
-            tooltip: "AeroACARS".to_string(),
+            tooltip: "NexusAir ACARS".to_string(),
             menu_header: None,
         };
     };
@@ -32799,11 +32799,11 @@ fn compute_tray_display(app: &AppHandle) -> TrayDisplay {
 
     let tooltip = match s {
         TrayState::Error => format!(
-            "AeroACARS — {} {}\nPIREP serverseitig gecancelt",
+            "NexusAir ACARS — {} {}\nPIREP serverseitig gecancelt",
             callsign, route
         ),
         TrayState::Warning => {
-            let mut parts = vec![format!("AeroACARS — {} {}", callsign, route)];
+            let mut parts = vec![format!("NexusAir ACARS — {} {}", callsign, route)];
             if heartbeat_age_s > TRAY_HEARTBEAT_STALE_SECS && stats.last_heartbeat_at.is_some() {
                 parts.push(format!("Heartbeat stale ({}s)", heartbeat_age_s));
             } else if stats.last_heartbeat_at.is_none() {
@@ -32815,14 +32815,14 @@ fn compute_tray_display(app: &AppHandle) -> TrayDisplay {
             parts.join("\n")
         }
         TrayState::Active => {
-            let mut t = format!("AeroACARS — {} {} · {}", callsign, route, phase_label);
+            let mut t = format!("NexusAir ACARS — {} {} · {}", callsign, route, phase_label);
             if let Some(t0) = stats.last_heartbeat_at {
                 let age = (now - t0).num_seconds();
                 t.push_str(&format!("\nHeartbeat vor {}s", age));
             }
             t
         }
-        TrayState::Idle => "AeroACARS".to_string(),
+        TrayState::Idle => "NexusAir ACARS".to_string(),
     };
 
     let menu_header = Some(format!("✈ {} · {}", callsign, phase_label));
@@ -32866,7 +32866,7 @@ fn build_tray_icon(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
     use tauri::Manager;
 
-    let menu = build_tray_menu(app, "AeroACARS — kein aktiver Flug")?;
+    let menu = build_tray_menu(app, "NexusAir ACARS — kein aktiver Flug")?;
 
     // Idle icon = the default app icon, untouched. The periodic
     // tray-updater swaps to a status-badged variant when there's an
@@ -32877,7 +32877,7 @@ fn build_tray_icon(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .clone();
 
     TrayIconBuilder::with_id("aeroacars-tray")
-        .tooltip("AeroACARS")
+        .tooltip("NexusAir ACARS")
         .icon(icon)
         .menu(&menu)
         .show_menu_on_left_click(false)
@@ -33033,7 +33033,7 @@ fn spawn_tray_updater(app: AppHandle) {
                 let header_label = display
                     .menu_header
                     .clone()
-                    .unwrap_or_else(|| "AeroACARS — kein aktiver Flug".to_string());
+                    .unwrap_or_else(|| "NexusAir ACARS — kein aktiver Flug".to_string());
                 if let Ok(new_menu) = build_tray_menu(&app, &header_label) {
                     let _ = tray.set_menu(Some(new_menu));
                 }
@@ -33063,7 +33063,7 @@ fn spawn_tray_updater(app: AppHandle) {
                 let _ = app
                     .notification()
                     .builder()
-                    .title("AeroACARS")
+                    .title("NexusAir ACARS")
                     .body(&display.tooltip)
                     .show();
             }
@@ -33182,7 +33182,7 @@ pub fn run() {
 
             // v0.7.14: alte Pilot-Local-Webhook-Datei `discord-webhook.txt`
             // aus v0.7.13 loeschen. Discord-Posts macht ab v0.7.14 der
-            // Recorder auf live.kant.ovh zentral (Webapp-Admin-Settings).
+            // Recorder auf live.nexusairva.org zentral (Webapp-Admin-Settings).
             // Audit Q4-2026-05 (C1).
             migrate_remove_discord_webhook_file(&app.handle());
 
@@ -33220,7 +33220,7 @@ pub fn run() {
                 let banner = ActivityEntry {
                     timestamp: Utc::now(),
                     level: ActivityLevel::Info,
-                    message: format!("AeroACARS v{} gestartet", env!("CARGO_PKG_VERSION")),
+                    message: format!("NexusAir ACARS v{} gestartet", env!("CARGO_PKG_VERSION")),
                     // Tiny credit line — keeps the tool feeling human-made.
                     detail: Some("Made with ❤️ in Gifhorn — by Thomas Kant".into()),
                 };

@@ -281,7 +281,7 @@ pub fn build_accident_notes(
         reasons.join(", ")
     };
     format!(
-        "AeroACARS Accident detected: {kind_label}, {confidence} confidence.\n\
+        "NexusAir ACARS Accident detected: {kind_label}, {confidence} confidence.\n\
          Reasons: {reasons_str}."
     )
 }

@@ -7,7 +7,7 @@
 //
 // Lade-Strategie:
 //   1. Beim App-Start versucht der Pilot-Client einen frischen Skin von
-//      https://live.kant.ovh/api/v2-skin zu holen
+//      https://live.nexusairva.org/api/v2-skin zu holen
 //   2. Erfolgreicher Fetch → in AppData\com.aeroacars.app\v2-skin.json
 //      cachen + verwenden
 //   3. Fehlgeschlagener Fetch (offline) → letzten Cache lesen

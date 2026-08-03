@@ -1059,7 +1059,7 @@ pub enum AircraftProfile {
     FsLabsA321,
     /// v0.17.x (#Premium, Aircraft-Scan): Contrail „Dassault Falcon 50"
     /// (MSFS, Trijet — 3 Triebwerke). Erster über das Aircraft-Scan-Tool
-    /// (live.kant.ovh/aircraft) analysierte Flieger. Kein Stub — echtes
+    /// (live.nexusairva.org/aircraft) analysierte Flieger. Kein Stub — echtes
     /// `contrailsystem.wasm` (6,58 MB) + offener EFIS-JS-Quellcode.
     /// Namespace `CTL_FA50_*` (System) + `EFIS_C86C_*` (Avionik).
     /// Premium-Quellen (verifiziert per Paket-Analyse 2026-07-05):

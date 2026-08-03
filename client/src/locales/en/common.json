@@ -1,6 +1,6 @@
 {
   "app": {
-    "name": "AeroACARS",
+    "name": "NexusAir ACARS",
     "tagline": "ACARS for phpVMS 7"
   },
   "tabs": {
@@ -41,7 +41,7 @@
     "accident": {
       "primary_label": "ACCIDENT DETECTED",
       "confirmed_title": "Accident detected",
-      "confirmed_body": "AeroACARS classified this touchdown as an accident. This does not count as a normal landing. Score 0 here means 'accident', not 'very hard landing'.",
+      "confirmed_body": "NexusAir ACARS classified this touchdown as an accident. This does not count as a normal landing. Score 0 here means 'accident', not 'very hard landing'.",
       "suspected_title": "Possible accident — review recommended",
       "suspected_body": "Indicators point to an accident, but not all 'confirmed' thresholds were met. The pilot confirms or overrides the classification in the filing dialog.",
       "kind_label": "Kind",
@@ -355,10 +355,10 @@
     "sinkrate_forensik": {
       "title": "🎯 Sink-Rate Forensics",
       "intro_header": "Which sink-rate is the right one?",
-      "intro_body": "Depending on the averaging window you get different values for the same touchdown. Volanta and the cockpit VSI average over 0.5–1.5 s and filter out spikes, so a gust does not tag every touchdown as a hard landing. AeroACARS instead scores the sink-rate value at the actual ground-contact moment (engineering standard per FAR 25.473 — measures the loading on the landing-gear structure).",
+      "intro_body": "Depending on the averaging window you get different values for the same touchdown. Volanta and the cockpit VSI average over 0.5–1.5 s and filter out spikes, so a gust does not tag every touchdown as a hard landing. NexusAir ACARS instead scores the sink-rate value at the actual ground-contact moment (engineering standard per FAR 25.473 — measures the loading on the landing-gear structure).",
       "tool_section_title": "What your cockpit / Volanta shows",
       "tool_section_subtitle": "Means over different time windows — spikes smoothed. Compare with the score block below.",
-      "score_section_title": "What AeroACARS scores",
+      "score_section_title": "What NexusAir ACARS scores",
       "score_section_subtitle": "Engineering standard FAR 25.473 — load on the gear at the touchdown moment.",
       "bucket_title": "How your sink rate developed in each phase",
       "bucket_subtitle": "From the 4 cumulative means above we compute the real sink rate in each sub-window.",
@@ -396,12 +396,12 @@
     "gforce_forensik": {
       "title": "💪 G-Force Forensics",
       "intro_header": "Which G-force is the right one?",
-      "intro_body": "AeroACARS scores the touchdown G the way real flight-data monitoring (FOQA) does: the G signal is lightly smoothed (EMA, ~100 ms), then the peak is taken. That removes the over-sharp single-frame spikes of 50 Hz sampling — the scored value matches what an aircraft's flight recorder would log. The raw 50 Hz peak stays below as forensic detail.",
+      "intro_body": "NexusAir ACARS scores the touchdown G the way real flight-data monitoring (FOQA) does: the G signal is lightly smoothed (EMA, ~100 ms), then the peak is taken. That removes the over-sharp single-frame spikes of 50 Hz sampling — the scored value matches what an aircraft's flight recorder would log. The raw 50 Hz peak stays below as forensic detail.",
       "tool_section_title": "G trace around touchdown",
       "tool_section_subtitle": "Raw values (50 Hz) — forensic detail, not the scored value.",
       "robust_section_title": "Robust statistics (spike-resistant)",
       "robust_section_subtitle": "Median and 95th percentile filter out single sim-frame spikes. If they are noticeably lower than the peak, the peak was a spike — not a real impact.",
-      "score_section_title": "What AeroACARS scores",
+      "score_section_title": "What NexusAir ACARS scores",
       "score_section_subtitle": "Master score favors sink rate over G — V/S is what maintenance rules actually define.",
       "tile_edge": "Edge (touchdown frame)",
       "tile_250ms": "250 ms mean",
@@ -460,7 +460,7 @@
         "aim": {
           "abbr": "AIM — Aim Point",
           "full": "Aim point",
-          "explanation": "TWO wide white stripes on the runway — one directly above, one directly below the centerline, symmetric (ICAO Annex 14 §5.2.6). On a stabilised approach your eye aims EXACTLY there because the 3° glideslope would take you precisely to that point if you didn't flare. During the flare you raise the nose, reduce thrust — and typically touch down 50–150 m BEYOND the aim point (= start of the TDZ). POSITION (AeroACARS 2-bucket logic, FAA AIM 8-9-1): runway ≥ 2400 m → aim point at 400 m past threshold; runway < 2400 m → 300 m. Example: LIEE 2803 m → 400 m, EDDR 1320 m → 300 m. ICAO Annex 14 would stagger this more finely (150/250/300/400 m by LDA), but the FAA 300/400 simplification is enough for scoring. Stripe length on a real runway: 30–60 m."
+          "explanation": "TWO wide white stripes on the runway — one directly above, one directly below the centerline, symmetric (ICAO Annex 14 §5.2.6). On a stabilised approach your eye aims EXACTLY there because the 3° glideslope would take you precisely to that point if you didn't flare. During the flare you raise the nose, reduce thrust — and typically touch down 50–150 m BEYOND the aim point (= start of the TDZ). POSITION (NexusAir ACARS 2-bucket logic, FAA AIM 8-9-1): runway ≥ 2400 m → aim point at 400 m past threshold; runway < 2400 m → 300 m. Example: LIEE 2803 m → 400 m, EDDR 1320 m → 300 m. ICAO Annex 14 would stagger this more finely (150/250/300/400 m by LDA), but the FAA 300/400 simplification is enough for scoring. Stripe length on a real runway: 30–60 m."
         },
         "tch": {
           "abbr": "TCH — Threshold Crossing Height",
@@ -619,7 +619,7 @@
       "data_source": "Data source: {{sim}}",
       "data_source_unknown": "Data source: unknown",
       "missing_value": "—",
-      "legacy_notice": "This landing was recorded with an older AeroACARS version. The extended stability tiles are only available for PIREPs from v0.11.0 on.",
+      "legacy_notice": "This landing was recorded with an older NexusAir ACARS version. The extended stability tiles are only available for PIREPs from v0.11.0 on.",
       "tiles": {
         "vs_jerk": {
           "label": "V/S jerk",
@@ -664,7 +664,7 @@
       "title": "Approach stability — what do the values mean?",
       "close_label": "Close ✕",
       "close_aria": "Close approach-stability help",
-      "intro": "Stable-approach concept per FAA AC 120-71B: from 1000 ft above the touchdown point all approach parameters (sink rate, bank, speed, configuration) should be within tight tolerances and stay there. AeroACARS measures this stability sample by sample across the entire gate window and shows seven values.",
+      "intro": "Stable-approach concept per FAA AC 120-71B: from 1000 ft above the touchdown point all approach parameters (sink rate, bank, speed, configuration) should be within tight tolerances and stay there. NexusAir ACARS measures this stability sample by sample across the entire gate window and shows seven values.",
       "gate": {
         "heading": "The stability gate",
         "body": "The gate window contains all approach samples between 0 and 1000 ft above the touchdown point (HAT). The last 3 seconds before TD (flare manoeuvre) are excluded. If the airport elevation isn't known, the system falls back to AGL filtering (the card shows which one)."
@@ -720,9 +720,9 @@
     "wind_calm": "Calm",
     "report": {
       "button": "Export PDF",
-      "title": "AeroACARS",
+      "title": "NexusAir ACARS",
       "subtitle": "Landing Analysis",
-      "generated": "Generated on {{date}} · AeroACARS v{{version}}",
+      "generated": "Generated on {{date}} · NexusAir ACARS v{{version}}",
       "page": "Page {{n}} / {{total}}",
       "identity": "Flight & Score",
       "route": "Route",
@@ -758,9 +758,9 @@
   },
   "about": {
     "tagline": "Modern ACARS for phpVMS 7 — MSFS 2020/2024 + X-Plane 11/12",
-    "purpose_title": "What is AeroACARS?",
+    "purpose_title": "What is NexusAir ACARS?",
     "purpose_body": "A modern open-source ACARS client — Tauri-based, Rust + React, cross-platform. Captures telemetry from the sim, scores landings with industry-grounded thresholds, correlates touchdowns to runway-centerline precision, and ships clean PIREPs to phpVMS.",
-    "acknowledgements_title": "Shoulders AeroACARS stands on",
+    "acknowledgements_title": "Shoulders NexusAir ACARS stands on",
     "acknowledgements_intro": "These projects were studied, measured, or referenced extensively:",
     "thresholds_title": "Score thresholds — verified sources",
     "thresholds_intro": "Smooth/Acceptable/Firm/Hard/Severe boundaries come from real pilot literature:"
@@ -874,17 +874,17 @@
   },
   "settings": {
     "title": "Settings",
-    "description": "General AeroACARS preferences.",
+    "description": "General NexusAir ACARS preferences.",
     "tabs": {
       "simulator": "🎮 Simulator",
       "required": "🛫 Required",
       "extras": "🎨 Comfort",
       "plugins": "✈️ Plugins",
       "tech": "🛠 Technical",
-      "simulator_hint": "Which flight sim is installed? AeroACARS connects to the chosen sim for live data, touchdown forensics and loadsheet comparison.",
+      "simulator_hint": "Which flight sim is installed? NexusAir ACARS connects to the chosen sim for live data, touchdown forensics and loadsheet comparison.",
       "required_hint": "SimBrief account + flight recording behaviour — the basis for flight-plan data and automatic tracking.",
       "extras_hint": "Optional comfort settings — appearance, behaviour, Discord presence.",
-      "plugins_hint": "Aircraft-specific add-ons: PMDG SDK (Boeing) and the AeroACARS X-Plane plugin. Detected automatically once the matching aircraft loads.",
+      "plugins_hint": "Aircraft-specific add-ons: PMDG SDK (Boeing) and the NexusAir ACARS X-Plane plugin. Detected automatically once the matching aircraft loads.",
       "tech_hint": "Diagnostics, debug tools and rarely used maintenance features."
     },
     "appearance_section": "Language & appearance",
@@ -894,7 +894,7 @@
     "theme_light": "Light",
     "simbrief": {
       "title": "SimBrief Integration",
-      "intro": "If your SimBrief identifier is set here, AeroACARS can fetch a freshly generated OFP directly from simbrief.com — even if the bid in phpVMS has already been removed (normal state during boarding). You can use username or user-ID (or both). User-ID is more robust, username is easier to find.",
+      "intro": "If your SimBrief identifier is set here, NexusAir ACARS can fetch a freshly generated OFP directly from simbrief.com — even if the bid in phpVMS has already been removed (normal state during boarding). You can use username or user-ID (or both). User-ID is more robust, username is easier to find.",
       "username_label": "SimBrief username",
       "username_hint": "Visible in simbrief.com/dashboard/?username=…",
       "userid_label": "SimBrief user-ID (optional)",
@@ -909,7 +909,7 @@
     },
     "simulator_section": "Simulator",
     "simulator_label": "Active simulator",
-    "simulator_hint": "Pick your simulator. AeroACARS connects automatically as soon as the sim is running.",
+    "simulator_hint": "Pick your simulator. NexusAir ACARS connects automatically as soon as the sim is running.",
     "filing_section": "PIREP filing",
     "auto_file_label": "Auto-file PIREP",
     "auto_file_hint": "Files the PIREP automatically once the flight reaches the \"Arrived\" phase (at gate, engines off, parking brake set). The manual \"End flight\" button remains available for cases where validation fails.",
@@ -943,7 +943,7 @@
   "behaviour": {
     "section_title": "Behaviour",
     "minimize_to_tray_label": "Minimize to system tray on close",
-    "minimize_to_tray_hint": "Instead of quitting, AeroACARS is minimized to the system tray (macOS: menubar). Click the tray icon to bring the window back. Use the tray menu → \"Quit\" to actually exit the app.<br/><br/>Recommended during active flights: AeroACARS keeps running in the background and pushes heartbeat + position updates to phpVMS."
+    "minimize_to_tray_hint": "Instead of quitting, NexusAir ACARS is minimized to the system tray (macOS: menubar). Click the tray icon to bring the window back. Use the tray menu → \"Quit\" to actually exit the app.<br/><br/>Recommended during active flights: NexusAir ACARS keeps running in the background and pushes heartbeat + position updates to phpVMS."
   },
   "discord_rpc": {
     "section_title": "Discord Rich Presence",
@@ -970,8 +970,8 @@
   },
   "remote": {
     "gate": {
-      "title": "AeroACARS Remote",
-      "subtitle": "Enter the 6-digit PIN shown in AeroACARS on your sim PC under Settings → LAN remote.",
+      "title": "NexusAir ACARS Remote",
+      "subtitle": "Enter the 6-digit PIN shown in NexusAir ACARS on your sim PC under Settings → LAN remote.",
       "pinLabel": "PIN",
       "unlock": "Connect",
       "connecting": "Connecting …",
@@ -981,7 +981,7 @@
     },
     "server": {
       "section_title": "LAN remote control",
-      "intro": "Control the active flight from a tablet or a second PC on the same Wi-Fi. AeroACARS hosts a local server on this PC and shows a pairing PIN + a QR code.",
+      "intro": "Control the active flight from a tablet or a second PC on the same Wi-Fi. NexusAir ACARS hosts a local server on this PC and shows a pairing PIN + a QR code.",
       "toggle_label": "Enable LAN remote control",
       "toggle_hint": "Starts a local web server on this PC. Off by default — never auto-started.",
       "port_label": "Port",
@@ -1002,11 +1002,11 @@
   },
   "error_reporting": {
     "section_title": "Error telemetry (anonymous)",
-    "intro": "AeroACARS can automatically send technical crash and error reports to our self-hosted GlitchTip server (tip.kant.ovh). This helps fix bugs before they hit many pilots. Fully anonymous, opt-in, can be turned off any time.",
+    "intro": "NexusAir ACARS can automatically send technical crash and error reports to our self-hosted GlitchTip server (tip.kant.ovh). This helps fix bugs before they hit many pilots. Fully anonymous, opt-in, can be turned off any time.",
     "toggle_label": "Send anonymous crash reports",
-    "toggle_hint": "<strong>What is sent?</strong> Crash stack traces, sim name, aircraft ICAO, AeroACARS version, OS.<br/><strong>What is NOT sent?</strong> Position, route, login, IP address, passwords, e-mail.<br/><strong>Where to?</strong> tip.kant.ovh (self-hosted, no third party). Privacy per GDPR Art. 6 (1) a.<br/>Toggle takes effect immediately — no restart needed.",
-    "banner_title": "Help us improve AeroACARS",
-    "banner_body": "AeroACARS can send anonymous crash reports to our own server (tip.kant.ovh) — no position, no login, no IP. It helps us find bugs before they hit many pilots. You can change this any time in Settings.",
+    "toggle_hint": "<strong>What is sent?</strong> Crash stack traces, sim name, aircraft ICAO, NexusAir ACARS version, OS.<br/><strong>What is NOT sent?</strong> Position, route, login, IP address, passwords, e-mail.<br/><strong>Where to?</strong> tip.kant.ovh (self-hosted, no third party). Privacy per GDPR Art. 6 (1) a.<br/>Toggle takes effect immediately — no restart needed.",
+    "banner_title": "Help us improve NexusAir ACARS",
+    "banner_body": "NexusAir ACARS can send anonymous crash reports to our own server (tip.kant.ovh) — no position, no login, no IP. It helps us find bugs before they hit many pilots. You can change this any time in Settings.",
     "banner_accept": "Yes, send anonymously",
     "banner_decline": "No, thanks"
   },
@@ -1081,7 +1081,7 @@
     "title": "PMDG Premium Telemetry",
     "inactive_hint": "Load a PMDG aircraft (737 / 777) and live cockpit data straight from the PMDG SDK will show up here.",
     "sdk_disabled_title": "PMDG detected, but SDK not enabled yet",
-    "sdk_disabled_explanation": "For AeroACARS to read FMA, MCP values, V-speeds and FMC data straight from the cockpit, one line needs to go into the PMDG options file. Takes 30 seconds:",
+    "sdk_disabled_explanation": "For NexusAir ACARS to read FMA, MCP values, V-speeds and FMC data straight from the cockpit, one line needs to go into the PMDG options file. Takes 30 seconds:",
     "step_close_msfs": "Close MSFS.",
     "step_open_options_ini": "Open this file in Notepad:",
     "step_add_lines": "Add these two lines at the end:",
@@ -1097,11 +1097,11 @@
   "xplane_premium_panel": {
     "title": "X-Plane Premium Plugin",
     "active_hint": "Native telemetry is streaming from X-Plane — touchdowns are captured in the exact frame of wheel contact (peak descent VS, pitch-corrected).",
-    "inactive_hint_xp_running": "Optional: the AeroACARS plugin provides frame-perfect landing-rate capture. Copy the plugin into X-Plane/Resources/plugins/AeroACARS/ and restart X-Plane.",
-    "inactive_hint_xp_not_running": "Will activate as soon as X-Plane runs with the AeroACARS plugin installed. Standard RREF capture works without it.",
+    "inactive_hint_xp_running": "Optional: the NexusAir ACARS plugin provides frame-perfect landing-rate capture. Copy the plugin into X-Plane/Resources/plugins/NexusAir ACARS/ and restart X-Plane.",
+    "inactive_hint_xp_not_running": "Will activate as soon as X-Plane runs with the NexusAir ACARS plugin installed. Standard RREF capture works without it.",
     "packets_label": "Packets received",
     "bind_error_title": "Plugin listener failed to start",
-    "bind_error_explanation": "Port 52000 is held by another application — most likely a second AeroACARS instance is running. Close it and click \"Re-check sim\".",
+    "bind_error_explanation": "Port 52000 is held by another application — most likely a second NexusAir ACARS instance is running. Close it and click \"Re-check sim\".",
     "install_path_label": "X-Plane root folder",
     "install_path_placeholder": "e.g. C:\\X-Plane 12  (or /Applications/X-Plane 12)",
     "detect_button": "Auto-detect",
@@ -1153,7 +1153,7 @@
       "config_read": "Could not read the saved configuration.",
       "config_write": "Could not save the configuration.",
       "config_parse": "The saved configuration is corrupted.",
-      "pilot_pending": "Your GSG account is still awaiting approval by the VA management. You can use AeroACARS once it is active.",
+      "pilot_pending": "Your GSG account is still awaiting approval by the VA management. You can use NexusAir ACARS once it is active.",
       "pilot_rejected": "This GSG account was not approved. Please contact the VA management.",
       "pilot_on_leave": "Your GSG account is marked as „on leave\". Report back in the crew centre to fly again.",
       "pilot_suspended": "Your GSG account is suspended. Please contact the VA management.",
@@ -1168,7 +1168,7 @@
     "off_hint": "Simulator integration is disabled.",
     "idle_hint": "Waiting for the simulator…",
     "connecting_hint": "Waiting for the simulator… the adapter will connect automatically once it starts.",
-    "xplane_phase2": "X-Plane support runs via the AeroACARS plugin (Settings → Plugins). Once installed and X-Plane is started, live data flows automatically.",
+    "xplane_phase2": "X-Plane support runs via the NexusAir ACARS plugin (Settings → Plugins). Once installed and X-Plane is started, live data flows automatically.",
     "kinds": {
       "off": "Off",
       "msfs2024": "MSFS 2024",
@@ -1362,7 +1362,7 @@
     "cancelling": "Discarding…",
     "confirm_cancel": "Really discard this flight? The PIREP will be marked as \"cancelled\" on phpVMS — it stays visible in the PIREP list. Full deletion only via the phpVMS website.",
     "confirm_cancel_finalizable_title": "Flight is almost done — really discard?",
-    "confirm_cancel_finalizable_body": "You are in LANDING/TaxiIn/Arrived phase with a valid touchdown. Discarding now loses the PIREP even though it could be filed. Should AeroACARS try to file the flight instead?",
+    "confirm_cancel_finalizable_body": "You are in LANDING/TaxiIn/Arrived phase with a valid touchdown. Discarding now loses the PIREP even though it could be filed. Should NexusAir ACARS try to file the flight instead?",
     "confirm_cancel_finalizable_file": "Try filing instead",
     "confirm_cancel_finalizable_other": "Other action",
     "confirm_cancel_force_title": "Discard flight anyway?",
@@ -1375,7 +1375,7 @@
     "accident": {
       "confirm_title": "Was that an accident?",
       "suspected_title": "Possible accident detected — what now?",
-      "confirm_body": "AeroACARS detected strong indicators of an accident:\n\n{{reasons}}\n\nIf correct, the flight will be filed as accident/review with score 0. If not, you can still file it as a hard landing.",
+      "confirm_body": "NexusAir ACARS detected strong indicators of an accident:\n\n{{reasons}}\n\nIf correct, the flight will be filed as accident/review with score 0. If not, you can still file it as a hard landing.",
       "file_as_accident": "Yes, file as accident",
       "other_action": "Other action…",
       "other_title": "How should the flight be filed?",
@@ -1423,7 +1423,7 @@
       "option_cancel_hint": "Discards the PIREP entirely on phpVMS.",
       "option_back": "Back (do nothing)",
       "manual_form_title": "Manual PIREP",
-      "manual_form_intro": "The PIREP will be filed as a manual report tagged 'AeroACARS (manual)' and reviewed by the VA admin.",
+      "manual_form_intro": "The PIREP will be filed as a manual report tagged 'NexusAir ACARS (manual)' and reviewed by the VA admin.",
       "divert_label": "Divert airport (ICAO, optional)",
       "divert_hint": "If you landed somewhere other than the planned arrival ({{planned}}).",
       "reason_label": "Reason / note (required for diverts)",
@@ -1455,7 +1455,7 @@
       "fuel_used_label": "Fuel used (kg)",
       "fuel_used_hint": "Block − remaining. Blank = computed",
       "remaining_fuel_label": "Fuel still in tank (kg)",
-      "remaining_fuel_hint": "Fuel left after landing. AeroACARS computes used = block − remaining",
+      "remaining_fuel_hint": "Fuel left after landing. NexusAir ACARS computes used = block − remaining",
       "notes_placeholder": "e.g. weather, anomalies, technical issues …"
     },
     "sync_route": "Sync route",
@@ -1502,7 +1502,7 @@
       "moving": "Aircraft is already taxiing — auto-start only fires while parked. Use 'Start flight' manually.",
       "airborne": "You're airborne — auto-start only works on the ground.",
       "title_missing": "Auto-start is waiting for sim data: aircraft title missing. The sim is still booting or the aircraft isn't fully loaded.",
-      "title_missing_xplane": "Auto-start is waiting for sim data: aircraft title missing. Enable X-Plane Settings → Network → Web API so AeroACARS can read the aircraft name.",
+      "title_missing_xplane": "Auto-start is waiting for sim data: aircraft title missing. Enable X-Plane Settings → Network → Web API so NexusAir ACARS can read the aircraft name.",
       "fuel_zero": "Auto-start is waiting for sim data: fuel = 0. Tanks empty (cold & dark) or the sim is still booting.",
       "no_bids": "No booked bids found. Book a flight on the website first.",
       "no_bid_match": "No bid matches your current position. Auto-start only fires at the departure airport stand.",
@@ -1727,7 +1727,7 @@
   },
   "ascan": {
     "title": "🔬 Submit aircraft for analysis (Aircraft Scan)",
-    "hint": "Got a new add-on AeroACARS doesn't recognise properly yet? Send us the aircraft's configuration and code files (MSFS: cfg/json/xml/js/wasm · X-Plane: acf/lua/xpl — never textures, models or sounds). You'll see the exact file list before sending. You can delete your data (upload, file list, personal reference) at live.kant.ovh/aircraft at any time — only the anonymised technical analysis report is retained.",
+    "hint": "Got a new add-on NexusAir ACARS doesn't recognise properly yet? Send us the aircraft's configuration and code files (MSFS: cfg/json/xml/js/wasm · X-Plane: acf/lua/xpl — never textures, models or sounds). You'll see the exact file list before sending. You can delete your data (upload, file list, personal reference) at live.nexusairva.org/aircraft at any time — only the anonymised technical analysis report is retained.",
     "find_button": "Search for aircraft (MSFS Community & X-Plane Aircraft folders)",
     "searching": "Searching…",
     "manual_dir_label": "Optional: custom path — also works for a single aircraft's own folder",
@@ -1743,7 +1743,7 @@
     "skipped_large": "Skipped (too large)",
     "send_button": "Agree — send & analyse",
     "cancel": "Cancel",
-    "sending": "Sending {{title}} to live.kant.ovh…",
+    "sending": "Sending {{title}} to live.nexusairva.org…",
     "done": "{{title}} has been analysed",
     "done_stats": "{{lvars}} LVar candidates found · {{size}} transferred",
     "stub_warning": "Note: this add-on's systems likely run in an external process — static analysis only finds part of the data. We'll take care of the rest.",
@@ -1812,7 +1812,7 @@
     "pdc_station_placeholder": "EDDF",
     "pdc_request_button": "Request clearance",
     "pdc_log_empty": "No clearance requested yet.",
-    "cpdlc_explain": "Log on to the responsible centre before sending. When a centre announces a handover, AeroACARS logs you on to the next one automatically — you only enter a centre yourself if that doesn't happen.",
+    "cpdlc_explain": "Log on to the responsible centre before sending. When a centre announces a handover, NexusAir ACARS logs you on to the next one automatically — you only enter a centre yourself if that doesn't happen.",
     "cpdlc_log_empty": "No datalink messages yet.",
     "center_label": "Centre",
     "center_placeholder": "EDGG",
@@ -1896,7 +1896,7 @@
     "save_button": "Save",
     "clear_button": "Remove",
     "notify_os_label": "System notification for new messages",
-    "notify_os_hint": "Shows a toast even when AeroACARS isn't focused.",
+    "notify_os_hint": "Shows a toast even when NexusAir ACARS isn't focused.",
     "notify_sound_label": "Play a sound for new messages",
     "callsign_moved_hint": "The callsign is now set directly on the PDC/CPDLC tab, not here."
   }

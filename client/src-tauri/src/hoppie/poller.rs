@@ -112,7 +112,7 @@ fn notify_new_message(app: &AppHandle, from: &str) {
     let _ = app
         .notification()
         .builder()
-        .title("AeroACARS — CPDLC")
+        .title("NexusAir ACARS — CPDLC")
         .body(format!("Neue Nachricht von {from}"))
         .show();
 }

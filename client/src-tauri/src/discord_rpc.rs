@@ -95,7 +95,7 @@ async fn refresh_app_id(manager: &Arc<DiscordPresenceManager>) -> Result<(), ()>
     // Login-State); wir nutzen aber den festen Public-Pfad — keine Auth.
     // Wenn die VPS-URL noch nicht konfiguriert ist, fallen wir auf die
     // Default-VPS aus dem `aeroacars-mqtt`-Crate zurueck.
-    let url = "https://live.kant.ovh/api/public/discord-rpc-config";
+    let url = "https://live.nexusairva.org/api/public/discord-rpc-config";
     let resp = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()

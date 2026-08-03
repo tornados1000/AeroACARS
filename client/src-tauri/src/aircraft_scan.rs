@@ -2,10 +2,10 @@
 //!
 //! Der Pilot schickt einen GEFILTERTEN Auszug eines MSFS-Addon-Pakets
 //! (nur cfg/json/xml/js + panel-WASM — nie Texturen/Modelle/Sounds) an
-//! live.kant.ovh (`POST /api/ascan/submissions?source=client`). Der
-//! Recorder analysiert LVar-Kandidaten/Engines/Titles fuer AeroACARS-
+//! live.nexusairva.org (`POST /api/ascan/submissions?source=client`). Der
+//! Recorder analysiert LVar-Kandidaten/Engines/Titles fuer NexusAir-ACARS-
 //! Profile; der Pilot sieht seine Einreichung (exakte Dateiliste, DSGVO)
-//! unter https://live.kant.ovh/aircraft/.
+//! unter https://live.nexusairva.org/aircraft/.
 //!
 //! Transparenz-Regel: `ascan_collect` liefert die exakte Dateiliste an die
 //! UI, die sie dem Piloten VOR dem Senden anzeigt. `ascan_submit` sendet
@@ -30,7 +30,7 @@ const MAX_WASM_FILE: u64 = 110 * 1024 * 1024;
 const MAX_TOTAL: u64 = 400 * 1024 * 1024;
 const MAX_FILES: usize = 3000;
 
-const DEFAULT_ENDPOINT: &str = "https://live.kant.ovh/api/ascan/submissions";
+const DEFAULT_ENDPOINT: &str = "https://live.nexusairva.org/api/ascan/submissions";
 
 /// Vom letzten `ascan_list_aircraft` gefundene Paket-Wurzeln. Die UI
 /// referenziert Pakete ausschliesslich per Index in diese Liste.
@@ -558,7 +558,7 @@ pub async fn ascan_collect(
         .map_err(|e| format!("Collect-Task abgebrochen: {e}"))?
 }
 
-/// Paket zippen und an live.kant.ovh senden. Auth = phpVMS-API-Key aus dem
+/// Paket zippen und an live.nexusairva.org senden. Auth = phpVMS-API-Key aus dem
 /// Keyring (derselbe Trust-Anker wie Provisioning). Sendet exakt die
 /// Auswahl aus `collect_files` (deterministisch identisch zu ascan_collect).
 #[tauri::command]

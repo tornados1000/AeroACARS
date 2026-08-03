@@ -55,7 +55,7 @@ function isUiError(value: unknown): value is UiError {
  * whatever URL the form sent and always uses this, so we just
  * surface it read-only in the UI for transparency.
  */
-const LOCKED_HOST = "https://german-sky-group.eu";
+const LOCKED_HOST = "https://crew.nexusairva.org";
 
 export function LoginPage({
   initialUrl: _initialUrl = "",

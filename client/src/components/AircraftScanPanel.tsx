@@ -1,11 +1,11 @@
 // Aircraft-Scan — "Flugzeug zur Analyse einreichen" (Settings → Plugins).
 //
-// Gegenstueck zum Web-Tool auf https://live.kant.ovh/aircraft/: der Client
+// Gegenstueck zum Web-Tool auf https://live.nexusairva.org/aircraft/: der Client
 // findet MSFS-Community-Ordner (UserCfg.opt) UND X-Plane-Aircraft-Ordner
 // (x-plane_install_*.txt) selbst, listet die Flugzeug-Pakete, zeigt VOR dem
 // Senden die exakte Dateiliste (DSGVO-Transparenz — nur cfg/json/xml/js/wasm
 // bzw. acf/lua/xpl, nie Texturen/Modelle/Sounds) und schickt den gefilterten
-// Auszug an live.kant.ovh. Die Einreichung erscheint dort unter "Meine
+// Auszug an live.nexusairva.org. Die Einreichung erscheint dort unter "Meine
 // Einreichungen".
 
 import { useState } from "react";
@@ -252,8 +252,8 @@ export function AircraftScanPanel() {
           ))}
           <p className="settings__row-hint">
             {t("ascan.see_web")}{" "}
-            <a href="https://live.kant.ovh/aircraft/" target="_blank" rel="noreferrer">
-              live.kant.ovh/aircraft
+            <a href="https://live.nexusairva.org/aircraft/" target="_blank" rel="noreferrer">
+              live.nexusairva.org/aircraft
             </a>
           </p>
           <button type="button" onClick={() => setStep({ kind: "idle" })}>

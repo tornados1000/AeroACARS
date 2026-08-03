@@ -51,7 +51,7 @@ const CMD_BUFFER: usize = 200;
 
 #[derive(Clone, Debug)]
 pub struct MqttConfig {
-    /// e.g. `wss://live.kant.ovh/mqtt`
+    /// e.g. `wss://live.nexusairva.org/mqtt`
     pub broker_url: String,
     /// Mosquitto user — typically `pilot_<id>`.
     pub username: String,
@@ -123,7 +123,7 @@ struct PositionPayload {
     /// ON_BLOCK). Inlined into every position so the Monitor never has
     /// to wait for a separate phase-topic delivery.
     phase: &'static str,
-    /// v0.16.13: Phasen-Engine-v2-Schatten (live.kant.ovh zeigt "v2:"-Badge
+    /// v0.16.13: Phasen-Engine-v2-Schatten (live.nexusairva.org zeigt "v2:"-Badge
     /// bei Abweichung). None solange der Client <0.16.12 ist oder die
     /// Engine noch im Warmup — skip_serializing haelt alte Payloads byte-
     /// identisch.

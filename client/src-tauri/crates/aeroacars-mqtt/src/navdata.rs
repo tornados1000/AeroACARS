@@ -2,7 +2,7 @@
 //!
 //! Holt pro Flugstart bis zu 3 Airports (dep/arr/alt) parallel vom VPS.
 //! Lebt hier (statt im api-client crate) weil der Endpoint gegen
-//! `live.kant.ovh` geht — same host wie provision.rs / log_upload.rs.
+//! `live.nexusairva.org` geht — same host wie provision.rs / log_upload.rs.
 //!
 //! Spec: `docs/spec/v0.8.0-vps-navdata-runway-awareness.md`. Wire-Format
 //! ist 1:1 das was `GET /api/navdata/airport/<ICAO>` zurückgibt.
@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 /// Default-Host für den Navdata-Endpoint. Override via Test-Setup
 /// oder Webapp-Admin-Setting (analog provision.rs).
-pub const DEFAULT_NAVDATA_BASE: &str = "https://live.kant.ovh";
+pub const DEFAULT_NAVDATA_BASE: &str = "https://live.nexusairva.org";
 
 /// Per-call Timeout. Größer als provision (15s) weil die VPS-Side bei
 /// kaltem DB-Cache evtl. erst eine SQLite-Page faulten muss.
