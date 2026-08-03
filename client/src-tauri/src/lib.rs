@@ -7983,7 +7983,7 @@ async fn phpvms_refresh_profile(
 
 /// Single GitHub release record — the subset we render in the
 /// in-app "What's new" modal. Source: anonymous GET against
-/// <https://api.github.com/repos/MANFahrer-GF/AeroACARS/releases/tags/v{version}>
+/// <https://api.github.com/repos/tornados1000/AeroACARS/releases/tags/v{version}>
 /// (GitHub allows 60 anonymous req/h per IP, way more than we'd ever
 /// hit since we cache the result for the modal's lifetime).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8022,7 +8022,7 @@ async fn fetch_release_notes(version: String) -> Result<ReleaseNotes, UiError> {
         format!("v{version}")
     };
     let url = format!(
-        "https://api.github.com/repos/MANFahrer-GF/AeroACARS/releases/tags/{tag}"
+        "https://api.github.com/repos/tornados1000/AeroACARS/releases/tags/{tag}"
     );
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))

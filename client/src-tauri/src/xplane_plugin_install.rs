@@ -43,7 +43,7 @@ use serde::Serialize;
 /// runtime via `env!("CARGO_PKG_VERSION")` and substitute it in.
 /// Tag pattern matches `release.yml`'s `${{ github.ref_name }}`.
 const PLUGIN_ZIP_URL_TEMPLATE: &str =
-    "https://github.com/MANFahrer-GF/AeroACARS/releases/download/v{VERSION}/AeroACARS-XPlane-Plugin-v{VERSION}.zip";
+    "https://github.com/tornados1000/AeroACARS/releases/download/v{VERSION}/AeroACARS-XPlane-Plugin-v{VERSION}.zip";
 
 /// HTTP timeout for the plugin download. The zip is small (~250 KB)
 /// but the pilot might be on a slow connection — 60 s is generous.

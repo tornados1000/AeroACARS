@@ -47,9 +47,9 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/MANFahrer-GF/AeroACARS/releases/latest/download/latest.json"
+        "https://github.com/tornados1000/AeroACARS/releases/latest/download/latest.json"
       ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDREM0E0NzUxQzBGOTg0MDgKUldRSWhQbkFVVWM2VFFnMzJqRTVtM0pvQ285QTJPbFJBRWtIMXdUR3BDRkdtQWFFbm5lZzNiM2kK"
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDJGQkFBREZBOEIzMDdBMjgKUldRb2VqQ0wrcTI2TDZGY0NuUEF5KzFsQW00WUVsVnpnV3htOTBzd1pmYUlrL2I0NEtuWVdyd24K"
     }
   }
 }

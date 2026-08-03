@@ -63,7 +63,7 @@ export function AboutPanel({ onShowReleaseNotes }: Props) {
             </button>
             <a
               className="button button--ghost"
-              href="https://github.com/MANFahrer-GF/AeroACARS/releases"
+              href="https://github.com/tornados1000/AeroACARS/releases"
               target="_blank"
               rel="noreferrer"
             >
