@@ -4346,6 +4346,16 @@ pub struct ActiveFlightInfo {
     started_at: String,
     airline_icao: String,
     planned_registration: String,
+    /// ICAO type of the phpVMS-planned aircraft (e.g. "A320"), looked up via
+    /// the same `get_aircraft` call as `planned_registration`. Empty when no
+    /// matching bid/OFP aircraft could be resolved.
+    aircraft_icao: String,
+    /// Full type name of the phpVMS-planned aircraft (e.g. "Airbus A320-200").
+    /// Field feedback (2026-08-03): the Karte-Flugwerte-card footer used to
+    /// show the SIM's own `aircraft_icao`/`aircraft_registration` (from
+    /// `SimSnapshot`) here — wrong source, since the pilot wants to see what
+    /// phpVMS actually planned/booked, not whatever's loaded in the sim.
+    aircraft_name: String,
     flight_number: String,
     /// `Bid.flight.callsign` (z.B. "7ME"), falls phpVMS es fuellt — reuses
     /// `ActiveFlight::bid_callsign` (bislang nur fuer den OFP-Match genutzt,
@@ -4424,6 +4434,19 @@ pub struct ActiveFlightInfo {
     /// None → Runway/Winkel unbekannt oder unplausibel → Banner bleibt beim
     /// 3°-Default (unverändert für normale Anflüge).
     approach_glideslope_angle: Option<f64>,
+    /// v1.3.5 (#Hard-Landing-Banner): mirrors `FlightStats.landing_score_
+    /// finalized` — true once the post-touchdown vertical-speed refinement
+    /// (edge-value recompute, ~9-12s after touchdown) is done. The live
+    /// hard-landing banner waits for this instead of showing the raw
+    /// SimVar-latched estimate immediately (field report 31.07.2026: raw
+    /// SimVar read -770 fpm at touchdown, the refined/scored value for the
+    /// SAME touchdown was -455 fpm — the banner showed the wrong number
+    /// for ~9 seconds before the Logbook/PIREP showed the real one).
+    /// `landing_rate_fpm` below can already hold a plausible early value
+    /// before this flips true (the edge-recompute cascade has an earlier,
+    /// less-refined fallback) — this flag is the actual "won't change
+    /// again" signal, not mere presence of a value.
+    landing_score_finalized: bool,
     /// ISO-8601 UTC timestamp of the last successful position-post.
     /// Powers the cockpit's LIVE recording indicator — "X seconds
     /// ago" derived client-side.
@@ -8277,6 +8300,24 @@ async fn bid_simbrief_preview(
         pax_count: ofp.pax_count,
         cargo_kg: ofp.cargo_kg,
         freight_kg: ofp.freight_kg,
+        aircraft_icao: ofp.aircraft_icao.clone(),
+        max_passengers: ofp.max_passengers,
+        sched_out_epoch: ofp.sched_out_epoch,
+        sched_in_epoch: ofp.sched_in_epoch,
+        planned_taxi_kg: ofp.planned_taxi_kg,
+        planned_contingency_kg: ofp.planned_contingency_kg,
+        planned_alternate_burn_kg: ofp.planned_alternate_burn_kg,
+        planned_extra_kg: ofp.planned_extra_kg,
+        planned_oew_kg: ofp.planned_oew_kg,
+        planned_payload_kg: ofp.planned_payload_kg,
+        planned_pax_weight_kg: ofp.planned_pax_weight_kg,
+        planned_baggage_kg: ofp.planned_baggage_kg,
+        // Briefing-2a: OPERATIONELLER MTOW-Grenzwert fuer diesen Flug
+        // (z.B. bahnlaengen-/temperaturlimitiert) — enger als der
+        // strukturelle Grenzwert aus phpVMS' `aircraft.mtow`. Pilot-
+        // Feedback 2026-08-03: der strukturelle Wert zeigte einen viel
+        // groesseren Puffer als real vorhanden.
+        planned_max_tow_kg: ofp.max_tow_kg,
         callsign_warning,
     })
 }
@@ -8305,6 +8346,32 @@ pub struct BidSimBriefPreview {
     pub cargo_kg: f32,
     /// Reine Fracht ohne Pax-Gepaeck — das zeigt die Bid-Card als "Cargo".
     pub freight_kg: f32,
+    /// Briefing-2a: Aircraft-ICAO-Typ aus dem SimBrief-OFP — Fallback wenn
+    /// der Bid (noch) keinen phpVMS-Bid-Pointer-Subfleet hat.
+    pub aircraft_icao: Option<String>,
+    /// Sitzplatz-Total der geplanten Config — Grundlage fuer "PAX von N".
+    pub max_passengers: Option<i32>,
+    /// Geplante Blockzeit ab/an (Unix-Epoch-Sekunden, UTC) — Fallback-STD/STA
+    /// wenn phpVMS' `flight.dpt_time`/`arr_time` fehlen.
+    pub sched_out_epoch: Option<i64>,
+    pub sched_in_epoch: Option<i64>,
+    /// Restliche Fuel-Kategorien — zusammen mit Trip + Reserve ergeben sie
+    /// exakt Block (Pilot-Feedback 2026-08-02: Trip+Reserve allein liess
+    /// sich nicht zu Block nachrechnen).
+    pub planned_taxi_kg: f32,
+    pub planned_contingency_kg: f32,
+    pub planned_alternate_burn_kg: f32,
+    pub planned_extra_kg: f32,
+    /// Operating Empty Weight + Payload — zusammen ergeben sie ZFW.
+    pub planned_oew_kg: f32,
+    pub planned_payload_kg: f32,
+    /// Pax-Gesamtgewicht + Gepaeck-Gesamtgewicht — zusammen mit der reinen
+    /// Fracht (`freight_kg`) ergeben sie `planned_payload_kg`.
+    pub planned_pax_weight_kg: f32,
+    pub planned_baggage_kg: f32,
+    /// Operationeller (flug-spezifischer) MTOW-Grenzwert aus dem OFP —
+    /// enger als der strukturelle Grenzwert aus phpVMS' `aircraft.mtow`.
+    pub planned_max_tow_kg: f32,
     /// Wenn DEP+ARR matchen aber Callsign abweicht (v0.7.9 Soft-Warning).
     pub callsign_warning: Option<CallsignWarningDetails>,
 }
@@ -9111,6 +9178,11 @@ async fn phpvms_get_aircraft(
         registration: details.registration,
         icao: details.icao,
         name: details.name,
+        // Briefing-2a-Spec §5.3: WEIGHTS-Rubrik braucht MTOW fuer die
+        // Einordnung ("TOW · n kg unter MTOW"). phpVMS liefert die Masse
+        // immer als {kg, lbs} — wir geben nur kg weiter, das Frontend
+        // braucht keine lbs-Variante.
+        mtow_kg: details.mtow.and_then(|m| m.kg),
     })
 }
 
@@ -9122,6 +9194,7 @@ struct AircraftInfoDto {
     registration: Option<String>,
     icao: Option<String>,
     name: Option<String>,
+    mtow_kg: Option<f64>,
 }
 
 // ---- Active-flight persistence (for resume after crash/restart) ----
@@ -9594,6 +9667,8 @@ fn flight_info(flight: &ActiveFlight, resume_position_suspect: bool) -> ActiveFl
         started_at: flight.started_at.to_rfc3339(),
         airline_icao: flight.airline_icao.clone(),
         planned_registration: flight.planned_registration.clone(),
+        aircraft_icao: flight.aircraft_icao.clone(),
+        aircraft_name: flight.aircraft_name.clone(),
         flight_number: flight.flight_number.clone(),
         callsign: flight.bid_callsign.clone(),
         dpt_airport: flight.dpt_airport.clone(),
@@ -9621,6 +9696,7 @@ fn flight_info(flight: &ActiveFlight, resume_position_suspect: bool) -> ActiveFl
         // den Engineering-Edge.
         landing_rate_fpm: stats.canonical_landing_rate_fpm(),
         landing_g_force: stats.landing_g_force,
+        landing_score_finalized: stats.landing_score_finalized,
         was_just_resumed,
         resume_position_suspect,
         // v0.13.0 Stream F: nur befüllen wenn was_just_resumed=true, sonst
@@ -20207,12 +20283,15 @@ fn spawn_touchdown_sampler(app: AppHandle, flight: Arc<ActiveFlight>) {
                 // exakten on_ground-Edge). User-Forderung Mai 12: "warum
                 // nutzen wir den MSFS Wert wenn wir das selber ermitteln".
                 //
-                // Neue Cascade-Ordnung:
-                //   1. v2-Result (= raffinierte Cascade vs_at_impact ->
-                //      smoothed_500ms -> smoothed_1000ms -> pre_flare_peak)
-                //   2. vs_at_edge_fpm aus dem Buffer (= 50-Hz interpoliert)
+                // Cascade-Ordnung (seit v0.20.0, siehe PIA3452-Kommentar
+                // direkt unten):
+                //   1. vs_at_edge_fpm aus dem Buffer (= 50-Hz interpoliert,
+                //      physikalisch am genauesten — FAR-25.473-Standard)
+                //   2. v2-Result (= raffinierte Cascade vs_at_impact ->
+                //      smoothed_500ms -> smoothed_1000ms -> pre_flare_peak),
+                //      nur wenn kein gueltiger Edge-Wert vorliegt
                 //   3. landing_rate_fpm unveraendert (= SimVar-latched
-                //      Fallback wenn weder v2 noch Edge verfuegbar — sehr
+                //      Fallback wenn weder Edge noch v2 verfuegbar — sehr
                 //      selten, nur bei Pre-v0.5.43 oder Buffer-Dump-Fail)
                 let edge_vs = analysis
                     .get("vs_at_edge_fpm")
@@ -41374,6 +41453,7 @@ mod v0_16_23_route_only_refresh_tests {
             pax_count: 150,
             cargo_kg: 2000.0,
             freight_kg: 2000.0,
+            ..Default::default()
         }
     }
 

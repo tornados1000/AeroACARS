@@ -97,6 +97,9 @@ export interface AircraftInfo {
   registration: string | null;
   icao: string | null;
   name: string | null;
+  /** Max takeoff weight in kg (`phpvmsaircraft.mtow`), per-tail. Briefing-2a
+   *  WEIGHTS-Rubrik zeigt damit "TOW · n kg unter/über MTOW". */
+  mtow_kg: number | null;
 }
 
 /** SimBrief OFP plan values — fetched via `fetch_simbrief_preview` Tauri
@@ -129,6 +132,19 @@ export interface SimBriefOfp {
   cargo_kg?: number;
   /** Reine Fracht ohne Pax-Gepaeck. */
   freight_kg?: number;
+  /** Aircraft-ICAO-Typ aus dem SimBrief-OFP (z.B. "A320") — reiner Typ-Code,
+   *  NICHT der volle phpVMS-Subfleet-Name. Grundlage fuer den OFP/Bid-
+   *  Aircraft-Mismatch-Vergleich. */
+  aircraft_icao?: string | null;
+  /** Operationeller (flug-spezifischer) MTOW-Grenzwert aus dem OFP — enger
+   *  als der strukturelle Grenzwert aus phpVMS' `aircraft.mtow`. */
+  max_tow_kg?: number;
+  /** Operating Empty Weight + Payload — zusammen ergeben sie ZFW. */
+  planned_oew_kg?: number;
+  planned_payload_kg?: number;
+  /** Pax-Gewicht + Gepaeck + Fracht ergeben zusammen Payload. */
+  planned_pax_weight_kg?: number;
+  planned_baggage_kg?: number;
 }
 
 export interface Flight {
@@ -141,6 +157,12 @@ export interface Flight {
   arr_airport_id: string;
   alt_airport_id: string | null;
   flight_time: number | null;
+  /** Scheduled departure/arrival time-of-day, "HH:MM" Zulu, raw phpVMS
+   *  schedule fields (`phpvmsflights.dpt_time`/`arr_time`). Briefing-2a
+   *  §8: Pflichtfeld der Anzeige — null nur wenn die Buchung wirklich
+   *  keine Zeit hat, nie die Zeile weglassen. */
+  dpt_time: string | null;
+  arr_time: string | null;
   level: number | null;
   route: string | null;
   flight_type: string | null;
@@ -338,6 +360,11 @@ export interface ActiveFlightInfo {
   /** Planned aircraft registration from phpVMS (e.g. "D-AIUV"). Empty
    *  when no matching bid / aircraft details could be looked up. */
   planned_registration: string;
+  /** ICAO type of the phpVMS-planned aircraft (e.g. "A320"). Empty when no
+   *  matching bid/OFP aircraft could be resolved. */
+  aircraft_icao: string;
+  /** Full type name of the phpVMS-planned aircraft (e.g. "Airbus A320-200"). */
+  aircraft_name: string;
   flight_number: string;
   /** `Bid.flight.callsign` (e.g. "7ME"), when phpVMS fills it. Prefer this
    *  over `airline_icao + flight_number` when building a display callsign —
@@ -366,6 +393,11 @@ export interface ActiveFlightInfo {
   block_on_at: string | null;
   landing_rate_fpm: number | null;
   landing_g_force: number | null;
+  /** v1.3.5 (#Hard-Landing-Banner): true once the post-touchdown V/S
+   *  refinement is done. `landing_rate_fpm` can already hold a plausible
+   *  early value before this flips true — wait for this flag, not mere
+   *  presence of a value, before trusting the number on screen. */
+  landing_score_finalized: boolean;
   was_just_resumed: boolean;
   /** v0.12.1 (Stream E): on a resume, true when the sim position looks
    *  like a glitchy crash-reload (persisted phase airborne but sim

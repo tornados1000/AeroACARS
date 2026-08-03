@@ -3,30 +3,26 @@ import { useTranslation } from "react-i18next";
 import { invoke } from "../lib/ipc";
 import type { ActiveFlightInfo } from "../types";
 import { formatRefreshError } from "../lib/refreshErrorFormatter";
+import { Badge } from "./ui";
 
 interface Props {
   info: ActiveFlightInfo;
 }
 
 /**
- * Live-Loadsheet (v0.3.0 — überarbeitet, v0.5.46 — OFP-Refresh inline).
+ * Live-Loadsheet (v0.3.0, v0.5.46 OFP-Refresh inline, Stage E redesign
+ * — grid4 card with an Actual/Plan/Δ table).
  *
  * **Sichtbarkeit:** nur in Phase = `preflight` oder `boarding`.
  * Sobald Pushback / TaxiOut beginnt → komplett weg, weil dann der
  * Cruise/Approach-Pfad relevant ist und das Loadsheet "fertig" ist.
  *
- * **Optik:** identisch zum InfoStrip darüber — gleiche `.info-strip`-
- * Klasse, gleiche `Group`/`Cell`-Struktur, gleiche Schriftgrößen
- * und Monospace-Werte. Pilot soll's als nahtlose Erweiterung der
- * MASSE/FLUG/TRIP-Zeilen sehen, nicht als eigene Box mit anderem
- * Stil.
+ * **Optik (Stage E):** eigene Karte im selben `.grid4` wie Weights/Air
+ * Data/Trip, mit einer echten Actual/Plan/Δ-Tabelle statt der früheren
+ * kompakten Inline-Δ-Zelle — dieselben Werte, dieselbe Farbcodierung
+ * (<5 % grün, 5-10 % gelb, >10 % rot; Overweight = rot + ⚠), nur
+ * tabellarisch statt inline.
  *
- * **Toggle:** kleiner Aufklapp-Pfeil rechts in der Group-Label-Zeile.
- * Default offen während Boarding.
- *
- * **Δ-Anzeige:** kompakt inline (z.B. `TOW 64.544 kg (+227)`) statt
- * einer eigenen Spalte. Farbcode wie sonst: <5% grün, 5-10% gelb,
- * >10% rot. Bei Overweight (IST > MAX): rote Δ + ⚠.
  *
  * **v0.5.46 — OFP-Refresh-Button inline:** wenn der IST/SOLL-Vergleich
  * ein "OFP-Outdated"-Muster zeigt (großer Block-Delta + ZFW-Match,
@@ -42,7 +38,6 @@ export function LoadsheetMonitor({ info }: Props) {
   // Hook-Reihenfolge: alle Hooks vor early returns, sonst stolpert
   // React beim Re-Render wenn die Phase wechselt und der Component
   // mal mit/ohne useState aufgerufen wird.
-  const [expanded, setExpanded] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [refreshDone, setRefreshDone] = useState(false);
   const [refreshErr, setRefreshErr] = useState<string | null>(null);
@@ -128,107 +123,113 @@ export function LoadsheetMonitor({ info }: Props) {
   }
 
   return (
-    <section className="info-strip">
-      {/* Header-Zeile mit Toggle-Button rechts */}
-      <div className="info-strip__group loadsheet__header-row">
-        <h4 className="info-strip__group-label">
-          {t("cockpit.loadsheet.label")}
-        </h4>
-        <button
-          type="button"
-          className="loadsheet__toggle"
-          onClick={() => setExpanded((v) => !v)}
-          aria-expanded={expanded}
-          title={
-            expanded
-              ? t("cockpit.loadsheet.collapse")
-              : t("cockpit.loadsheet.expand")
-          }
-        >
-          {expanded ? "▾" : "▸"}
-        </button>
+    <div className="card">
+      <div className="card__head">
+        <span className="card__title">{t("cockpit.loadsheet.label")}</span>
+        <Badge tone="neutral" style={{ marginLeft: 6 }}>
+          {t(
+            info.phase === "boarding"
+              ? "cockpit.loadsheet.boarding"
+              : "cockpit.loadsheet.preflight",
+          )}
+        </Badge>
       </div>
 
-      {/* Werte-Zeile — gleicher Stil wie MASSE-Strip oben */}
-      {expanded && (
-        <>
-          <div className="info-strip__group">
-            <h4 className="info-strip__group-label">
-              {t("cockpit.loadsheet.ist_label")}
-            </h4>
-            <div className="info-strip__cells">
-              <Cell
+      <div className="card__body">
+          <table className="ls" aria-label={t("cockpit.loadsheet.ist_label")}>
+            <thead>
+              <tr>
+                <th></th>
+                <th>{t("cockpit.loadsheet.ist")}</th>
+                <th>{t("cockpit.loadsheet.soll")}</th>
+                <th>Δ</th>
+              </tr>
+            </thead>
+            <tbody>
+              <LsRow
                 label={t("cockpit.loadsheet.block")}
                 ist={info.sim_fuel_kg}
                 soll={info.planned_block_fuel_kg}
                 max={null}
               />
-              <Cell
+              <LsRow
                 label="ZFW"
                 ist={info.sim_zfw_kg}
                 soll={info.planned_zfw_kg}
                 max={info.planned_max_zfw_kg}
               />
-              <Cell
+              <LsRow
                 label="TOW"
                 ist={info.sim_tow_kg}
                 soll={info.planned_tow_kg}
                 max={info.planned_max_tow_kg}
               />
-            </div>
-          </div>
-          {(effectiveHint || ofpLooksOutdated) && (
-            <div className="info-strip__group">
-              <h4 className="info-strip__group-label">&nbsp;</h4>
-              <div className="loadsheet__hint-inline">
-                {effectiveHint}
-                {/* v0.5.46 — Inline Refresh-Button bei OFP-Outdated.
-                    Bewusst direkt neben dem Hint, damit die Aktion
-                    am Ort des Problems sichtbar ist. */}
-                {ofpLooksOutdated && (
-                  <>
-                    {" "}
-                    <button
-                      type="button"
-                      className="loadsheet__refresh-btn"
-                      onClick={handleRefreshOfp}
-                      disabled={refreshing}
-                      title={t("cockpit.loadsheet.refresh_btn_hint")}
-                    >
-                      {refreshing
-                        ? t("cockpit.loadsheet.refresh_btn_busy")
-                        : t("cockpit.loadsheet.refresh_btn")}
-                    </button>
-                    {refreshDone && (
-                      <span className="loadsheet__refresh-done">
-                        {" "}
-                        {t("cockpit.loadsheet.refresh_btn_done")}
-                      </span>
-                    )}
-                    {refreshErr && (
-                      <span
-                        className="loadsheet__refresh-err"
-                        title={refreshErr}
-                      >
-                        {" "}⚠ {refreshErr}
-                      </span>
-                    )}
-                  </>
-                )}
-              </div>
+            </tbody>
+          </table>
+
+          {/* Field feedback (2026-08-03): the combined "Max ZFW / TOW" label
+              was too long for this narrow card at this font size — it wrapped
+              mid-phrase across three ragged lines ("Max" / "ZFW /" / "TOW"),
+              which read as broken/implausible even though the numbers
+              themselves were correct. Split into two ordinary rows (short
+              labels, same pattern as Block/ZFW/TOW above) — each fits on one
+              line like every other row in this card. */}
+          {info.planned_max_zfw_kg != null && (
+            <div className="row" style={{ paddingTop: 9, marginTop: 5, borderTop: "1px solid var(--line)" }}>
+              <span className="row__label">Max ZFW</span>
+              <span className="row__value">{fmtKg(info.planned_max_zfw_kg)}</span>
             </div>
           )}
-        </>
-      )}
-    </section>
+          {info.planned_max_tow_kg != null && (
+            <div className="row" style={info.planned_max_zfw_kg == null ? { paddingTop: 9, marginTop: 5, borderTop: "1px solid var(--line)" } : undefined}>
+              <span className="row__label">Max TOW</span>
+              <span className="row__value">{fmtKg(info.planned_max_tow_kg)}</span>
+            </div>
+          )}
+
+          {(effectiveHint || ofpLooksOutdated) && (
+            <div className="loadsheet__hint-inline">
+              {effectiveHint}
+              {/* v0.5.46 — Inline Refresh-Button bei OFP-Outdated.
+                  Bewusst direkt neben dem Hint, damit die Aktion
+                  am Ort des Problems sichtbar ist. */}
+              {ofpLooksOutdated && (
+                <>
+                  {" "}
+                  <button
+                    type="button"
+                    className="loadsheet__refresh-btn"
+                    onClick={handleRefreshOfp}
+                    disabled={refreshing}
+                    title={t("cockpit.loadsheet.refresh_btn_hint")}
+                  >
+                    {refreshing
+                      ? t("cockpit.loadsheet.refresh_btn_busy")
+                      : t("cockpit.loadsheet.refresh_btn")}
+                  </button>
+                  {refreshDone && (
+                    <span className="loadsheet__refresh-done">
+                      {" "}
+                      {t("cockpit.loadsheet.refresh_btn_done")}
+                    </span>
+                  )}
+                  {refreshErr && (
+                    <span className="loadsheet__refresh-err" title={refreshErr}>
+                      {" "}⚠ {refreshErr}
+                    </span>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+        </div>
+    </div>
   );
 }
 
-/**
- * Eine Loadsheet-Cell im InfoStrip-Stil. Format: `LABEL 6.334 kg (+0)`
- * mit Δ inline und farbcodiert. Bei MAX-Wert + Overweight: ⚠-Indikator.
- */
-function Cell({
+/** One Actual/Plan/Δ row. Overweight (IST > MAX) gets the alert color
+ *  on the Δ cell plus a ⚠ prefix, same as the pre-redesign inline Cell. */
+function LsRow({
   label,
   ist,
   soll,
@@ -239,7 +240,7 @@ function Cell({
   soll: number | null;
   max: number | null;
 }) {
-  // Wenn weder IST noch SOLL da sind, Cell überspringen.
+  // Wenn weder IST noch SOLL da sind, Zeile überspringen.
   if (ist == null && soll == null) return null;
 
   const delta = ist != null && soll != null ? ist - soll : null;
@@ -248,8 +249,7 @@ function Cell({
       ? Math.abs(delta / soll) * 100
       : null;
 
-  // Δ-Farbcode: <5% grün, 5-10% gelb, >10% rot. Wird auf den
-  // Delta-Suffix angewendet, nicht auf den Hauptwert.
+  // Δ-Farbcode: <5% grün, 5-10% gelb, >10% rot.
   let deltaClass = "loadsheet__delta--ok";
   if (deltaPct != null) {
     if (deltaPct >= 10) deltaClass = "loadsheet__delta--alert";
@@ -260,22 +260,22 @@ function Cell({
   const overweight = ist != null && max != null && ist > max;
   if (overweight) deltaClass = "loadsheet__delta--alert";
 
-  const istLabel =
-    ist != null ? `${Math.round(ist).toLocaleString("de-DE")} kg` : "—";
-
   return (
-    <div className="info-strip__cell">
-      <span className="info-strip__cell-label">{label}</span>
-      <span className="info-strip__cell-value">{istLabel}</span>
-      {delta != null && (
-        <span className={`loadsheet__delta-inline ${deltaClass}`}>
-          {overweight ? "⚠ " : ""}
-          {delta >= 0 ? "+" : ""}
-          {Math.round(delta).toLocaleString("de-DE")}
-        </span>
-      )}
-    </div>
+    <tr>
+      <td>{label}</td>
+      <td>{fmtKg(ist)}</td>
+      <td>{fmtKg(soll)}</td>
+      <td className={deltaClass}>
+        {delta == null
+          ? "—"
+          : `${overweight ? "⚠ " : ""}${delta >= 0 ? "+" : ""}${Math.round(delta).toLocaleString("de-DE")}`}
+      </td>
+    </tr>
   );
+}
+
+function fmtKg(kg: number | null): string {
+  return kg != null ? `${Math.round(kg).toLocaleString("de-DE")} kg` : "—";
 }
 
 function computeHint(
