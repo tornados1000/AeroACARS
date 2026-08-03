@@ -215,7 +215,7 @@ jobs:
         with:
           projectPath: client
           tagName: ${{ github.ref_name }}
-          releaseName: 'AeroACARS ${{ github.ref_name }}'
+          releaseName: 'NexusAir ACARS ${{ github.ref_name }}'
           # The full bilingual (🇩🇪 + 🇬🇧) release notes from
           # docs/release-notes/v{tag}.md — loaded in the step above.
           # tauri-action puts this into the GitHub release body AND the
