@@ -22,6 +22,7 @@
 // Blau↔Grau (Höhe/Geschwindigkeit, ΔE 15–18).
 
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 
 export interface ProfilePt {
   t?: number;
@@ -74,12 +75,55 @@ const hhmm = (ms: number) => {
   return `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
 };
 
+/**
+ * v0.19.x FIX: the crosshair used to pick `hoverIdx` by treating the
+ * mouse's X-percentage as a linear fraction of the point ARRAY (`round(
+ * hoverPercent * (n-1))`) — but the crosshair line itself is drawn at
+ * `x(i) = (t(i)/tMax) * W`, i.e. proportional to TIMESTAMP, not index.
+ * Real telemetry samples aren't evenly time-spaced (cruise ticks are
+ * sparser than approach ticks), so wherever sampling density varies the
+ * two disagreed: the vertical line the pilot sees and the readout values
+ * shown could belong to visibly different points on the timeline. This
+ * inverts the SAME time-proportional mapping `x()` uses, so the crosshair
+ * and the values it reports always refer to the same point.
+ */
+export function findHoverIndex(
+  pts: ProfilePt[],
+  hasTime: boolean,
+  tMax: number,
+  hoverPercent: number,
+): number {
+  const n = pts.length;
+  if (n === 0) return 0;
+  const pct = Math.max(0, Math.min(100, hoverPercent));
+  if (!hasTime) {
+    return Math.round((pct / 100) * (n - 1));
+  }
+  const targetT = (pct / 100) * tMax;
+  // Binary search for the first point with t >= targetT — pts are
+  // chronologically ordered telemetry, so t(i) is monotonic.
+  let lo = 0;
+  let hi = n - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if ((pts[mid].t ?? 0) < targetT) lo = mid + 1;
+    else hi = mid;
+  }
+  if (lo > 0) {
+    const before = pts[lo - 1].t ?? 0;
+    const at = pts[lo].t ?? 0;
+    if (Math.abs(before - targetT) <= Math.abs(at - targetT)) return lo - 1;
+  }
+  return lo;
+}
+
 export function FlightProfile({ route }: { route: ProfilePt[] }) {
+  const { t } = useTranslation();
   const [hover, setHover] = useState<number | null>(null);
 
   const pts = route.filter((p) => typeof p.alt_ft === "number");
   if (pts.length < 2) {
-    return <div className="aa-lb-muted" style={{ padding: 8 }}>Keine Höhendaten.</div>;
+    return <div className="aa-lb-muted" style={{ padding: 8 }}>{t("flight_profile.no_altitude_data")}</div>;
   }
 
   // Gemeinsame Zeitachse. Fehlt `t`, wird gleichmäßig über den Index verteilt —
@@ -110,36 +154,35 @@ export function FlightProfile({ route }: { route: ProfilePt[] }) {
   // Titel "Treibstoff" behauptet, es gäbe nichts zu tanken.
   const bands: Band[] = [
     {
-      key: "alt", title: "Höhe über Meer", unit: "ft", height: 150,
+      key: "alt", title: t("flight_profile.title_alt"), unit: "ft", height: 150,
       series: [{ label: "MSL", vals: msl, color: BLUE, width: 2 }],
       fill: has(gnd) ? gnd : undefined,
     },
     has(agl) && {
-      key: "agl", title: "Höhe über Grund", unit: "ft", height: 100,
+      key: "agl", title: t("flight_profile.title_agl"), unit: "ft", height: 100,
       series: [{ label: "AGL", vals: agl, color: GREEN, width: 2 }],
     },
     (has(ias) || has(gs)) && {
-      key: "spd", title: "Geschwindigkeit", unit: "kt", height: 100,
+      key: "spd", title: t("flight_profile.title_speed"), unit: "kt", height: 100,
       series: [
         ...(has(ias) ? [{ label: "IAS", vals: ias, color: BLUE, width: 2 }] : []),
         ...(has(gs) ? [{ label: "GS", vals: gs, color: GREY, width: 1.5, dash: true }] : []),
       ],
     },
     has(vs) && {
-      key: "vs", title: "Steig- und Sinkrate", unit: "fpm", height: 100,
+      key: "vs", title: t("flight_profile.title_vs"), unit: "fpm", height: 100,
       series: [{ label: "V/S", vals: vs, color: BLUE, width: 1.6 }],
       diverging: true,
     },
     has(fuel) && {
-      key: "fuel", title: "Treibstoff an Bord", unit: "kg", height: 90,
+      key: "fuel", title: t("flight_profile.title_fuel"), unit: "kg", height: 90,
       series: [{ label: "Fuel", vals: fuel, color: ORANGE, width: 2 }],
     },
   ].filter(Boolean) as Band[];
 
   const x = (i: number) => (tMax === 0 ? 0 : (tOf(pts[i], i) / tMax) * W);
 
-  const hoverIdx = hover === null ? null : Math.max(0, Math.min(pts.length - 1,
-    Math.round((hover / 100) * (pts.length - 1))));
+  const hoverIdx = hover === null ? null : findHoverIndex(pts, hasTime, tMax, hover);
 
   return (
     <div
@@ -172,6 +215,36 @@ export function FlightProfile({ route }: { route: ProfilePt[] }) {
             cur.push(`${x(i).toFixed(1)},${y(v).toFixed(1)}`);
           });
           if (cur.length > 1) runs.push(cur.join(" "));
+          return runs;
+        };
+
+        // v0.19.x FIX: a missing terrain sample must NOT draw as 0 ft MSL —
+        // that would be sea level under an aircraft over the Alps (see the
+        // matching contract comment in LogbookView.tsx). One polygon per
+        // gap-free run, closed at ITS OWN baseline endpoints, mirrors how
+        // `path()` already breaks the MSL/AGL/speed lines into separate
+        // segments at null gaps instead of interpolating through them.
+        const fillRuns = (vals: (number | null)[]) => {
+          const runs: string[] = [];
+          let cur: string[] = [];
+          let startIdx = -1;
+          let endIdx = -1;
+          const flush = () => {
+            if (cur.length > 1) {
+              runs.push(
+                `${x(startIdx).toFixed(1)},${H - PAD_B} ${cur.join(" ")} ${x(endIdx).toFixed(1)},${H - PAD_B}`,
+              );
+            }
+            cur = [];
+            startIdx = -1;
+          };
+          vals.forEach((v, i) => {
+            if (v === null) { flush(); return; }
+            if (startIdx === -1) startIdx = i;
+            endIdx = i;
+            cur.push(`${x(i).toFixed(1)},${y(v).toFixed(1)}`);
+          });
+          flush();
           return runs;
         };
 
@@ -213,12 +286,9 @@ export function FlightProfile({ route }: { route: ProfilePt[] }) {
                     stroke="var(--border)" strokeWidth="1"
                     opacity={b.diverging && v === 0 ? 0.9 : 0.45} />
                 ))}
-                {b.fill && (
-                  <polygon
-                    points={`0,${H - PAD_B} ${b.fill.map((v, i) => `${x(i).toFixed(1)},${y(v ?? 0).toFixed(1)}`).join(" ")} ${W},${H - PAD_B}`}
-                    fill={GREY} opacity="0.38"
-                  />
-                )}
+                {b.fill && fillRuns(b.fill).map((pts, k) => (
+                  <polygon key={`fill${k}`} points={pts} fill={GREY} opacity="0.38" />
+                ))}
                 {b.series.map((s) =>
                   path(s.vals).map((d, k) => (
                     <polyline key={`${s.label}${k}`} points={d} fill="none"

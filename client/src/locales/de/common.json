@@ -917,8 +917,10 @@
       "intro": "Wenn dein SimBrief-Identifier hier eingetragen ist, kann NexusAir ACARS einen neu generierten OFP direkt von simbrief.com holen — auch wenn der Bid in phpVMS schon entfernt wurde (regulärer Zustand während Boarding). Du kannst Username oder User-ID nutzen (oder beides). User-ID ist robuster, Username einfacher zu finden.",
       "username_label": "SimBrief-Username",
       "username_hint": "Sichtbar in simbrief.com/dashboard/?username=…",
+      "username_placeholder": "z.B. thomaskant",
       "userid_label": "SimBrief-User-ID (optional)",
       "userid_hint": "Aus SimBrief Account Settings, rein numerisch",
+      "userid_placeholder": "z.B. 612345",
       "verify_button": "Verbindung prüfen",
       "verify_ok": "OFP gefunden: {{origin}} → {{destination}} ({{callsign}})",
       "verify_err_user_not_found": "Username/User-ID nicht gefunden. Prüfe Schreibweise.",
@@ -958,7 +960,9 @@
     "delete_all_logs_done_one": "{{count}} Fluglog-Datei gelöscht.",
     "delete_all_logs_done_other": "{{count}} Fluglog-Dateien gelöscht.",
     "refresh_button_label": "Speicher-Statistiken aktualisieren",
-    "refresh_button_title": "Aktualisieren"
+    "refresh_button_title": "Aktualisieren",
+    "auto_start_label": "Auto-Start aufzeichnen",
+    "auto_start_hint": "Startet einen Flug automatisch, sobald das Flugzeug am Departure-Airport eines deiner Bids steht (≤ 5 km, am Boden, Triebwerke aus). Prüfung alle 3 s."
   },
   "behaviour": {
     "section_title": "Verhalten",
@@ -997,6 +1001,7 @@
       "connecting": "Verbinde …",
       "badPin": "Falsche PIN. Bitte prüfe die PIN am Sim-PC und versuche es erneut.",
       "network": "Verbindung fehlgeschlagen. Bist du im selben WLAN wie der Sim-PC?",
+      "rateLimited": "Zu viele Versuche. Bitte warte kurz, bevor du es erneut probierst — das ist kein Netzwerkproblem.",
       "hint": "Wer diese PIN kennt, kann den laufenden Flug steuern. Gib sie nur an Geräte weiter, denen du vertraust."
     },
     "server": {
@@ -1017,8 +1022,60 @@
       "copy_url": "URL kopieren",
       "copied": "Kopiert ✓",
       "firewall_note": "Hinweis: Beim ersten Start fragt Windows bzw. macOS eventuell nach einer Firewall-Freigabe. Bitte für das lokale (private) Netzwerk erlauben.",
-      "security_warning": "⚠ Achtung: Jede Person in diesem Netzwerk, die die PIN kennt, kann deinen laufenden Flug vollständig steuern (starten, beenden, PIREP einreichen). Aktiviere die Fernbedienung nur in einem vertrauenswürdigen Netzwerk. Pairing und Login (z. B. deine phpVMS-API-Key-Eingabe) sollten nur in einem vertrauenswürdigen Netzwerk erfolgen — die Verbindung läuft unverschlüsselt (HTTP) über das LAN."
+      "security_warning": "⚠ Achtung: Jede Person in diesem Netzwerk, die die PIN kennt, kann deinen laufenden Flug vollständig steuern (starten, beenden, PIREP einreichen). Aktiviere die Fernbedienung nur in einem vertrauenswürdigen Netzwerk. Pairing und Login (z. B. deine phpVMS-API-Key-Eingabe) sollten nur in einem vertrauenswürdigen Netzwerk erfolgen — die Verbindung läuft unverschlüsselt (HTTP) über das LAN.",
+      "revoke_label": "Alle gekoppelten Geräte trennen",
+      "revoke_hint": "Erzeugt einen neuen Zugangs-Code. Bisher gekoppelte Tablets/PCs verlieren sofort den Zugriff und müssen sich mit der aktuellen PIN neu koppeln.",
+      "revoke_button": "Geräte trennen",
+      "revoke_confirm_title": "Alle gekoppelten Geräte trennen?",
+      "revoke_confirm_message": "Jedes bisher gekoppelte Tablet/PC verliert sofort den Zugriff und muss sich mit der aktuell angezeigten PIN neu koppeln.",
+      "revoke_done": "Geräte getrennt ✓"
     }
+  },
+  "flight_profile": {
+    "title_alt": "Höhe über Meer",
+    "title_agl": "Höhe über Grund",
+    "title_speed": "Geschwindigkeit",
+    "title_vs": "Steig- und Sinkrate",
+    "title_fuel": "Treibstoff an Bord",
+    "no_altitude_data": "Keine Höhendaten."
+  },
+  "logbook_view": {
+    "section_title": "Logbuch",
+    "section_subtitle": "deine geflogenen Flüge — live aus phpVMS",
+    "stat_flights": "Flüge",
+    "stat_hours": "Stunden",
+    "stat_distance": "Distanz",
+    "stat_avg_landing": "Ø Landung",
+    "stat_this_month": "Diesen Monat",
+    "stat_this_year": "Dieses Jahr",
+    "stat_rank": "Rang",
+    "unit_hours": "h",
+    "unit_flights": "Flüge",
+    "error_prefix": "Logbuch konnte nicht geladen werden: {{error}}",
+    "error_network": "Keine Verbindung zu phpVMS. ({{detail}})",
+    "error_unauthorized": "Anmeldung abgelehnt — prüfe deinen API-Schlüssel in den Einstellungen. ({{detail}})",
+    "error_not_found": "Das Logbuch-Modul antwortet nicht — läuft GsgLogbook auf dem Server? ({{detail}})",
+    "error_unknown": "Unbekannter Fehler.",
+    "retry": "Erneut versuchen",
+    "table_date": "Datum",
+    "table_route": "Route",
+    "table_type": "Muster",
+    "table_duration": "Dauer",
+    "table_distance": "Distanz",
+    "table_landing": "Landung",
+    "table_status": "Status",
+    "opening_aria": "lädt",
+    "loading": "lädt …",
+    "pager_range": "{{from}}–{{to}} von {{total}}",
+    "pager_back": "‹ Zurück",
+    "pager_next": "Weiter ›",
+    "pager_page": "Seite {{page}} / {{pages}}",
+    "detail_back": "← Logbuch",
+    "detail_log_title": "Fluglogbuch",
+    "detail_profile_title": "Flugprofil",
+    "status_accepted": "akzeptiert",
+    "status_pending": "ausstehend",
+    "status_rejected": "abgelehnt"
   },
   "error_reporting": {
     "section_title": "Fehler-Telemetrie (anonym)",
@@ -1113,7 +1170,10 @@
     "waiting": "Subscription registriert — warte auf das erste Datenpaket …",
     "waiting_for_sim": "Warte auf Sim-Verbindung — die SDK-Statusprüfung läuft sobald MSFS / X-Plane verbunden ist.",
     "waiting_for_aircraft": "Warte auf Aircraft-Load — sobald das Flugzeug im MSFS / X-Plane fertig geladen ist, prüfe ich den SDK-Status.",
-    "waiting_init": "Subscription registriert — gebe PMDG noch {{secs}} s Zeit zum Initialisieren …"
+    "waiting_init": "Subscription registriert — gebe PMDG noch {{secs}} s Zeit zum Initialisieren …",
+    "age_live": "📡 live",
+    "age_seconds": "vor {{secs}}s",
+    "age_minutes": "vor {{min}} min"
   },
   "xplane_premium_panel": {
     "title": "X-Plane Premium Plugin",
@@ -1144,12 +1204,6 @@
     "language_it": "Italiano",
     "show_app_info": "App-Info anzeigen",
     "logout": "Abmelden"
-  },
-  "appinfo": {
-    "title": "Anwendungs-Info",
-    "version": "Version",
-    "commit": "Commit",
-    "commit_unknown": "(Entwicklungs-Build)"
   },
   "login": {
     "title": "Mit German Sky Group verbinden",
@@ -1324,6 +1378,13 @@
     "col_value": "Wert",
     "col_actions": "Aktionen"
   },
+  "xplane_inspector": {
+    "title": "X-Plane DataRefs",
+    "status": "{{live}} live · {{missing}} fehlend von {{total}}",
+    "col_index": "#",
+    "col_dataref": "DataRef",
+    "col_value": "Wert"
+  },
   "integrity": {
     "title_critical": "Data-Integrity-Problem entdeckt",
     "title_anomaly": "Datenanomalie",
@@ -1349,7 +1410,16 @@
     "confirm_cancel": "Den aktiven Flug abbrechen? Der PIREP wird auf phpVMS als „storniert\" markiert — er bleibt in der PIREP-Liste sichtbar. Vollständiges Löschen nur über die phpVMS-Webseite.",
     "adopt_failed": "Wiederherstellung fehlgeschlagen",
     "confirm_failed": "Bestätigung fehlgeschlagen",
-    "cancel_failed": "Flug konnte nicht abgebrochen werden"
+    "cancel_failed": "Flug konnte nicht abgebrochen werden",
+    "compare_head_saved": "Gespeichert",
+    "compare_head_sim": "Sim jetzt",
+    "compare_position": "Position",
+    "compare_altitude": "Höhe",
+    "compare_heading": "Kurs",
+    "compare_aircraft": "Flugzeug",
+    "compare_fuel": "Kraftstoff",
+    "compare_zfw": "ZFW",
+    "compare_total_weight": "Gesamtgewicht"
   },
   "active_flight": {
     "title": "Aktiver Flug",
@@ -1635,7 +1705,8 @@
     "sink_rate_pull_up": "🔴 Sinkrate! Hochziehen!",
     "hard_landing": "🛬 Harte Landung erkannt",
     "settings_label": "Anflug-Warnungen anzeigen",
-    "settings_hint": "Zeigt im Cockpit eine farbige Warnung wenn der Anflug die FAA-Stable-Approach-Kriterien (V/S, Bank, Konfiguration) verletzt — bei 1000 ft, 500 ft und 200 ft AGL. Plus Sinkrate-Warnung unter 100 ft und Hard-Landing-Hinweis nach Touchdown. Visuell, kein Sound."
+    "settings_hint": "Zeigt im Cockpit eine farbige Warnung wenn der Anflug die FAA-Stable-Approach-Kriterien (V/S, Bank, Konfiguration) verletzt — bei 1000 ft, 500 ft und 200 ft AGL. Plus Sinkrate-Warnung unter 100 ft und Hard-Landing-Hinweis nach Touchdown. Visuell, kein Sound.",
+    "hard_landing_detail": "V/S {{vs}} fpm — unter der Hard-Landing-Schwelle von {{threshold}} fpm (Boeing/Airbus FCOM)"
   },
   "manual_flight": {
     "title": "VFR / Manual-Mode — Flug starten",
@@ -1655,6 +1726,14 @@
     "cancel": "Abbrechen",
     "next": "Weiter →",
     "optional": "(optional)",
+    "fleet_load_error": "Konnte Fleet nicht laden: {{message}}",
+    "state_in_use": "🔒 belegt",
+    "state_in_flight": "✈ im Flug",
+    "state_maintenance": "🔧 Wartung",
+    "available_hint": "Verfügbar",
+    "available_hint_at": "Verfügbar am {{airport}}",
+    "available_hint_elsewhere": "Verfügbar (steht in {{airport}})",
+    "unavailable_hint_suffix": "{{state}} — phpVMS lehnt ggf. den Prefile ab.",
     "form": {
       "block_fuel": "Block-Fuel",
       "block_fuel_placeholder": "z.B. 250",
@@ -1780,7 +1859,19 @@
     "surface_grv": "Schotter",
     "surface_grs": "Gras",
     "surface_dirt": "Erde",
-    "surface_turf": "Rasen"
+    "surface_turf": "Rasen",
+    "tooltip_pre_threshold": "Pre-Threshold-Zone (Displaced Threshold, DDS): {{m}} m vor der Landeschwelle — Aufsetzen hier ist in der echten Welt illegal (Hindernis-Clearance).",
+    "tooltip_threshold": "Landeschwelle (Threshold) — Beginn des landbaren Bahn-Teils.",
+    "tooltip_runway_end": "Bahn-Ende — Ende des landbaren Bahn-Teils.",
+    "tooltip_tdz": "Aufsetzzone (Touchdown Zone, TDZ): erste {{m}} m der Bahn. Soll-Aufsetz-Bereich nach ICAO Annex 14.",
+    "tooltip_aim_point": "Aim-Point — die zwei großen weißen Quadrate auf der echten Bahn (hier gelb gezeichnet). Pilot zielt im Anflug auf diese Markierung; durch den Flare setzt er typisch 50–150 m DAHINTER auf (= Anfang der TDZ). Position: {{m}} m hinter Schwelle.",
+    "tooltip_touchdown": "Aufsetzpunkt (Touchdown): {{distance}} m {{beforeAfter}} Schwelle, {{lateral}} m {{side}} der Mittellinie.",
+    "tooltip_word_before": "vor",
+    "tooltip_word_after": "hinter",
+    "tooltip_word_right": "rechts",
+    "tooltip_word_left": "links",
+    "tooltip_word_on": "auf",
+    "tooltip_brake_point": "Bremspunkt — Ab hier hast du auf ~40 kt abgebremst. Das ist die typische High-Speed-Exit-Geschwindigkeit; am nächsten Rollwege-Abzweig kannst du die Bahn jetzt normal verlassen. NICHT die Stelle wo du tatsächlich abbiegst — das passiert später, an einem konkreten Taxiway."
   },
   "ascan": {
     "title": "🔬 Flugzeug zur Analyse einreichen (Aircraft-Scan)",

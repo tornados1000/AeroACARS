@@ -5,7 +5,7 @@
 //   1. Aircraft-Picker mit Suche + Sim-Default
 //   2. Manual-Plan-Form (Block-Fuel, ETA Pflicht; Rest optional)
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "../lib/ipc";
 import { useTranslation } from "react-i18next";
 import type { Bid, ActiveFlightInfo, UiError } from "../types";
@@ -52,6 +52,31 @@ interface SimContextHint {
   fuel_total_kg?: number | null;
 }
 
+// Pure functions — testbar isoliert
+//
+// v0.19.x FIX: findet das zur Sim-Telemetrie passende Fleet-Aircraft.
+// Registration hat Vorrang vor ICAO, da eindeutig; beide werden case-
+// insensitive und trim-tolerant verglichen (Sim liefert teils Leer-
+// zeichen-gepolstert oder klein geschrieben).
+export function matchAircraftFromSimHint(
+  list: AircraftPickerEntry[],
+  simHint: SimContextHint | null,
+): AircraftPickerEntry | null {
+  if (simHint?.aircraft_registration) {
+    const match = list.find(
+      (a) => a.registration.trim().toUpperCase() === simHint.aircraft_registration!.trim().toUpperCase(),
+    );
+    if (match) return match;
+  }
+  if (simHint?.aircraft_icao) {
+    const match = list.find(
+      (a) => a.icao.trim().toUpperCase() === simHint.aircraft_icao!.trim().toUpperCase(),
+    );
+    if (match) return match;
+  }
+  return null;
+}
+
 interface Props {
   bid: Bid;
   /** Aktueller Sim-Snapshot fuer Aircraft-Default + Block-Fuel-Default. */
@@ -76,6 +101,17 @@ export function ManualFlightModal({ bid, simHint, onClose, onFlightStarted }: Pr
   const [selected, setSelected] = useState<AircraftPickerEntry | null>(null);
   const [loadingFleet, setLoadingFleet] = useState(true);
 
+  // v0.19.x FIX: dieser Effect feuert erneut, sobald sich die Sim-
+  // Telemetrie aendert (Pilot wechselt im Sim das Flugzeug/die Livery).
+  // Vorher wurde bei jedem Refeuern bedingungslos setSelected(match)
+  // aufgerufen — das ueberschrieb eine bereits manuell getroffene Wahl
+  // des Piloten, sogar noch im "plan"-Stage nachdem er schon Werte
+  // eingetippt hatte (Race: Sim-Hint gewinnt immer gegen Pilot-Klick).
+  // pilotCommittedRef haelt fest, sobald der Pilot selbst geklickt hat
+  // ODER die Auswahl durch proceedToPlan() bestaetigt wurde — danach
+  // ist der Sim-Default endgueltig aus dem Rennen.
+  const pilotCommittedRef = useRef(false);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -88,22 +124,17 @@ export function ManualFlightModal({ bid, simHint, onClose, onFlightStarted }: Pr
         if (cancelled) return;
         setAircraftList(list);
         // Sim-Default-Auswahl: wenn der Sim ein passendes Aircraft geladen
-        // hat, dieses vorauswaehlen damit Pilot nicht raten muss
-        if (simHint?.aircraft_registration) {
-          const match = list.find(
-            (a) => a.registration.trim().toUpperCase() === simHint.aircraft_registration!.trim().toUpperCase(),
-          );
-          if (match) setSelected(match);
-        } else if (simHint?.aircraft_icao) {
-          const match = list.find(
-            (a) => a.icao.trim().toUpperCase() === simHint.aircraft_icao!.trim().toUpperCase(),
-          );
+        // hat, dieses vorauswaehlen damit Pilot nicht raten muss — aber
+        // nur solange der Pilot noch keine eigene Entscheidung getroffen
+        // hat.
+        if (!pilotCommittedRef.current) {
+          const match = matchAircraftFromSimHint(list, simHint);
           if (match) setSelected(match);
         }
       } catch (err: unknown) {
         if (cancelled) return;
         const ui = asUiError(err);
-        setError(`Konnte Fleet nicht laden: ${ui.message}`);
+        setError(t("manual_flight.fleet_load_error", { message: ui.message }));
         setAircraftList([]);
       } finally {
         if (!cancelled) setLoadingFleet(false);
@@ -196,6 +227,7 @@ export function ManualFlightModal({ bid, simHint, onClose, onFlightStarted }: Pr
 
   function proceedToPlan() {
     if (!selected) return;
+    pilotCommittedRef.current = true;
     setError(null);
     setWarning(null);
     setStage("plan");
@@ -357,9 +389,9 @@ export function ManualFlightModal({ bid, simHint, onClose, onFlightStarted }: Pr
                   {filtered.map((a) => {
                     const stateLabel =
                       a.state === 0 ? null :
-                      a.state === 1 ? "🔒 in Use" :
-                      a.state === 2 ? "✈ in Flight" :
-                      "🔧 Maintenance";
+                      a.state === 1 ? t("manual_flight.state_in_use") :
+                      a.state === 2 ? t("manual_flight.state_in_flight") :
+                      t("manual_flight.state_maintenance");
                     const stateColor =
                       a.state === 0 ? undefined :
                       a.state === 1 ? "#fbbf24" :
@@ -371,10 +403,14 @@ export function ManualFlightModal({ bid, simHint, onClose, onFlightStarted }: Pr
                         key={a.id}
                         type="button"
                         className={`manual-modal__list-item ${selected?.id === a.id ? "selected" : ""}`}
-                        onClick={() => setSelected(a)}
+                        onClick={() => { pilotCommittedRef.current = true; setSelected(a); }}
                         title={a.state === 0
-                          ? `Verfügbar${atDpt ? ` am ${bid.flight.dpt_airport_id}` : a.airport_id ? ` (steht in ${a.airport_id})` : ""}`
-                          : `${stateLabel} — phpVMS lehnt ggf. den Prefile ab.`}
+                          ? (atDpt
+                              ? t("manual_flight.available_hint_at", { airport: bid.flight.dpt_airport_id })
+                              : a.airport_id
+                                ? t("manual_flight.available_hint_elsewhere", { airport: a.airport_id })
+                                : t("manual_flight.available_hint"))
+                          : t("manual_flight.unavailable_hint_suffix", { state: stateLabel })}
                       >
                         <span className="manual-modal__list-icao">{a.icao || "—"}</span>
                         <span className="manual-modal__list-reg">{a.registration || "—"}</span>

@@ -1231,6 +1231,37 @@ struct DataEnvelope<T> {
 
 // ---- Client ----
 
+/// v0.19.x FIX: outcome of [`same_host_redirect_decision`] — kept separate
+/// from `reqwest::redirect::Action` so the decision logic is testable
+/// without constructing a real `reqwest::redirect::Attempt` (which has no
+/// public constructor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedirectDecision {
+    Follow,
+    Stop,
+    TooMany,
+}
+
+/// Pure redirect-policy decision: only ever follow a redirect that stays
+/// on the phpVMS host this client was configured for. `X-API-Key` is not
+/// in reqwest's cross-host header-strip allowlist (only Authorization/
+/// Cookie/... are), so an unrestricted redirect could hand the API key —
+/// which also mints MQTT credentials — to any host a compromised or
+/// misconfigured phpVMS install redirects to.
+fn same_host_redirect_decision(
+    target_host: Option<&str>,
+    allowed_host: Option<&str>,
+    hops_so_far: usize,
+) -> RedirectDecision {
+    if hops_so_far > 5 {
+        RedirectDecision::TooMany
+    } else if target_host.is_some() && target_host == allowed_host {
+        RedirectDecision::Follow
+    } else {
+        RedirectDecision::Stop
+    }
+}
+
 /// A reusable client. `Clone` is cheap because the inner reqwest client is
 /// `Arc`-backed and `Connection` only holds a URL + API key string.
 #[derive(Clone)]
@@ -1242,6 +1273,26 @@ pub struct Client {
 impl Client {
     pub fn new(conn: Connection) -> Result<Self, ApiError> {
         let user_agent = format!("AeroACARS/{}", env!("CARGO_PKG_VERSION"));
+        // SECURITY (v0.19.x FIX): reqwest's default redirect policy strips
+        // Authorization/Cookie/... on a cross-host hop but does NOT strip
+        // custom headers — `X-API-Key` (the phpVMS credential, which also
+        // mints MQTT credentials) would survive a redirect to a completely
+        // different host. A compromised or misconfigured VA phpVMS install
+        // could hand it straight to an attacker. There is no legitimate
+        // reason for this client to ever need a cross-host redirect — every
+        // request is built against the one configured `base_url` — so only
+        // same-host redirects are followed at all; anything else is
+        // rejected outright, same effect as `Policy::none()` for the case
+        // that actually matters, without breaking a same-host https upgrade
+        // some phpVMS/load-balancer setups issue.
+        let allowed_host = conn.base_url.host_str().map(|h| h.to_string());
+        let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
+            match same_host_redirect_decision(attempt.url().host_str(), allowed_host.as_deref(), attempt.previous().len()) {
+                RedirectDecision::Follow => attempt.follow(),
+                RedirectDecision::Stop => attempt.stop(),
+                RedirectDecision::TooMany => attempt.error("too many redirects"),
+            }
+        });
         let http = HttpClient::builder()
             .user_agent(user_agent)
             .timeout(DEFAULT_TIMEOUT)
@@ -1252,6 +1303,7 @@ impl Client {
             .tcp_keepalive(TCP_KEEPALIVE)
             .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .pool_max_idle_per_host(8)
+            .redirect(redirect_policy)
             .build()
             .map_err(ApiError::from)?;
         Ok(Self { http, conn })
@@ -2244,9 +2296,23 @@ fn parse_simbrief_ofp(xml: &str) -> Option<SimBriefOfp> {
     // the raw inner XML which made the PIREP-detail show
     // "<icao_code>LFBO</icao_code> <iata_code>TLS</iata_code> ..."
     // as the alternate string. Drill in to grab just the ICAO.
+    // QS 2026-08-04: hier stand ein `.or_else(|| extract_tag(xml, "icao_code"))`
+    // als "defensiver" Rueckfall, falls SimBrief den Alternate mal flach als
+    // Geschwister-Element liefert. Der Rueckfall war aber NICHT auf einen
+    // Bereich eingegrenzt, und `extract_tag` nimmt das ERSTE Vorkommen im
+    // ganzen Dokument. In einem echten OFP steht <origin> vor <alternate>
+    // und enthaelt selbst ein <icao_code> — plante der Pilot also gar kein
+    // Ausweichziel (auf Kurzstrecke die Regel, SimBrief laesst den Block
+    // dann weg oder leer), griff der Rueckfall daneben und lieferte den
+    // ABFLUGHAFEN. Ein EDDL->EDDM-Flug briefte damit "Alternate: EDDL" —
+    // und zwar nicht nur in der Anzeige: der Wert lief ueber
+    // `stats.planned_alternate` auch in die Live-Karte und ins PIREP-Feld
+    // "Plan Alternate". Kein Ausweichziel geplant heisst jetzt schlicht
+    // "keins" statt eines falschen. Der alte Test hat das nie bemerkt, weil
+    // sein Fixture kein <origin> enthielt — die eine Form, in der der
+    // Rueckfall nicht danebengreifen kann.
     let alternate = extract_tag(xml, "alternate")
         .and_then(|inner| extract_tag(inner, "icao_code"))
-        .or_else(|| extract_tag(xml, "icao_code"))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     let waypoints = extract_navlog_fixes(xml);
@@ -2441,6 +2507,42 @@ fn extract_navlog_fixes(xml: &str) -> Vec<RouteFix> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- same_host_redirect_decision (v0.19.x FIX: X-API-Key redirect leak) ----
+
+    #[test]
+    fn redirect_to_the_same_host_is_followed() {
+        assert_eq!(
+            same_host_redirect_decision(Some("va.example.com"), Some("va.example.com"), 0),
+            RedirectDecision::Follow
+        );
+    }
+
+    #[test]
+    fn redirect_to_a_different_host_is_stopped() {
+        // The exact vulnerability: a redirect to ANY other host used to
+        // carry X-API-Key straight along with it.
+        assert_eq!(
+            same_host_redirect_decision(Some("attacker.evil"), Some("va.example.com"), 0),
+            RedirectDecision::Stop
+        );
+    }
+
+    #[test]
+    fn redirect_with_no_resolvable_host_is_stopped() {
+        assert_eq!(
+            same_host_redirect_decision(None, Some("va.example.com"), 0),
+            RedirectDecision::Stop
+        );
+    }
+
+    #[test]
+    fn too_many_hops_is_rejected_even_on_the_same_host() {
+        assert_eq!(
+            same_host_redirect_decision(Some("va.example.com"), Some("va.example.com"), 6),
+            RedirectDecision::TooMany
+        );
+    }
 
     #[test]
     fn rejects_non_http_scheme() {
@@ -2639,10 +2741,16 @@ mod tests {
         assert_eq!(b.flight.flight_number, "6431");
     }
 
+    /// QS 2026-08-04: hiess frueher `..._falls_back_to_root_icao_when_no_wrapper`
+    /// und sicherte einen "defensiven" Rueckfall ab (flaches <icao_code>
+    /// irgendwo im Dokument = Alternate). Genau dieser Rueckfall war der
+    /// Fehler: sein Fixture enthielt kein <origin>, und nur deshalb konnte
+    /// er nicht danebengreifen — siehe den Test darunter. Der Rueckfall ist
+    /// entfernt; ein flach geliefertes <icao_code> gilt jetzt bewusst NICHT
+    /// mehr als Ausweichziel, weil sich diese Form nicht zuverlaessig vom
+    /// <origin>-ICAO unterscheiden laesst.
     #[test]
-    fn simbrief_alternate_falls_back_to_root_icao_when_no_wrapper() {
-        // Defensive — if a future SimBrief variant flattens the
-        // alternate to a sibling icao_code we still pick it up.
+    fn simbrief_alternate_ignores_a_bare_root_icao_code() {
         let xml = r#"
             <ofp>
                 <weights>
@@ -2652,8 +2760,71 @@ mod tests {
             </ofp>
         "#;
         let ofp = parse_simbrief_ofp(xml).expect("parses");
-        assert_eq!(ofp.alternate.as_deref(), Some("LFBO"));
+        assert_eq!(
+            ofp.alternate.as_deref(),
+            None,
+            "ein loses <icao_code> ist nicht unterscheidbar vom origin-ICAO"
+        );
     }
+
+    /// QS 2026-08-04: der Test, der den Fehler aufgedeckt hat. Das Fixture
+    /// des Tests darueber hatte KEIN <origin> — genau die eine Form, in der
+    /// der fruehere `.or_else()`-Rueckfall nicht danebengreifen konnte. In
+    /// einem echten OFP steht <origin> VOR <alternate>, und `extract_tag`
+    /// nimmt das ERSTE Vorkommen im ganzen Dokument: ohne geplantes
+    /// Ausweichziel lieferte der Rueckfall damit den ABFLUGHAFEN. Das lief
+    /// ins Briefing, in die Live-Karte und ins PIREP-Feld "Plan Alternate"
+    /// — ein EDDL->EDDM-Flug briefte "Alternate: EDDL".
+    #[test]
+    fn simbrief_alternate_is_none_when_ofp_plans_no_alternate() {
+        // Realistische Element-Reihenfolge: origin vor destination vor
+        // (hier fehlendem) alternate.
+        let xml = r#"
+            <ofp>
+                <origin>
+                    <icao_code>EDDL</icao_code>
+                </origin>
+                <destination>
+                    <icao_code>EDDM</icao_code>
+                </destination>
+                <weights>
+                    <est_zfw>71242</est_zfw>
+                </weights>
+            </ofp>
+        "#;
+        let ofp = parse_simbrief_ofp(xml).expect("parses");
+        assert_eq!(
+            ofp.alternate.as_deref(),
+            None,
+            "ohne <alternate> darf NICHT der Abflughafen einlaufen"
+        );
+        assert_eq!(ofp.ofp_origin_icao, "EDDL");
+        assert_eq!(ofp.ofp_destination_icao, "EDDM");
+    }
+
+    /// Gegenstueck: ein echt geplantes Ausweichziel muss weiter ankommen.
+    #[test]
+    fn simbrief_alternate_is_read_from_the_alternate_block() {
+        let xml = r#"
+            <ofp>
+                <origin>
+                    <icao_code>EDDL</icao_code>
+                </origin>
+                <destination>
+                    <icao_code>EDDM</icao_code>
+                </destination>
+                <alternate>
+                    <icao_code>EDDN</icao_code>
+                </alternate>
+                <weights>
+                    <est_zfw>71242</est_zfw>
+                </weights>
+            </ofp>
+        "#;
+        let ofp = parse_simbrief_ofp(xml).expect("parses");
+        assert_eq!(ofp.alternate.as_deref(), Some("EDDN"));
+    }
+
 
     /// v0.7.8: <params><request_id> ist die canonical changed-flag-
     /// Quelle fuer SimBrief-direct Refresh. Spec §3.

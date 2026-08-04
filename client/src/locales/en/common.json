@@ -917,8 +917,10 @@
       "intro": "If your SimBrief identifier is set here, NexusAir ACARS can fetch a freshly generated OFP directly from simbrief.com — even if the bid in phpVMS has already been removed (normal state during boarding). You can use username or user-ID (or both). User-ID is more robust, username is easier to find.",
       "username_label": "SimBrief username",
       "username_hint": "Visible in simbrief.com/dashboard/?username=…",
+      "username_placeholder": "e.g. thomaskant",
       "userid_label": "SimBrief user-ID (optional)",
       "userid_hint": "From SimBrief account settings, numeric only",
+      "userid_placeholder": "e.g. 612345",
       "verify_button": "Check connection",
       "verify_ok": "OFP found: {{origin}} → {{destination}} ({{callsign}})",
       "verify_err_user_not_found": "Username/user-ID not found. Check spelling.",
@@ -958,7 +960,9 @@
     "delete_all_logs_done_one": "{{count}} flight log file deleted.",
     "delete_all_logs_done_other": "{{count}} flight log files deleted.",
     "refresh_button_label": "Refresh storage statistics",
-    "refresh_button_title": "Refresh"
+    "refresh_button_title": "Refresh",
+    "auto_start_label": "Auto-start recording",
+    "auto_start_hint": "Starts a flight automatically as soon as the aircraft is at the departure airport of one of your bids (≤ 5 km, on ground, engines off). Checked every 3 s."
   },
   "behaviour": {
     "section_title": "Behaviour",
@@ -997,6 +1001,7 @@
       "connecting": "Connecting …",
       "badPin": "Wrong PIN. Check the PIN on the sim PC and try again.",
       "network": "Connection failed. Are you on the same Wi-Fi as the sim PC?",
+      "rateLimited": "Too many attempts. Please wait a moment before trying again — this is not a network problem.",
       "hint": "Anyone with this PIN can control the active flight. Only share it with devices you trust."
     },
     "server": {
@@ -1017,8 +1022,60 @@
       "copy_url": "Copy URL",
       "copied": "Copied ✓",
       "firewall_note": "Note: on first start Windows or macOS may prompt for a firewall permission. Please allow it for the local (private) network.",
-      "security_warning": "⚠ Warning: anyone on this network who knows the PIN can fully control your active flight (start, end, file the PIREP). Only enable remote control on a network you trust. Pairing and login (e.g. entering your phpVMS API key) should only be done on a trusted network — the connection runs unencrypted (HTTP) over the LAN."
+      "security_warning": "⚠ Warning: anyone on this network who knows the PIN can fully control your active flight (start, end, file the PIREP). Only enable remote control on a network you trust. Pairing and login (e.g. entering your phpVMS API key) should only be done on a trusted network — the connection runs unencrypted (HTTP) over the LAN.",
+      "revoke_label": "Disconnect all paired devices",
+      "revoke_hint": "Generates a new access token. Previously paired tablets/PCs lose access immediately and must re-pair with the current PIN.",
+      "revoke_button": "Disconnect devices",
+      "revoke_confirm_title": "Disconnect all paired devices?",
+      "revoke_confirm_message": "Every previously paired tablet/PC loses access immediately and must re-pair using the PIN currently shown.",
+      "revoke_done": "Devices disconnected ✓"
     }
+  },
+  "flight_profile": {
+    "title_alt": "Altitude MSL",
+    "title_agl": "Altitude AGL",
+    "title_speed": "Speed",
+    "title_vs": "Vertical Speed",
+    "title_fuel": "Fuel on board",
+    "no_altitude_data": "No altitude data."
+  },
+  "logbook_view": {
+    "section_title": "Logbook",
+    "section_subtitle": "your flown flights — live from phpVMS",
+    "stat_flights": "Flights",
+    "stat_hours": "Hours",
+    "stat_distance": "Distance",
+    "stat_avg_landing": "Avg. landing",
+    "stat_this_month": "This month",
+    "stat_this_year": "This year",
+    "stat_rank": "Rank",
+    "unit_hours": "h",
+    "unit_flights": "flights",
+    "error_prefix": "Could not load the logbook: {{error}}",
+    "error_network": "No connection to phpVMS. ({{detail}})",
+    "error_unauthorized": "Login rejected — check your API key in Settings. ({{detail}})",
+    "error_not_found": "The logbook module isn't responding — is GsgLogbook running on the server? ({{detail}})",
+    "error_unknown": "Unknown error.",
+    "retry": "Retry",
+    "table_date": "Date",
+    "table_route": "Route",
+    "table_type": "Type",
+    "table_duration": "Duration",
+    "table_distance": "Distance",
+    "table_landing": "Landing",
+    "table_status": "Status",
+    "opening_aria": "loading",
+    "loading": "loading …",
+    "pager_range": "{{from}}–{{to}} of {{total}}",
+    "pager_back": "‹ Back",
+    "pager_next": "Next ›",
+    "pager_page": "Page {{page}} / {{pages}}",
+    "detail_back": "← Logbook",
+    "detail_log_title": "Flight log",
+    "detail_profile_title": "Flight profile",
+    "status_accepted": "accepted",
+    "status_pending": "pending",
+    "status_rejected": "rejected"
   },
   "error_reporting": {
     "section_title": "Error telemetry (anonymous)",
@@ -1113,7 +1170,10 @@
     "waiting": "Subscription registered — waiting for first data packet …",
     "waiting_for_sim": "Waiting for sim connection — SDK status check resumes once MSFS / X-Plane is connected.",
     "waiting_for_aircraft": "Waiting for aircraft load — SDK status check resumes once the aircraft is fully loaded in MSFS / X-Plane.",
-    "waiting_init": "Subscription registered — giving PMDG {{secs}} s more to initialise …"
+    "waiting_init": "Subscription registered — giving PMDG {{secs}} s more to initialise …",
+    "age_live": "📡 live",
+    "age_seconds": "{{secs}}s ago",
+    "age_minutes": "{{min}} min ago"
   },
   "xplane_premium_panel": {
     "title": "X-Plane Premium Plugin",
@@ -1144,12 +1204,6 @@
     "language_it": "Italiano",
     "show_app_info": "Show app info",
     "logout": "Sign out"
-  },
-  "appinfo": {
-    "title": "Application info",
-    "version": "Version",
-    "commit": "Commit",
-    "commit_unknown": "(development build)"
   },
   "login": {
     "title": "Connect to phpVMS",
@@ -1324,6 +1378,13 @@
     "col_value": "Value",
     "col_actions": "Actions"
   },
+  "xplane_inspector": {
+    "title": "X-Plane DataRefs",
+    "status": "{{live}} live · {{missing}} missing of {{total}}",
+    "col_index": "#",
+    "col_dataref": "DataRef",
+    "col_value": "Value"
+  },
   "integrity": {
     "title_critical": "Data integrity problem detected",
     "title_anomaly": "Data anomaly",
@@ -1349,7 +1410,16 @@
     "confirm_cancel": "Cancel the active flight? The PIREP will be marked as \"cancelled\" on phpVMS — it stays visible in the PIREP list. Full deletion only via the phpVMS website.",
     "adopt_failed": "Could not resume the flight",
     "confirm_failed": "Could not confirm the resume",
-    "cancel_failed": "Could not cancel the flight"
+    "cancel_failed": "Could not cancel the flight",
+    "compare_head_saved": "Saved",
+    "compare_head_sim": "Sim now",
+    "compare_position": "Position",
+    "compare_altitude": "Altitude",
+    "compare_heading": "Heading",
+    "compare_aircraft": "Aircraft",
+    "compare_fuel": "Fuel",
+    "compare_zfw": "ZFW",
+    "compare_total_weight": "Total weight"
   },
   "active_flight": {
     "title": "Active flight",
@@ -1635,7 +1705,8 @@
     "sink_rate_pull_up": "🔴 Sink rate! Pull up!",
     "hard_landing": "🛬 Hard landing detected",
     "settings_label": "Show approach advisories",
-    "settings_hint": "Shows a colored advisory in the cockpit when the approach violates FAA Stable-Approach criteria (V/S, bank, configuration) — at 1000 ft, 500 ft and 200 ft AGL. Plus a sink rate warning below 100 ft and a hard-landing hint after touchdown. Visual only, no sound."
+    "settings_hint": "Shows a colored advisory in the cockpit when the approach violates FAA Stable-Approach criteria (V/S, bank, configuration) — at 1000 ft, 500 ft and 200 ft AGL. Plus a sink rate warning below 100 ft and a hard-landing hint after touchdown. Visual only, no sound.",
+    "hard_landing_detail": "V/S {{vs}} fpm — below the {{threshold}} fpm hard-landing threshold (Boeing/Airbus FCOM)"
   },
   "manual_flight": {
     "title": "VFR / Manual mode — start flight",
@@ -1655,6 +1726,14 @@
     "cancel": "Cancel",
     "next": "Next →",
     "optional": "(optional)",
+    "fleet_load_error": "Could not load the fleet: {{message}}",
+    "state_in_use": "🔒 in Use",
+    "state_in_flight": "✈ in Flight",
+    "state_maintenance": "🔧 Maintenance",
+    "available_hint": "Available",
+    "available_hint_at": "Available at {{airport}}",
+    "available_hint_elsewhere": "Available (currently at {{airport}})",
+    "unavailable_hint_suffix": "{{state}} — phpVMS may reject the prefile.",
     "form": {
       "block_fuel": "Block fuel",
       "block_fuel_placeholder": "e.g. 250",
@@ -1780,7 +1859,19 @@
     "surface_grv": "Gravel",
     "surface_grs": "Grass",
     "surface_dirt": "Dirt",
-    "surface_turf": "Turf"
+    "surface_turf": "Turf",
+    "tooltip_pre_threshold": "Pre-threshold zone (displaced threshold, DDS): {{m}} m before the landing threshold — touching down here is illegal in the real world (obstacle clearance).",
+    "tooltip_threshold": "Landing threshold — start of the usable runway.",
+    "tooltip_runway_end": "Runway end — end of the usable runway.",
+    "tooltip_tdz": "Touchdown zone (TDZ): first {{m}} m of the runway. Intended touchdown area per ICAO Annex 14.",
+    "tooltip_aim_point": "Aim point — the two large white squares on the real runway (drawn yellow here). The pilot aims for this marking on approach; the flare typically puts the touchdown 50–150 m PAST it (= start of the TDZ). Position: {{m}} m past the threshold.",
+    "tooltip_touchdown": "Touchdown point: {{distance}} m {{beforeAfter}} the threshold, {{lateral}} m {{side}} the centerline.",
+    "tooltip_word_before": "before",
+    "tooltip_word_after": "past",
+    "tooltip_word_right": "right of",
+    "tooltip_word_left": "left of",
+    "tooltip_word_on": "on",
+    "tooltip_brake_point": "Brake point — from here you've slowed to ~40 kt. That's the typical high-speed-exit speed; you can now leave the runway normally at the next taxiway junction. NOT the spot where you actually turn off — that happens later, at a specific taxiway."
   },
   "ascan": {
     "title": "🔬 Submit aircraft for analysis (Aircraft Scan)",
