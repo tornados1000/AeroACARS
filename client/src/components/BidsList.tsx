@@ -409,7 +409,7 @@ export function BidsList({
   const [manualModalBid, setManualModalBid] = useState<Bid | null>(null);
   /** v0.12.12-dev: Wetter-Briefing-Lade-Hinweis. Erscheint per Toast für 5 s
    *  beim Klick auf "Wetter-Briefing öffnen" und informiert den Pilot, dass
-   *  die GSG-Seite ihre Daten live holt → Browser-Tab kann bis 30 s laden. */
+   *  die NXS-Seite ihre Daten live holt → Browser-Tab kann bis 30 s laden. */
   const [weatherLoadHint, setWeatherLoadHint] = useState(false);
   /** Cached airport coords keyed by uppercase ICAO. */
   const [airports, setAirports] = useState<Record<string, AirportInfo>>({});
@@ -777,7 +777,7 @@ export function BidsList({
 
   async function openOfp(flight: Flight) {
     if (!flight.simbrief?.id) return;
-    // paxstudio-theme convention; works on GSG and most paxstudio-based VAs.
+    // paxstudio-theme convention; works on NXS and most paxstudio-based VAs.
     // TODO: per-VA configurable URL pattern in Phase 4.
     const url = `${baseUrl.replace(/\/$/, "")}/paxstudio/ofp/${flight.simbrief.id}`;
     try {
@@ -1151,7 +1151,7 @@ export function BidsList({
                   onWeather={() => {
                     setWeatherLoadHint(true);
                     window.setTimeout(() => setWeatherLoadHint(false), 5000);
-                    void openUrl("https://german-sky-group.eu/weatherbriefing").catch(() => {});
+                    void openUrl("https://crew.nexusairva.org/weatherbriefing").catch(() => {});
                   }}
                 />
               );

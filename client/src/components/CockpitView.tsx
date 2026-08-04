@@ -11,10 +11,10 @@ import { ResumeFlightBanner } from "./ResumeFlightBanner";
 import { ActiveFlightPanel } from "./ActiveFlightPanel";
 import { StableApproachBanner } from "./StableApproachBanner";
 
-// v0.12.12-dev: GSG-Wetter-Briefing-Seite. Login-basiert — wenn der Pilot
+// v0.12.12-dev: NXS-Wetter-Briefing-Seite. Login-basiert — wenn der Pilot
 // in seinem Standard-Browser bei phpVMS eingeloggt ist, zieht die Seite
 // den aktiven Bid automatisch.
-const WEATHER_BRIEFING_URL = "https://german-sky-group.eu/weatherbriefing";
+const WEATHER_BRIEFING_URL = "https://crew.nexusairva.org/weatherbriefing";
 // v0.3.0: LoadsheetMonitor wird jetzt direkt im ActiveFlightPanel
 // gerendert (zwischen InfoStrip und WeatherBriefing), damit das
 // Loadsheet visuell zum aktiven Flug gehört statt als getrennte
@@ -195,7 +195,7 @@ export function CockpitView({
     </div>
   );
 
-  // v0.12.12-dev: Wetter-Briefing-Knopf öffnet die GSG-Briefing-Seite im
+  // v0.12.12-dev: Wetter-Briefing-Knopf öffnet die NXS-Briefing-Seite im
   // System-Browser. Login-basiert, die Seite zieht den aktiven Bid auto-
   // matisch. Der Lade-Hinweis erscheint per Toast beim Klick (5 s sichtbar)
   // statt als permanenter Schild — der Pilot soll bemerken dass die Seite
