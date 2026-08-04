@@ -1646,7 +1646,7 @@
       "error_text": "SimBrief non raggiungibile — riprova"
     },
     "empty_title": "Nessun volo prenotato",
-    "empty_hint": "Prenota un volo su german-sky-group.eu e clicca qui su „Aggiorna\" — apparirà qui.",
+    "empty_hint": "Prenota un volo sul tuo sito phpVMS e clicca qui su „Aggiorna\" — apparirà qui.",
     "empty_action": "Prenota un volo"
   },
   "flight": {

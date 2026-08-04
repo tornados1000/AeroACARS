@@ -1646,7 +1646,7 @@
       "error_text": "SimBrief nicht erreichbar — erneut versuchen"
     },
     "empty_title": "Keine Flüge gebucht",
-    "empty_hint": "Buche einen Flug auf german-sky-group.eu und klicke hier auf „Aktualisieren“ — dann erscheint er hier.",
+    "empty_hint": "Buche einen Flug auf deiner phpVMS-Seite und klicke hier auf „Aktualisieren“ — dann erscheint er hier.",
     "empty_action": "Flug buchen"
   },
   "flight": {
