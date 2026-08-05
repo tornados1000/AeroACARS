@@ -1,6 +1,6 @@
 // Phasen-Farben + Label — portiert aus der VPS-Live-Map (aeroacars-live
 // `src/data/phaseColors.ts`), damit der Flieger-Marker dieselbe phasenabhängige
-// Färbung + dasselbe Look-and-Feel hat wie live.kant.ovh.
+// Färbung + dasselbe Look-and-Feel hat wie live.nexusairva.org.
 //
 // Tolerant gegenüber zwei Quellen:
 //   • eigener Flug: FlightPhase snake_case ("taxi_out", "cruise", …)

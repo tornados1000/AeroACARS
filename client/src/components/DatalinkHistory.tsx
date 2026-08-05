@@ -10,7 +10,7 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { formatDatalinkText } from "../lib/datalink";
 import { parseUplink, formatCtot, type ParsedUplink } from "../lib/datalinkParse";
-import { CpdlcQuickReply, TelexQuickReply } from "./CpdlcQuickReply";
+import { CpdlcQuickReply, TelexQuickReply, REQUEST_TOKENS } from "./CpdlcQuickReply";
 import type { ThreadEntry } from "../hooks/useCpdlcMessages";
 
 /** GOLD response codes that actually demand an answer (ported from the
@@ -24,7 +24,19 @@ function isTelexClearance(text: string): boolean {
 }
 
 function isCpdlcOpenUplink(m: ThreadEntry): boolean {
-  return m.kind === "cpdlc" && m.direction === "received" && !m.closed && REPLYABLE.includes(m.response ?? "");
+  // v0.19.x FIX: a handover can leave an uplink neither closed (never
+  // actually answered) NOR reply-worthy any more (`superseded`, see
+  // `CpdlcThread::mark_logged_off`) — the station that sent it isn't
+  // talking to the aircraft any more. Must be excluded here so it
+  // doesn't become "the" answer-row uplink and offer WILCO/UNABLE
+  // buttons whose reply the backend would refuse to send anyway.
+  return (
+    m.kind === "cpdlc" &&
+    m.direction === "received" &&
+    !m.closed &&
+    !m.superseded &&
+    REPLYABLE.includes(m.response ?? "")
+  );
 }
 
 /** Across the WHOLE unified thread, the single most recent uplink still
@@ -45,17 +57,18 @@ function findLatestUnansweredUplink(all: ThreadEntry[]): ThreadEntry | null {
   return null;
 }
 
-/** Substrings that make a telex a NEW clearance REQUEST rather than an
- *  acknowledgement — identical list to CpdlcQuickReply.tsx's REQUEST_TOKENS,
- *  which actively REFUSES to send an acknowledgement containing any of them
- *  (a controller's client classifies inbound telex by these substrings and
+/** A telex is a NEW clearance REQUEST rather than an acknowledgement if it
+ *  contains any of CpdlcQuickReply.tsx's shared `REQUEST_TOKENS` — the same
+ *  list that actively REFUSES to send an acknowledgement containing them (a
+ *  controller's client classifies inbound telex by these substrings and
  *  tests the request branch first). The PDC composer's own template
  *  ("REQUEST PREDEP CLEARANCE …") is built from them by definition, so this
- *  is a reliable way to tell the two apart. */
-const TELEX_REQUEST_TOKENS = ["CLR", "REQ", "PDC", "PREDEP", "REQUEST"];
+ *  is a reliable way to tell the two apart. v0.20.x QS fix: this used to be
+ *  a second, hand-copied literal array instead of importing the one real
+ *  list. */
 function isTelexRequest(text: string): boolean {
   const upper = text.toUpperCase();
-  return TELEX_REQUEST_TOKENS.some((tok) => upper.includes(tok));
+  return REQUEST_TOKENS.some((tok) => upper.includes(tok));
 }
 
 /** The reply that closed `uplink`, if any — CPDLC threads it via MRN;
@@ -277,7 +290,7 @@ export function DatalinkHistory({ callsign, cpdlcStation, pdcRecipient, messages
     return (
       <article
         key={key}
-        className={`datalink-uplink ${freshUplinkAt.has(m.at) ? "datalink-uplink--fresh" : ""}`}
+        className={`datalink-uplink ${freshUplinkAt.has(m.at) ? "datalink-uplink--fresh" : ""} ${m.superseded ? "datalink-uplink--superseded" : ""}`}
         aria-label={`${t("cpdlc.thread_received")} ${station ?? ""} ${formatUtcHms(m.at)}`}
       >
         <header className="datalink-uplink__head">
@@ -335,6 +348,10 @@ export function DatalinkHistory({ callsign, cpdlcStation, pdcRecipient, messages
           <p className="datalink-uplink__answered">
             {t("cpdlc.answered_status", { answer: reply.text.trim(), time: formatUtcHms(reply.at) })}
           </p>
+        )}
+
+        {m.kind === "cpdlc" && m.superseded && (
+          <p className="datalink-uplink__superseded">{t("cpdlc.superseded_status")}</p>
         )}
 
         {parsed.recognized && (

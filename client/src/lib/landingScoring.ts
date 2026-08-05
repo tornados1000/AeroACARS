@@ -34,6 +34,14 @@ export interface SubScore {
 // beim gleichen deutschen Text.
 
 export const RATIONALE_LABELS: Record<string, string> = {
+  // v0.20.x QS fix: possible_float/firm_positive_touchdown were added to
+  // the real scoring ladder (sub_landing_rate's target-corridor rework)
+  // but never added here — this file's own header comment demands they
+  // stay 1:1 with the aeroacars-live webapp mirror, which renders
+  // straight from this table with no i18next fallback. Text mirrors
+  // locales/de/common.json's landing.rat.*/landing.tip.* keys verbatim.
+  possible_float: "Sehr weich aufgesetzt — mögliches langes Abfangen",
+  firm_positive_touchdown: "Fest, positiv aufgesetzt",
   smooth_touchdown: "Butterweich aufgesetzt",
   firm_but_clean: "Feste, aber saubere Landung",
   above_target: "Etwas härter als ideal",
@@ -68,6 +76,10 @@ export const RATIONALE_LABELS: Record<string, string> = {
 };
 
 export const TIP_LABELS: Record<string, string> = {
+  possible_float:
+    "Sehr sanft — das deutet auf ein langes Abfangen hin, was Bodenkontakt, Spoiler/Autobrake und damit auch den Bremsweg verzögert. Etwas entschlossener aufsetzen (Ziel 90–250 fpm).",
+  firm_positive_touchdown:
+    "Genau richtig — fest und positiv aufgesetzt, ohne zu hart. So sollen Airliner-Landungen aussehen.",
   smooth_touchdown: "Genau so — leichter Flare zur richtigen Zeit, sanfte Reduzierung der Sinkrate kurz vor TD.",
   firm_but_clean: "Solide. Falls ruhiger gewünscht: 1-2 Sekunden früher mit dem Flare beginnen.",
   above_target: "Mehr Flare einleiten und Schubreduktion etwas später timen — nicht aufdrücken.",
@@ -144,16 +156,26 @@ export function band(points: number): Band {
   return "bad";
 }
 
+// v0.20.x (score_algorithm_version 4→5): replaced the old monotonic
+// "softer is always better" curve with a TARGET CORRIDOR — kept in
+// lockstep with Rust's sub_landing_rate.rs, see that file's doc comment
+// for the full rationale. T_VS_SMOOTH_FPM/etc. above are DELIBERATELY
+// left unchanged (they still drive classifyByVS's category ladder and
+// the forensics-chart tone functions) — only this function's own point
+// bands use the new corridor constants below.
+const VS_FLOAT_RISK_BELOW_FPM = 90;
+const VS_TARGET_CORRIDOR_TOP_FPM = 250;
+
 function subLandingRate(peakVsFpm: number): SubScore {
   const vs = Math.abs(peakVsFpm);
   const signed = Math.round(peakVsFpm);
   const display = `${signed === 0 ? 0 : signed} fpm`;
-  if (vs < 60)
-    return { key: "landing_rate", points: 100, value: display, band: "good", rationale: "smooth_touchdown" };
-  if (vs < T_VS_SMOOTH_FPM)
-    return { key: "landing_rate", points: 90, value: display, band: "good", rationale: "firm_but_clean" };
+  if (vs < VS_FLOAT_RISK_BELOW_FPM)
+    return { key: "landing_rate", points: 85, value: display, band: "good", rationale: "possible_float" };
+  if (vs < VS_TARGET_CORRIDOR_TOP_FPM)
+    return { key: "landing_rate", points: 100, value: display, band: "good", rationale: "firm_positive_touchdown" };
   if (vs < T_VS_FIRM_FPM)
-    return { key: "landing_rate", points: 70, value: display, band: "ok", rationale: "above_target" };
+    return { key: "landing_rate", points: 80, value: display, band: "good", rationale: "above_target" };
   if (vs < T_VS_HARD_FPM)
     return { key: "landing_rate", points: 45, value: display, band: "ok", rationale: "hard_landing" };
   if (vs < T_VS_SEVERE_FPM)

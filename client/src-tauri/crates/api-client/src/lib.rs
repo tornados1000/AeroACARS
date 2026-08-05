@@ -1242,24 +1242,82 @@ enum RedirectDecision {
     TooMany,
 }
 
+/// Origin fingerprint used for same-host redirect comparison: scheme +
+/// host + the *effective* port (falls back to the scheme's default port
+/// when the URL has none explicit, so `https://host` and `https://host:443`
+/// compare equal).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RedirectOrigin {
+    scheme: String,
+    host: String,
+    port: Option<u16>,
+}
+
+impl RedirectOrigin {
+    fn from_url(url: &Url) -> Option<Self> {
+        Some(Self {
+            scheme: url.scheme().to_string(),
+            host: url.host_str()?.to_string(),
+            port: url.port_or_known_default(),
+        })
+    }
+}
+
 /// Pure redirect-policy decision: only ever follow a redirect that stays
-/// on the phpVMS host this client was configured for. `X-API-Key` is not
-/// in reqwest's cross-host header-strip allowlist (only Authorization/
-/// Cookie/... are), so an unrestricted redirect could hand the API key —
-/// which also mints MQTT credentials — to any host a compromised or
-/// misconfigured phpVMS install redirects to.
+/// on the phpVMS host+scheme+port this client was configured for.
+/// `X-API-Key` is not in reqwest's cross-host header-strip allowlist (only
+/// Authorization/Cookie/... are), so an unrestricted redirect could hand
+/// the API key — which also mints MQTT credentials — to any host a
+/// compromised or misconfigured phpVMS install redirects to.
+///
+/// v0.20.x FIX: the original version compared `host_str()` only. That
+/// missed two leaks on the SAME host: (a) an https -> http redirect would
+/// still be "same host" and get followed, sending X-API-Key in cleartext
+/// (a classic scheme-downgrade attack); (b) a redirect to a different port
+/// on the same host — a completely different service — would also be
+/// followed. Both are now rejected. The one same-host cross-scheme case we
+/// deliberately keep allowing is an http -> https *upgrade* (some phpVMS/
+/// load-balancer setups issue exactly this) — but ONLY to the standard
+/// https port (443), not an arbitrary one.
+///
+/// v0.20.x QS fix (follow-up): the first cut of this upgrade exception
+/// skipped the port check ENTIRELY whenever schemes differed, so an
+/// upgrade redirect to `https://<host>:<any-port>` was followed — not just
+/// the standard port. Since the only case reaching this branch is a
+/// plaintext `http://` connection (and `Connection::new` only ever allows
+/// that for loopback/localhost), this narrowed the exposure to an
+/// unexpected local service on an unexpected port, rather than a routable
+/// host — but it was still broader than the "some phpVMS/load-balancer
+/// setups issue a same-host https upgrade" case this exception exists for.
 fn same_host_redirect_decision(
-    target_host: Option<&str>,
-    allowed_host: Option<&str>,
+    target: Option<&RedirectOrigin>,
+    allowed: &RedirectOrigin,
     hops_so_far: usize,
 ) -> RedirectDecision {
     if hops_so_far > 5 {
-        RedirectDecision::TooMany
-    } else if target_host.is_some() && target_host == allowed_host {
-        RedirectDecision::Follow
-    } else {
-        RedirectDecision::Stop
+        return RedirectDecision::TooMany;
     }
+    let Some(target) = target else {
+        return RedirectDecision::Stop;
+    };
+    if target.host != allowed.host {
+        return RedirectDecision::Stop;
+    }
+    if target.scheme == allowed.scheme {
+        if target.port != allowed.port {
+            return RedirectDecision::Stop;
+        }
+    } else if allowed.scheme == "http" && target.scheme == "https" {
+        // The upgrade exception — standard https port only.
+        if target.port != Some(443) {
+            return RedirectDecision::Stop;
+        }
+    } else {
+        // Any other scheme mismatch (an https -> http downgrade, or
+        // anything else) is rejected.
+        return RedirectDecision::Stop;
+    }
+    RedirectDecision::Follow
 }
 
 /// A reusable client. `Clone` is cheap because the inner reqwest client is
@@ -1285,9 +1343,18 @@ impl Client {
         // rejected outright, same effect as `Policy::none()` for the case
         // that actually matters, without breaking a same-host https upgrade
         // some phpVMS/load-balancer setups issue.
-        let allowed_host = conn.base_url.host_str().map(|h| h.to_string());
+        let allowed_origin = RedirectOrigin::from_url(&conn.base_url);
         let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
-            match same_host_redirect_decision(attempt.url().host_str(), allowed_host.as_deref(), attempt.previous().len()) {
+            let target_origin = RedirectOrigin::from_url(attempt.url());
+            let decision = match &allowed_origin {
+                Some(allowed) => same_host_redirect_decision(
+                    target_origin.as_ref(),
+                    allowed,
+                    attempt.previous().len(),
+                ),
+                None => RedirectDecision::Stop,
+            };
+            match decision {
                 RedirectDecision::Follow => attempt.follow(),
                 RedirectDecision::Stop => attempt.stop(),
                 RedirectDecision::TooMany => attempt.error("too many redirects"),
@@ -2508,12 +2575,20 @@ fn extract_navlog_fixes(xml: &str) -> Vec<RouteFix> {
 mod tests {
     use super::*;
 
-    // ---- same_host_redirect_decision (v0.19.x FIX: X-API-Key redirect leak) ----
+    // ---- same_host_redirect_decision (v0.19.x/v0.20.x FIX: X-API-Key redirect leak) ----
+
+    fn origin(url: &str) -> RedirectOrigin {
+        RedirectOrigin::from_url(&Url::parse(url).unwrap()).unwrap()
+    }
 
     #[test]
-    fn redirect_to_the_same_host_is_followed() {
+    fn redirect_to_the_same_host_scheme_and_port_is_followed() {
         assert_eq!(
-            same_host_redirect_decision(Some("va.example.com"), Some("va.example.com"), 0),
+            same_host_redirect_decision(
+                Some(&origin("https://va.example.com/api/foo")),
+                &origin("https://va.example.com/api"),
+                0
+            ),
             RedirectDecision::Follow
         );
     }
@@ -2523,7 +2598,11 @@ mod tests {
         // The exact vulnerability: a redirect to ANY other host used to
         // carry X-API-Key straight along with it.
         assert_eq!(
-            same_host_redirect_decision(Some("attacker.evil"), Some("va.example.com"), 0),
+            same_host_redirect_decision(
+                Some(&origin("https://attacker.evil/api")),
+                &origin("https://va.example.com/api"),
+                0
+            ),
             RedirectDecision::Stop
         );
     }
@@ -2531,7 +2610,7 @@ mod tests {
     #[test]
     fn redirect_with_no_resolvable_host_is_stopped() {
         assert_eq!(
-            same_host_redirect_decision(None, Some("va.example.com"), 0),
+            same_host_redirect_decision(None, &origin("https://va.example.com/api"), 0),
             RedirectDecision::Stop
         );
     }
@@ -2539,8 +2618,70 @@ mod tests {
     #[test]
     fn too_many_hops_is_rejected_even_on_the_same_host() {
         assert_eq!(
-            same_host_redirect_decision(Some("va.example.com"), Some("va.example.com"), 6),
+            same_host_redirect_decision(
+                Some(&origin("https://va.example.com/api")),
+                &origin("https://va.example.com/api"),
+                6
+            ),
             RedirectDecision::TooMany
+        );
+    }
+
+    #[test]
+    fn same_host_https_to_http_downgrade_is_stopped() {
+        // v0.20.x FIX: the original host-only check missed this — same
+        // host, but the API key would now travel in cleartext.
+        assert_eq!(
+            same_host_redirect_decision(
+                Some(&origin("http://va.example.com/api")),
+                &origin("https://va.example.com/api"),
+                0
+            ),
+            RedirectDecision::Stop
+        );
+    }
+
+    #[test]
+    fn same_host_same_scheme_different_port_is_stopped() {
+        // v0.20.x FIX: same host, but a different port is a different
+        // service — no legitimate reason for the phpVMS API to redirect
+        // across ports, and the old check never looked at port at all.
+        assert_eq!(
+            same_host_redirect_decision(
+                Some(&origin("https://va.example.com:8443/api")),
+                &origin("https://va.example.com/api"),
+                0
+            ),
+            RedirectDecision::Stop
+        );
+    }
+
+    #[test]
+    fn same_host_http_to_https_upgrade_is_followed() {
+        // The legitimate case this port-awareness must not break: some
+        // phpVMS/load-balancer setups redirect a plaintext loopback dev
+        // request straight to https on the standard port.
+        assert_eq!(
+            same_host_redirect_decision(
+                Some(&origin("https://localhost/api")),
+                &origin("http://localhost/api"),
+                0
+            ),
+            RedirectDecision::Follow
+        );
+    }
+
+    #[test]
+    fn same_host_http_to_https_upgrade_to_a_non_standard_port_is_stopped() {
+        // v0.20.x QS fix: the upgrade exception must only cover the
+        // standard https port — not skip the port check outright.
+        assert_eq!(
+            same_host_redirect_decision(
+                Some(&origin("https://localhost:8443/api")),
+                &origin("http://localhost/api"),
+                0
+            ),
+            RedirectDecision::Stop
         );
     }
 

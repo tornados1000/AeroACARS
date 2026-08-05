@@ -72,8 +72,8 @@ use serde::{Deserialize, Serialize};
 use metar::{MetarError, MetarSnapshot};
 use recorder::{FlightLogEvent, FlightOutcome, FlightRecorder, TouchdownWindowSample};
 use storage::{
-    ApproachSample, GateWindow, LandingProfilePoint, LandingRecord, LandingRunwayMatch,
-    LandingStore, PositionQueue, QueuedPosition,
+    ApproachSample, DeletedLandingsTombstone, GateWindow, LandingProfilePoint, LandingRecord,
+    LandingRunwayMatch, LandingStore, PositionQueue, QueuedPosition,
 };
 use sim_core::{FlightPhase, SimKind, SimSnapshot, Simulator};
 // v0.7.0 — re-export fuer Replay-Acceptance-Tests in tests/touchdown_v2_replay.rs
@@ -1516,6 +1516,62 @@ impl Drop for FlightSetupGuard<'_> {
         if self.armed {
             self.flag.store(false, Ordering::SeqCst);
         }
+    }
+}
+
+#[cfg(test)]
+mod flight_setup_guard_tests {
+    use super::*;
+
+    // v0.20.x QS fix (finding from `2bf9f48`'s flight-lifecycle race guard):
+    // that commit made `flight_end`/`flight_end_manual` hold this guard
+    // across their whole take -> file -> (restore-on-failure) window,
+    // specifically so a concurrent `flight_start`/`flight_adopt` can't grab
+    // the just-emptied `active_flight` slot while a slow `/file` call is
+    // still in flight. No test proved that concurrency semantic — this
+    // does, at the unit level the guard itself lives at.
+
+    #[test]
+    fn a_second_acquire_is_rejected_while_the_first_guard_is_still_held() {
+        let flag = AtomicBool::new(false);
+        let _first = FlightSetupGuard::try_acquire(&flag).expect("first acquire succeeds");
+
+        // This is the exact race: e.g. `flight_end` is mid-flight (still
+        // holding `_first`, standing in for its `_lifecycle_guard`) when a
+        // concurrent auto-start/manual-start tries to begin a new flight.
+        let second = FlightSetupGuard::try_acquire(&flag);
+        assert!(
+            second.is_err(),
+            "a concurrent setup must be rejected while the lifecycle guard is held"
+        );
+    }
+
+    #[test]
+    fn dropping_the_guard_releases_the_flag_for_a_later_acquire() {
+        let flag = AtomicBool::new(false);
+        {
+            let _guard = FlightSetupGuard::try_acquire(&flag).expect("first acquire succeeds");
+            assert!(flag.load(Ordering::SeqCst));
+        }
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "flag must be cleared once the guard is dropped"
+        );
+        assert!(
+            FlightSetupGuard::try_acquire(&flag).is_ok(),
+            "a fresh acquire must succeed once the previous guard is gone"
+        );
+    }
+
+    #[test]
+    fn disarm_releases_the_flag_immediately_without_waiting_for_drop() {
+        let flag = AtomicBool::new(false);
+        let guard = FlightSetupGuard::try_acquire(&flag).expect("first acquire succeeds");
+        guard.disarm();
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "disarm() must release the flag right away, same as flight_start/flight_adopt rely on"
+        );
     }
 }
 
@@ -7175,6 +7231,14 @@ fn landing_delete(app: AppHandle, pirep_id: String) -> Result<(), UiError> {
     if let Err(e) = store.replace_all(&all) {
         return Err(UiError::new("landing_write", format!("{e}")));
     }
+    // v0.20.x QS fix: record the deletion so the next backup merge (or an
+    // explicit restore) can't silently resurrect this record from the
+    // server's still-existing copy — see `DeletedLandingsTombstone`.
+    if let Some(tombstone) = open_deleted_landings_tombstone(&app) {
+        if let Err(e) = tombstone.record_deleted(&pirep_id) {
+            tracing::warn!(pirep_id, error = %e, "could not record landing-deletion tombstone");
+        }
+    }
     Ok(())
 }
 
@@ -12268,6 +12332,14 @@ fn open_landing_store(app: &AppHandle) -> Option<LandingStore> {
     LandingStore::open(dir).ok()
 }
 
+/// Open the local deleted-landings tombstone (see
+/// [`storage::DeletedLandingsTombstone`]). Same "best-effort, None on
+/// unresolvable app dir" contract as `open_landing_store`.
+fn open_deleted_landings_tombstone(app: &AppHandle) -> Option<DeletedLandingsTombstone> {
+    let dir = app.path().app_data_dir().ok()?;
+    DeletedLandingsTombstone::open(dir).ok()
+}
+
 /// v0.7.5 Phase-Safety Hotfix (Spec docs/spec/flight-phase-state-machine.md §13.8):
 /// Reine pure-function fuer den Universal Arrived-Fallback. URO913 zeigte historisch:
 /// Pilot rollte mit `engines_running=0` aber `groundspeed_kt = 141 -> 42` ueber ~31.5s
@@ -13271,9 +13343,12 @@ fn build_pirep_payload(
     };
     // v0.10.0 (#runway-utilization-score): LDA-basierter
     // Bahn-Auslastungs-Score. Markiert weiter unten am
-    // PirepPayload via score_algorithm_version: Some(4)
+    // PirepPayload via score_algorithm_version: Some(5)
     // (v0.12.0: Float-Toleranz-Refinement;
-    //  v0.16.21: MSFS touchdown V/S SimVar-lag g-force-gated de-lag).
+    //  v0.16.21: MSFS touchdown V/S SimVar-lag g-force-gated de-lag;
+    //  v0.20.x: Bahnauslastung-QS — Float-Toleranz 15→20 % LDA, Banding
+    //  30/50/70/90 → 40/60/80/95; Sinkraten-Score von monotoner
+    //  "weicher=besser"-Kurve auf Ziel-Korridor 90-250 fpm umgestellt).
     fill_v2_rollout_fields(&mut scoring_input, &stats, effective_arr_icao);
     let payload_sub_scores =
         landing_scoring::compute_sub_scores(&scoring_input);
@@ -13440,7 +13515,9 @@ fn build_pirep_payload(
         // Bahn-Auslastungs-Algorithmus stammen.
         // v0.16.21: bump 3→4 — MSFS touchdown V/S SimVar-lag corrected
         // (g-force-gated AGL de-lag; MSFS only, X-Plane unchanged).
-        score_algorithm_version: Some(4),
+        // v0.20.x: bump 4→5 — Bahnauslastung-QS (Float-Toleranz +
+        // Banding grosszuegiger) + Sinkraten-Ziel-Korridor.
+        score_algorithm_version: Some(5),
         client_health: build_client_health_report(&stats),
     }
 }
@@ -14047,6 +14124,23 @@ fn resolve_flight_ident(flight_number: &str, callsign: Option<&str>) -> String {
         .unwrap_or_else(|| flight_number.to_string())
 }
 
+/// Wire-format displaced-threshold value for a persisted `LandingRunwayMatch`
+/// / live `TouchdownPayload`. Reads from the runway match's OWN field
+/// (`RunwayMatch::displaced_threshold_ft`), never from `runway_nav_geometry`.
+///
+/// v0.20.x QS fix: both wire sites used to read
+/// `runway_nav_geometry.map(|g| g.displaced_threshold_ft)` — Navigraph-only,
+/// so it silently stayed `None` on every OurAirports-fallback landing, even
+/// though `RunwayMatch::displaced_threshold_ft` (this release's `71a6533`)
+/// now correctly populates from BOTH sources and is exactly what
+/// `assess_touchdown`/`fill_v2_rollout_fields` already score against.
+/// Reading from the match itself instead keeps what's persisted/displayed
+/// in sync with the score for the same landing. Extracted so this is
+/// directly unit-testable without needing a full `FlightStats` fixture.
+fn wire_displaced_threshold_ft(runway_match: Option<&runway::RunwayMatch>) -> Option<i32> {
+    runway_match.map(|m| m.displaced_threshold_ft)
+}
+
 fn build_landing_record<F>(
     flight: &ActiveFlight,
     stats: &FlightStats,
@@ -14151,7 +14245,7 @@ where
             source: source_wire,
             nav_cycle: stats.runway_nav_cycle.clone(),
             true_course_deg: nav_g.map(|g| g.true_course),
-            displaced_threshold_ft: nav_g.map(|g| g.displaced_threshold_ft),
+            displaced_threshold_ft: wire_displaced_threshold_ft(Some(m)),
             tch_expected_ft: nav_g.map(|g| g.tch_ft),
             glideslope_angle_deg: nav_g.map(|g| g.glideslope_angle),
         }
@@ -14455,7 +14549,9 @@ where
         // wurde. UI (LandingPanel.tsx) gated darauf das Rendering der
         // neuen `extra`-Lines + erweiterten Rationale-/Warning-Keys.
         // v0.16.21: bump 3→4 — MSFS touchdown V/S SimVar-lag corrected.
-        score_algorithm_version: Some(4),
+        // v0.20.x: bump 4→5 — Bahnauslastung-QS (Float-Toleranz +
+        // Banding grosszuegiger) + Sinkraten-Ziel-Korridor.
+        score_algorithm_version: Some(5),
     })
 }
 
@@ -14601,6 +14697,15 @@ async fn upload_landing_backup(app: AppHandle) -> Result<usize, String> {
                 .into_iter()
                 .filter_map(|v| serde_json::from_value(v).ok())
                 .collect();
+            // v0.20.x QS fix: `merge_from` is a plain union with no delete
+            // concept — without this, a record the pilot deleted locally
+            // (landing_delete only ever touches the local file, never the
+            // server) would be silently resurrected right here, since the
+            // server's backup still has the old copy. Filter it out first.
+            let tombstoned = open_deleted_landings_tombstone(&app)
+                .and_then(|t| t.read_all().ok())
+                .unwrap_or_default();
+            let incoming = storage::filter_tombstoned(incoming, &tombstoned);
             store.merge_from(incoming).map_err(|e| e.to_string())?;
         }
         Ok(None) => {
@@ -14652,6 +14757,13 @@ async fn restore_landing_backup(app: AppHandle) -> Result<usize, String> {
         .into_iter()
         .filter_map(|v| serde_json::from_value(v).ok())
         .collect();
+    // v0.20.x QS fix: same reasoning as `upload_landing_backup` — a
+    // record deleted locally must stay deleted through an explicit
+    // restore too, not just through the automatic backup path.
+    let tombstoned = open_deleted_landings_tombstone(&app)
+        .and_then(|t| t.read_all().ok())
+        .unwrap_or_default();
+    let incoming = storage::filter_tombstoned(incoming, &tombstoned);
     let added = store.merge_from(incoming).map_err(|e| e.to_string())?;
     tracing::info!(added, saved_at = %payload.saved_at, "landing backup restored");
     Ok(added)
@@ -15369,6 +15481,28 @@ async fn compute_distance_to_airport(
 /// active while nothing is actually recording it anymore: no streaming,
 /// no phpVMS posts, no touchdown capture. Mirrors the exact re-arm
 /// sequence `spawn_resume_sim_gate` uses after an app-restart resume.
+/// Clears the three per-flight "already spawned" latches
+/// (`streamer_spawned`/`phpvms_worker_spawned`/`touchdown_sampler_spawned`)
+/// so a retry can legitimately re-arm the background tasks on a flight
+/// object that already went through one spawn cycle.
+///
+/// v0.20.x QS fix: `restore_flight_for_retry` reuses the SAME `Arc`
+/// `flight_end`/`flight_end_manual` took out of state — its guards are
+/// already latched `true` from the flight's original start, and every
+/// `spawn_resume_sim_gate` construction site starts a FRESH `ActiveFlight`
+/// (guards default `false`), so this is the one call site that actually
+/// needs an explicit re-arm. Without it, `spawn_phpvms_position_worker`/
+/// `spawn_position_streamer`/`spawn_touchdown_sampler` each hit their own
+/// "already running, skipping spawn" guard and silently no-op — the
+/// restored flight looks active in `active_flight` with zero background
+/// tasks actually running, exactly the bug this function's doc comment
+/// claims to fix.
+fn rearm_background_task_guards(flight: &ActiveFlight) {
+    flight.streamer_spawned.store(false, Ordering::SeqCst);
+    flight.phpvms_worker_spawned.store(false, Ordering::SeqCst);
+    flight.touchdown_sampler_spawned.store(false, Ordering::SeqCst);
+}
+
 fn restore_flight_for_retry(
     app: &AppHandle,
     state: &AppState,
@@ -15376,11 +15510,65 @@ fn restore_flight_for_retry(
     flight: Arc<ActiveFlight>,
 ) {
     flight.stop.store(false, Ordering::Relaxed);
+    rearm_background_task_guards(&flight);
     spawn_phpvms_position_worker(app.clone(), Arc::clone(&flight), client.clone());
     spawn_position_streamer(app.clone(), Arc::clone(&flight), client.clone());
     spawn_touchdown_sampler(app.clone(), Arc::clone(&flight));
     let mut guard = state.active_flight.lock().expect("active_flight lock");
     *guard = Some(flight);
+}
+
+#[cfg(test)]
+mod rearm_background_task_guards_tests {
+    use super::*;
+
+    fn fixture_with_guards(latched: bool) -> ActiveFlight {
+        ActiveFlight {
+            pirep_id: "test-pirep".into(),
+            bid_id: 0,
+            flight_id: String::new(),
+            bid_callsign: None,
+            pilot_callsign: None,
+            started_at: Utc::now(),
+            airline_icao: String::new(),
+            planned_registration: String::new(),
+            aircraft_icao: "C172".into(),
+            aircraft_name: String::new(),
+            flight_number: "1".into(),
+            dpt_airport: "EDDF".into(),
+            arr_airport: "ZZZZ".into(),
+            airline_logo_url: None,
+            fares: Vec::new(),
+            stats: Mutex::new(FlightStats::new()),
+            stop: AtomicBool::new(true),
+            was_just_resumed: AtomicBool::new(false),
+            streamer_spawned: AtomicBool::new(latched),
+            cancelled_remotely: AtomicBool::new(false),
+            position_outbox: Mutex::new(std::collections::VecDeque::new()),
+            phpvms_worker_spawned: AtomicBool::new(latched),
+            touchdown_sampler_spawned: AtomicBool::new(latched),
+            connection_state: std::sync::atomic::AtomicU8::new(CONN_STATE_LIVE),
+            navdata: Mutex::new(NavdataCache::default()),
+        }
+    }
+
+    #[test]
+    fn resets_all_three_guards_that_are_already_latched_from_the_original_spawn() {
+        let flight = fixture_with_guards(true);
+        rearm_background_task_guards(&flight);
+        assert!(!flight.streamer_spawned.load(Ordering::SeqCst));
+        assert!(!flight.phpvms_worker_spawned.load(Ordering::SeqCst));
+        assert!(!flight.touchdown_sampler_spawned.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn leaves_fresh_unlatched_guards_false() {
+        let flight = fixture_with_guards(false);
+        rearm_background_task_guards(&flight);
+        assert!(!flight.streamer_spawned.load(Ordering::SeqCst));
+        assert!(!flight.phpvms_worker_spawned.load(Ordering::SeqCst));
+        assert!(!flight.touchdown_sampler_spawned.load(Ordering::SeqCst));
+    }
 }
 
 /// File the active PIREP with computed final stats. Refuses to file if any
@@ -22329,10 +22517,9 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                                 .runway_nav_geometry
                                 .as_ref()
                                 .map(|g| g.true_course),
-                            runway_displaced_threshold_ft: stats
-                                .runway_nav_geometry
-                                .as_ref()
-                                .map(|g| g.displaced_threshold_ft),
+                            runway_displaced_threshold_ft: wire_displaced_threshold_ft(
+                                stats.runway_match.as_ref(),
+                            ),
                             runway_tch_expected_ft: stats
                                 .runway_nav_geometry
                                 .as_ref()
@@ -22379,7 +22566,10 @@ fn spawn_position_streamer(app: AppHandle, flight: Arc<ActiveFlight>, client: Cl
                             // entstanden ist.
                             // v0.16.21: bump 3→4 — MSFS touchdown V/S
                             // SimVar-lag corrected (g-force-gated de-lag).
-                            score_algorithm_version: Some(4),
+                            // v0.20.x: bump 4→5 — Bahnauslastung-QS
+                            // (Float-Toleranz + Banding grosszuegiger) +
+                            // Sinkraten-Ziel-Korridor.
+                            score_algorithm_version: Some(5),
                         }
                     })
                 };
@@ -39253,6 +39443,27 @@ mod touchdown_metadata_stamp_tests {
         assert!(!dds.in_pre_threshold_zone);
     }
 
+    /// v0.20.x QS fix: the persisted/live wire value for displaced-threshold
+    /// must come from the runway match itself (works for OurAirports too),
+    /// not from `runway_nav_geometry` (Navigraph-only) — otherwise the score
+    /// (which already reads the match) and the displayed diagram/LDA (which
+    /// used to read nav geometry) silently disagree for the same landing.
+    #[test]
+    fn wire_displaced_threshold_ft_reads_from_runway_match_not_nav_geometry() {
+        let m = eddp_26r_match_with_raw_td_and_displacement(600.0, 4000);
+        assert_eq!(
+            wire_displaced_threshold_ft(Some(&m)),
+            Some(4000),
+            "must report the real displaced threshold even with zero Navigraph geometry \
+             (this fixture has none) — an OurAirports-only match"
+        );
+    }
+
+    #[test]
+    fn wire_displaced_threshold_ft_is_none_without_a_runway_match_at_all() {
+        assert_eq!(wire_displaced_threshold_ft(None), None);
+    }
+
     /// Regression: for the overwhelming majority of runways (no displaced
     /// threshold), the correction must be a complete no-op — the corrected
     /// distance equals the raw one, byte for byte.
@@ -39287,8 +39498,11 @@ mod touchdown_metadata_stamp_tests {
         // for `landing_score_field` to surface a value to compare).
         stats.landing_score = Some(LandingScore::Acceptable);
         // Runway-utilisation inputs. td_dist ~300 m past threshold, rollout
-        // 1400 m. Against OurAirports LDA 3600 m → ratio ~39 % (good_stop).
-        // Against the displaced Navigraph LDA 2381 m → ratio ~59 % (ok_stop).
+        // 1400 m. Against OurAirports LDA 3600 m → ratio ~39 % (excellent_margin,
+        // v0.20.x bands). Against the displaced Navigraph LDA 2381 m → ratio
+        // ~59 % (good_stop). The test only asserts the two scores DIFFER
+        // (assert_ne!), not the literal rationale, so this comment is
+        // documentation only — no assertion depends on these band names.
         stats.rollout_distance_m = Some(1400.0);
         stats.landing_float_distance_m = Some(0.0);
         // Trust the geometry on this divert: the matched ICAO (EDDP) must

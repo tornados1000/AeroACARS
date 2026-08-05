@@ -94,6 +94,12 @@ pub const TELEMETRY_FIELDS: &[TelemetryField] = &[
     F::bool("BRAKE PARKING POSITION"),
     F::bool("STALL WARNING"),
     F::bool("OVERSPEED WARNING"),
+    // v0.19.x QS: "percent over 100" is SimConnect's distinct 0.0-1.0
+    // fraction unit, NOT plain "Percent" (0-100) — matches the 0.0=up/
+    // 1.0=down scale gear_position is documented and consumed at
+    // (sim-core::SimSnapshot::gear_position; lib.rs's >= 0.99 / >= 0.5
+    // gates). Confirmed correct, not a unit bug — noted explicitly
+    // since a backlog item once suspected it was.
     F::f64("GEAR POSITION", "percent over 100"),
     F::f64("FLAPS HANDLE PERCENT", "percent over 100"),
     F::bool("GENERAL ENG COMBUSTION:1"),
@@ -1287,6 +1293,37 @@ impl InspectorState {
         }
     }
 
+    /// Clear every watch's `error` field. Called right before a fresh
+    /// `register_inspector()` attempt so a name the pilot just fixed
+    /// (or a transient SimConnect hiccup) gets a clean slate instead
+    /// of showing a stale error forever.
+    pub fn clear_errors(&mut self) {
+        for w in &mut self.watches {
+            w.error = None;
+        }
+    }
+
+    /// Attribute a SIMCONNECT_RECV_EXCEPTION to the watch with this
+    /// stable `id`, so the UI can render an error indicator instead of
+    /// a stale value. No-op if the watch was removed before the
+    /// (async) exception arrived.
+    ///
+    /// Keyed on `id`, NOT `name`: the pilot can legitimately add the
+    /// same SimVar/LVar name twice (e.g. once as Number, once as Bool,
+    /// to test both interpretations) — nothing rejects duplicate names
+    /// (see `add`). Matching by name would attribute every exception to
+    /// whichever of the two happens to come first in `watches`,
+    /// leaving the actual failing one (if it's the second) silently
+    /// stuck at `error: None` — the exact bug this method exists to
+    /// fix, just for the duplicate-name case. `id` is unique by
+    /// construction (`next_id` is a monotonic counter), so it can't
+    /// collide.
+    pub fn set_error(&mut self, id: u32, message: String) {
+        if let Some(w) = self.watches.iter_mut().find(|w| w.id == id) {
+            w.error = Some(message);
+        }
+    }
+
     /// Parse the data block returned by SimConnect for the inspector
     /// definition — fields are at fixed offsets in watchlist order,
     /// same parsing model as the main telemetry block.
@@ -1315,6 +1352,27 @@ impl InspectorState {
             }
         }
     }
+}
+
+/// Correlate an async `SIMCONNECT_RECV_EXCEPTION` back to the inspector
+/// watch whose `AddToDataDefinition` call produced it. Returns the
+/// watch's stable `id` (not its name — see `InspectorState::set_error`
+/// for why a name isn't a safe enough key when duplicate names exist).
+///
+/// `send_ids` is the `(send_id, watch_id)` table captured while
+/// registering the inspector's data definition — one entry per watch,
+/// in call order (see `Connection::register_inspector`). SimConnect
+/// often accepts an unresolvable SimVar/LVar name synchronously (the
+/// `AddToDataDefinition` call itself returns success) and only reports
+/// the problem later via an exception whose `dwSendID` matches that
+/// specific `AddToDataDefinition` call — this is the only reliable way
+/// to attribute the failure to one watch out of many sharing the same
+/// data definition.
+pub fn inspector_watch_for_exception(send_ids: &[(u32, u32)], exception_send_id: u32) -> Option<u32> {
+    send_ids
+        .iter()
+        .find(|(id, _)| *id == exception_send_id)
+        .map(|(_, watch_id)| *watch_id)
 }
 
 impl Touchdown {
@@ -2030,6 +2088,42 @@ fn synaptic_a220_fma_vertical(
     }
 }
 
+/// Normalize a set of raw N1 readings that may come in on the 0-1
+/// fraction scale OR the 0-100 percent scale, depending on addon.
+///
+/// The old per-value heuristic (`if raw <= 1.5 { raw * 100.0 } else
+/// { raw }`) was applied independently to each engine and had a real
+/// overlap: a genuinely low PERCENT-scale reading — e.g. 1.2, meaning
+/// 1.2 % N1, which every single aircraft passes through during every
+/// engine start and every engine shutdown — is numerically
+/// indistinguishable *on its own* from a FRACTION-scale reading of the
+/// same magnitude (raw 1.2 as a 0-1 ratio would mean 120 %, i.e. deep
+/// overspeed, which is what the heuristic assumed). Multiplying it by
+/// 100 fabricated an impossible >100 % N1 right as an engine was
+/// spooling through single-digit percent.
+///
+/// Looking at all engines on the aircraft together resolves this in
+/// the overwhelmingly common case: fraction-scale N1 cannot physically
+/// exceed roughly 1.06 (106 % — the outer edge of turboprop overspeed)
+/// on ANY engine, so a single reading above 1.5 this tick proves the
+/// whole aircraft's N1 SimVars report percent directly — every engine
+/// must then be read literally, including ones sitting low (spooling
+/// up/down) in the same tick. Only a perfectly-synchronized multi-
+/// engine start/shutdown (or a single-engine aircraft) still passes
+/// through the old ambiguous branch, since there is then no other
+/// engine to disambiguate against.
+fn normalize_n1_group(raw: [f64; 4]) -> [f64; 4] {
+    const UNAMBIGUOUS_PERCENT_ABOVE: f64 = 1.5;
+    let confirmed_percent = raw.iter().any(|&r| r > UNAMBIGUOUS_PERCENT_ABOVE);
+    raw.map(|r| {
+        if confirmed_percent || r > UNAMBIGUOUS_PERCENT_ABOVE {
+            r
+        } else {
+            r * 100.0
+        }
+    })
+}
+
 fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
     let profile = AircraftProfile::detect(&t.title, &t.atc_model);
     let is_fenix = profile.is_fenix();
@@ -2126,22 +2220,19 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
             // nativ abgedeckt; der N1-Fallback bleibt als letzte Stufe
             // fuer Addons, die WEDER plain NOCH EX1 treiben. Fallback:
             // N1 ueber Idle/Windmill-Schwelle = Triebwerk laeuft. N1
-            // kommt je nach Addon als 0-1-Ratio ODER 0-100 % → auf
-            // Prozent normalisieren. Greift NUR wenn COMBUSTION (incl.
-            // EX1) komplett 0 ist → kein Regress fuer Flieger, deren
-            // COMBUSTION-Flag funktioniert (dort ist N1 ohnehin 0 wenn
-            // aus). Schwelle bewusst ueber reinem Windmilling (~15 %);
-            // am Boden (wo die FSM das Signal braucht) gibt es kein
-            // Windmilling, also trennt es dort sauber aus(0) vs laufend.
+            // kommt je nach Addon als 0-1-Ratio ODER 0-100 % →
+            // `normalize_n1_group` normalisiert alle 4 Triebwerke
+            // gemeinsam auf Prozent (Skalen-Erkennung ueber alle
+            // Engines zusammen, siehe dortiger Kommentar). Greift NUR
+            // wenn COMBUSTION (incl. EX1) komplett 0 ist → kein Regress
+            // fuer Flieger, deren COMBUSTION-Flag funktioniert (dort ist
+            // N1 ohnehin 0 wenn aus). Schwelle bewusst ueber reinem
+            // Windmilling (~15 %); am Boden (wo die FSM das Signal
+            // braucht) gibt es kein Windmilling, also trennt es dort
+            // sauber aus(0) vs laufend.
             const N1_RUNNING_PCT: f64 = 15.0;
-            let n1_on = |raw: f64| {
-                let pct = if raw <= 1.5 { raw * 100.0 } else { raw };
-                pct > N1_RUNNING_PCT
-            };
-            (n1_on(t.n1_pct_1) as u8)
-                + (n1_on(t.n1_pct_2) as u8)
-                + (n1_on(t.n1_pct_3) as u8)
-                + (n1_on(t.n1_pct_4) as u8)
+            let n1_pct = normalize_n1_group([t.n1_pct_1, t.n1_pct_2, t.n1_pct_3, t.n1_pct_4]);
+            n1_pct.iter().filter(|&&pct| pct > N1_RUNNING_PCT).count() as u8
         }
     };
 
@@ -2177,11 +2268,21 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
     // the Asobo A320neo default reports ~1422 kg which is clearly bogus
     // (real OEW is ~42 t). Smallest realistic transport-cat empty
     // weight is a King Air at ~3.5 t / 7700 lb, so we'd ideally clamp
-    // there, but for now we just drop literal-zero readings and trust
-    // the value otherwise (lets GA addons through).
+    // there, but a fixed floor would also reject real GA addons (a
+    // Cessna 172's true OEW is under 1 t), so we can't tell "bogus
+    // default for THIS airframe" from "legit tiny aircraft" without
+    // per-type reference data we don't have. What we CAN reject without
+    // any such data: an OEW at or above the aircraft's own current
+    // gross weight, which is a hard physical impossibility (gross =
+    // empty + fuel + payload, all >= 0) rather than a merely-unusual
+    // number — e.g. a unit-mixup bug reporting OEW in the wrong scale.
     let empty_weight_kg: Option<f32> = {
         let kg = (t.empty_weight_lb * KG_PER_LB) as f32;
-        if kg > 0.0 { Some(kg) } else { None }
+        let physically_possible = match total_weight_kg {
+            Some(gw) => kg < gw,
+            None => true,
+        };
+        if kg > 0.0 && physically_possible { Some(kg) } else { None }
     };
 
     // Payload = ZFW − OEW. No MSFS SimVar exposes payload directly
@@ -3279,8 +3380,10 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
     // ODER dessen normalisiertes N1 > 5 % liegt — das Praefix 1..k
     // bleibt positionserhaltend (Single-Engine-Taxi auf Engine 2
     // liefert [0, n1_2], nicht [n1_2]). Alles aus → None. Skala je
-    // Addon 0-1 ODER 0-100 → auf Prozent normalisiert (wie der
-    // N1-Fallback fuer engines_running oben).
+    // Addon 0-1 ODER 0-100 → `normalize_n1_group` normalisiert alle 4
+    // Triebwerke gemeinsam auf Prozent (wie der N1-Fallback fuer
+    // engines_running oben — geteilte Funktion, siehe dortiger
+    // Kommentar zur Skalen-Ueberlappung).
     // MD-11-Ausnahme: display-exakte `MD11_ENG1..3_N1`-LVars
     // bevorzugen, sobald irgendeine > 0 liest; sonst Standard-Pfad.
     // v0.16.10 QS (Minor 9): zusaetzlich max(N1) >= 5 % verlangt —
@@ -3300,13 +3403,7 @@ fn telemetry_to_snapshot(t: Telemetry, simulator: Simulator) -> SimSnapshot {
             None
         };
         md11_n1.or_else(|| {
-            let normalize = |raw: f64| if raw <= 1.5 { raw * 100.0 } else { raw };
-            let n1 = [
-                normalize(t.n1_pct_1),
-                normalize(t.n1_pct_2),
-                normalize(t.n1_pct_3),
-                normalize(t.n1_pct_4),
-            ];
+            let n1 = normalize_n1_group([t.n1_pct_1, t.n1_pct_2, t.n1_pct_3, t.n1_pct_4]);
             let combustion = [
                 t.eng1_firing || t.eng1_combustion_ex1,
                 t.eng2_firing || t.eng2_combustion_ex1,
@@ -5371,6 +5468,116 @@ mod tests {
         assert_eq!(snap.eng_n1_pct, None);
     }
 
+    // ---- N1-Skalen-Ueberlappung: 0-1-Fraction vs. 0-100-Prozent ----
+    // Bug: die alte Pro-Engine-Heuristik (`raw <= 1.5 → *100`) konnte
+    // eine echte NIEDRIGE Prozent-Ablesung (z.B. 1.2, waehrend jedes
+    // Anlassens/Abstellens durchlaufen) nicht von einer NIEDRIGEN
+    // Fraction-Ablesung unterscheiden — beide sehen als reine Zahl
+    // identisch aus. Multipliziert ergab das ein physikalisch
+    // unmoegliches N1 > 100 %. Fix: alle 4 Triebwerke gemeinsam
+    // betrachten — eine Fraction-Skala kann physikalisch nie > ~1,06
+    // (106 % Overspeed) liefern, also beweist EIN Wert > 1.5 in
+    // diesem Tick, dass die ganze Aircraft auf Prozent liest.
+
+    #[test]
+    fn normalize_n1_group_uses_a_confirmed_sibling_to_read_a_low_engine_literally() {
+        // Engine 1 laeuft normal bei 85 % (beweist: Prozent-Skala).
+        // Engine 2 steht bei echten 1.2 % (fast aus) — ohne den
+        // Cross-Engine-Fix wuerde das isoliert als Fraction (*100 =
+        // 120 %) fehlinterpretiert.
+        let result = normalize_n1_group([85.0, 1.2, 0.0, 0.0]);
+        assert_eq!(result, [85.0, 1.2, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn normalize_n1_group_still_multiplies_a_genuine_all_fraction_group() {
+        // Kein Engine ueber der Schwelle → keine Sibling-Bestaetigung
+        // moeglich, die Gruppe bleibt (wie zuvor) komplett als
+        // Fraction-Skala interpretiert. Deckt den Haupt-Fall ab
+        // (siehe n1_fallback_counts_running_when_combustion_zero).
+        let result = normalize_n1_group([0.6648, 0.6643, 0.6645, 0.6649]);
+        let expected = [66.48, 66.43, 66.45, 66.49];
+        for (r, e) in result.iter().zip(expected.iter()) {
+            assert!((r - e).abs() < 0.001, "expected {expected:?}, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn normalize_n1_group_leaves_unambiguous_percent_values_untouched() {
+        let result = normalize_n1_group([72.9, 10.0, 0.0, 0.0]);
+        assert_eq!(result, [72.9, 10.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn engines_running_does_not_falsely_count_a_spooling_down_engine_as_running() {
+        // Twin auf Prozent-Skala: Engine 1 haelt echte 85 % (laeuft),
+        // Engine 2 spult gerade durch 1.2 % Richtung Stillstand (aus).
+        // Vor dem Fix waere Engine 2 isoliert als Fraction gelesen
+        // (1.2 → *100 = 120 %) und faelschlich mitgezaehlt worden.
+        let mut t = Telemetry::default();
+        t.n1_pct_1 = 85.0;
+        t.n1_pct_2 = 1.2;
+        let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
+        assert_eq!(snap.engines_running, 1);
+    }
+
+    #[test]
+    fn eng_n1_pct_reports_a_low_sibling_literally_once_another_engine_confirms_percent_scale() {
+        let mut t = Telemetry::default();
+        t.eng1_firing = true;
+        t.eng2_firing = true;
+        t.n1_pct_1 = 85.0;
+        t.n1_pct_2 = 1.2;
+        let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
+        assert_eq!(snap.eng_n1_pct, Some(vec![85.0, 1.2]));
+    }
+
+    // ---- empty_weight_kg plausibility ----
+    // Bug: the only gate on OEW was `kg > 0.0` — a unit-mixup or
+    // otherwise-corrupt reading that happened to stay positive sailed
+    // straight through into payload_kg and the MQTT live-map feed.
+    // Fix: also reject an OEW at or above the aircraft's own current
+    // gross weight, a hard physical impossibility regardless of
+    // aircraft type (no fixed-floor heuristic needed, and none that
+    // would also safely reject real tiny GA airframes exists).
+
+    #[test]
+    fn empty_weight_kg_rejects_a_reading_at_or_above_current_gross_weight() {
+        // Real A320 at ZFW: gross ~64000 kg. An OEW reading of 250000
+        // kg (e.g. a unit-mixup bug) is physically impossible — can't
+        // weigh more empty than the aircraft currently weighs loaded.
+        let mut t = Telemetry::default();
+        t.total_weight_lb = 141_000.0; // ~64000 kg
+        t.empty_weight_lb = 551_000.0; // ~250000 kg — impossible
+        let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
+        assert_eq!(snap.empty_weight_kg, None);
+        assert_eq!(snap.payload_kg, None, "an impossible OEW must not leak into payload math");
+    }
+
+    #[test]
+    fn empty_weight_kg_accepts_a_plausible_reading_below_gross_weight() {
+        // Real A320: OEW ~42 t, current gross ~64 t — must pass through.
+        let mut t = Telemetry::default();
+        t.total_weight_lb = 141_000.0; // ~64000 kg
+        t.empty_weight_lb = 92_600.0; // ~42000 kg
+        let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
+        assert!(snap.empty_weight_kg.is_some());
+        let kg = snap.empty_weight_kg.unwrap();
+        assert!((kg - 42_002.0).abs() < 5.0, "expected ~42000 kg, got {kg}");
+    }
+
+    #[test]
+    fn empty_weight_kg_still_passes_through_when_gross_weight_is_unavailable() {
+        // No total_weight reading this tick (0.0 = unknown) — can't
+        // check the physical-impossibility gate, so fall back to the
+        // pre-existing positive-only gate rather than dropping valid
+        // data just because a sibling field hasn't arrived yet.
+        let mut t = Telemetry::default();
+        t.empty_weight_lb = 92_600.0; // ~42000 kg
+        let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
+        assert!(snap.empty_weight_kg.is_some());
+    }
+
     #[test]
     fn eng_n1_pct_md11_prefers_display_exact_lvars() {
         // MD-11: display-exakte LVars gewinnen, sobald eine > 0 liest
@@ -6333,5 +6540,101 @@ mod tests {
         let snap = telemetry_to_snapshot(t, Simulator::Msfs2024);
         assert_eq!(snap.seatbelts_sign, Some(0)); // OFF, not None — A220 has its own LVar
         assert_eq!(snap.no_smoking_sign, Some(0));
+    }
+
+    // Inspector-tool per-watch error attribution. Bug: `InspectorWatch.error`
+    // was documented ("set whenever a SIMCONNECT_RECV_EXCEPTION fires for
+    // this entry during registration") but nothing ever wrote it — the
+    // dispatch loop only logged the exception and looked up the *main
+    // telemetry* field table, never touching the inspector state at all.
+    // A pilot who mistyped an LVar name in the Inspector tool saw the
+    // watch sit forever at "no value", indistinguishable from "sim hasn't
+    // sent data yet".
+
+    #[test]
+    fn inspector_watch_for_exception_finds_the_matching_watch() {
+        let send_ids = vec![(101, 7u32), (102, 8u32), (103, 9u32)];
+        assert_eq!(inspector_watch_for_exception(&send_ids, 102), Some(8));
+    }
+
+    #[test]
+    fn inspector_watch_for_exception_ignores_unrelated_send_ids() {
+        // An exception from some other SimConnect call entirely (e.g. the
+        // main telemetry definition) must not be misattributed to an
+        // inspector watch just because *a* table lookup succeeds.
+        let send_ids = vec![(101, 7u32)];
+        assert_eq!(inspector_watch_for_exception(&send_ids, 999), None);
+    }
+
+    #[test]
+    fn inspector_watch_for_exception_empty_table_is_none() {
+        assert_eq!(inspector_watch_for_exception(&[], 42), None);
+    }
+
+    #[test]
+    fn inspector_state_set_error_flags_only_the_matching_watch_id() {
+        let mut state = InspectorState::default();
+        let good = state.add("PLANE ALTITUDE".to_string(), "feet".to_string(), WatchKind::Number);
+        let bad = state.add(
+            "L:TYPO_NOT_A_REAL_LVAR".to_string(),
+            "number".to_string(),
+            WatchKind::Number,
+        );
+
+        state.set_error(bad, "SimConnect exception #3".to_string());
+
+        let bad_watch = state.watches.iter().find(|w| w.id == bad).unwrap();
+        assert_eq!(bad_watch.error.as_deref(), Some("SimConnect exception #3"));
+        let good_watch = state.watches.iter().find(|w| w.id == good).unwrap();
+        assert_eq!(good_watch.error, None);
+    }
+
+    // v0.20.x QS: `set_error` used to key on the watch NAME, not its
+    // stable `id`. Nothing stops a pilot from adding the same SimVar/
+    // LVar name twice (e.g. once as Number, once as Bool, to see which
+    // interpretation actually works) — with a name-keyed lookup, an
+    // exception belonging to the SECOND watch would land on the FIRST
+    // one instead (first match wins), leaving the actually-failing
+    // watch stuck at `error: None` forever — the exact bug this whole
+    // feature exists to fix, just for the duplicate-name case.
+    #[test]
+    fn inspector_state_set_error_distinguishes_two_watches_with_the_same_name() {
+        let mut state = InspectorState::default();
+        let as_number = state.add("L:AMBIGUOUS_LVAR".to_string(), "number".to_string(), WatchKind::Number);
+        let as_bool = state.add("L:AMBIGUOUS_LVAR".to_string(), "bool".to_string(), WatchKind::Bool);
+
+        // Only the SECOND watch (as_bool) actually failed.
+        state.set_error(as_bool, "SimConnect exception #3".to_string());
+
+        let number_watch = state.watches.iter().find(|w| w.id == as_number).unwrap();
+        assert_eq!(
+            number_watch.error, None,
+            "the Number watch never failed — a name-keyed lookup would wrongly flag it too"
+        );
+        let bool_watch = state.watches.iter().find(|w| w.id == as_bool).unwrap();
+        assert_eq!(bool_watch.error.as_deref(), Some("SimConnect exception #3"));
+    }
+
+    #[test]
+    fn inspector_state_set_error_on_unknown_id_is_a_harmless_noop() {
+        // The exception can legitimately arrive after the pilot already
+        // removed the watch from the UI — must not panic or affect other
+        // entries.
+        let mut state = InspectorState::default();
+        state.add("PLANE ALTITUDE".to_string(), "feet".to_string(), WatchKind::Number);
+        state.set_error(9999, "SimConnect exception #3".to_string());
+        assert!(state.watches.iter().all(|w| w.error.is_none()));
+    }
+
+    #[test]
+    fn inspector_state_clear_errors_resets_every_watch_for_a_fresh_registration_attempt() {
+        let mut state = InspectorState::default();
+        let id = state.add("L:TYPO_NOT_A_REAL_LVAR".to_string(), "number".to_string(), WatchKind::Number);
+        state.set_error(id, "SimConnect exception #3".to_string());
+        assert!(state.watches[0].error.is_some());
+
+        state.clear_errors();
+
+        assert_eq!(state.watches[0].error, None);
     }
 }

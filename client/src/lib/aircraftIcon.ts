@@ -1,6 +1,6 @@
 // Flugzeug-Marker-Icons nach ICAO-Kategorie — 1:1 portiert aus der VPS-Live-Map
 // (aeroacars-live `src/data/icaoCategory.ts`), damit die In-App-Karte denselben
-// Look hat wie live.kant.ovh / Stratos.
+// Look hat wie live.nexusairva.org / Stratos.
 //
 // Kein 1:1-Realismus — 5 Silhouetten (Heavy / Medium / Light / Turboprop / Heli).
 // Unbekannte Codes → "medium". Quelle der Heuristik: ICAO Doc 8643.

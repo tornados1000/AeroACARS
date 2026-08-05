@@ -42,6 +42,14 @@ pub struct ThreadEntry {
     /// second and third deferral of the same clearance and learn nothing
     /// from any of them. Always `false` for downlinks.
     pub deferred: bool,
+    /// This uplink was still open (no WILCO/UNABLE/etc. sent yet) when a
+    /// sector handover happened — the controller who sent it is no
+    /// longer the one talking to the aircraft. Distinct from `closed`:
+    /// a superseded entry was never actually answered, it just became
+    /// unanswerable. Set by [`CpdlcThread::mark_logged_off`]. Always
+    /// `false` for downlinks (our own outstanding requests are left
+    /// alone — see that method's doc comment for why).
+    pub superseded: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -131,11 +139,7 @@ impl CpdlcThread {
             if defers {
                 // STANDBY leaves the instruction open on purpose, but
                 // records that we've already deferred it once.
-                if let Some(entry) = self
-                    .history
-                    .iter_mut()
-                    .find(|e| e.min == m && e.direction == Direction::Uplink)
-                {
+                if let Some(entry) = self.find_current_entry_mut(Direction::Uplink, m) {
                     entry.deferred = true;
                 }
             } else {
@@ -181,6 +185,7 @@ impl CpdlcThread {
             message: message.clone(),
             closed: false,
             deferred: false,
+            superseded: false,
         });
         (message, ThreadEvent::Sent { min })
     }
@@ -228,6 +233,7 @@ impl CpdlcThread {
             message,
             closed: false,
             deferred: false,
+            superseded: false,
         });
         ThreadEvent::ReceivedUplink { min, mrn, resolves }
     }
@@ -244,14 +250,43 @@ impl CpdlcThread {
     /// Mark the history entry closed. Matches on direction as well as
     /// MIN — otherwise `find` returns whichever of the two numbering
     /// spaces happens to come first and ticks off the wrong message.
+    ///
+    /// A superseded entry is deliberately left alone: it was never
+    /// legitimately answered, just orphaned by a handover, and a reply
+    /// that still reaches this far (the UI is expected to block it, see
+    /// [`Self::is_superseded_uplink`]) went to the wrong — new — station
+    /// rather than the one that actually asked. Recording it as `closed`
+    /// would misrepresent the audit trail as a real WILCO/UNABLE.
     fn mark_closed(&mut self, direction: Direction, min: u32) {
-        if let Some(entry) = self
-            .history
-            .iter_mut()
-            .find(|e| e.min == min && e.direction == direction)
-        {
-            entry.closed = true;
+        if let Some(entry) = self.find_current_entry_mut(direction, min) {
+            if !entry.superseded {
+                entry.closed = true;
+            }
         }
+    }
+
+    /// The most recent history entry for `(direction, min)`.
+    ///
+    /// A MIN is only unique within ONE controller's own numbering space
+    /// for as long as that station is active — ATC renumbers from
+    /// (usually) 1 with every new facility, so the same `(direction,
+    /// min)` key can legitimately appear more than once across a
+    /// handover: an old, now-superseded entry from the station that let
+    /// go, and a brand new, live one from whichever facility took over.
+    /// The live one is always the LATEST match: [`Self::mark_logged_off`]
+    /// supersedes anything still open in the OLD station's numbering
+    /// space before the new station's traffic can start arriving, so
+    /// nothing colliding with it can exist yet at the time an older
+    /// entry gets superseded. Searching from the end (rather than a
+    /// plain `find`, which returns whichever occurrence is chronologically
+    /// FIRST) is what makes closing/deferring/superseded-checks resolve
+    /// to the right one instead of accidentally re-triggering the old,
+    /// unrelated controller's message.
+    fn find_current_entry_mut(&mut self, direction: Direction, min: u32) -> Option<&mut ThreadEntry> {
+        self.history
+            .iter_mut()
+            .rev()
+            .find(|e| e.min == min && e.direction == direction)
     }
 
     /// Number of messages awaiting a response — drives the poller's
@@ -285,11 +320,74 @@ impl CpdlcThread {
     /// network hands us over to another facility: the old centre has
     /// released us, the new one has not accepted yet, so we are
     /// logged on to nobody until it answers.
+    ///
+    /// Also supersedes every still-open UPLINK: an instruction the old
+    /// centre sent but the pilot hadn't answered yet becomes
+    /// unanswerable the instant it lets go — that controller is no
+    /// longer talking to the aircraft, and its MIN numbering space
+    /// belongs to a session that's now over. Left open, it did two
+    /// things wrong: kept counting toward `pending_uplink_count` (a
+    /// permanent "you must reply" badge for an instruction nobody is
+    /// waiting on any more), and if the pilot answered it anyway, the
+    /// reply would go out addressed to whatever station is CURRENT at
+    /// send time — the new centre, not the one that asked, silently
+    /// misdirected. Superseding here removes it from `open` (fixing the
+    /// badge/poll-cadence side) and flags the history entry (`superseded
+    /// = true`, NOT `closed` — it was never actually answered) so the UI
+    /// can grey it out and refuse to send a reply for it.
+    ///
+    /// Deliberately UPLINK-only: our own still-open downlink requests
+    /// (e.g. a REQUEST DIRECT TO the old centre hasn't answered) aren't
+    /// touched — nothing about them requires the pilot to act, and the
+    /// pending logon they might reference is already closed just above.
     pub fn mark_logged_off(&mut self) {
         self.logged_on = false;
         if let Some(pending) = self.logon_request_min.take() {
             self.close_open_entry(Direction::Downlink, pending);
         }
+        let stale_mins: Vec<u32> = self
+            .open
+            .keys()
+            .filter(|(direction, _)| *direction == Direction::Uplink)
+            .map(|(_, min)| *min)
+            .collect();
+        for min in stale_mins {
+            self.open.remove(&(Direction::Uplink, min));
+            // v0.20.x QS fix: a plain forward `.find()` here returned
+            // whichever entry with this MIN came FIRST in history — on
+            // a SECOND handover reusing a MIN a prior handover already
+            // superseded, that's the old, already-superseded (no-op)
+            // entry, not the new station's now-actually-stale one. Must
+            // use the same reverse "most recent" search as
+            // `mark_closed`/`is_superseded_uplink`, or a second-handover
+            // MIN collision silently defeats the whole supersede
+            // mechanism: `is_superseded_uplink` would keep reading the
+            // NEW (unmarked) entry as not-superseded, letting a reply
+            // through to the wrong station.
+            if let Some(entry) = self.find_current_entry_mut(Direction::Uplink, min) {
+                entry.superseded = true;
+            }
+        }
+    }
+
+    /// Whether uplink `min` was left unanswered by a handover — see
+    /// [`Self::mark_logged_off`]. The sending layer must refuse to build
+    /// a reply whose `mrn` references one of these: the station it would
+    /// actually reach is not the one that asked.
+    pub fn is_superseded_uplink(&self, min: u32) -> bool {
+        // Must check only the MOST RECENT entry for this MIN, not
+        // whether ANY entry ever was superseded — a `.any()` here would
+        // permanently block replying to every future reuse of this MIN
+        // number after just one handover superseded an older message
+        // with the same number, even a brand new, genuinely still-open
+        // instruction from whichever station took over. See
+        // `find_current_entry_mut`'s doc for why "most recent" is
+        // always the live one.
+        self.history
+            .iter()
+            .rev()
+            .find(|e| e.min == min && e.direction == Direction::Uplink)
+            .is_some_and(|e| e.superseded)
     }
 
     /// MIN of a `REQUEST LOGON` still waiting for its answer, if any.
@@ -696,6 +794,208 @@ mod tests {
                 resolves: None,
             }
         );
+    }
+
+    // ---- Handover: stale open uplinks must not survive it ----
+    // Bug this replaces: a controller sends an instruction requiring a
+    // reply, then hands over BEFORE the pilot answers. `mark_logged_off`
+    // (the handover event) used to only touch the pending logon —
+    // ATC's still-open uplink stayed in `open` forever (permanent
+    // "you must reply" badge for an instruction nobody's waiting on),
+    // and if the pilot replied anyway, `record_sent`'s `to_station`
+    // would already be the NEW centre — the reply silently went to the
+    // wrong controller with an MRN from the OLD one's numbering space.
+
+    #[test]
+    fn handover_supersedes_a_still_open_uplink_and_clears_the_badge() {
+        let mut thread = CpdlcThread::new();
+        receive(&mut thread, "/data2/3//WU/CLIMB TO AND MAINTAIN FL350");
+        assert_eq!(thread.pending_uplink_count(), 1);
+        assert!(!thread.is_superseded_uplink(3));
+
+        thread.mark_logged_off();
+
+        assert_eq!(
+            thread.pending_uplink_count(),
+            0,
+            "the badge must not keep asking the pilot to answer a controller who let go"
+        );
+        assert!(thread.is_superseded_uplink(3));
+        let entry = thread
+            .history()
+            .iter()
+            .find(|e| e.direction == Direction::Uplink && e.min == 3)
+            .unwrap();
+        assert!(entry.superseded);
+        assert!(
+            !entry.closed,
+            "superseded is not the same as answered — it was never actually closed"
+        );
+    }
+
+    #[test]
+    fn second_handover_supersedes_the_new_stations_reused_min_not_the_stale_old_one() {
+        // v0.20.x QS fix: mark_logged_off's own supersede loop used a
+        // plain forward `.find()` — on a SECOND handover reusing a MIN
+        // the FIRST handover already superseded, that returned the old,
+        // already-superseded (no-op) entry instead of the new station's
+        // now-actually-stale one, leaving it with `superseded: false`.
+        // is_superseded_uplink (which correctly reverse-searches) would
+        // then read the wrong entry as "not superseded" — letting a
+        // reply through to the wrong (third) station.
+        let mut thread = CpdlcThread::new();
+        // Station A: uplink MIN 3, left open at handover 1.
+        receive(&mut thread, "/data2/3//WU/CLIMB TO AND MAINTAIN FL240");
+        thread.mark_logged_off(); // handover 1: A → B
+        assert!(thread.is_superseded_uplink(3));
+
+        // Station B reuses MIN 3 for an unrelated instruction, also
+        // left open when handover 2 fires before the pilot answers.
+        receive(&mut thread, "/data2/3//WU/DESCEND TO AND MAINTAIN FL180");
+        assert!(
+            !thread.is_superseded_uplink(3),
+            "B's fresh MIN-3 entry must not inherit A's stale supersession"
+        );
+        thread.mark_logged_off(); // handover 2: B → C
+
+        assert!(
+            thread.is_superseded_uplink(3),
+            "B's entry must now be superseded too — the pilot never answered it either"
+        );
+        assert_eq!(thread.pending_uplink_count(), 0);
+
+        let mut uplinks_min_3 = thread
+            .history()
+            .iter()
+            .filter(|e| e.direction == Direction::Uplink && e.min == 3);
+        let from_a = uplinks_min_3.next().unwrap();
+        let from_b = uplinks_min_3.next().unwrap();
+        assert!(from_a.superseded, "A's entry: superseded by handover 1");
+        assert!(from_b.superseded, "B's entry: must be superseded by handover 2, not left untouched");
+    }
+
+    #[test]
+    fn a_reply_to_a_superseded_uplink_does_not_retroactively_mark_it_closed() {
+        // Defense-in-depth: even if something upstream fails to block
+        // the send (the UI is expected to), the protocol layer must not
+        // let a stray reply repaint a superseded/misdirected message as
+        // a legitimate, answered one in the audit trail.
+        let mut thread = CpdlcThread::new();
+        receive(&mut thread, "/data2/3//WU/CLIMB TO AND MAINTAIN FL350");
+        thread.mark_logged_off();
+
+        send(&mut thread, "DM0", &[], Some(3));
+
+        let entry = thread
+            .history()
+            .iter()
+            .find(|e| e.direction == Direction::Uplink && e.min == 3)
+            .unwrap();
+        assert!(entry.superseded);
+        assert!(!entry.closed, "must stay unanswered in the audit trail");
+    }
+
+    #[test]
+    fn handover_does_not_touch_our_own_still_open_downlink_requests() {
+        let mut thread = CpdlcThread::new();
+        send(&mut thread, "DM22", &["UDROS"], None); // AnyRequired, stays open
+        assert_eq!(thread.pending_response_count(), 1);
+
+        thread.mark_logged_off();
+
+        assert_eq!(
+            thread.pending_response_count(),
+            1,
+            "our own outstanding request is not an uplink the pilot must answer — leave it alone"
+        );
+        let ours = thread
+            .history()
+            .iter()
+            .find(|e| e.direction == Direction::Downlink)
+            .unwrap();
+        assert!(!ours.superseded);
+    }
+
+    #[test]
+    fn handover_with_nothing_open_is_a_harmless_noop() {
+        let mut thread = CpdlcThread::new();
+        thread.mark_logged_off();
+        assert_eq!(thread.pending_uplink_count(), 0);
+        assert!(thread.history().is_empty());
+    }
+
+    #[test]
+    fn is_superseded_uplink_is_false_for_a_normal_open_or_closed_uplink() {
+        let mut thread = CpdlcThread::new();
+        receive(&mut thread, "/data2/3//WU/CLIMB TO AND MAINTAIN FL350");
+        assert!(!thread.is_superseded_uplink(3), "still open, no handover happened");
+
+        send(&mut thread, "DM0", &[], Some(3));
+        assert!(!thread.is_superseded_uplink(3), "answered normally, not superseded");
+    }
+
+    // ---- MIN-collision across a handover ----
+    // ATC renumbers MINs per station (often restarting at 1), so the
+    // same (Uplink, min) key can legitimately recur after a handover:
+    // an old, now-superseded message from the station that let go, and
+    // a brand new, live one from whichever facility took over. Before
+    // this fix, `mark_closed`/the STANDBY-defer lookup used a plain
+    // `.find()`, which always returns the OLDER (first-in-history)
+    // match — so replying to the NEW controller's message with the
+    // reused MIN silently closed/deferred the OLD, unrelated one
+    // instead, while the new one stayed open forever.
+
+    #[test]
+    fn handover_min_collision_closes_the_new_controllers_message_not_the_stale_one() {
+        let mut thread = CpdlcThread::new();
+        // Old controller's uplink, MIN 3, still open at handover time.
+        receive(&mut thread, "/data2/3//WU/CLIMB TO AND MAINTAIN FL240");
+        thread.mark_logged_off();
+        assert!(thread.is_superseded_uplink(3));
+
+        // New controller reuses MIN 3 for a completely unrelated uplink.
+        receive(&mut thread, "/data2/3//WU/DESCEND TO AND MAINTAIN FL180");
+        assert!(
+            !thread.is_superseded_uplink(3),
+            "the CURRENT MIN-3 entry is the new controller's live one, not the old superseded one"
+        );
+        assert_eq!(thread.pending_uplink_count(), 1);
+
+        // Pilot replies WILCO, mrn=3 — must resolve to the new message.
+        send(&mut thread, "DM0", &[], Some(3));
+        assert_eq!(
+            thread.pending_uplink_count(),
+            0,
+            "the new controller's instruction must actually get answered"
+        );
+
+        let mut uplinks_min_3 = thread
+            .history()
+            .iter()
+            .filter(|e| e.direction == Direction::Uplink && e.min == 3);
+        let old = uplinks_min_3.next().unwrap();
+        let new = uplinks_min_3.next().unwrap();
+        assert!(old.superseded && !old.closed, "old message stays superseded, never answered");
+        assert!(!new.superseded && new.closed, "new message is the one that actually got the WILCO");
+    }
+
+    #[test]
+    fn handover_min_collision_defers_the_new_controllers_message_via_standby() {
+        let mut thread = CpdlcThread::new();
+        receive(&mut thread, "/data2/3//WU/CLIMB TO AND MAINTAIN FL240");
+        thread.mark_logged_off();
+        receive(&mut thread, "/data2/3//WU/DESCEND TO AND MAINTAIN FL180");
+
+        send(&mut thread, "DM2", &[], Some(3)); // STANDBY
+
+        let mut uplinks_min_3 = thread
+            .history()
+            .iter()
+            .filter(|e| e.direction == Direction::Uplink && e.min == 3);
+        let old = uplinks_min_3.next().unwrap();
+        let new = uplinks_min_3.next().unwrap();
+        assert!(!old.deferred, "STANDBY must not touch the old, unrelated superseded message");
+        assert!(new.deferred, "STANDBY must defer the new controller's actual instruction");
     }
 
     #[test]

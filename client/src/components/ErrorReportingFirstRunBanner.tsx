@@ -13,7 +13,7 @@
 // Banner-Text macht klar:
 //   - Was gesendet wird (anonyme Crash/Error-Events, Stack-Traces)
 //   - Was NICHT gesendet wird (Position, Route, Login, IP)
-//   - Wo es hingeht (self-hosted GlitchTip auf live.kant.ovh, kein 3rd-Party)
+//   - Wo es hingeht (self-hosted GlitchTip auf tip.nexusairva.org, kein 3rd-Party)
 //   - Wie der Pilot es spaeter aendert (Settings-Link)
 
 import { useState } from "react";
