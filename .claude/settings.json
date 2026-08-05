@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(shred -u /private/tmp/claude-501/-Users-chrigas-Documents-GitHub-AeroACARS/de913c53-286c-4a04-82ae-4787000b8873/scratchpad/nexusair-updater.key /private/tmp/claude-501/-Users-chrigas-Documents-GitHub-AeroACARS/de913c53-286c-4a04-82ae-4787000b8873/scratchpad/nexusair-updater.key.pub /private/tmp/claude-501/-Users-chrigas-Documents-GitHub-AeroACARS/de913c53-286c-4a04-82ae-4787000b8873/scratchpad/updater-key-password.txt)",
+      "Bash(gh auth *)",
+      "Bash(gh secret *)",
+      "Bash(dig +short tip.nexusairva.org)",
+      "Bash(curl -sI --max-time 10 https://tip.nexusairva.org)",
+      "Bash(curl -s --max-time 10 -o /dev/null -w \"HTTP %{http_code}\\\\n\" \"https://tip.nexusairva.org/api/3/store/\")",
+      "Bash(git ls-remote *)",
+      "Bash(git fetch *)",
+      "Bash(echo \"no unmerged: $?\")",
+      "Bash(git tag *)",
+      "Bash(gh run *)",
+      "Bash(gh api *)",
+      "Bash(gh workflow *)",
+      "Bash(brew install *)",
+      "Read(//private/tmp/**)",
+      "Bash(base64 -d \"NexusAir.ACARS_aarch64.app.tar.gz.sig\")",
+      "Bash(minisign -V -p pubkey_decoded.txt -x decoded.sig -m \"NexusAir.ACARS_aarch64.app.tar.gz\")",
+      "Bash(base64 -d -i \"NexusAir.ACARS_aarch64.app.tar.gz.sig\" -o decoded.sig)",
+      "Bash(rm -f /tmp/NexusAir.ACARS_aarch64.app.tar.gz* /tmp/pubkey_decoded.txt /tmp/decoded.sig)",
+      "Bash(echo \"done checking, exit code $?\")"
+    ],
+    "additionalDirectories": [
+      "/tmp"
+    ]
+  }
+}
