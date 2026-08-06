@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    aeroacars_app_lib::run()
+    nexusair_acars_lib::run()
 }

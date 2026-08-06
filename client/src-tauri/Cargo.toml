@@ -94,17 +94,17 @@ dbg_macro = "warn"
 # ---- The Tauri application itself ----
 
 [package]
-name = "aeroacars-app"
+name = "nexusair-acars"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "AeroACARS desktop client (Tauri 2 + React)"
+description = "NexusAir ACARS desktop client (Tauri 2 + React)"
 
 [lib]
 # The `_lib` suffix avoids a Windows linker name clash between the bin and lib targets.
 # See https://github.com/rust-lang/cargo/issues/8519
-name = "aeroacars_app_lib"
+name = "nexusair_acars_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

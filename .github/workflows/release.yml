@@ -94,7 +94,7 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev
         # v0.10.0 hotfix-2: `cargo check` weiter unten kompiliert den
-        # `aeroacars-app`-Crate (Tauri-App), der auf Linux libwebkit2gtk-
+        # `nexusair-acars`-Crate (Tauri-App), der auf Linux libwebkit2gtk-
         # 4.1, glib-2.0 etc. als System-Lib braucht. Ohne diesen Step
         # failt cargo check auf Ubuntu mit „pkg-config: glib-2.0 not
         # found" (siehe Run 26045741380). Platform-Build-Jobs laufen auf
@@ -118,7 +118,7 @@ jobs:
         # referenzierte `sentry_init::send_test_event`-Funktion war nur
         # im lokalen Working-Tree des Devs, nie ans Repo committed.
         # Lokal kompilierte alles, im sauberen CI-Checkout broke der
-        # aeroacars-app crate. Mit diesem cargo-check-Step im preflight
+        # nexusair-acars crate. Mit diesem cargo-check-Step im preflight
         # wird die Klasse von Bug VOR den eigentlichen platform-Builds
         # gefangen — spart 4+ Minuten Mac-Runner-Zeit pro broken Tag.
 

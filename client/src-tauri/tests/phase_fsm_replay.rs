@@ -20,7 +20,7 @@
 //! Die Dateinamen tragen bewusst KEINE Real-Callsigns mehr — anonymisierte
 //! Fixtures sollen auch im Dateinamen kein PII tragen.
 
-use aeroacars_app_lib::{
+use nexusair_acars_lib::{
     arrived_fallback_conditions_basic, should_reset_holding_pending, PublicSimKind,
 };
 use flate2::read::GzDecoder;

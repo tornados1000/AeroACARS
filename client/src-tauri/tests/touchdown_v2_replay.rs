@@ -17,12 +17,12 @@ use chrono::{DateTime, Utc};
 use flate2::read::GzDecoder;
 use serde_json::Value;
 
-use aeroacars_app_lib::touchdown_v2::*;
+use nexusair_acars_lib::touchdown_v2::*;
 // Fuer SimKind brauchen wir den public re-export
-use aeroacars_app_lib::PublicSimKind as SimKind;
+use nexusair_acars_lib::PublicSimKind as SimKind;
 // All replay fixtures are fixed-wing flights → pass FixedWing so the
 // category-aware paths are byte-identical to the pre-category behaviour.
-use aeroacars_app_lib::aircraft_category::AircraftCategory;
+use nexusair_acars_lib::aircraft_category::AircraftCategory;
 
 fn fixture_path(name: &str) -> std::path::PathBuf {
     let manifest = env!("CARGO_MANIFEST_DIR");

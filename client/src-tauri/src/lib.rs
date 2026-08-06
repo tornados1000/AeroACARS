@@ -7306,7 +7306,7 @@ fn app_info() -> AppInfo {
         name: "NexusAir ACARS",
         version: env!("CARGO_PKG_VERSION"),
         commit: option_env!("AEROACARS_GIT_SHA"),
-        credit: "Made with ❤️ in Gifhorn — by Thomas Kant",
+        credit: "Made with ❤️ in Greece 🇬🇷 — by Charalampos Rig.",
     }
 }
 
@@ -7851,7 +7851,7 @@ fn error_reporting_set_consent(enabled: bool) -> Result<(), UiError> {
 // (war für eine v0.9.3 GlitchTip-Pipeline-DevTest-Funktion gedacht) ist
 // hier rausgeflogen weil seine Implementation `sentry_init::send_test_event`
 // nie ans Repo committed wurde (nur lokal im Working-Tree existiert) —
-// CI-Build failed beim aeroacars-app Compile (cannot find function in
+// CI-Build failed beim nexusair-acars Compile (cannot find function in
 // module). Falls wir den Test-Button später wirklich shippen wollen,
 // MUSS er als atomarer Commit (Rust-Fn + Tauri-Command + invoke_handler-
 // Registrierung + Frontend-Aufruf) reingebracht werden, nicht halbgar.

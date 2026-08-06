@@ -41,7 +41,7 @@ fn main() {
     // final binary. Cargo doesn't expose that path directly, so we
     // climb three levels out of OUT_DIR:
     //   target/<profile>/build/<crate>-<hash>/out  →  target/<profile>
-    // That's where the aeroacars-app.exe lives during `cargo run`,
+    // That's where the nexusair-acars.exe lives during `cargo run`,
     // so the OS loader will find SimConnect.dll next to it.
     for file in &["SimConnect.dll", "SimConnect.lib"] {
         let src = lib_dir.join(file);

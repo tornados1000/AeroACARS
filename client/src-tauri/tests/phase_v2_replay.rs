@@ -28,7 +28,7 @@ use flate2::read::GzDecoder;
 use serde_json::Value;
 use sim_core::FlightPhase;
 
-use aeroacars_app_lib::phase_v2::ShadowPhaseEngine;
+use nexusair_acars_lib::phase_v2::ShadowPhaseEngine;
 
 fn fixture_path(name: &str) -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
