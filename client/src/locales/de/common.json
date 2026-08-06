@@ -922,7 +922,7 @@
       "intro": "Wenn dein SimBrief-Identifier hier eingetragen ist, kann NexusAir ACARS einen neu generierten OFP direkt von simbrief.com holen — auch wenn der Bid in phpVMS schon entfernt wurde (regulärer Zustand während Boarding). Du kannst Username oder User-ID nutzen (oder beides). User-ID ist robuster, Username einfacher zu finden.",
       "username_label": "SimBrief-Username",
       "username_hint": "Sichtbar in simbrief.com/dashboard/?username=…",
-      "username_placeholder": "z.B. thomaskant",
+      "username_placeholder": "z.B. pilot123",
       "userid_label": "SimBrief-User-ID (optional)",
       "userid_hint": "Aus SimBrief Account Settings, rein numerisch",
       "userid_placeholder": "z.B. 612345",
