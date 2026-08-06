@@ -1,7 +1,7 @@
 {
   "name": "aeroacars-client",
   "private": true,
-  "version": "1.4.4-nexusair.1",
+  "version": "1.4.6-nexusair.1",
   "type": "module",
   "description": "NexusAir ACARS desktop client — Tauri 2 + React + TypeScript",
   "scripts": {
