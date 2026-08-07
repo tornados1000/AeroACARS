@@ -33672,7 +33672,7 @@ pub fn run() {
                     level: ActivityLevel::Info,
                     message: format!("NexusAir ACARS v{} gestartet", env!("CARGO_PKG_VERSION")),
                     // Tiny credit line — keeps the tool feeling human-made.
-                    detail: Some("Made with ❤️ in Gifhorn — by Thomas Kant".into()),
+                    detail: Some("Made with ❤️ in Greece 🇬🇷 — by Charalampos Rig.".into()),
                 };
                 tracing::info!(message = %banner.message, "activity");
                 log.push_back(banner);
