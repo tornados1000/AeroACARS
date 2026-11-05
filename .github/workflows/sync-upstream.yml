@@ -1,0 +1,29 @@
+name: Sync fork with Thomas's repo
+
+# Lives on its own branch on purpose. GitHub only schedules workflows from the
+# default branch, and main/v3 here are exact copies of MANFahrer-GF/AeroACARS,
+# so a job stored on them would be wiped by its own copy (that happened on
+# 2026-10-31). Thomas has no sync-job branch, so this copy never touches it.
+#
+# Pushes with GITHUB_TOKEN don't start other workflows, so his CI and Release
+# workflows stay quiet here.
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # daily, 06:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Copy every branch and tag from upstream
+        run: |
+          git clone --bare https://github.com/MANFahrer-GF/AeroACARS.git upstream.git
+          cd upstream.git
+          # Not --mirror: that would delete this branch, and with it this job.
+          git push --force "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
+            'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*'
