@@ -5,8 +5,11 @@ name: Sync fork with Thomas's repo
 # so a job stored on them would be wiped by its own copy (that happened on
 # 2026-10-31). Thomas has no sync-job branch, so this copy never touches it.
 #
-# Pushes with GITHUB_TOKEN don't start other workflows, so his CI and Release
-# workflows stay quiet here.
+# Pushes use MIRROR_TOKEN (fine-grained PAT: Contents + Workflows write, this
+# repo only): the built-in GITHUB_TOKEN may not touch .github/workflows, so
+# Thomas's workflow changes were refused (2026-11-06). Pushes with a PAT start
+# other workflows, so the fork only allows plain run steps and his workflows
+# are disabled.
 
 on:
   schedule:
@@ -14,7 +17,7 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   sync:
@@ -25,5 +28,5 @@ jobs:
           git clone --bare https://github.com/MANFahrer-GF/AeroACARS.git upstream.git
           cd upstream.git
           # Not --mirror: that would delete this branch, and with it this job.
-          git push --force "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
+          git push --force "https://x-access-token:${{ secrets.MIRROR_TOKEN }}@github.com/${{ github.repository }}.git" \
             'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*'
