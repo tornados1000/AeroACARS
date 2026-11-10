@@ -1,0 +1,29 @@
+{
+  "scenario": "long-landing",
+  "hint": "Pilot setzt 900 m past threshold auf - TDZ verfehlt (drittes Drittel beginnt erst bei ~1083 m, also noch zweites). Aim-Class long_landing. TCH war hoch (75 ft statt 50). Bahn-Auslastung knapp.",
+  "props": {
+    "airport_ident": "EDDM",
+    "airport_name": "München Franz Josef Strauß",
+    "runway_ident": "08R",
+    "length_m": 4000,
+    "surface": "ASP",
+    "source": "navigraph",
+    "nav_cycle": "2604",
+    "displaced_threshold_m": 0,
+    "td_distance_from_threshold_m": 900,
+    "td_centerline_offset_m": 3.5,
+    "td_in_tdz": false,
+    "td_third": 2,
+    "td_tdz_length_m": 900,
+    "aim_point_m": 400,
+    "aim_delta_m": 500,
+    "aim_class": "long_landing",
+    "tch_actual_ft": 75,
+    "tch_expected_ft": 50,
+    "tch_delta_ft": 25,
+    "tch_class": "high",
+    "pre_displaced_threshold": false,
+    "rollout_m": 2800,
+    "locale": "de"
+  }
+}

@@ -1,0 +1,30 @@
+import { describe, it, expect } from "vitest";
+import { cleanPdcRemark, PDC_REMARK_MAX } from "./pdcRemark";
+
+describe("cleanPdcRemark", () => {
+  it("uppercases, drops braces and collapses whitespace", () => {
+    expect(cleanPdcRemark("req {de-icing}  pad\t2")).toBe("REQ DE-ICING PAD 2");
+    expect(cleanPdcRemark("a}b{c")).toBe("ABC");
+    // Same result as the backend's sanitize_free_text (external QS P3).
+    expect(cleanPdcRemark("REQ { PAD } 2")).toBe("REQ PAD 2");
+  });
+
+  it("keeps a trailing space while typing but no leading one", () => {
+    expect(cleanPdcRemark("  ready ")).toBe("READY ");
+  });
+
+  it("spells out German letters and drops other non-ASCII, like the backend", () => {
+    expect(cleanPdcRemark("enteisung größer")).toBe("ENTEISUNG GROESSER");
+    expect(cleanPdcRemark("über → pad ✈ 2")).toBe("UEBER PAD 2");
+  });
+
+  it("treats a no-break space and control characters as spaces, like the backend", () => {
+    expect(cleanPdcRemark("a\u00A0b")).toBe("A B");
+    expect(cleanPdcRemark("a\u0007b")).toBe("A B");
+  });
+
+  it("caps at the backend's limit", () => {
+    expect(cleanPdcRemark("x".repeat(PDC_REMARK_MAX + 10))).toHaveLength(PDC_REMARK_MAX);
+    expect(PDC_REMARK_MAX).toBe(48);
+  });
+});

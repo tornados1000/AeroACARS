@@ -1,0 +1,56 @@
+/* Anfluggrafik und 50-Hz-Nahaufnahme (AnflugGrafik.tsx).
+ * GESPIEGELT in die Webapp (scripts/anzeige-sync.mjs, DATEIEN). */
+
+.landing-chart {
+  width: 100%;
+  /* v0.12.7-fix: Höhe folgt dem viewBox-Seitenverhältnis (1120×320),
+     vorher fixe 200px → die Kurve wurde bei preserveAspectRatio="meet"
+     mittig klein gequetscht mit toten Rändern. Jetzt volle Box-Breite. */
+  height: auto;
+  display: block;
+  color: var(--text-muted);
+}
+
+.landing-chart--empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-style: italic;
+}
+
+.landing-stability-chart {
+  margin-top: 1rem;
+}
+
+/* Rahmen und Überschrift des Abschnitts (wie im Client in App.css);
+ * :where() hält die Spezifität bei 0. */
+:where(.landing-section) {
+  background: var(--surface, #141a21);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md, 6px);
+  padding: 1rem 1.25rem;
+}
+
+:where(.landing-section) h3 {
+  margin: 0 0 0.85rem;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+
+/* 05.10.2026: Hinweis, wenn der Flug keine Gleitpfad-Kurve hat. */
+.landing-chart__hinweis {
+  margin: 0.4rem 0 0;
+  font-size: 0.78rem;
+  color: var(--text-muted, #94a3b8);
+}
+
+/* Papier (QS 06.10.2026): Gitter, Rahmen und Achsen sind für den dunklen
+   Grund gezeichnet — weiß auf weißem Papier waren sie unsichtbar, die
+   Achsentexte blass. Der frühere Bericht legte die Grafik dafür auf eine
+   dunkle Karte; jetzt druckt sie im hellen Abschnitt, also dunkle Linien.
+   CSS schlägt das SVG-Attribut; auf dem Bildschirm greift nichts davon. */
+.landing-report .ag-gitter { stroke: rgba(15, 23, 42, 0.14); }
+.landing-report .ag-rahmen { fill: none; stroke: rgba(15, 23, 42, 0.35); }
+.landing-report .ag-achse { fill: #334155; }

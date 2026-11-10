@@ -1,0 +1,30 @@
+[package]
+name = "discord-presence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Discord Rich Presence Manager fuer AeroACARS — Pilot-Flug-Status im Discord-Profil (v0.9.0)."
+publish = false
+
+[lib]
+name = "discord_presence"
+path = "src/lib.rs"
+
+[dependencies]
+# discord-rich-presence: MIT, cross-platform (Windows Named-Pipe + Unix-Socket),
+# spielt mit Tokio zusammen, kein nativer Build-Step. v0.2.x ist die aktuelle
+# stabile Linie (rauchtest auf Win/Mac via CI bei tauri-action passieren).
+discord-rich-presence = "0.2"
+serde.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "macros", "rt"] }
+tracing.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+# Pure-Fn-Tests in tests/format.rs brauchen kein Discord-Mock.
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,29 @@
+{
+  "scenario": "ourairports-fallback",
+  "hint": "VPS war beim flight_start nicht erreichbar (oder unbekannter ICAO). Pilot-Client nutzt eingebaute OurAirports-CSV. TDZ + Aim sind quell-agnostisch verfuegbar; TCH/DDS bleiben null weil OurAirports diese Felder nicht hat.",
+  "props": {
+    "airport_ident": "EDDK",
+    "airport_name": "Köln-Bonn",
+    "runway_ident": "24",
+    "length_m": 2459,
+    "surface": "CON",
+    "source": "ourairports_fallback",
+    "nav_cycle": null,
+    "displaced_threshold_m": 0,
+    "td_distance_from_threshold_m": 358,
+    "td_centerline_offset_m": 8.8,
+    "td_in_tdz": true,
+    "td_third": 1,
+    "td_tdz_length_m": 820,
+    "aim_point_m": 400,
+    "aim_delta_m": -42,
+    "aim_class": "perfect",
+    "tch_actual_ft": null,
+    "tch_expected_ft": null,
+    "tch_delta_ft": null,
+    "tch_class": null,
+    "pre_displaced_threshold": null,
+    "rollout_m": 1979,
+    "locale": "de"
+  }
+}

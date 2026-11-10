@@ -1,0 +1,20 @@
+[package]
+name = "recorder"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Flight recorder — flight log, position history, landing analyzer (centerline / heading / threshold / bounces)"
+
+[dependencies]
+sim-core.workspace = true
+geo.workspace = true
+metar.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

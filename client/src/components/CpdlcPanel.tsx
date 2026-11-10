@@ -1,0 +1,586 @@
+// v1.3.5 (#Datalink-3a) — PDC/CPDLC tab root.
+//
+// Datalink is a radio exchange, not a form: the message that comes back
+// from the station is the point, not the sending. See
+// handoff_datalink_3a/README.md §0 for the four decisions this rebuild
+// carries through — two fixed columns (composer/history), the uplink
+// parsed into large values, PDC/CPDLC as one connection with a shared
+// history (only the composer swaps), and replies sitting at the message
+// they answer.
+//
+// This shell owns exactly what's shared across both modes: the 66px
+// connection status row (ACARS link, callsign) and the two-column
+// workspace grid. Composer and history each own their own concerns.
+//
+// CPDLC logon STATE lives here (this is where `online`/`loggedOn` are
+// already computed, and DatalinkHistory needs the station too), but its
+// UI moved into DatalinkComposer (only rendered in CPDLC mode) — it used
+// to sit dimmed-but-visible in this status row for both modes, which
+// crammed variable-width, CPDLC-only content into a row that also has to
+// carry things that are ALWAYS relevant. That one row produced three
+// separate real layout bugs in a single afternoon; see the comment at
+// the logon block's new home in DatalinkComposer.tsx for the full list.
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { invoke, formatIpcError, isTauri, openExternal } from "../lib/ipc";
+import { useCpdlcMessages } from "../hooks/useCpdlcMessages";
+import { useStationOnline } from "../hooks/useStationOnline";
+import { DatalinkComposer } from "./DatalinkComposer";
+import { DatalinkHistory } from "./DatalinkHistory";
+
+interface HoppieSettings {
+  enabled: boolean;
+  callsign_override: string | null;
+  notify_sound: boolean;
+}
+
+interface HoppieStatus {
+  connected: boolean;
+  logged_on: boolean;
+  pending_response_count: number;
+  pending_uplink_count: number;
+  last_error: string | null;
+  station_id: string | null;
+  logon_pending: boolean;
+  logon_timed_out: boolean;
+}
+
+interface FlightContext {
+  callsign: string | null;
+}
+
+const STATUS_POLL_MS = 5000;
+
+/** How long the logon button stays blocked after a request went out — a
+ *  double-click guard, not a timeout. See the CPDLC logon block below;
+ *  ported unchanged from the previous CpdlcView. */
+const LOGON_COOLDOWN_SECS = 90;
+
+/** Persists a typed-but-not-yet-sent centre across tab switches and panel
+ *  remounts — same reasoning as the previous CpdlcView draft key.
+ *
+ *  v1.3.5 fix: this used to live in `localStorage`, which never expires and
+ *  was never cleared once the draft was actually sent — a station typed in
+ *  ONE session (verified: "EDDF", almost certainly typed during this
+ *  session's own testing of the Datalink-3a rewrite) kept resurfacing on
+ *  every app start indefinitely, forcing the pilot to delete it every time.
+ *  `sessionStorage` still survives a tab switch/remount within one running
+ *  app instance (the original point of this cache) but is gone on the next
+ *  launch. Also now cleared the moment a logon request actually goes out
+ *  (see `sendLogon` below) — at that point the field's job (holding an
+ *  unsent draft) is done. */
+const STATION_DRAFT_KEY = "aeroacars.cpdlc.station_draft";
+
+function loadStationDraft(): string {
+  try {
+    return sessionStorage.getItem(STATION_DRAFT_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function saveStationDraft(value: string): void {
+  try {
+    if (value) sessionStorage.setItem(STATION_DRAFT_KEY, value);
+    else sessionStorage.removeItem(STATION_DRAFT_KEY);
+  } catch {
+    // Private-mode / quota — falls back to per-mount behaviour, no worse
+    // than before this existed.
+  }
+}
+
+/** Clears the PERSISTED draft only — leaves `stationInput` itself alone, so
+ *  the just-typed station stays visible through the cooldown/pending
+ *  period. Called once a logon request actually goes out. */
+function clearStationDraft(): void {
+  try {
+    sessionStorage.removeItem(STATION_DRAFT_KEY);
+  } catch {
+    // Nothing to clean up if storage isn't available in the first place.
+  }
+}
+
+export type DatalinkMode = "pdc" | "cpdlc";
+
+interface Props {
+  onOpenSettings: () => void;
+  /** v1.7.20 (#pdc-cpdlc-mode-routing): lifted to `App.tsx` instead of a
+   *  local `useState` default of `"pdc"`. This panel is conditionally
+   *  rendered (unmounted whenever another tab is active, not hidden), so
+   *  a local default meant BOTH the attention banner's "open the CPDLC
+   *  message" click AND simply navigating away and back always landed
+   *  back on PDC — the panel had no memory of its own. */
+  mode: DatalinkMode;
+  onModeChange: (mode: DatalinkMode) => void;
+}
+
+export function CpdlcPanel({ onOpenSettings, mode, onModeChange: setMode }: Props) {
+  const { t } = useTranslation();
+  const [settings, setSettings] = useState<HoppieSettings | null>(null);
+  const [status, setStatus] = useState<HoppieStatus | null>(null);
+  const [flightCallsign, setFlightCallsign] = useState<string | null>(null);
+
+  const [callsignInput, setCallsignInput] = useState("");
+  const [callsignDirty, setCallsignDirty] = useState(false);
+  const [callsignEditing, setCallsignEditing] = useState(false);
+  const [callsignReconnecting, setCallsignReconnecting] = useState(false);
+
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Mirrors DatalinkComposer's PDC recipient field — see the prop doc on
+  // DatalinkComposer for why the history needs a copy of it.
+  const [pdcRecipient, setPdcRecipient] = useState("");
+
+  // --- CPDLC logon: state lives here, UI rendered by DatalinkComposer
+  // (CPDLC mode only — see that file). ---
+  const [stationInput, setStationInputState] = useState(() => loadStationDraft());
+  const setStationInput = (value: string) => {
+    setStationInputState(value);
+    saveStationDraft(value);
+  };
+  const [stationEditing, setStationEditing] = useState(false);
+  const [logonBusy, setLogonBusy] = useState(false);
+  const [logonError, setLogonError] = useState<string | null>(null);
+  // v1.9.5 (#hoppie-logon-precheck): the backend refuses a logon to a
+  // station Hoppie does not list as online. That reading rests on an
+  // undocumented reply format, so the pilot can always override it: the
+  // SECOND click for the same station sends anyway (`force`).
+  const [offlineWarnedFor, setOfflineWarnedFor] = useState<string | null>(null);
+  const [cooldownLeft, setCooldownLeft] = useState(0);
+  const cooldownRunning = cooldownLeft > 0;
+
+  useEffect(() => {
+    if (!cooldownRunning) return;
+    const id = window.setInterval(() => setCooldownLeft((s) => Math.max(0, s - 1)), 1000);
+    return () => window.clearInterval(id);
+  }, [cooldownRunning]);
+
+  useEffect(() => {
+    void invoke<HoppieSettings>("hoppie_get_settings").then((s) => {
+      setSettings(s);
+      setCallsignInput(s.callsign_override ?? "");
+    });
+    void invoke<FlightContext>("hoppie_get_flight_context").then((ctx) =>
+      setFlightCallsign(ctx.callsign),
+    );
+  }, []);
+
+  const refreshStatus = () => {
+    void invoke<HoppieStatus>("hoppie_status").then(setStatus).catch(() => undefined);
+  };
+
+  useEffect(() => {
+    if (!settings?.enabled) return;
+    refreshStatus();
+    const id = window.setInterval(refreshStatus, STATUS_POLL_MS);
+    return () => window.clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings?.enabled]);
+
+  // QS round 2 (06.09.2026, #pdc-cpdlc-session-end): a session can now end
+  // with no automatic follow-up logon — a manual "Abmelden", or a GOLD
+  // `END SERVICE` with no `NEXT DATA AUTHORITY` named. Either way, the
+  // field keeps showing the STATION THAT JUST ENDED — nothing update it,
+  // since `stationInput` is a plain manual-entry field, not derived from
+  // `to_station`. Left alone, the pilot could hit "Anmelden" again on a
+  // facility that has already told the network it's done with us. Clear
+  // it whenever a logged-on session ends; harmless if this instead
+  // catches the brief false-then-true blip of an automatic handover —
+  // `stationInput` plays no role in that path anyway.
+  const wasLoggedOn = useRef(false);
+  useEffect(() => {
+    const loggedOn = Boolean(status?.logged_on);
+    if (wasLoggedOn.current && !loggedOn) {
+      setStationInput("");
+    }
+    wasLoggedOn.current = loggedOn;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status?.logged_on]);
+
+  /** Oeffnet die CDM-Seite in einem eigenen Fenster der App. Im
+   *  LAN-Browser gibt es keine App-Fenster — dort der normale Weg. */
+  const oeffneVatsimCdm = useCallback(async () => {
+    if (!isTauri) {
+      void openExternal("https://vats.im/vdgs").catch(() => {});
+      return;
+    }
+    try {
+      await invoke("vdgs_fenster_oeffnen");
+    } catch {
+      void openExternal("https://vats.im/vdgs").catch(() => {});
+    }
+  }, []);
+
+  const online = Boolean(status?.connected);
+  const { messages, refresh: refreshMessages, lastFetchedAt } = useCpdlcMessages(online);
+  const cpdlcStationStatus = useStationOnline(stationInput, online);
+
+  // "Letzte Abfrage vor {n} s" — ticks every second, jumps to 0 the
+  // moment a poll actually lands (README §2, right-hand readout).
+  const [pollAgeSec, setPollAgeSec] = useState(0);
+  useEffect(() => {
+    if (lastFetchedAt == null) return;
+    setPollAgeSec(0);
+    const id = window.setInterval(() => {
+      setPollAgeSec(Math.max(0, Math.round((Date.now() - lastFetchedAt) / 1000)));
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [lastFetchedAt]);
+
+  if (!settings) return null;
+
+  if (!settings.enabled) {
+    return (
+      <section className="cpdlc-panel cpdlc-panel--disabled">
+        <p>{t("cpdlc.disabled_hint")}</p>
+        <button type="button" className="button button--primary" onClick={onOpenSettings}>
+          {t("cpdlc.disabled_open_settings")}
+        </button>
+      </section>
+    );
+  }
+
+  /// Blur-save. Deliberately does NOT touch `busy` — see the equivalent
+  /// note that used to live here before the rebuild: flipping it meant
+  /// the very click that caused the blur landed on a disabled button.
+  const saveCallsign = async () => {
+    setCallsignEditing(false);
+    if (!callsignDirty) return;
+    const trimmed = callsignInput.trim().toUpperCase();
+    try {
+      const next = { ...settings, callsign_override: trimmed === "" ? null : trimmed };
+      await invoke<HoppieSettings>("hoppie_set_settings", { settings: next });
+      setSettings(next);
+      setCallsignInput(trimmed);
+      setCallsignDirty(false);
+      // v1.5.6 (#hoppie-callsign): Das Rufzeichen ist der ABSENDER der
+      // Hoppie-Verbindung — eine laufende Verbindung sendet sonst weiter
+      // unter dem alten. Frueher war das der Grund, das Aendern bei
+      // Verbindung komplett zu sperren; Michel lief damit in eine
+      // Sackgasse (Hinweis "trag ein Rufzeichen ein", Knopf tot).
+      // Jetzt: kurz neu aufbauen, der Pilot merkt nur, dass es wirkt.
+      if (online) {
+        setCallsignReconnecting(true);
+        try {
+          await invoke<HoppieStatus>("hoppie_disconnect");
+          setStatus(await invoke<HoppieStatus>("hoppie_connect"));
+        } finally {
+          setCallsignReconnecting(false);
+        }
+      }
+    } catch (e) {
+      setError(formatIpcError(e));
+    }
+  };
+
+  const toggleLink = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      if (online) {
+        setStatus(await invoke<HoppieStatus>("hoppie_disconnect"));
+        return;
+      }
+      // Persist a freshly typed callsign BEFORE connecting — blur-saving
+      // alone races the click (backend would read the old, usually
+      // empty, value and refuse with "no callsign configured").
+      const trimmed = callsignInput.trim().toUpperCase();
+      if (callsignDirty) {
+        const next = { ...settings, callsign_override: trimmed === "" ? null : trimmed };
+        await invoke<HoppieSettings>("hoppie_set_settings", { settings: next });
+        setSettings(next);
+        setCallsignInput(trimmed);
+        setCallsignDirty(false);
+      }
+      setStatus(await invoke<HoppieStatus>("hoppie_connect"));
+    } catch (e) {
+      setError(formatIpcError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onChanged = () => {
+    refreshMessages();
+    refreshStatus();
+  };
+
+  const loggedOn = Boolean(status?.logged_on);
+  const logonSent = Boolean(status?.logon_pending);
+  const logonTimedOut = Boolean(status?.logon_timed_out);
+  const currentStation = status?.station_id ?? null;
+  const alreadyOn =
+    loggedOn && currentStation !== null && stationInput.trim().toUpperCase() === currentStation.toUpperCase();
+
+  const sendLogon = async () => {
+    if (logonBusy || cooldownLeft > 0) return;
+    const target = stationInput.trim().toUpperCase();
+    setLogonBusy(true);
+    setLogonError(null);
+    try {
+      await invoke("hoppie_send_logon_request", { station: target, force: offlineWarnedFor === target });
+      setOfflineWarnedFor(null);
+      setCooldownLeft(LOGON_COOLDOWN_SECS);
+      setStationEditing(false);
+      clearStationDraft();
+      onChanged();
+    } catch (e) {
+      const code = (e as { code?: string } | null)?.code;
+      setOfflineWarnedFor(code === "hoppie_station_offline" ? target : null);
+      setLogonError(formatIpcError(e));
+    } finally {
+      setLogonBusy(false);
+    }
+  };
+
+  const sendLogoff = async () => {
+    if (logonBusy) return;
+    setLogonBusy(true);
+    setLogonError(null);
+    try {
+      await invoke("hoppie_send_logoff");
+      onChanged();
+    } catch (e) {
+      setLogonError(formatIpcError(e));
+    } finally {
+      setLogonBusy(false);
+    }
+  };
+
+  // Nothing typed and no flight to fall back to a VA callsign from —
+  // worth saying out loud since the failure mode is silent: the
+  // controller never sees the request.
+  // v1.5.6 (#hoppie-callsign, Feldbefund Michel SBBR→LPPT): Vorher war das
+  // hier eine ORANGE WARNUNG, sobald das Feld leer war — also im Normalfall,
+  // denn dann greift das Flugplan-Callsign. Sie forderte zum Handeln auf,
+  // während Knopf und Feld gesperrt waren (siehe unten): eine Sackgasse.
+  //
+  // Der Client kann gar nicht wissen, was richtig ist — er kennt das
+  // NETZWERK-Callsign des Piloten nicht. Deshalb jetzt beides als
+  // neutraler Hinweis: was gesendet wird, und woher es kommt.
+  const callsignNotice: { key: string; vars: Record<string, string> } | null = (() => {
+    const typed = callsignInput.trim();
+    if (typed === "" && flightCallsign) {
+      const vars: Record<string, string> = { flight: flightCallsign };
+      return { key: "cpdlc.callsign_from_plan", vars };
+    }
+    if (typed !== "" && flightCallsign && typed.toUpperCase() !== flightCallsign.toUpperCase()) {
+      const vars: Record<string, string> = {
+        entered: typed.toUpperCase(),
+        flight: flightCallsign,
+      };
+      return { key: "cpdlc.callsign_override_active", vars };
+    }
+    return null;
+  })();
+
+  const linkKind: "connected" | "error" | "none" = online
+    ? "connected"
+    : status?.last_error
+      ? "error"
+      : "none";
+  const linkLabel =
+    linkKind === "connected"
+      ? t("cpdlc.acars_online")
+      : linkKind === "error"
+        ? t("cpdlc.link_error")
+        : t("cpdlc.acars_offline");
+
+  // The backend distinguishes "logged on", "request sent, no answer yet"
+  // and "sent, no answer within the poll window" — there is no signal
+  // for an explicit ATC rejection (Hoppie/vSMR give no such reply), so
+  // that word from README §2d is not reachable from real status today.
+  const logonWord: "ok" | "pending" | "none" = loggedOn ? "ok" : logonSent && !logonTimedOut ? "pending" : "none";
+  const logonValue = loggedOn ? (currentStation ?? stationInput) : stationInput;
+  const hasLogonOrPending = loggedOn || logonSent || logonTimedOut;
+  // Nothing sent yet at all: the field IS the way to log on in the first
+  // place, so it can't be gated behind "Wechseln" — that button only
+  // exists once there's something to hand over FROM. Bug found in field
+  // testing: with the old `stationEditing`-only gate, a pilot who had
+  // never logged on saw a bare, un-editable value and no way to type a
+  // centre at all.
+  const showStationInput = stationEditing || !hasLogonOrPending;
+
+  const resolvedCallsign = callsignInput || flightCallsign;
+
+  return (
+    <section className="cpdlc-panel">
+      <header className="datalink-status">
+        <div className="datalink-status__left">
+          {/* Grouped per README §2 (a/b/d): 22px separates these groups from
+              each other, but a block stays tight (12px) against the button
+              that belongs to it — a flat, uniform 22px gap across every
+              child here (dot+text, its own button, block, its own button, …)
+              was what made the row read as cramped-yet-sparse at once: too
+              little room between unrelated groups showed up as visual noise
+              right where the field feedback ("alles so gequetscht") points,
+              once the actual overlap bug (input width) no longer forced this
+              row into a squeeze-everything band-aid. */}
+          <div className="datalink-status__group">
+            <span className={`datalink-link datalink-link--${linkKind}`}>
+              <span className="datalink-link__dot" aria-hidden="true" />
+              {linkLabel}
+            </span>
+            <button
+              type="button"
+              className={`button datalink-connect-btn ${online ? "" : "button--primary"}`}
+              disabled={busy}
+              onClick={() => void toggleLink()}
+            >
+              {online ? t("cpdlc.acars_stop") : t("cpdlc.acars_start")}
+            </button>
+          </div>
+
+          <div className="datalink-status__group">
+            <div className="datalink-block">
+              <label className="datalink-block__label" htmlFor="datalink-callsign-input">
+                {t("cpdlc.callsign_label")}
+              </label>
+              {callsignEditing ? (
+                <input
+                  id="datalink-callsign-input"
+                  autoFocus
+                  type="text"
+                  className="datalink-block__input"
+                  value={callsignInput}
+                  onChange={(e) => {
+                    setCallsignInput(e.target.value.toUpperCase());
+                    setCallsignDirty(true);
+                  }}
+                  onBlur={() => void saveCallsign()}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void saveCallsign();
+                    if (e.key === "Escape") setCallsignEditing(false);
+                  }}
+                  placeholder={flightCallsign ?? t("cpdlc.callsign_placeholder")}
+                  disabled={busy || loggedOn || callsignReconnecting}
+                  title={t("cpdlc.callsign_network_hint")}
+                />
+              ) : (
+                <span
+                  id="datalink-callsign-input"
+                  className="datalink-block__value"
+                  title={t("cpdlc.callsign_network_hint")}
+                >
+                  {resolvedCallsign || t("cpdlc.callsign_placeholder")}
+                </span>
+              )}
+            </div>
+            {/* v1.5.6 (#hoppie-callsign): Der Knopf war früher schon bei
+                bloßer VERBINDUNG gesperrt (`busy || online`) — Michel stand
+                damit vor einem toten Knopf, während der Hinweis darüber ein
+                Rufzeichen verlangte. Gesperrt ist jetzt nur noch, was
+                wirklich nicht gehen darf: eine laufende CPDLC-Anmeldung
+                (der Lotse kennt ihn unter dem alten Rufzeichen). */}
+            {!callsignEditing && (
+              <button
+                type="button"
+                className="button button--secondary"
+                disabled={busy || loggedOn || callsignReconnecting}
+                title={
+                  loggedOn
+                    ? t("cpdlc.callsign_locked_logon", {
+                        callsign: resolvedCallsign ?? "",
+                      })
+                    : undefined
+                }
+                onClick={() => setCallsignEditing(true)}
+              >
+                {callsignReconnecting
+                  ? t("cpdlc.callsign_reconnecting")
+                  : t("cpdlc.callsign_change")}
+              </button>
+            )}
+          </div>
+        </div>
+        <span className="datalink-status__poll">
+          {lastFetchedAt != null && t("cpdlc.last_poll", { seconds: pollAgeSec })}
+        </span>
+        {/* VATSIM CDM (12.08.2026): kein eigener Menueeintrag fuer einen
+            einzigen Knopf. Die Abflugfolge gehoert dorthin, wo man ohnehin
+            die Freigabe holt — und dort bestaetigt man auch seine TOBT.
+            Das Fenster oeffnet die Seite von VATSIM Spain; einbetten laesst
+            sie sich nicht (X-Frame-Options), siehe VatsimCdmView. */}
+        <button
+          type="button"
+          className="button datalink-cdm-btn"
+          onClick={() => void oeffneVatsimCdm()}
+          title={t("cdm.knopf_titel", "Abflugfolge auf VATSIM öffnen (TOBT, TSAT, CTOT)")}
+        >
+          {t("cdm.knopf", "VATSIM CDM")} ↗
+        </button>
+      </header>
+
+      {/* Das Rufzeichen oben übersteuert ALLES, was der Client unter
+          einer Kennung tut — Hoppie-Funk, PDC und seit v1.7.44 auch die
+          VDGS-Abfrage der eigenen Abflugfolge. Das stand bisher
+          nirgends: Wer ein leeres VDGS-Band sah, suchte den Fehler beim
+          Dienst, statt hier nachzusehen (Thomas, 21.09.2026: „dann muss
+          das irgendwo erklärt sein").
+
+          Bewusst HIER, unter dem Kopf, und nicht im Rufzeichen-Block:
+          Dessen Zeile ist auf 66 px festgenagelt und schneidet mit
+          `overflow-y: hidden` ab, was nicht hineinpasst (siehe
+          `.datalink-block__label` in App.css — genau daran ist schon
+          einmal eine dritte Zeile still verschwunden). Und bewusst als
+          sichtbarer Satz statt als Tooltip: Was man erst durch Hovern
+          findet, erreicht im Cockpit niemanden. */}
+      <p className="datalink-callsign-reichweite" data-testid="callsign-reichweite">
+        {t(
+          "cpdlc.callsign_gilt_auch_vdgs",
+          "Das Callsign oben gilt auch für die VDGS-Abfrage der eigenen Abflugfolge (TOBT/TSAT) — dort wird unter demselben Rufzeichen gesucht.",
+        )}
+      </p>
+
+      {(status?.last_error || error || logonError || logonTimedOut || callsignNotice) && (
+        <div className="datalink-alerts">
+          {status?.last_error && <p className="cpdlc-panel__error">{status.last_error}</p>}
+          {error && <p className="cpdlc-panel__error">{error}</p>}
+          {logonError && <p className="cpdlc-panel__error">{logonError}</p>}
+          {logonTimedOut && (
+            <p className="cpdlc-link-bar__warn">{t("cpdlc.logon_no_answer", { station: stationInput })}</p>
+          )}
+          {callsignNotice && (
+            <p className="cpdlc-link-bar__note">{t(callsignNotice.key, callsignNotice.vars)}</p>
+          )}
+        </div>
+      )}
+
+      <div className="datalink-workspace">
+        <DatalinkComposer
+          online={online}
+          mode={mode}
+          setMode={setMode}
+          callsign={resolvedCallsign}
+          loggedOn={loggedOn}
+          onChanged={onChanged}
+          onRecipientChange={setPdcRecipient}
+          stationInput={stationInput}
+          onStationInputChange={setStationInput}
+          stationEditing={stationEditing}
+          onStationEditingChange={setStationEditing}
+          logonBusy={logonBusy}
+          logonWord={logonWord}
+          logonValue={logonValue}
+          hasLogonOrPending={hasLogonOrPending}
+          showStationInput={showStationInput}
+          cpdlcStationStatus={cpdlcStationStatus}
+          alreadyOn={alreadyOn}
+          cooldownRunning={cooldownRunning}
+          cooldownLeft={cooldownLeft}
+          onSendLogon={() => void sendLogon()}
+          onSendLogoff={() => void sendLogoff()}
+        />
+        <DatalinkHistory
+          callsign={resolvedCallsign}
+          cpdlcStation={currentStation ?? stationInput}
+          pdcRecipient={pdcRecipient}
+          messages={messages}
+          onChanged={onChanged}
+        />
+      </div>
+    </section>
+  );
+}

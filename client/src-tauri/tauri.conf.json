@@ -1,0 +1,57 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "AeroACARS",
+  "version": "2.1.27",
+  "identifier": "com.aeroacars.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "AeroACARS",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 600,
+        "resizable": true,
+        "center": true,
+        "backgroundThrottling": "disabled"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' ipc: http://ipc.localhost; connect-src 'self' ipc: http://ipc.localhost data: https://tiles.openfreemap.org https://s3.amazonaws.com https://german-sky-group.eu https://www.german-sky-group.eu https://www.simbrief.com https://*.simbrief.com https://live.kant.ovh wss://live.kant.ovh https://github.com https://*.cartocdn.com https://server.arcgisonline.com https://ourairports.com https://data.vatsim.net https://cdn.jsdelivr.net; img-src 'self' data: blob: https://tiles.openfreemap.org https://german-sky-group.eu https://www.german-sky-group.eu https://*.cartocdn.com https://server.arcgisonline.com; style-src 'self' 'unsafe-inline'; script-src 'self' blob:; worker-src 'self' blob:; child-src 'self' blob:; font-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "crates/sim-msfs/ffi/lib/SimConnect.dll": "SimConnect.dll",
+      "kabine-reaktionen/": "kabine-reaktionen/"
+    },
+    "createUpdaterArtifacts": true,
+    "publisher": "AeroACARS Project",
+    "shortDescription": "Cross-platform ACARS client for phpVMS 7",
+    "longDescription": "AeroACARS connects phpVMS 7 with MSFS 2020/2024 and X-Plane 11/12, recording flights, streaming live position data, and submitting full PIREPs with detailed runway and landing analysis."
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/MANFahrer-GF/AeroACARS/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDREM0E0NzUxQzBGOTg0MDgKUldRSWhQbkFVVWM2VFFnMzJqRTVtM0pvQ285QTJPbFJBRWtIMXdUR3BDRkdtQWFFbm5lZzNiM2kK"
+    }
+  }
+}

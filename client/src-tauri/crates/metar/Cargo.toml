@@ -1,0 +1,21 @@
+[package]
+name = "metar"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "METAR fetch + parse — used to snapshot weather at takeoff and touchdown"
+
+[dependencies]
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# Used by `tokio::time::sleep` in the fetch retry loop — only the time
+# feature is required, no runtime / I/O.
+tokio = { workspace = true, features = ["time"] }
+
+[lints]
+workspace = true

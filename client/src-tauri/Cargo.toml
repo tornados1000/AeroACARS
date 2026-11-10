@@ -1,0 +1,295 @@
+[workspace]
+members = [
+    ".",
+    "crates/api-client",
+    "crates/sim-core",
+    "crates/sim-msfs",
+    "crates/sim-xplane",
+    "crates/recorder",
+    "crates/storage",
+    "crates/secrets",
+    "crates/geo",
+    "crates/metar",
+    "crates/aeroacars-mqtt",
+    "crates/landing-scoring",
+    # v0.9.0 (#Discord-RPC) — Pilot-Flugstatus im Discord-Profil
+    "crates/discord-presence",
+    # v1.3.0 (#Hoppie-PDC-CPDLC) — Hoppie-ACARS-Netzwerk-Protokoll +
+    # GOLD-Elementtabelle. Pure Logik, kein tauri/reqwest.
+    "crates/hoppie-protocol",
+    # v2.0.26 (Beta) — Kabinenansagen: Planer, Warteschlange, Drehbuch,
+    # SSML. Pure Logik, kein tauri/reqwest.
+    "crates/cabin-announcements",
+]
+resolver = "2"
+
+[workspace.package]
+version = "2.1.27"
+edition = "2021"
+# Proprietaer seit 29.09.2026 — siehe LICENSE im Repo-Wurzelordner.
+license = "LicenseRef-AeroACARS-Proprietary"
+authors = ["Thomas Kant <github@MANFahrer-GF>"]
+publish = false
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Error / logging
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Rotierende Logdatei neben der stdout-Ausgabe. Eingeführt 2026-08-09,
+# nachdem drei Abstürze in Folge (Ereignisanzeige 1000: 0xC0000374
+# Heap-Korruption bzw. 0xC000001D) NULL Anwendungs-Log hinterlassen
+# hatten — `tracing_subscriber::fmt()` schrieb ausschließlich nach
+# stdout, das beim Start aus dem Explorer ins Leere läuft.
+tracing-appender = "0.2"
+# Basisverzeichnis für die Logdatei, BEVOR es einen AppHandle gibt
+# (init_tracing() läuft als Erstes in run()). Dieselbe Ableitung, die
+# Tauri für `app_config_dir()` benutzt.
+dirs = "6"
+
+# (De)serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_with = "3"
+
+# HTTP client (rustls — no OpenSSL on Windows/macOS)
+# "http2" seit v1.6.11: ohne das Merkmal fehlt `h2` komplett im Bau und der
+# Client spricht ausschliesslich HTTP/1.1 — jede Anfrage braucht dann eine
+# EIGENE TCP+TLS-Verbindung. Beim Oeffnen des Landungen-Reiters gehen ~90
+# Flughafen-Abfragen gleichzeitig raus; parallel laufende Abrufe bekamen
+# keine Verbindung mehr und liefen in CONNECT_TIMEOUT (Feldbefund
+# 18.08.2026, BTI22). Mit HTTP/2 laufen sie ueber EINE Verbindung.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip", "http2"] }
+url = "2"
+
+# Discord Rich Presence — IPC zu lokalem Discord-Client (Named Pipe
+# v0.7.13: discord-rich-presence-Dep entfernt — Rich-Presence-Foundation
+# blieb 8 Releases lang dead, RP-Wiring kam nie. Falls Revival: wieder
+# `= "1"` hinzufuegen + Code aus git history rausziehen. Audit Q4-2026-05.
+
+# Persistence
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# v0.7.13: keyring-Dep entfernt. v0.5.15 hat von OS-Keyring auf
+# File-based Secrets-Storage (chmod 0600 JSON in <app_data_dir>) umgestellt.
+# Die `migrate_from_keyring`-Funktion war seit 30+ Releases ungenutzt.
+# Audit Q4-2026-05 (CC1) + Security-Audit M5.
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# v0.20 (Process-Integrity): cross-platform OS-process-table lookup, used
+# by sim-core::process_probe to check whether the sim's own process is
+# still alive after a disconnect (Windows/Linux/macOS, one API).
+sysinfo = "0.32"
+
+# v0.7.13: schemars-Workspace-Dep entfernt — wurde von keinem direkten
+# Code-Pfad mehr genutzt. Audit Q4-2026-05 (L9).
+
+# Internal crates (path entries)
+api-client = { path = "crates/api-client" }
+sim-core   = { path = "crates/sim-core" }
+sim-msfs   = { path = "crates/sim-msfs" }
+sim-xplane = { path = "crates/sim-xplane" }
+recorder   = { path = "crates/recorder" }
+storage    = { path = "crates/storage" }
+secrets    = { path = "crates/secrets" }
+geo        = { path = "crates/geo" }
+metar      = { path = "crates/metar" }
+aeroacars-mqtt = { path = "crates/aeroacars-mqtt" }
+landing-scoring = { path = "crates/landing-scoring" }
+hoppie-protocol = { path = "crates/hoppie-protocol" }
+cabin-announcements = { path = "crates/cabin-announcements" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+todo = "warn"
+dbg_macro = "warn"
+# clippy.toml: verbotene Aufrufe mit Deadlock-Gefahr (v1.9.24) - bricht die CI.
+disallowed_methods = "deny"
+
+# ---- The Tauri application itself ----
+
+[package]
+name = "aeroacars-app"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "AeroACARS desktop client (Tauri 2 + React)"
+
+[lib]
+# The `_lib` suffix avoids a Windows linker name clash between the bin and lib targets.
+# See https://github.com/rust-lang/cargo/issues/8519
+name = "aeroacars_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-opener = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+# v0.18.x: nativer Ordner-Auswahl-Dialog fuers Aircraft-Scan-Panel — der
+# Pilot musste den Community-/Aircraft-Pfad bisher als Text eintippen
+# (fehleranfaellig unter Windows/macOS-Pfaden). Ein Klick statt Tippen.
+tauri-plugin-dialog = "2"
+# Boarding-Musik (2.1.1 G3): streamend dekodieren (mp3/m4a/aac/wav/flac/ogg),
+# nicht die ganze Datei in den Speicher. Reines Rust, MPL-2.0.
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "aac", "isomp4", "flac", "ogg", "vorbis", "wav", "pcm"] }
+# v0.18.x: verhindert dass zwei AeroACARS-Prozesse gleichzeitig denselben
+# aktiven Flug tracken (Minimize-to-Tray laesst die App im Hintergrund
+# weiterlaufen — ein erneuter Doppelklick auf das App-Icon startete bisher
+# einen ZWEITEN Prozess statt das Fenster zu fokussieren). Zwei Prozesse
+# posten unabhaengig voneinander Phase-/Touchdown-ACARS-Logs an dieselbe
+# PIREP-ID -> doppelte Zeilen im Fluglogbuch (Live-Befund Thomas K.,
+# 05.07.2026). Muss laut Tauri-Doku als ERSTES Plugin registriert werden.
+tauri-plugin-single-instance = "2"
+# OS-native notifications (system tray badges, banners). Used to
+# alert pilots when AeroACARS is running in tray-only mode and a
+# critical event happens (PIREP cancelled remotely, sim
+# disconnected mid-flight). Cross-platform.
+tauri-plugin-notification = "2"
+
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+sysinfo.workspace = true
+dirs.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+# HTTP client for the in-app GitHub-release-notes fetch. The
+# api-client and metar crates already use reqwest via the workspace
+# dep; we just need it directly here for `fetch_release_notes`.
+reqwest.workspace = true
+
+# v1.6.14: Idempotenz-Schluessel fuer phpVMS-Positionen (siehe
+# snapshot_to_position). Nur v4 — kein Zeitstempel-Anteil noetig, die
+# ID muss lediglich stabil und kollisionsfrei sein.
+uuid = { version = "1", features = ["v4"] }
+
+# v0.7.13: discord-rich-presence Workspace-Dep entfernt (Cleanup, RP-Code raus).
+
+# Bundled CSV parser for the embedded ourairports runway table
+# (used by `src/runway.rs` to map a touchdown coord → runway).
+csv = "1.3"
+
+# v0.5.44: Regex fuer extract_icao_code — extrahiert MSFS-ATC-MODEL-Strings
+# wie "ATCCOM.AC_MODEL A321.0.text" zu "A321". regex ist eh schon als
+# transitive Dep im Tree (via tracing-subscriber + anderen).
+regex = "1"
+
+# In-process zip extraction for the X-Plane plugin auto-install
+# flow — pulls `AeroACARS-XPlane-Plugin-vX.Y.Z.zip` from the matching
+# GitHub release and unpacks it into `<X-Plane>/Resources/plugins/
+# AeroACARS/`. Default features cover deflate, which is what GitHub
+# Actions' `zip` action uses. No native deps.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# AP7 (ADR-0004 §8): SHA-256 des Plugin-Pakets pruefen. Steckt schon im Baum
+# (ueber tauri/rustls), keine neue Kiste.
+sha2 = "0.10"
+
+# v0.9.0 (#GlitchTip): Sentry-Rust SDK. Sendet anonymisierte Panics +
+# capture_message-Calls an GlitchTip (Sentry-API-kompatibel). DSN
+# kommt aus build-time-env AEROACARS_SENTRY_DSN (in CI/Build gesetzt,
+# nicht ins Repo). Wenn leer = kein Init = No-Op.
+# Wir nutzen rustls-tls (kein OpenSSL) konsistent mit reqwest.
+sentry = { version = "0.42", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
+
+# v0.15.10 (#GlitchTip-Panic): Im Dependency-Tree sind BEIDE rustls-Crypto-
+# Provider (aws-lc-rs via sentry/tauri-updater + ring via reqwest). rustls 0.23
+# kann den Process-Default dann nicht automatisch wählen → Panic auf TLS-Pfaden,
+# die den Default nutzen (GlitchTip aeroacars-client, 2026-06-01). Wir ziehen
+# rustls direkt rein, um in run() EINMAL den Default explizit zu installieren.
+rustls = { version = "0.23", features = ["aws_lc_rs"] }
+
+# v0.16.0 (#LAN-Remote): in-app LAN remote-control server. Serves the
+# real React SPA + bridges every safe Tauri command over HTTP/WS to a
+# tablet or second PC on the local network, PIN-gated. axum 0.8 reuses
+# the hyper 1.x / tower 0.5 / tower-http 0.6 already in the tree (via
+# reqwest + tauri), so this pulls almost no new transitive weight.
+# Lives entirely in `src/remote/` — does NOT bloat lib.rs.
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "ws", "query", "tokio"] }
+# `cors` → strict same-host CORS layer. The SPA itself is served from the
+# EMBEDDED Tauri assets via `app.asset_resolver()` (see `remote/router.rs`),
+# not `ServeDir`, so the `fs` feature is no longer needed.
+# `compression-gzip` → /api-Antworten gepackt (Feldbefund 28.10.2026: die
+# Landungsliste waren über die LAN-Brücke 9,9 MB; JSON packt ~7:1).
+tower-http = { version = "0.6", features = ["cors", "compression-gzip"] }
+# Enumerate the host's RFC1918 interface addresses to build the
+# http://<lan-ip>:<port> connect URLs shown in the QR code.
+if-addrs = "0.13"
+# Render the primary connect URL (+ "?pin=") to a scannable QR as an
+# inline SVG data-URL the React settings panel can <img> directly.
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+# Constant-time PIN/token comparison — avoids a timing side-channel on
+# the auth endpoint that gates control of the REAL flight.
+subtle = "2"
+# CSPRNG for the 6-digit pairing PIN + the 256-bit bearer token. These
+# gate control of the REAL flight, so they must be unguessable — a
+# SystemTime-seeded PRNG is not acceptable here. `getrandom` is the
+# minimal OS-entropy primitive and is already fully resolved in the lock
+# (pulled transitively by rand/ring), so this adds zero new build weight.
+getrandom = "0.2"
+
+# Internal crates — wired up for use as the project grows
+api-client.workspace = true
+sim-core.workspace = true
+recorder.workspace = true
+storage.workspace = true
+secrets.workspace = true
+geo.workspace = true
+metar.workspace = true
+aeroacars-mqtt.workspace = true
+landing-scoring.workspace = true
+cabin-announcements.workspace = true
+# v1.3.0 (#Hoppie-PDC-CPDLC): Hoppie-ACARS-Netzwerk-Protokoll + GOLD-
+# Elementtabelle. Wiring lebt in src/hoppie/.
+hoppie-protocol.workspace = true
+# v0.9.0 (#Discord-RPC): Pilot-Flugstatus im Discord-Profil
+discord-presence = { path = "crates/discord-presence" }
+tauri-plugin-window-state = "2"
+
+# Flugaufzeichnung vor macOS-Drosselung schützen (src/flug_aktivitaet.rs)
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSProcessInfo", "NSString"] }
+libc = "0.2"
+
+# MSFS adapter is Windows-only
+[target.'cfg(target_os = "windows")'.dependencies]
+sim-msfs.workspace = true
+# v2.0.19: Vorrang für den Aufsetz-Messfaden (src/flug_aktivitaet.rs)
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+# v2.1.27: InstallLocation von AeroACARS 3 lesen (src/bruecke_v3.rs). Kein
+# reg.exe, dessen OEM-Ausgabe zerlegt Umlaute im Pfad.
+winreg = "0.55"
+
+# Kabinenansagen (Beta): Ausgabegeraet waehlbar (src/kabinenansagen.rs,
+# mod ausgabe). Nur Windows und macOS: unter Linux braeuchte cpal libasound,
+# und dort laeuft der Client nicht (nur CI-cargo-check).
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+cpal = "0.18"
+
+# X-Plane adapter is cross-platform (UDP listener); included on all targets
+[dependencies.sim-xplane]
+workspace = true
+
+[dev-dependencies]
+# v0.7.0 — Replay-Acceptance-Tests gegen historische JSONL-Fixtures
+# (Touchdown-Forensik v2). Fixtures sind .jsonl.gz, brauchen flate2.
+flate2 = "1"
+
+[lints]
+workspace = true

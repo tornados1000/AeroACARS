@@ -1,0 +1,1060 @@
+# Prüfstand — PIREP-Infrastruktur-Härtung (nachgereicht aus v1.7.17)
+
+Zwei Befunde, die Codex (adversarial) waehrend der langen v1.7.17-QS-Kette
+(siehe `docs/qs/v1.7.17-pruefstand.md`, Runden 13 und 17) am Rande fand,
+aber die NICHT spezifisch fuer das Departure-Gate-Feature sind — sie
+betreffen Infrastruktur, die JEDE PIREP-Einreichung nutzt, seit v0.5.49
+bzw. laenger. Beide wurden bewusst NICHT in der v1.7.17-Runde selbst
+behoben (Scope), sondern als eigene `spawn_task`-Vorschlaege vorgemerkt
+und hier, auf Thomas' Wunsch, nachgereicht bearbeitet.
+
+## Befund 1 — `pirep_queue`-Worker gibt nach ~50 Versuchen fuer immer und still auf
+
+**Gefunden:** Codex, Runde 13 der v1.7.17-QS-Kette (04.09.2026).
+
+Der Hintergrund-Worker (`spawn_pirep_queue_worker`, seit v0.5.49) versucht
+einen gequeueten PIREP alle 60 Sekunden erneut einzureichen. Bei
+`attempt_count >= MAX_ATTEMPTS` (50) gab er bisher fuer immer auf — nur
+eine `tracing::warn!`-Zeile, die kein Pilot je zu sehen bekam. Da ein
+Eintrag bereits mit `attempt_count: 3` eingereiht wird (die 3 Live-Retries
+via `file_pirep_with_retry` sind schon verbraucht), blieben effektiv nur
+~47 weitere Versuche — ein phpVMS-Ausfall oder eine anhaltende Sperre
+laenger als ~47 Minuten verlor einen bereits geflogenen, fertigen PIREP
+dauerhaft und lautlos.
+
+**Gefixt:**
+
+1. **Kein permanentes Aufgeben mehr.** Nach Ueberschreiten von
+   `PIREP_QUEUE_MAX_FAST_ATTEMPTS` (weiterhin 50) wechselt der Worker in
+   eine LANGSAMERE Phase (`PIREP_QUEUE_SLOW_RETRY_INTERVAL_SECS`, 30
+   Minuten) statt aufzugeben — er versucht es einfach seltener weiter,
+   potenziell fuer Stunden, bis der Server sich erholt oder der Pilot/
+   Admin manuell eingreift.
+2. **Einmalige, sichtbare Warnung statt Stille.** Beim ERSTEN
+   Ueberschreiten der Schnellphase schreibt der Worker einen Activity-
+   Log-Eintrag ("PIREP konnte nach N Versuchen noch nicht eingereicht
+   werden ... bitte beim VA-Team melden") — einmalig (`dead_letter_notified`-
+   Flag, persistiert), kein Log-Spam bei jedem weiteren Versuch.
+3. **`Retry-After` wird jetzt honoriert.** Ein `ApiError::RateLimited`
+   setzt `retry_not_before` auf die vom Server diktierte Wartezeit
+   (gedeckelt auf `PIREP_QUEUE_RATE_LIMIT_CAP_SECS`, eine Stunde — siehe
+   unten fuer die Begruendung dieser Zahl im Vergleich zur
+   Departure-Gate-Arbeit) statt stur jede Minute erneut anzufragen.
+
+**Warum die Rate-Limit-Obergrenze hier LOCKERER ist als bei der
+Departure-Gate-Rueckzugs-Meldung** (`RATE_LIMIT_WARTEZEIT_OBERGRENZE_SEC`,
+eine Minute, siehe v1.7.17 Runde 11): jene Grenze schuetzt einen
+ABGETRENNTEN, nicht persistenten Tokio-Task vor stundenlangem Schlaf.
+`pirep_queue` dagegen ist ein DAUERHAFTER, plattenbasierter Hintergrund-
+Worker, der ohnehin jede Minute neu nachschaut — ein laengeres Warten
+kostet hier nur einen uebersprungenen Tick, kein verlorenes Ergebnis.
+
+**Tests:** `pirep_queue_dead_letter_tests` (8 Tests) — die reine
+Entscheidungslogik (`pirep_queue_eintrag_ist_faellig`,
+`pirep_queue_dead_letter_warnung_faellig`,
+`pirep_queue_slow_phase_wartezeit_sec`) ist vollstaendig unabhaengig vom
+Worker-Loop selbst testbar. Der Worker-Loop bleibt (wie der gesamte
+Rest dieser Infrastruktur) async/Tauri-gebunden und nicht isoliert
+testbar.
+
+## Befund 2 — `save_active_flight`/`flight.stop` ist ein Time-of-Check-to-Time-of-Use-Rennen
+
+**Gefunden:** Codex, Runde 17 der v1.7.17-QS-Kette (04./05.09.2026), beim
+Review zweier NEUER `!flight.stop.load(...)`-Wachen — aber zurueckverfolgt
+auf den LANGE bestehenden periodischen Checkpoint (Kommentar dort
+zitiert bereits das Risiko: "Re-check stop *before* writing").
+
+Es gibt genau EINE Aktiv-Flug-Ablage (fester Pfad, `active_flight_path`,
+keine Datei-pro-PIREP wie bei `pirep_queue`). Ueberall, wo
+`save_active_flight` nur HINTER einem separaten `if !flight.stop.load(...)`
+aufgerufen wurde, lagen Pruefung und Schreiben unsynchronisiert
+auseinander: zwischen beiden konnte `flight_end`/`flight_cancel`/
+`flight_forget` die Ablage loeschen — der laengst "erlaubte" Schreibzugriff
+haette sie danach wiederbelebt, oder schlimmer, die Ablage eines
+INZWISCHEN gestarteten neuen Fluges ueberschrieben (derselbe feste Pfad).
+
+**Gefixt:** neues `AppState::persistence_lock` (`std::sync::Mutex<()>`,
+`#[derive(Default)]` — keine Aenderung an der einzigen Konstruktionsstelle
+noetig). `save_active_flight` prueft `flight.stop` und schreibt jetzt in
+EINEM kritischen Abschnitt (`schreiben_falls_aktiv`, eine reine, von
+`AppHandle` losgeloeste Hilfsfunktion). `clear_persisted_flight` nimmt
+denselben Lock, bevor sie die Ablage loescht. An JEDER der sechs echten
+Aufrufstellen war `flight.stop` bereits VOR dem `clear_persisted_flight`-
+Aufruf gesetzt (direkt davor oder frueher in derselben Funktion) — es war
+KEINE Aenderung an den `stop.store(true, ...)`-Aufrufen selbst noetig,
+nur an den beiden Stellen, die tatsaechlich lesen/schreiben/loeschen.
+
+**Zwei resume-Discard-Aufrufstellen (`try_resume_flight`) urspruenglich
+bewusst nicht angefasst — diese Einschaetzung war UNVOLLSTAENDIG, siehe
+Nachtrag unten.** Die urspruengliche Begruendung ("dort existiert noch gar
+kein `ActiveFlight`/`flight.stop`, der Flug wird erst DANACH ins
+`Arc<ActiveFlight>` geladen, ohne gleichzeitigen Schreiber kann dort keine
+Race auftreten") stimmt fuer `state.active_flight` selbst — uebersah aber,
+dass die Ablage-DATEI (ein fester Pfad fuer "den" aktiven Flug, unabhaengig
+davon ob er schon im State liegt) waehrend des Awaits vor dem Loeschen
+sehr wohl von einem PARALLEL gestarteten neuen Flug beschrieben werden
+kann. Der Fix dafuer ist Teil des Nachtrags.
+
+**Tests:** `persistence_lock_tests` (3 Tests) — die reine Synchronisations-
+Grundlage (`schreiben_falls_aktiv`) ist unabhaengig von `AppHandle`/Tauri
+testbar. Der wichtigste Test (`schreiben_und_loeschen_ueberlappen_sich_nie`)
+erzwingt ueber 200 Durchlaeufe mit kuenstlich verzoegerten kritischen
+Abschnitten (Threads + `Barrier`) eine echte Wettlaufsituation und prueft,
+dass sich Schreiben und Loeschen NIE zeitlich ueberlappen — eine
+Gegenprobe (Lock aus der Pruef-Funktion entfernt) bestaetigte, dass der
+Test eine echte Regression zuverlaessig faengt.
+
+## Nachtrag (05.09.2026): Codex-Folgefund — Loeschung kannte keinen Eigentuemer
+
+**Gefunden:** Codex, adversarial-Review GEGEN den Commit dieser Sitzung
+(alle vier hier dokumentierten Fixes plus den Accident-Klassifikator-Fix
+zusammen), unmittelbar nach dem Push. Verdict: `needs-attention`.
+
+Der `persistence_lock` aus Befund 2 serialisiert Schreiben und Loeschen nur
+GEGENEINANDER — er sagt nichts darueber, WESSEN Flug gerade an dem einen
+festen Pfad (`active_flight_path`) liegt. `flight_cancel` nimmt den alten
+Flug per `guard.take()` aus `state.active_flight`, setzt `stop`, und haengt
+DANACH an einem echten Await (`client.cancel_pirep(...).await`, ein
+Server-Roundtrip). In dieser Luecke ist der State-Slot leer —
+`flight_start` kann in dieser Zeit bereits einen NEUEN Flug anlegen und
+dessen ersten Checkpoint an denselben Pfad schreiben. Setzt der alte Cancel
+danach fort und ruft `clear_persisted_flight`, loeschte diese Funktion
+bisher blind — und riss damit den gerade erst gestarteten neuen Flug weg.
+Ein Absturz vor dessen naechstem Checkpoint haette dessen Recovery-Zustand
+dauerhaft verloren.
+
+Derselbe Spalt betrifft — entgegen der urspruenglichen Einschaetzung oben —
+auch die beiden resume-Discard-Stellen in `try_resume_flight`: zwischen
+`client.get_pirep(...).await` und der Loeschung kann ein Pilot am
+Programmstart bereits manuell einen neuen Flug gestartet haben.
+
+**Gefixt:** neue reine Funktion `sollte_persistierten_flug_loeschen(
+erwartete_pirep_id: Option<&str>, tatsaechliche_pirep_id_auf_platte:
+Option<&str>) -> bool`. `clear_persisted_flight` bekommt jetzt an JEDER
+Aufrufstelle den PIREP der eigenen Flug-Teardown mit (`Some(&pirep_id)`)
+und liest — noch INNERHALB desselben `persistence_lock`-Abschnitts, damit
+zwischen Lesen und Loeschen kein neuer Schreiber dazwischenkommt — die
+tatsaechlich auf der Platte liegende `pirep_id` per `read_persisted_flight`.
+Geloescht wird nur, wenn beide uebereinstimmen (oder kein Eigentuemer
+erwartet wird, oder die Ablage nicht lesbar/vorhanden ist — dann gibt es
+nichts fremdes zu schuetzen).
+
+`flight_forget` musste dafuer leicht umgebaut werden: die `pirep_id` wird
+jetzt aus dem `if let Some(flight) = ...`-Block herausgetragen (statt mit
+dem Block-Ende zu verschwinden), damit sie beim Aufruf noch verfuegbar ist.
+
+**Tests:** `persistierten_flug_loeschen_eigentuemer_tests` (4 Tests) — die
+reine Entscheidung deckt: gleicher Eigentuemer loescht, ANDERER (neuerer)
+Eigentuemer loescht NICHT (der eigentliche Befund), kein erwarteter
+Eigentuemer loescht (verwaiste Datei ohne State-Gegenstueck), unlesbare/
+fehlende Ablage loescht (kein fremder Eigentuemer feststellbar). Gegenprobe
+durchgefuehrt: mit der Entscheidung fest auf `true` gesetzt schlaegt
+`loescht_nicht_wenn_die_ablage_inzwischen_einem_neueren_flug_gehoert`
+zuverlaessig fehl.
+
+## Nachtrag #2 (05.09.2026): dritte Codex-Runde — zwei weitere Befunde
+
+Dieselbe adversarial-Review, die Befund 1 im Nachtrag oben fand, ging danach
+noch einmal ueber den ANGEWACHSENEN Diff (alle Fixes dieser Sitzung
+zusammen, inkl. Nachtrag #1) und fand zwei weitere, unabhaengige Luecken.
+
+### Befund 3 — `flight_cancel`/`flight_forget` hatten die Eigentuemer-Pruefung, aber nicht den State-Lock
+
+Der Ownership-Check aus Nachtrag #1 verhindert nur, dass eine Loeschung eine
+fremde DATEI trifft. Er sagt nichts darueber, dass `flight_cancel` (Await
+vor der Loeschung) und `flight_forget` (kein Await, aber Tauri-Kommandos
+laufen auf einem Mehr-Thread-Runtime — echte Parallelitaet, kein Await
+noetig) einen NEUEN `flight_start`/`flight_adopt` ueberlappen koennten,
+waehrend `state.active_flight` schon leer ist. `flight_end` haelt fuer
+genau dieses Fenster schon seit v0.20.x `FlightSetupGuard` — `flight_cancel`
+und `flight_forget` taten das nicht.
+
+**Gefixt:** beide nehmen jetzt denselben `FlightSetupGuard` fuer ihre
+gesamte Teardown-Dauer (kein `disarm()` noetig, da beide Pfade nie wieder
+einen Flug in `active_flight` zurueckschreiben). Ein gleichzeitiger
+`flight_start`/`flight_adopt` bekommt in dem Fall den bestehenden
+"another flight start or adopt is already in progress"-Fehler und der
+Pilot versucht es einfach nochmal — ein akzeptabler Trade-off gegen
+Datenverlust.
+
+### Befund 4 — `pending_pireps/` kennt keinen Piloten
+
+Die unbegrenzte Slow-Phase aus Befund 1 macht das Zeitfenster, in dem ein
+ANDERER Pilot auf derselben Maschine eingeloggt sein kann
+(`phpvms_logout` erlaubt das ausdruecklich), potenziell beliebig lang statt
+auf ~47 Minuten begrenzt. Ohne Eigentuemer-Pruefung haette der Worker Pilot
+As PIREP mit Pilot Bs Credentials eingereicht — Erfolg: falsch zugeordnet;
+403/404 (als "nicht transient" eingestuft): geloescht, Pilot As Flug
+dauerhaft verloren.
+
+**Gefixt:** neue `Client::identity_fingerprint()` (api-client-Crate) — ein
+nicht-kryptographischer, aber fuer Gleichheitspruefungen ausreichender Hash
+aus Basis-URL + API-Key, NIE der Rohschluessel selbst. `QueuedPirep` traegt
+jetzt `owner_identity: Option<String>` (beim Einreihen gesetzt). Reine
+Entscheidungsfunktion `pirep_queue_eintrag_gehoert_aktuellem_piloten`: ein
+Eintrag wird nur bearbeitet, wenn sein Eigentuemer exakt dem GERADE
+eingeloggten Client entspricht. Alt-Eintraege ohne das Feld (`None`) zaehlen
+als "Eigentuemer unbekannt" — NICHT als "niemandes, also frei" — und werden
+wie ein Fremd-Eigentuemer in Quarantaene belassen (weder eingereicht noch
+geloescht, kein Versuchszaehler/Retry-Zeit angefasst).
+
+**Tests:** `pirep_queue_eigentuemer_tests` (3 Tests) + 4 neue Tests fuer
+`Client::identity_fingerprint` im api-client-Crate (gleiche Verbindung →
+gleicher Fingerabdruck, anderer Key/andere VA → anderer Fingerabdruck,
+Fingerabdruck enthaelt den Rohschluessel nicht). Gegenprobe fuer die
+Eigentuemer-Entscheidung durchgefuehrt: mit `None` absichtlich als "frei"
+behandelt schlaegt `unbekannter_eigentuemer_gilt_nicht_als_frei` zuverlaessig
+fehl.
+
+## Nachtrag #3 (05.09.2026): vierte Codex-Runde — die Eigentuemer-Pruefung selbst hatte zwei Ausfaelle
+
+Adversarial-Review gegen den ANGEWACHSENEN Diff (alle bisherigen Nachtraege
+zusammen) fand zwei "no-ship"-Probleme GENAU in der Eigentuemer-Pruefung
+aus Befund 4 — beide haetten fuer sich genommen wartende PIREPs dauerhaft
+verwaisen lassen, also exakt das Gegenteil dessen bewirkt, was der Fix
+verhindern sollte.
+
+**Ausfall A — der Upgrade-Moment selbst.** Jeder VOR diesem Fix bereits
+gequeuete PIREP deserialisiert mit `owner_identity: None` (der
+`#[serde(default)]`). Die reine Fingerabdruck-Pruefung aus Befund 4 laesst
+`None` nie durch — ein bereits wartender, fertig geflogener PIREP waere
+beim ersten Tick nach dem Update fuer immer in Quarantaene gelandet, auch
+wenn derselbe Pilot, der ihn eingereiht hat, noch eingeloggt ist.
+
+**Ausfall B — API-Key-Rotation.** Der Fingerabdruck haengt am Rohschluessel;
+rotiert ein Pilot seinen eigenen API-Key (phpVMS-Einstellungen), aendert
+sich der Fingerabdruck, obwohl es derselbe Account bleibt — jeder zuvor
+gequeuete Eintrag faellt danach dauerhaft durch dieselbe Pruefung.
+Verschaerft durch einen dritten, unabhaengigen Fund: die erste Fassung von
+`identity_fingerprint` nahm `std::collections::hash_map::DefaultHasher`,
+dessen Ausgabe laut eigener std-Doku NICHT ueber Rust-/Compiler-Versionen
+stabil ist — waere also bei JEDEM Client-Update ohnehin fuer ALLE
+Eintraege, nicht nur nach einer Key-Rotation, neu ausgefallen.
+
+**Gefixt (zwei Teile):**
+
+1. `identity_fingerprint` nimmt jetzt FNV-1a von Hand statt `DefaultHasher`
+   — deterministisch fuer immer, weil es eigener Code ist, nicht
+   std-internes, ausdruecklich unspezifiziertes Verhalten.
+2. Vor der endgueltigen Quarantaene fragt der Worker EINMAL pro Tick
+   serverseitig nach (`GET /api/user/pireps?state=0` via
+   `get_user_pireps_in_progress()`, bereits serverseitig auf den
+   eingeloggten Piloten gefiltert): steht der Eintrag dort noch als
+   IN_PROGRESS, gehoert er unabhaengig vom lokalen Fingerabdruck demselben
+   Account — der Worker schreibt den aktuellen Fingerabdruck auf den
+   Eintrag (reklamiert ihn) statt ihn verwaisen zu lassen. Ein echter
+   Fremd-Eigentuemer (Pilot A eingeloggt als Pilot B) taucht in Pilot Bs
+   eigener, serverseitig gefilterter Liste nie auf und bleibt korrekt in
+   Quarantaene.
+
+**Tests:** golden-value-Test fuer `identity_fingerprint` (fest verdrahteter
+Erwartungswert, faengt einen kuenftigen Ruecktausch auf einen std-Hasher —
+ein reiner "gleiche Eingabe -> gleiche Ausgabe"-Test haette das NICHT
+gefangen, weil er auch mit `DefaultHasher` innerhalb eines Testlaufs
+bestanden haette). Quelltext-Wächter fuer den Reklamier-Pfad im
+Worker-Loop (Tauri-/async-gebunden, nicht isoliert testbar) — verlangt
+sowohl den Server-Aufruf als auch das Umschreiben von `owner_identity`.
+**Eigene Lehre aus dieser Runde:** die erste Fassung dieses Wächters
+suchte per `.find("fn spawn_pirep_queue_worker")` nach der Zielfunktion —
+genau dieses Literal stand aber bereits VORHER im eigenen Testcode (als
+Teil der Fehlermeldung), `include_str!` liest die gesamte Datei
+einschliesslich dieser Zeile, also fand sich der Test beinahe selbst statt
+der echten Funktion. Behoben nach demselben Muster wie
+`vor_der_server_auskunft_wird_nichts_geloescht` weiter oben in dieser
+Datei: die Suchnadel wird aus zwei Teilen zur Laufzeit zusammengesetzt,
+damit sie als zusammenhaengendes Literal nirgends im eigenen Testcode
+steht. Gegenprobe fuer beide Haelften des Wächters durchgefuehrt.
+
+## Nachtrag #4 (05.09.2026): fuenfte Codex-Runde — Eigentuemer-Identitaet war nicht am Flug festgemacht
+
+Adversarial-Review gegen den weiter angewachsenen Diff fand: die
+Eigentuemer-Fixes aus Nachtrag #3 leiteten den Fingerabdruck bei JEDER
+Speicherung/Einreihung frisch aus `current_client(&state)` ab — also aus
+WER GERADE eingeloggt ist, nicht aus wem der Flug tatsaechlich gehoert.
+`phpvms_logout` leert `state.client`, aber ausdruecklich NICHT
+`state.active_flight` ("ein anderer Pilot kann sich auf derselben Maschine
+anmelden"). Zwei konkrete Ausfaelle daraus:
+
+* **`try_resume_flight`** fragte den PIREP direkt per ID ab
+  (`client.get_pirep`), bevor irgendeine Eigentuemer-Pruefung lief. Meldet
+  phpVMS dabei `NotFound` fuer den falschen (inzwischen eingeloggten)
+  Account, loeschte der Code Pilot As Ablage dauerhaft. Antwortet phpVMS
+  stattdessen `Ok` (falls die Abfrage nicht pro Account beschraenkt ist),
+  haette der Code Pilot As Flug unter Pilot Bs Session wiederaufgenommen.
+* **`pirep_queue`s Einreihung** (Nachtrag #3) stempelte den Fingerabdruck
+  des Piloten, der GERADE eingeloggt ist, wenn `flight_end` laeuft — nicht
+  den des Piloten, der den Flug gestartet hat. Loggt sich Pilot A aus
+  (ohne den Flug zu beenden) und Pilot B ein, bevor ein transienter
+  Filing-Fehler den PIREP in die Queue schiebt, traegt der Eintrag Pilot Bs
+  Fingerabdruck — der Worker haette ihn spaeter fuer B, nicht fuer A,
+  behandelt.
+
+**Gefixt:** neues `AppState::active_flight_owner_identity` (`Mutex<Option
+<String>>`, Default-abgeleitet — keine Aenderung an der einzigen
+`AppState`-Konstruktionsstelle noetig, im Unterschied zu `ActiveFlight` mit
+seinen 22 Konstruktionsstellen). Wird EINMAL gesetzt, in `flight_start`,
+`flight_adopt` und beim erfolgreichen Resume — direkt wenn der Flug in
+`state.active_flight` installiert wird — aus dem GERADE eingeloggten
+Client. `PersistedFlight` traegt jetzt `owner_identity: Option<String>`
+(bei jedem Speichern aus `active_flight_owner_identity` uebernommen, nicht
+aus `current_client`), `pirep_queue::QueuedPirep::owner_identity` liest
+beim Einreihen ebenfalls aus `active_flight_owner_identity` statt aus
+`current_client(&state)`.
+
+`try_resume_flight` prueft die Eigentuemerschaft jetzt VOR der direkten
+PIREP-ID-Abfrage: stimmt der Fingerabdruck ueberein, laeuft die bestehende
+Logik unveraendert. Stimmt er nicht ueberein ODER fehlt er (Alt-Ablage von
+vor diesem Feld) — derselbe Reklamier-Weg wie bei `pirep_queue`: einmalig
+serverseitig nachfragen (`get_user_pireps_in_progress`, bereits
+serverseitig auf den eingeloggten Piloten gefiltert), ob der PIREP
+TROTZDEM zum aktuellen Account gehoert. Wenn ja: reklamieren (Fingerabdruck
+neu schreiben), normal fortfahren. Wenn nein: Resume ueberspringen, Ablage
+unangetastet lassen (weder Loeschen noch Uebernehmen) — dieselbe
+Quarantaene-Philosophie wie bei der Warteschlange.
+
+**Tests:** ein Quelltext-Wächter (`die_eigentuemer_pruefung_laeuft_vor_der_
+server_abfrage_per_id`) verlangt, dass die Eigentuemer-Pruefung textuell VOR
+der direkten `client.get_pirep`-Abfrage in `try_resume_flight` steht.
+Gegenprobe durchgefuehrt: Pruefung entfernt (Zeilen geloescht, ein einzelner
+Ersatz fuer die dadurch fehlende Variable eingefuegt, damit es weiter
+kompiliert) — der Wächter schlaegt zuverlaessig fehl.
+
+### Ein zweiter, unabhaengiger Fund derselben Runde: G-Kraft-Merge kam zu spaet fuer den Klassifikator
+
+Dieselbe Codex-Runde fand ausserdem, dass der Fruehdump-Fix aus
+`docs/qs/accident-klassifikator-bounce-aufprall-2026-09.md` selbst noch
+eine Ordnungs-Luecke hatte — Details dort im Nachtrag. Kurzfassung: der
+Merge von `peak_g_post_500ms` nach `landing_peak_g_force` lief bisher NUR
+NACH dem `apply_accident_heuristic`-Aufruf (Zeile ~180 weiter unten, nach
+`drop(stats)` + Re-Lock) — der Klassifikator sah damit fuer GENAU den
+Touchdown, den er bewerten soll, entweder `None` (nach dem Klettern-Reset
+aus dem urspruenglichen Fruehdump-Fix) oder einen veralteten Wert. Neue
+Hilfsfunktion `peak_g_force_verschmelzen` (aus den zwei bisherigen
+Kopien der Merge-Logik zusammengezogen), jetzt zusaetzlich VOR dem
+Klassifikator-Aufruf angewendet.
+
+## Nachtrag #5 (05.09.2026): sechste Codex-Runde — der erste Checkpoint und die lebenden API-Aufrufe
+
+Adversarial-Review gegen den weiter angewachsenen Diff fand zwei letzte
+Luecken in derselben Eigentuemer-Kette.
+
+**Befund A — der ERSTE Checkpoint eines neuen Fluges trug noch den
+Eigentuemer des vorigen.** Alle drei Flug-Erzeugungspfade (`flight_start`,
+`flight_adopt`, manueller Plan) rufen `save_active_flight` UNMITTELBAR nach
+dem Bauen des `ActiveFlight`-Objekts auf — die Eigentuemer-Zuweisung aus
+Nachtrag #4 sass aber erst SPAETER, wenn der Flug in `state.active_flight`
+installiert wird. Da `active_flight_owner_identity` beim Beenden eines
+Fluges nicht geleert wird, haette dieser allererste Checkpoint den
+Fingerabdruck des VORHERIGEN Piloten getragen (oder gar keinen, beim
+allerersten Flug ueberhaupt). Ein Absturz genau in diesem schmalen Fenster
+haette den falschen Eigentuemer auf der Platte eingefroren.
+
+**Gefixt:** die Eigentuemer-Zuweisung wandert an alle drei Erzeugungspfaden
+VOR den jeweils ersten `save_active_flight`-Aufruf, direkt nachdem
+`client` (der gerade authentifizierte Account) feststeht.
+
+**Befund B — die Eigentuemer-Bindung schuetzte nur, was auf der Platte
+liegt, nicht die laufenden API-Aufrufe.** Alle bisherigen Fixes (Resume-
+Ablage, PIREP-Queue) greifen nur an den Stellen, die den `owner_identity`-
+Wert tatsaechlich lesen. Positions-Updates, normales/manuelles PIREP-
+Filing, Cancel und MQTT-Finalisierung lesen dagegen bei JEDEM Aufruf frisch
+`current_client(&state)` — waere waehrend eines laufenden Fluges bereits
+ein anderer Pilot eingeloggt, haetten ALLE diese Aufrufe klaglos mit dessen
+Credentials gearbeitet, unabhaengig vom Eigentuemer-Feld. Jede einzelne
+dieser Aufrufstellen im gesamten Flug-Lebenszyklus abzusichern waere eine
+sehr breite Aenderung mit hohem Streu-Risiko gewesen.
+
+**Gefixt an der Wurzel statt an jeder Aufrufstelle:** `phpvms_logout` lehnt
+jetzt ab, solange ein Flug aktiv ist ("bitte zuerst beenden oder
+abbrechen"). `phpvms_login` prueft zusaetzlich, ob ein bereits laufender
+Flug einem ANDEREN Account gehoert als dem neu eingegebenen Schluessel —
+ein Re-Login DESSELBEN Piloten (z. B. nach einem abgelaufenen Key) bleibt
+ausdruecklich erlaubt, ein Kontowechsel waehrend eines fremden laufenden
+Fluges wird verweigert. Damit kann `state.client` waehrend eines Fluges
+gar nicht mehr auf einen anderen Account wechseln — die Wurzel des
+gesamten Befundklasse ist verriegelt, ohne dass jede einzelne der vielen
+API-Aufrufstellen einzeln geprueft werden musste.
+
+**Tests:** Quelltext-Wächter fuer beide Riegel (`logout_prueft_
+aktiven_flug_vor_dem_leeren_von_state_client`,
+`login_prueft_den_flug_eigentuemer_vor_dem_ueberschreiben_von_state_
+client`), beide gegen Whitespace/Zeilenumbrueche gehaertet (`ohne_
+leerraum`) — ein rustfmt-Lauf brach die erste, naive Fassung sofort, weil
+er die mehrteilige Bedingung im Logout-Riegel auf mehrere Zeilen umbrach.
+Gegenprobe fuer beide Riegel durchgefuehrt: Reihenfolge vertauscht, beide
+Wächter schlagen zuverlaessig fehl.
+
+**Eigene Lehre aus dieser Runde:** gleich zwei Mal in Folge brach ein
+eigener Doc-Kommentar (nicht der Code selbst) den Klammer-Zaehler von
+`tests/angeschlossen.rs`, weil er ein einzelnes Klammerzeichen in
+Backticks zitierte, um Code zu erklaeren. Ab jetzt: Code-Fragmente in
+Kommentaren innerhalb dieser Datei nie mit einer einzelnen, unausgeglichenen
+`{` oder `}` zitieren — lieber umschreiben.
+
+## Nachtrag #6 (05.09.2026): siebte Codex-Runde — der Fingerabdruck selbst war die falsche Grundlage
+
+Adversarial-Review gegen den weiter angewachsenen Diff verwarf die
+Identitaets-QUELLE aus allen bisherigen Nachtraegen — nicht nur einzelne
+Aufrufstellen. Drei zusammenhaengende Befunde:
+
+**Befund A (medium) — API-Key-Rotation sperrte den eigenen Piloten aus.**
+`Client::identity_fingerprint()` hashte Basis-URL + API-Key. Eine legitime
+Rotation DESSELBEN Piloten (z. B. nach einem abgelaufenen Key neu erzeugt)
+aendert den Hash, obwohl der Account derselbe bleibt — kombiniert mit dem
+Logout-Riegel aus Nachtrag #5 (kein Logout waehrend ein Flug aktiv ist)
+und dem Login-Riegel (lehnt eine "andere" Identitaet ab) waere der Pilot
+eingesperrt gewesen: weder aus- noch mit dem neuen Key wieder einloggen,
+ohne die App neu zu starten oder den Flug aufzugeben.
+
+**Befund B (medium) — ein abgeschlossener Flug sperrte JEDEN naechsten
+Login dauerhaft.** Der Login-Riegel aus Nachtrag #5 prüfte
+`active_flight_owner_identity` OHNE zu pruefen, ob ueberhaupt noch ein Flug
+aktiv ist — dieses Feld wird beim Beenden/Abbrechen eines Fluges nicht
+geleert. Nach dem ALLERERSTEN abgeschlossenen Flug haette jeder folgende
+Login (auch desselben Piloten nach normalem Logout) mit "ein anderer
+Account ist aktiv" abgelehnt, obwohl `active_flight` laengst leer war.
+
+**Befund C (high) — Login/Flugstart konnten trotzdem interleaven.** Der
+Login-Riegel prieft und gibt seinen Lock frei, BEVOR `get_profile()`
+(ein echter Server-Roundtrip) laeuft; `state.client` wird erst DANACH
+committed. Ohne denselben Lifecycle-Lock wie `flight_start` haette ein
+zweiter Account waehrend genau dieses Roundtrips (kein aktiver Flug zum
+Pruefzeitpunkt) unbemerkt einen Flug starten koennen — das Login committet
+danach trotzdem, der neue Flug liefe unter falschen Credentials weiter.
+
+**Gefixt (Grundlagenwechsel, nicht nur Reihenfolge):**
+
+1. `Client::identity_fingerprint()` komplett entfernt (samt seiner 5
+   Tests) — ersetzt durch `Profile.pilot_id` (server-verifiziert,
+   ueberlebt eine Key-Rotation). Neues `AppState::authenticated_pilot_id`
+   (`Mutex<Option<i64>>`), gesetzt bei jedem erfolgreichen Login
+   (`phpvms_login`, `phpvms_load_session`) — `flight_start`/`flight_adopt`/
+   der manuelle Plan-Pfad und `try_resume_flight` lesen daraus statt einen
+   weiteren `get_profile()`-Roundtrip zu brauchen.
+2. `phpvms_login` prueft die Eigentuemerschaft jetzt ERST NACH
+   `get_profile()` (braucht `profile.pilot_id`) UND nur, wenn
+   `state.active_flight.is_some()` TATSAECHLICH zutrifft (Befund B).
+3. `phpvms_login` UND `phpvms_logout` nehmen jetzt denselben
+   `FlightSetupGuard`/`flight_setup_in_progress`-Lock wie `flight_start`/
+   `flight_adopt`/Resume — `phpvms_login` gibt ihn frei, BEVOR es selbst
+   `try_resume_flight` aufruft (sonst haette Resume sich staendig selbst
+   blockiert: "resume already in progress").
+
+**Tests:** die beiden Quelltext-Wächter aus Nachtrag #5 blieben gueltig
+(neu gegengeprueft nach dem Umbau — Reihenfolge weiterhin korrekt), plus
+ein neuer, gezielter Wächter fuer Befund B
+(`login_prueft_zusaetzlich_ob_ueberhaupt_ein_flug_aktiv_ist`). Gegenprobe
+fuer alle drei durchgefuehrt.
+
+## Nachtrag #7 (05.09.2026): achte Codex-Runde — Frontend-Riegel, Race im Queue-Worker, ehrliche Grenze bei Key-Rotation
+
+Adversarial-Review gegen den weiter gewachsenen Diff (jetzt HEAD~7) fand
+drei neue, voneinander unabhaengige Befunde — zwei davon werteten die
+Riegel aus den Nachtraegen #5/#6 ab, ohne sie selbst zu betreffen.
+
+**Befund 1 (high) — das Frontend ignorierte die Ablehnung des Backends.**
+`App.tsx::handleLogout` fing JEDEN Fehler aus `invoke("phpvms_logout")`
+pauschal ab (urspruenglich fuer einen ganz anderen Fehlerfall gedacht:
+ein nicht erreichbarer Schluesselbund) und loggte die Oberflaeche
+IMMER aus — auch wenn das Backend den Logout wegen eines aktiven Fluges
+(Nachtrag #5) korrekt mit `flight_active` verweigert hatte. Der Riegel im
+Backend war also fachlich vorhanden, wurde dem Piloten aber nie sichtbar
+gemacht: die App zeigte den Logout als erfolgreich an, obwohl serverseitig
+gar nichts passiert war.
+
+**Befund 2 (high) — Client und Piloten-ID konnten im Queue-Worker
+auseinanderlaufen.** `spawn_pirep_queue_worker` las `state.client` und
+`state.authenticated_pilot_id` bislang an zwei getrennten Stellen im
+selben Tick, getrennt durch einen echten Await-Punkt
+(`drain_pending_bid_cleanup(...).await`). Ein Logout/Login-Kontowechsel
+genau in dieser Luecke haette Pilot As Client mit Pilot Bs Identitaet
+gepaart — ein Warteschlangen-Eintrag, der tatsaechlich Pilot B gehoert,
+haette die Eigentuemer-Pruefung bestanden, waere aber mit Pilot As
+Credentials eingereicht worden (und bei einem 403/404 faelschlich
+geloescht statt in Quarantaene zu bleiben).
+
+**Befund 3 (high) — die seit Nachtrag #6 erlaubte Key-Rotation
+DESSELBEN Piloten hilft laufenden Hintergrund-Aufgaben nichts.**
+`spawn_position_streamer` nimmt seinen `Client` per Wert entgegen und
+haelt ihn fuer die gesamte Laufzeit des Fluges in einer `async move`-
+Task — er loest `current_client(&state)` nie erneut auf. Ein Re-Login
+DESSELBEN Piloten mit neuem Schluessel (seit Nachtrag #6 ausdruecklich
+erlaubt) aendert an dieser laufenden Positions-Uebertragung nichts: sie
+meldet mit dem ALTEN Schluessel weiter, bis der Flug endet. Gegengeprueft:
+`flight_end`/`flight_cancel` loesen `current_client(&state)` dagegen bei
+JEDEM Aufruf frisch auf — ein geordnetes Beenden/Abbrechen profitiert vom
+Re-Login also durchaus, nur die Positions-Uebertragung selbst nicht.
+
+**Gefixt:**
+
+1. `handleLogout` unterscheidet jetzt `code === "flight_active"` von
+   jedem anderen Fehler und bricht in diesem Fall VOR dem Aufraeumen des
+   Session-Zustands ab, statt die Oberflaeche trotzdem auszuloggen. Ein
+   `Notice`/`Button`-Banner (Hausmuster aus `IntegrityBanner.tsx`, bewusst
+   KEIN `window.alert()` — das wird unter macOS WKWebView lautlos
+   verschluckt, siehe bestehender Kommentar in `SettingsPanel.tsx`) zeigt
+   dem Piloten den Grund an.
+2. `spawn_pirep_queue_worker` erfasst `client` UND `authenticated_pilot_id`
+   jetzt als EINEN atomaren Schnappschuss, bevor irgendein Await in diesem
+   Tick laeuft — `drain_pending_bid_cleanup(...).await` folgt erst danach.
+3. Fuer Befund 3 KEINE Architekturaenderung (jeder Langlaeufer muesste
+   sonst pro Tick neu `current_client(&state)` aufloesen — eine sehr
+   breite, streuende Aenderung fuer eine seltene Situation). Stattdessen
+   eine ehrliche, sichtbare Warnung: `phpvms_login` protokolliert per
+   `log_activity_handle`, dass Positions-Updates bei einem erkannten
+   Kontowechsel waehrend eines laufenden Fluges mit dem ALTEN Zugang
+   weiterlaufen, bis der Flug endet — mit dem Hinweis, den Flug bei
+   anhaltenden Problemen zu beenden/abzubrechen und neu zu starten.
+
+**Tests:** neuer Quelltext-Waechter
+`client_und_piloten_id_werden_vor_dem_ersten_await_gemeinsam_erfasst`
+fuer Befund 2 (prueft, dass `authenticated_pilot_id` textuell VOR
+`drain_pending_bid_cleanup(&app, &client).await` im Funktionskoerper
+steht) — Gegenprobe durchgefuehrt (Reihenfolge vertauscht, Waechter
+schlaegt fehl; wiederhergestellt, Waechter besteht wieder). Fuer Befund 1
+(Frontend) und Befund 3 (Log-Warnung) keine dedizierten neuen Tests —
+Befund 1 ist durch `npx tsc -b` und den bestehenden Vitest-Lauf (731 grün)
+nur indirekt abgedeckt, Befund 3 ist eine reine Transparenz-Ergaenzung
+ohne eigenen Kontrollfluss, der sich sinnvoll gegenpruefen liesse.
+
+## Nachtrag #8 (05.09.2026): neunte Codex-Runde — Bid-Cleanup-Queue, Best-Effort-Nachbearbeitung, Resume-Lock-Reihenfolge
+
+Adversarial-Review gegen alle acht bisherigen Commits dieser Serie fand
+sechs weitere, voneinander unabhaengige Befunde (vier mittel, zwei gering)
+— keiner davon eine bereits gefixte Fehlerklasse.
+
+**Befund 1 (mittel) — die separate Bid-Cleanup-Warteschlange hatte GAR
+KEINE Kontobindung.** `PendingBidCleanup` (eigene, kleine Warteschlange
+neben dem Haupt-PIREP-Queue, fuer `delete_bid`-Retries nach transientem
+Scheitern) besass kein `owner_identity`-Feld — jeder Eintrag wurde mit dem
+gerade angemeldeten Client verarbeitet, unabhaengig davon wer ihn
+eingereiht hatte. Ein Kontowechsel waehrend ein Eintrag noch offen war,
+haette `delete_bid` mit dem FALSCHEN Account ausgefuehrt.
+
+**Befund 2 (mittel) — Best-Effort-Nachbearbeitung im Queue-Worker las
+nach dem Filing erneut den aktuellen Zustand.** Das phpVMS-Filing selbst
+nutzt korrekt den am Tick-Anfang erfassten Client. Die MQTT-Publish- und
+JSONL-Upload-Schritte DANACH lasen aber erneut `state.mqtt` bzw. frisch
+aus dem Keyring — nach mehreren Awaits seit dem Schnappschuss. Ein
+Kontowechsel in dieser Luecke haette Pilot As bereits korrekt
+eingereichten PIREP ueber Pilot Bs MQTT-Verbindung/Zugangsdaten
+weitergesendet.
+
+**Befund 3 (mittel) — das Frontend behandelte `flight_setup_in_progress`
+wie einen erfolgreichen Logout.** Der Fix aus Nachtrag #7 unterschied nur
+`flight_active` von anderen Fehlern. `phpvms_logout` kann aber auch mit
+`flight_setup_in_progress` ablehnen (der `FlightSetupGuard` wird gerade
+von einem Flugstart/einer Uebernahme gehalten) — ebenfalls VOR jeder
+Zustandsaenderung. Dieser Fall fiel weiterhin durch zum „trotzdem
+ausloggen"-Pfad.
+
+**Befund 4 (mittel) — `try_resume_flight` nahm seinen Lifecycle-Lock erst
+NACH zwei Server-Roundtrips.** Der `FlightSetupGuard` wurde erst nach der
+Eigentuemer-Reklamierung (`get_user_pireps_in_progress`) und `get_pirep`
+erworben, nicht davor. Ein zeitgleicher `flight_start`/`flight_adopt`
+(z. B. der Auto-Start-Watcher) haette in dieser Luecke einen neuen Flug
+anlegen und den Ablage-Platz ueberschreiben koennen — der zu
+wiederaufnehmende PIREP waere danach lokal verwaist und serverseitig fuer
+immer IN_PROGRESS steckengeblieben.
+
+**Befund 5 (gering) — der neue Logout-Banner (Nachtrag #7) war hart
+Deutsch,** ohne i18n-Anbindung, obwohl das Projekt DE/EN/IT unterstuetzt.
+
+**Befund 6 (gering) — die Logout-Sperr-Meldung ueberlebte einen spaeter
+erfolgreichen Logout/Login.** `logoutBlockedMessage` wurde nur ueber den
+Schliessen-Button zurueckgesetzt.
+
+**Gefixt:**
+
+1. `PendingBidCleanup` bekam ein `owner_identity`-Feld (`#[serde(default)]`
+   fuer Altbestand). `drain_pending_bid_cleanup` prueft es jetzt vor
+   `delete_bid` — bei Unbekannt/Fremd EINMAL serverseitig nachfragen
+   (`GET /api/user/bids`, serverseitig auf den eingeloggten Piloten
+   gefiltert): steht der Bid dort, wird reklamiert; sonst Quarantaene
+   (weder geloescht noch versucht), analog zum bestehenden Reklamier-Weg
+   der Haupt-Queue.
+2. Der Queue-Worker prueft direkt vor dem MQTT-Publish/JSONL-Upload eines
+   Eintrags erneut, ob `authenticated_pilot_id` noch mit dem
+   Tick-Schnappschuss uebereinstimmt — bei Kontowechsel werden beide
+   Best-Effort-Kanaele fuer diesen Eintrag uebersprungen (das Filing selbst
+   bleibt unangetastet, es ist bereits korrekt erfolgt).
+3. `handleLogout` unterscheidet jetzt `flight_active` UND
+   `flight_setup_in_progress` als „nichts veraendert" von jedem anderen
+   Code (der immer erst NACH dem Leeren von `state.client` auftritt).
+4. Der `FlightSetupGuard` in `try_resume_flight` wird jetzt vor der
+   Eigentuemer-Reklamierung erworben, nicht danach; die dadurch redundante
+   zweite Lock-Anforderung weiter unten (StrictMode-Doppelmount-Schutz) ist
+   entfernt, da der Lock ab jetzt schon die ganze Funktion ueber gehalten
+   wird.
+5. Neue i18n-Schluessel (`flight.error.flight_active`,
+   `flight.error.flight_setup_in_progress`, `logout.blocked_title`,
+   `logout.dismiss`) in DE/EN/IT — Parity-Test bleibt gruen.
+6. `logoutBlockedMessage` wird jetzt sowohl bei einem spaeter erfolgreichen
+   Logout als auch bei einem neuen Login zurueckgesetzt.
+
+**Tests:** drei neue Quelltext-Waechter
+(`pending_bid_cleanup_prueft_eigentuemer_vor_delete_bid`,
+`queue_worker_prueft_identitaet_erneut_vor_mqtt_und_log_upload`,
+`try_resume_flight_haelt_lifecycle_lock_vor_den_server_roundtrips`), alle
+drei per Gegenprobe verifiziert. Fuer Befund 5/6 (Frontend) keine
+dedizierten neuen Tests, dafuer die bestehende i18n-Parity-Suite plus
+`npx tsc -b`/Vitest weiterhin gruen — konsistent mit dem in Nachtrag #7
+etablierten Massstab.
+
+**Eigene Lehre aus dieser Runde:** zwei der drei neuen Quelltext-Waechter
+hatten anfangs den klassischen Selbst-Treffer-Fehler (Runde 3, siehe oben)
+— die Namens-Endboundary `\nfn ` allein reicht nicht, wenn die naechste
+Funktion selbst eine `async fn` ist (das Suchfenster ueberschiesst dann in
+spaetere, unverwandte Funktionen). Zusaetzlich hat der Test fuer
+`try_resume_flight` einen VOLLSTAENDIG ANDEREN, laengst bestehenden
+Waechter (`vor_der_server_auskunft_wird_nichts_geloescht` u. a., alle in
+`wiederaufnahme_langstrecke_tests`) mit rot gemacht — dessen
+whitespace-stripping-Suche fand versehentlich mein eigenes Test-Literal
+zuerst, weil eine der beiden zur Laufzeit zusammengesetzten Haelften
+("async fn try_resume_flight") exakt dem Suchbegriff jenes Waechters
+entsprach. Beide Male erst durch den vollen Testlauf aufgefallen, nicht
+durch den isolierten Testlauf des neuen Tests allein — **neue
+Quelltext-Waechter deshalb ab jetzt immer gegen die VOLLE Testsuite laufen
+lassen, nicht nur isoliert.**
+
+## Nachtrag #9 (05.09.2026): zehnte Codex-Runde — die Session selbst war nicht atomar, plus fünf weitere Lücken
+
+Adversarial-Review gegen alle neun bisherigen Commits fand sieben neue,
+voneinander unabhängige Befunde (fünf hoch, zwei mittel) — der wichtigste
+davon wertete eine tragende Annahme aus Runde 8 selbst ab.
+
+**Befund 1 (hoch) — `phpvms_load_session` nahm keinen Lifecycle-Lock.**
+Anders als `phpvms_login`/`phpvms_logout`/`try_resume_flight` prüfte diese
+Funktion nicht gegen den `FlightSetupGuard`, bevor sie `state.client`
+überschreibt — ein gleichzeitiger Login/Flugstart während ihres eigenen
+`get_profile`-Roundtrips hätte in der Lücke einen fremden Flug installieren
+können.
+
+**Befund 2 (hoch) — der „atomare Schnappschuss" aus Runde 8 war es nicht
+wirklich.** `client` und `authenticated_pilot_id` wurden über ZWEI
+unabhängige Mutexe gelesen bzw. geschrieben. Kein Await dazwischen schützt
+davor — auf Tauris Multi-Thread-Runtime können Leser und Schreiber
+gleichzeitig auf verschiedenen OS-Threads laufen, und zwei getrennte
+Lock/Unlock-Paare geben keine gemeinsame Atomaritäts-Garantie. Ein Leser
+hätte (neuer Client, alte Identität) oder umgekehrt sehen können.
+
+**Befund 3 (hoch) — die Bid-Reklamierung akzeptierte eine geteilte
+`flight_id` als Eigentumsnachweis.** `flight_id` bezeichnet den GEPLANTEN
+Flug, nicht den Bid — mehrere Piloten können legitim je einen eigenen Bid
+auf denselben Flug haben. Ein Treffer allein über `flight_id` hätte Pilot
+As Cleanup-Eintrag fälschlich Pilot B zugeschrieben und dessen `delete_bid`
+hätte Bs eigenen, unbeteiligten Bid gelöscht.
+
+**Befund 4 (hoch) — MQTT-Publisher-Provisionierung war nicht kontenatomar.**
+Der Idempotenz-Guard prüfte nur „läuft schon einer" und gab den Lock sofort
+wieder frei — zwischen dieser Prüfung und der tatsächlichen Installation
+liegen mehrere echte Netzwerk-Awaits. Ein Logout in dieser Lücke hätte
+einen verspäteten Handle trotzdem installiert. Zusätzlich stoppte der
+Status-Gate-Pfad in `phpvms_load_session` einen bereits laufenden Publisher
+nicht.
+
+**Befund 5 (mittel) — der JSONL-Upload band die tatsächlichen Credentials
+nicht.** Die Identitätsprüfung vor dem Spawn sagt nichts darüber, wer noch
+angemeldet ist, WENN der asynchron laufende Task Sekunden später die
+Keyring-Credentials liest. Ein Zweig (nicht-transiente Ablehnung) rief den
+Uploader zudem ganz ohne Prüfung auf.
+
+**Befund 6 (mittel) — die Bid-Cleanup-Warteschlange hatte einen
+Lost-Update-Race.** `enqueue` und der Worker-Zyklus (`read_all` →
+verarbeiten → `replace`) griffen unsynchronisiert auf dieselbe JSON-Datei
+zu — ein `enqueue` genau zwischen Lesen und Schreiben des Workers hätte den
+frisch hinzugekommenen Eintrag wieder verloren.
+
+**Befund 7 (mittel) — SimBrief-Identität überlebte einen Kontowechsel.**
+`simbrief_settings` (auto-gesourct oder manuell gesetzt) wurde bei Logout
+nie geleert; die Auto-Source-Logik füllt nie einen bereits gesetzten Wert
+nach. Der nächste Pilot ohne eigenen localStorage-Identifier hätte
+stillschweigend den SimBrief-OFP des Vorgängers übernommen.
+
+**Gefixt:**
+
+1. `phpvms_load_session` erwirbt jetzt denselben `FlightSetupGuard` vor dem
+   `get_profile`-Roundtrip, gibt ihn wie `phpvms_login` vor `try_resume_
+   flight` wieder frei.
+2. Neue Helfer `setze_session_atomar`/`aktuelle_session_atomar` — halten
+   BEIDE Mutexe gleichzeitig (feste Reihenfolge: Client zuerst), sowohl
+   beim Schreiben (`phpvms_login`, `phpvms_load_session`) als auch beim
+   Lesen (`spawn_pirep_queue_worker`s Tick-Schnappschuss).
+3. Die Reklamierung beweist Eigentum jetzt AUSSCHLIESSLICH über `bid_id` —
+   `flight_id` bleibt ein gültiger Fallback nur für den eigentlichen
+   `delete_bid`-Aufruf selbst (dort serverseitig auf den Account
+   beschränkt), nicht als Eigentumsnachweis.
+4. `init_mqtt_publisher_via_provisioning` erfasst den phpVMS-API-Key vor
+   der Provisionierung und prüft ihn erneut unmittelbar vor der
+   Installation — bei Änderung wird der frisch gebaute Handle verworfen.
+   Der Status-Gate-Pfad in `phpvms_load_session` stoppt jetzt symmetrisch
+   zu `phpvms_logout` einen eventuell schon laufenden Publisher.
+5. `spawn_flight_log_upload` bekommt die Identität als Parameter und prüft
+   sie im Moment des tatsächlichen Keyring-Lesens erneut — nicht nur beim
+   Spawn. Gilt jetzt an allen vier Aufrufstellen (beide Queue-Pfade,
+   `flight_end`, `flight_end_manual`).
+6. Neues `AppState::pending_bid_cleanup_lock` (`tokio::sync::Mutex`, ueber
+   Awaits haltbar) serialisiert `enqueue_pending_bid_cleanup` und
+   `drain_pending_bid_cleanup`s kompletten Lese-Verarbeiten-Schreiben-
+   Zyklus.
+7. `phpvms_logout` setzt `simbrief_settings` jetzt auf `Default` zurück.
+
+**Tests:** sieben neue Quelltext-Wächter
+(`konten_isolierung_runde_zehn_wiring_tests`), Gegenprobe für die beiden
+riskantesten (Bid-Reklamierung, Datei-Sperre) durchgeführt — beide korrekt
+fehlgeschlagen, dann wiederhergestellt. Drei bestehende Wächter aus Runde
+8/9 mussten wegen der Refaktorierung (`setze_session_atomar`/
+`aktuelle_session_atomar`, geänderte `spawn_flight_log_upload`-Signatur)
+angepasst werden — dabei erneut ein Selbst-Treffer entdeckt: ein eigener
+erklärender Kommentar zitierte denselben Ausdruck, den der Test suchte,
+noch VOR der echten Fundstelle. Behoben durch eine praezisere Suche
+(abschließendes Semikolon, das nur im echten Code steht).
+
+**Nachtrag zu Runde 10 (CI-Fund, direkt danach):** der Windows-CI-Job
+(`cargo test workspace, inkl. sim-msfs`) schlug nach dem Push fehl — ein
+bestehender Integrationstest (`tests/spur_verdrahtung.rs::der_worker_
+leert_die_ablage_vor_dem_client_riegel`) suchte textuell nach dem ALTEN
+Client-Riegel (`let Some(client) = client_opt else`), den der Umbau auf
+`aktuelle_session_atomar` entfernt hatte. Needle auf `let Some((client,
+pilot_id)) = aktuelle_session_atomar(&state) else` aktualisiert.
+
+**Eigener Prozessfehler, der das lokal verdeckt hat:** die lokale
+Verifikation lief als `cargo test --workspace 2>&1 | tail -N` — die Pipe
+gibt IMMER `tail`s Exit-Code zurück (0), nie den von `cargo test`. Der
+eigentliche Fehlschlag stand zwar im (abgeschnittenen) Text, wurde aber nie
+als roter Exit-Code bemerkt. **Neue Regel: nie mit `| tail` auf einen
+Pass/Fail-Exit-Code verlassen — entweder in eine Datei umleiten und den
+Exit-Code der eigentlichen Pruefung separat pruefen (`cmd > out.txt 2>&1;
+echo $?`), oder `grep -c "^test result: FAILED"` auf der vollen Ausgabe
+gegenpruefen.** Nach der Korrektur: `cargo test --workspace` mit derselben
+Methode neu verifiziert, echter Exit-Code 0, `grep -c "FAILED"` liefert 0.
+
+## Nachtrag #10 (05.09.2026): elfte Codex-Runde — der MQTT-Lebenszyklus war der eigentliche Rest-Herd
+
+Adversarial-Review gegen alle zehn bisherigen Commits fand fuenf weitere
+Befunde (vier hoch, einer mittel) — vier davon rund um denselben MQTT-
+Publisher-Lebenszyklus, den Runde 10 schon einmal angefasst hatte, plus
+einen Client/Identitaets-Mix im Resume-Pfad.
+
+**Befund 1 (hoch) — die Runde-10-Pruefung war nicht wirklich unmittelbar
+vor der Installation.** Zwischen der letzten Account-Pruefung und
+`*state.mqtt.lock().await = Some(handle)` lagen noch zwei echte Awaits
+(`take_integrity_rx`, `take_chat_rx`). Ein Kontowechsel in dieser
+Rest-Luecke haette trotzdem installiert.
+
+**Befund 2 (hoch) — ein Re-Login OHNE vorheriges Logout uebernahm den
+laufenden ODER gecachten MQTT-Account ungeprueft.** Der Idempotenz-Guard
+fragte nur „laeuft schon einer", nicht „gehoert er dem GERADE
+eingeloggten Piloten". Auch der Credential-Cache (`MQTT_KEYRING_PILOT_ID`)
+wurde ohne Abgleich gegen den aktuellen Account uebernommen.
+
+**Befund 3 (hoch) — ein teilweise fehlgeschlagener Logout liess
+sicherheitsrelevanten Altzustand stehen, waehrend das Frontend erfolgreich
+auslogt.** `phpvms_logout` konnte mit `?` vorzeitig zurueckkehren, BEVOR
+MQTT-Stopp und SimBrief-Reset erreicht wurden — das Frontend blockiert
+aber nur bei `flight_active`/`flight_setup_in_progress`, jeden anderen
+Fehlercode behandelt es als „ausgeloggt genug".
+
+**Befund 4 (hoch) — `try_resume_flight` kombinierte einen vom Aufrufer
+UEBERGEBENEN, potenziell veralteten Client mit einer separat aus `state`
+gelesenen Identitaet.** Zwischen dem Freigeben des Lifecycle-Locks beim
+Aufrufer (`phpvms_login`/`phpvms_load_session`) und dem Wiedererwerb hier
+kann ein vollstaendiger Login eines anderen Piloten stattfinden — genau
+die Garantie, die `aktuelle_session_atomar` eigentlich gibt, wurde hier
+umgangen.
+
+**Befund 5 (mittel) — der Auth-Fehler-Zweig in `phpvms_load_session`
+stoppte keinen parallel gestarteten Publisher.** Der benachbarte
+Status-Gate-Zweig tut das schon (Runde 10); der `Unauthenticated`/
+`Forbidden`-Zweig hatte dieselbe Behandlung noch nicht.
+
+**Gefixt:**
+
+1. Neuer zweiter Identitaets-Check unmittelbar VOR der Installation,
+   nach den beiden Empfaenger-Weiterleitungen.
+2. Neues `AppState::mqtt_owner_pilot_id` — verfolgt, wem der installierte
+   Publisher gehoert. Der Idempotenz-Guard vergleicht jetzt Eigentuemer
+   statt nur Existenz; ein fremder laufender Publisher wird gestoppt statt
+   ignoriert. Gecachte Credentials werden gegen den aktuellen Piloten
+   gefiltert, bevor sie verwendet werden.
+3. `phpvms_logout` raeumt MQTT + SimBrief jetzt VOR den beiden
+   fehlschlagfaehigen Schritten (`delete_api_key`, `clear_site_config`)
+   auf — diese Aufraeumung laeuft jetzt immer, unabhaengig vom Ausgang.
+   Neuer gemeinsamer Helfer `stoppe_mqtt_publisher` (Handle stoppen +
+   Eigentuemer vergessen) fuer alle drei Stellen, die einen Publisher
+   stoppen muessen (Logout, Status-Gate, Auth-Fehler).
+4. `try_resume_flight` nimmt keinen `client`-Parameter mehr entgegen —
+   Client UND Identitaet werden gemeinsam ueber `aktuelle_session_atomar`
+   gelesen, im Moment der tatsaechlichen Ausfuehrung.
+5. Der Auth-Fehler-Zweig in `phpvms_load_session` ruft jetzt ebenfalls
+   `stoppe_mqtt_publisher`.
+
+**Tests:** fuenf neue Quelltext-Waechter
+(`konten_isolierung_runde_elf_wiring_tests`), Gegenprobe fuer die beiden
+riskantesten (Client/Identitaets-Kopplung, Logout-Reihenfolge)
+durchgefuehrt — beide korrekt fehlgeschlagen, dann wiederhergestellt.
+
+**Eigene Lehre aus dieser Runde:** zwei der neuen Tests brachen erneut den
+Klammer-Zaehler von `tests/angeschlossen.rs` — diesmal nicht durch einen
+Kommentar, sondern durch STRING-LITERALE mit einer einzelnen,
+unausgeglichenen Klammer (`.find(") {")`, `.find("...cached {")`), um nach
+dem Ende einer Funktionssignatur zu suchen. Gleiche Fehlerklasse wie die
+schon dokumentierte Kommentar-Falle, nur in Anfuehrungszeichen statt
+Backticks. Behoben durch klammerfreie Anker (`"AppState>)"` statt `") {"`).
+**Erweiterte Regel: nie ein einzelnes, unausgeglichenes Klammerzeichen in
+lib.rs quotieren — weder in einem Kommentar noch in einem String-Literal.**
+Erst durch den vollen Testlauf bemerkt (isolierter Lauf des neuen Tests
+allein waere gruen gewesen) — bestaetigt erneut die Runde-10-Lehre, neue
+Waechter immer gegen die volle Suite laufen zu lassen.
+
+## Nachtrag #11 (05.09.2026): zwoelfte Codex-Runde — MQTT-Lebenszyklus, Reihenfolge geschaerft, Profil-Refresh gehaertet
+
+Adversarial-Review gegen alle elf bisherigen Commits fand drei weitere
+Befunde (einer kritisch, zwei mittel) — wieder rund um den MQTT-
+Lebenszyklus, jetzt mit hoeherer Einstufung als in Runde 11.
+
+**Befund 1 (kritisch) — zwei Rest-Luecken im MQTT-Lebenszyklus.**
+(a) Der Provisionierungs-Task wurde in `phpvms_login` VOR `setze_session_
+atomar` gespawnt — er konnte lostraben und `authenticated_pilot_id` lesen,
+BEVOR die neue Session ueberhaupt committed war (Tauris Runtime garantiert
+keine Reihenfolge zwischen einem gespawnten Task und dem restlichen
+synchronen Code). (b) Die abschliessende Identitaets-Pruefung vor der
+Handle-Installation (Runde 11) lag zwar unmittelbar VOR `state.mqtt.
+lock().await` im Quelltext — aber genau dieser Lock-Erwerb ist selbst ein
+Await. Ein paralleler Logout (derselbe Lock ueber `stoppe_mqtt_publisher`)
+konnte zwischen bestandener Pruefung und tatsaechlichem Lock-Erwerb
+hindurchschluepfen.
+
+**Befund 2 (mittel) — der Frontend-Effekt hob den SimBrief-Logout-Reset
+wieder auf.** Das Backend setzt `simbrief_settings` beim Logout auf
+Default zurueck (Runde 10), aber `App.tsx` liess `localStorage`-Werte
+(`simbrief_username`/`simbrief_user_id`) unangetastet — der Sync-Effekt
+bei jedem `loggedIn` schrieb sie beim naechsten Login (auch eines anderen
+Piloten) sofort wieder ins Backend.
+
+**Befund 3 (mittel) — ein verspaeteter Profil-Refresh konnte eine neue
+Sitzung ueberschreiben.** `phpvms_refresh_profile` schrieb das Ergebnis
+seines `get_profile`-Roundtrips ungeprueft zurueck — meldet sich waehrend
+dieses Roundtrips ein anderer Pilot an (ausdruecklich erlaubt), haette die
+verspaetete Antwort dessen `cached_pilot`/Callsign/SimBrief-Auto-Source
+ueberschrieben.
+
+**Gefixt:**
+
+1a. Der MQTT-Spawn in `phpvms_login` steht jetzt NACH `setze_session_
+    atomar`.
+1b. Die Identitaets-Pruefung in `init_mqtt_publisher_via_provisioning`
+    liegt jetzt INNERHALB der gehaltenen `state.mqtt`-Sperre (Lock zuerst
+    erwerben, dann pruefen, dann erst installieren) — kein Logout kann
+    mehr zwischen „geprueft" und „installiert" hindurch.
+2. `handleLogout` entfernt jetzt auch die `localStorage`-Schluessel
+   `simbrief_username`/`simbrief_user_id`.
+3. `phpvms_refresh_profile` erfasst Client+Identitaet ueber `aktuelle_
+   session_atomar`, prueft nach dem Roundtrip erneut gegen die aktuelle
+   `authenticated_pilot_id` und verwirft ein verspaetetes Ergebnis bei
+   Mismatch.
+
+**Tests:** drei neue Quelltext-Waechter
+(`konten_isolierung_runde_zwoelf_wiring_tests`), Gegenprobe fuer beide
+MQTT-/Resume-relevanten durchgefuehrt (Profil-Refresh-Pruefung,
+Sperr-Reihenfolge) — beide korrekt fehlgeschlagen, dann wiederhergestellt.
+Ein bestehender Runde-10-Test musste an die neue Installations-Stelle
+(`*mqtt_guard = ...` statt `*state.mqtt.lock().await = ...`) angepasst
+werden.
+
+**Einordnung:** dies ist die DRITTE Runde in Folge (10, 11, 12), die eine
+neue Facette desselben MQTT-Lebenszyklus-Bereichs findet, mit steigender
+Schweregrad-Einstufung. Sollte Runde 13 erneut in genau dieser Ecke etwas
+finden, ist das ein Signal fuer eine tiefere Architekturentscheidung (z. B.
+ein monoton steigender Session-Epochen-Zaehler, den jeder Hintergrund-Task
+vor jeder Mutation gegenprueft) statt weiterer Einzel-Patches — diese
+Entscheidung liegt bei Thomas, nicht bei diesem Kreislauf.
+
+## Nachtrag #12 (05.09.2026): dreizehnte Codex-Runde — Architektur-Umbau (Session-Epochen-Zähler)
+
+Adversarial-Review gegen alle zwoelf bisherigen Commits war die VIERTE
+Runde in Folge (10-13) mit neuen Funden im MQTT-Lebenszyklus, mit
+steigender Schweregrad-Einstufung (mittel → hoch → kritisch → kritisch).
+Codex fand zusaetzlich ZWEI echte Widersprueche zwischen fruheren Fixes:
+
+- **Runde 11 vs. 10/12:** die MQTT-Abschlusspruefung verliess sich darauf,
+  dass ein Logout den gespeicherten API-Key veraendert — Runde 11 zwang
+  aber, MQTT VOR allen fehlschlagfaehigen Keyring-Operationen zu stoppen.
+  Der Stopp lag damit VOR der Key-Loeschung — ein Task nach dem Stopp
+  konnte trotzdem noch erfolgreich validieren und installieren.
+- **Runde 10 vs. 12:** `client`+`authenticated_pilot_id` wurden als
+  atomarer Sitzungszustand behandelt, aber `authenticated_pilot_id` wird
+  bei Logout NICHT geleert (dokumentierte, bis dahin als harmlos geltende
+  Entscheidung). Runde 12s `phpvms_refresh_profile` benutzte dieses Feld
+  ALLEIN als Beweis, dass eine verspaetete Antwort noch zur aktiven
+  Sitzung gehoert — nach einem Logout bestand die Pruefung trotzdem.
+
+**Auf Thomas' ausdrueckliche Entscheidung hin (Ruecksprache nach Codex'
+Antwort "Nein, der MQTT-Lebenszyklus ist noch nicht geschlossen") wurde
+diese Runde als Architektur-Umbau statt als weiterer Einzel-Patch
+umgesetzt:**
+
+**Neuer Session-Epochen-Zaehler (`AppState::session_epoch: Mutex<u64>`).**
+JEDE Sitzungsaenderung (Login, Logout, Load-Session) erhoeht ihn EINMAL,
+synchron, als fester Bestandteil derselben atomaren Operation wie
+`client`/`authenticated_pilot_id`. Das ist jetzt das EINZIGE Signal, das
+Hintergrund-Tasks noch pruefen — nicht mehr API-Key, nicht mehr
+Piloten-ID, nicht mehr `mqtt_owner_pilot_id`.
+
+**Konkrete Aenderungen:**
+
+1. `setze_session_atomar`/`leere_session_atomar` (neu, Gegenstueck fuer
+   Logout) schreiben Client/Piloten-ID/Epoche als EINE atomare Operation,
+   feste Sperr-Reihenfolge, und geben die neue Epoche zurueck.
+   `aktuelle_session_atomar` liest alle drei zusammen; `aktuelle_epoche`
+   liest nur die Epoche fuer Stellen, die keinen Client brauchen.
+2. `mqtt_owner_pilot_id` → `mqtt_owner_epoch`: der Idempotenz-Guard in
+   `init_mqtt_publisher_via_provisioning` vergleicht jetzt Epochen, nicht
+   Piloten-IDs. BEIDE Abschlusspruefungen (vor den Empfaenger-
+   Weiterleitungen und unmittelbar vor der Installation) vergleichen
+   ebenfalls die Epoche — die zweite jetzt INNERHALB der gehaltenen
+   `state.mqtt`-Sperre (nicht mehr davor), sodass ein paralleler Logout
+   garantiert sichtbar ist, sobald dieser Code den Lock haelt.
+3. `phpvms_login`/`phpvms_load_session` stoppen einen zur neuen Epoche
+   nicht mehr passenden MQTT-Handle jetzt SYNCHRON, direkt nach dem
+   Session-Commit — nicht erst im gespawnten Provisionierungs-Task. Der
+   Login/Restore gilt erst als abgeschlossen, wenn kein fremder Handle
+   mehr aktiv sein kann.
+4. `phpvms_refresh_profile` vergleicht die Epoche statt der Piloten-ID —
+   schliesst automatisch auch den Fall, dass ein Logout (nicht nur ein
+   Kontowechsel) waehrend des Roundtrips stattfand.
+5. `phpvms_get_bids` (neuer, niedrig eingestufter Befund): vergleicht die
+   Epoche, bevor ein verspaeteter Erfolg einen inzwischen fuer einen
+   ANDEREN Account frisch erzeugten Aktivitaets-Log-Fehler faelschlich
+   als "wieder erreichbar" markiert.
+
+**Tests:** drei neue Quelltext-Waechter
+(`konten_isolierung_runde_dreizehn_wiring_tests`), Gegenprobe fuer die
+beiden zentralen (Epochen-Erhoehung, synchroner Login-Stopp)
+durchgefuehrt. Vier bestehende Waechter (Runde 10-12) mussten an die neue
+Epochen-Terminologie angepasst werden; ein Test in
+`tests/spur_verdrahtung.rs` ebenfalls (das 3-Tupel von
+`aktuelle_session_atomar`). Erneut ein String-Literal mit unausgeglichener
+Klammer im Klammer-Zaehler von `tests/angeschlossen.rs` gefunden und
+behoben (`.find("...async move {")` → ohne die abschliessende Klammer).
+
+cargo test --workspace gruen (echter Exit-Code geprueft), rustfmt --check
+sauber, alle Integrationstests gruen. Keine Frontend-Aenderungen in
+dieser Runde.
+
+Dokumentiert in docs/qs/pirep-infrastruktur-haertung-2026-09.md,
+Nachtrag #12.
+
+## Nachtrag #13 (06.09.2026): vierzehnte Codex-Runde — gezielte Pruefung des Architektur-Umbaus, zwei Regressionen behoben, Rest als Restrisiko dokumentiert
+
+Codex pruefte gezielt, ob der Runde-13-Umbau (Session-Epochen-Zaehler) die
+MQTT-/Session-Lebenszyklus-Klasse tatsaechlich schliesst. Antwort: **Nein**
+— neun Befunde, davon zwei echte Regressionen aus dem Umbau selbst,
+der Rest reale, aber zunehmend enge Randfaelle. Kernaussage: „Holding
+`state.mqtt` does not prevent either session helper from locking and
+incrementing `session_epoch`" — Epoche und MQTT-Handle haengen an
+UNTERSCHIEDLICHEN Mutexen, echte Atomaritaet zwischen beiden wuerde einen
+gemeinsamen Lock verlangen.
+
+**Ruecksprache mit Thomas:** angesichts einer bereits substanziellen
+Architektur-Aenderung, die den Kernfehler zwar drastisch entschaerft
+(die Fenster sind jetzt Mikrosekunden statt Sekunden bis Minuten), aber
+laut Codex nicht vollstaendig schliesst, wurde entschieden: NUR die
+beiden echten Regressionen aus dem eigenen Umbau fixen, den Rest als
+dokumentiertes Restrisiko stehen lassen, keinen weiteren
+Konsolidierungs-Pass in dieser Sitzung.
+
+**Behoben (echte Regressionen aus Runde 13):**
+
+1. `phpvms_get_bids` las `client` (`current_client`) und die Epoche
+   (`aktuelle_epoche`) GETRENNT — ein Kontowechsel genau dazwischen haette
+   Pilot As Client mit Pilot Bs (bereits aktueller) Epoche gepaart und den
+   Vergleich wertlos gemacht. Fix: beides gemeinsam ueber
+   `aktuelle_session_atomar`.
+2. Beide Restore-Ablehnungs-Zweige in `phpvms_load_session` (Status-Gate,
+   Auth-Fehler) erhoehten `session_epoch` nicht — ein Setup-Hook-
+   Provisionierungs-Task mit der ALTEN Epoche haette trotzdem noch
+   installieren koennen, NACHDEM der Restore bereits abgelehnt wurde.
+   Fix: `leere_session_atomar` in beiden Zweigen.
+
+**Bewusst NICHT behoben (dokumentiertes Restrisiko, Stand 06.09.2026):**
+
+* **Epoche und MQTT-Handle sind nicht unter einem gemeinsamen Lock.** Ein
+  Hintergrund-Provisionierungs-Task kann die Epoche pruefen und den
+  Handle installieren, WAEHREND ein Login/Logout gleichzeitig committet —
+  das Fenster ist durch den synchronen Stopp in `phpvms_login`/
+  `phpvms_load_session` auf die Zeit bis zum naechsten Scheduler-Tick
+  verkleinert, aber nicht auf Null. Eine vollstaendige Schliessung
+  braeuchte einen gemeinsamen Zustand (`Option<{pilot_id, epoch, handle}>`
+  unter EINEM Mutex) statt der aktuellen drei getrennten Mutexe
+  (`client`, `authenticated_pilot_id`+`session_epoch`, `mqtt`+
+  `mqtt_owner_epoch`).
+* **`mqtt_owner_epoch` wird erst NACH Freigabe von `state.mqtt` gesetzt**
+  (zwei getrennte Lock-Erwerbe) — ein knappes Fenster, in dem Handle und
+  Eigentuemer-Tag auseinanderlaufen koennen.
+* **`spawn_pirep_queue_worker` ignoriert die von `aktuelle_session_atomar`
+  zurueckgegebene Epoche** (`_epoche`) und prueft vor dem MQTT-Publish nur
+  noch `authenticated_pilot_id` — dieselbe Fehlerklasse wie die schon
+  gefixte Runde-9-Luecke, nur nicht auf den neuen Mechanismus uebertragen.
+  Die unbedingte Bahn-Nachtrag-Ablage (`nachtrag_queue::drain`) hat
+  ueberhaupt keine Konto-Pruefung.
+* **`init_mqtt_publisher_via_provisioning` schreibt die MQTT-Credentials
+  in den Keyring, BEVOR die erste Epochen-Pruefung nach dem
+  Server-Roundtrip stattfindet** — eine verspaetete Antwort von Pilot A
+  kann Pilot Bs frisch gecachte Credentials ueberschreiben, auch wenn As
+  Handle danach verworfen wird.
+* **`phpvms_refresh_profile`s Epochen-Pruefung ist selbst nicht atomar
+  mit `cache_pilot`** — zwischen Pruefung und Schreiben liegt kein
+  gemeinsamer Lock; ein Kontowechsel in dieser schmalen Luecke kann
+  weiterhin ein fremdes Profil zurueckschreiben.
+* **MQTT-Empfaenger-Weiterleitungen (Integritaet, Chat) sind nicht an die
+  Epoche gebunden** — ihre Endlos-Schleifen pruefen nie, ob die Sitzung
+  sich geaendert hat; `stoppe_mqtt_publisher` haelt/joint sie nicht.
+* **`phpvms_logout` gibt den Lifecycle-Guard frei, bevor MQTT-Stopp,
+  Credential-Cache-Leerung, Keyring-Loeschung und Site-Config-Leerung
+  abgeschlossen sind** — ein gleichzeitiger Login kann in dieser Luecke
+  committen, und der noch laufende Logout kann DANACH den neuen Publisher
+  stoppen bzw. den neuen Key/Config loeschen.
+* **Epochen-Ueberlauf bei `u64::MAX`** (theoretisch, 2^64 Sitzungswechsel
+  noetig — praktisch nicht erreichbar, aber die Monotonie-Garantie ist
+  strenggenommen nicht absolut).
+
+**Warum hier gestoppt statt weiter gepatcht:** die Rueckmeldungen aus den
+Runden 10-14 zeigen ein Muster abnehmenden Grenznutzens — jede weitere
+Runde findet etwas, aber die Fenster werden immer schmaler (Sekunden →
+Mikrosekunden → theoretisch) und die Funde zunehmend spekulativ (Runde
+14s Befund 8 ist ausdruecklich als Hypothese markiert, Befund 9 braucht
+2^64 Operationen). Eine vollstaendige Schliessung wuerde einen groesseren,
+eigenstaendigen Architektur-Auftrag rechtfertigen (gemeinsamer Session-
+Zustand statt drei/vier getrennter Mutexe) — das ist eine bewusste,
+separate Entscheidung fuer Thomas, nicht etwas, das dieser QS-Kreislauf
+in einer weiteren Runde nebenbei erledigen sollte.
+
+**Tests:** zwei neue Quelltext-Waechter
+(`konten_isolierung_runde_vierzehn_wiring_tests`), Gegenprobe fuer beide
+durchgefuehrt. Beim Schreiben des zweiten Tests einen SYSTEMISCHEN Fehler
+im etablierten `funktionskoerper`-Testmuster entdeckt: `\nfn `/`\nasync
+fn ` allein reicht nicht als Endgrenze, wenn direkt nach der Zielfunktion
+ein `#[cfg(test)] mod { }`-Block folgt — die Suche lief dann ueber 14000
+Zeichen ins NAECHSTE Testmodul hinein und fand dort zufaellig denselben
+String. Nur im lokalen Helfer dieser Runde um `\nmod ` als zusaetzliche
+Grenze erweitert (aeltere Testmodule liefen bisher zufaellig nicht in
+diesen Fall, wurden aber nicht rueckwirkend angepasst — bei einem
+kuenftigen Fund in einem aelteren Test gilt dieselbe Korrektur).
+
+cargo test --workspace gruen (echter Exit-Code geprueft), rustfmt --check
+sauber, alle Integrationstests gruen. Keine Codex-Runde 15 — Kreislauf auf
+Thomas' Entscheidung hin hier beendet.
+
+## Nicht behoben (bewusst außerhalb des Umfangs)
+
+* **`pirep_queue`s 50-Versuche-Grenze selbst** bleibt als Konzept
+  bestehen (nur die Reaktion DANACH ist jetzt anders) — eine vollstaendig
+  unbegrenzte, aggressiv nachfassende Warteschlange fuer eine derart
+  seltene Situation (>47 Minuten Ausfall) waere unverhaeltnismaessig.
+* **Die dep_gate-Reconciliation-Luecke** (v1.7.17, Runden 17-19) bleibt
+  wie dort dokumentiert offen — siehe `docs/qs/v1.7.17-pruefstand.md`,
+  Abschnitt „Was noch aussteht". Diese Sitzung ergaenzte dort NUR die
+  sichtbare Warnung beim Resume (Vorschlag b aus dem Auftrag), nicht die
+  Server-Read-Back-Reconciliation (Vorschlag a) — letztere braucht
+  serverseitige phpVMS-Kenntnisse ausserhalb dieses Repos (siehe dort).

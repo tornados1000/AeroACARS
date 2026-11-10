@@ -1,0 +1,287 @@
+// Deterministischer Schutz für die Live-Karten-„Follow"-Kamera (v0.15.6).
+//
+// Hintergrund: bis v0.15.5 hat jede Karten-Bewegung (Pan/Zoom/Scroll) das
+// Verfolgen HEIMLICH für 15 s abgeschaltet — der Haken blieb gesetzt, die Karte
+// folgte aber nicht (Michael: „Flugzeug nie im Bild" bei Boarding + Takeoff).
+//
+// Diese Tests nageln das korrigierte Verhalten fest, OHNE Sim/WebGL (MapLibre
+// gemockt, läuft in jsdom/CI):
+//   1. Follow=an → Karte zentriert auf das Flugzeug und folgt Positions-Updates.
+//   2. Ein echter Nutzer-Pan (dragstart mit originalEvent) → Follow geht
+//      SICHTBAR aus (Haken weg) und das Zentrieren stoppt.
+//   3. Der „🎯 Flugzeug"-Knopf zentriert wieder und schaltet Follow an.
+
+import { describe, it, expect, beforeEach, afterEach, beforeAll, vi } from "vitest";
+import { render, screen, fireEvent, act, cleanup } from "@testing-library/react";
+import i18next from "i18next";
+import { initReactI18next } from "react-i18next";
+import deCommon from "../locales/de/common.json";
+
+// This test predates the Livemap-4a chrome rewrite, which added real i18n
+// copy to LiveMapView — real i18next (same setup as CpdlcPanel.test.tsx)
+// rather than a key-passthrough mock, so the "Folgen" button text this file
+// queries for stays true to what's actually configured.
+beforeAll(async () => {
+  if (!i18next.isInitialized) {
+    await i18next.use(initReactI18next).init({
+      lng: "de",
+      resources: { de: { common: deCommon } },
+      defaultNS: "common",
+      interpolation: { escapeValue: false },
+    });
+  }
+});
+
+// Gemeinsamer mutbarer Zustand für den maplibre-Mock (vi.hoisted, damit die
+// Mock-Factory ihn referenzieren darf — sie wird an den Modulanfang gehoistet).
+const h = vi.hoisted(() => ({
+  mapHandlers: {} as Record<string, Array<(e?: unknown) => void>>,
+  easeTo: [] as Array<{ center?: [number, number]; zoom?: number }>,
+  jumpTo: [] as Array<{ center?: [number, number]; zoom?: number }>,
+}));
+
+vi.mock("maplibre-gl", () => {
+  class FakeMarker {
+    el: HTMLElement;
+    constructor(opts?: { element?: HTMLElement }) {
+      this.el = opts?.element ?? document.createElement("div");
+    }
+    setLngLat() { return this; }
+    setRotation() { return this; }
+    addTo() { return this; }
+    remove() { return this; }
+    getElement() { return this.el; }
+  }
+  class FakePopup {
+    setLngLat() { return this; }
+    setHTML() { return this; }
+    addTo() { return this; }
+    remove() { return this; }
+    on() { return this; }
+  }
+  class FakeBounds { extend() { return this; } }
+  class FakeNav {}
+  class FakeMap {
+    center = { lng: 6, lat: 48 };
+    zoom = 4;
+    addControl() { return this; }
+    on(ev: string, cb: (e?: unknown) => void) {
+      (h.mapHandlers[ev] ||= []).push(cb);
+      return this;
+    }
+    once() { return this; }
+    // v0.21: die Taxi-Karte haengt sich an moveend/zoomend und meldet sich beim
+    // Aufraeumen wieder ab. Ohne off() kracht der Unmount.
+    off(ev: string, cb: (e?: unknown) => void) {
+      const list = h.mapHandlers[ev];
+      if (list) h.mapHandlers[ev] = list.filter((f) => f !== cb);
+      return this;
+    }
+    // Sichtbereich — die Taxi-Karte laedt, was gerade im Bild ist.
+    getBounds() {
+      return {
+        getSouth: () => this.center.lat - 1,
+        getNorth: () => this.center.lat + 1,
+        getWest: () => this.center.lng - 1,
+        getEast: () => this.center.lng + 1,
+      };
+    }
+    getCenter() { return this.center; }
+    getZoom() { return this.zoom; }
+    isStyleLoaded() { return true; }
+    setStyle() { return this; }
+    addSource() { return this; }
+    // 12.08.2026 (VATSIM-Overlay): das Piloten-Symbol registriert ein
+    // Kartenbild. Der Nachbau kennt die Bild-API, wie die echte Karte.
+    hasImage() { return false; }
+    addImage() { return this; }
+    addLayer() { return this; }
+    getSource() { return { setData: () => {} }; }
+    getLayer() { return {}; }
+    setLayoutProperty() { return this; }
+    easeTo(o: { center?: [number, number]; zoom?: number }) {
+      h.easeTo.push(o);
+      if (o.center) this.center = { lng: o.center[0], lat: o.center[1] };
+      if (o.zoom != null) this.zoom = o.zoom;
+      return this;
+    }
+    jumpTo(o: { center?: [number, number]; zoom?: number }) {
+      h.jumpTo.push(o);
+      if (o.center) this.center = { lng: o.center[0], lat: o.center[1] };
+      if (o.zoom != null) this.zoom = o.zoom;
+      return this;
+    }
+    remove() { return this; }
+  }
+  return {
+    default: {
+      Map: FakeMap,
+      Marker: FakeMarker,
+      Popup: FakePopup,
+      NavigationControl: FakeNav,
+      LngLatBounds: FakeBounds,
+    },
+  };
+});
+
+// v0.16.0 (#LAN-Remote): LiveMapView now imports `invoke` from the `lib/ipc`
+// seam, not directly from `@tauri-apps/api/core`. Mock the seam so the test
+// keeps intercepting the calls (the old mock targeted a module the component
+// no longer imports). `listen`/`openExternal` are included for completeness.
+vi.mock("../lib/ipc", () => ({
+  isTauri: false,
+  invoke: vi.fn(async (cmd: string) => {
+    if (cmd === "flight_get_route_fixes") return [];
+    if (cmd === "va_live_flights") return { data: [] };
+    if (cmd === "airport_get") return { lat: null, lon: null };
+    if (cmd === "airport_ground_index") return [];
+    if (cmd === "airport_ground_get") return null;
+    // Livemap-4a's Ereignisliste (useMapEvents) polls both of these.
+    if (cmd === "activity_log_get") return [];
+    if (cmd === "hoppie_get_thread") return [];
+    return null;
+  }),
+  listen: vi.fn(async () => () => {}),
+  openExternal: vi.fn(async () => {}),
+}));
+vi.mock("./ActivityLogPanel", () => ({ ActivityLogPanel: () => null }));
+vi.mock("../lib/trackStore", () => ({ getTrack: () => [], setTrack: () => {} }));
+vi.mock("../lib/aircraftIcon", () => ({ aircraftSvg: () => "<svg class='aircraft-svg'></svg>" }));
+vi.mock("../lib/phaseColors", () => ({ phaseColor: () => "#ffffff", phaseLabel: () => "Steigflug" }));
+
+import { LiveMapView } from "./LiveMapView";
+
+const snap = (lat: number, lon: number) => ({
+  lat,
+  lon,
+  altitude_msl_ft: 6000,
+  groundspeed_kt: 280,
+  indicated_airspeed_kt: 250,
+  heading_deg_true: 295,
+  heading_deg_magnetic: 295,
+  aircraft_icao: "A21N",
+  timestamp: 0,
+});
+
+const flight = {
+  pirep_id: "P1",
+  airline_icao: "THY",
+  flight_number: "155",
+  dpt_airport: "LTFM",
+  arr_airport: "LYTV",
+  phase: "climb",
+  distance_nm: 120,
+  was_just_resumed: false,
+};
+
+function fireLoad() {
+  act(() => {
+    (h.mapHandlers["load"] ?? []).forEach((cb) => cb());
+  });
+}
+
+beforeEach(() => {
+  h.mapHandlers = {};
+  h.easeTo.length = 0;
+  h.jumpTo.length = 0;
+  document.documentElement.dataset.theme = "dark";
+});
+afterEach(() => cleanup());
+
+describe("LiveMapView Follow-Kamera", () => {
+  it("zentriert bei Follow=an auf das Flugzeug und folgt Positions-Updates", () => {
+    const { rerender } = render(
+      <LiveMapView activeFlight={flight as never} simSnapshot={snap(41.2, 28.7) as never} />,
+    );
+    fireLoad();
+    // großer Versatz (Default 6/48 → Istanbul) → harter jumpTo auf den Flieger
+    expect(h.jumpTo.length).toBeGreaterThan(0);
+    const c0 = h.jumpTo.at(-1)!.center!;
+    expect(c0[0]).toBeCloseTo(28.7, 1);
+    expect(c0[1]).toBeCloseTo(41.2, 1);
+
+    // kleiner Schritt → sanftes easeTo auf die neue Position
+    h.easeTo.length = 0;
+    act(() => {
+      rerender(<LiveMapView activeFlight={flight as never} simSnapshot={snap(41.4, 28.6) as never} />);
+    });
+    const c1 = h.easeTo.at(-1)!.center!;
+    expect(c1[0]).toBeCloseTo(28.6, 1);
+    expect(c1[1]).toBeCloseTo(41.4, 1);
+    // laufendes Folgen darf den ZOOM NICHT mehr anfassen (dein manueller
+    // Rauszoom bleibt erhalten — das war der zweite Teil des Bugs).
+    expect(h.easeTo.at(-1)!.zoom).toBeUndefined();
+  });
+
+  it("zentriert auch aus weit entfernter/rausgezoomter Ansicht (Follow-Bug)", () => {
+    const { rerender } = render(
+      <LiveMapView activeFlight={flight as never} simSnapshot={snap(41.2, 28.7) as never} />,
+    );
+    fireLoad();
+    // Erst-Lock erfolgt (jumpTo). Jetzt eine Position WEIT weg melden, so als
+    // hätte man weit rausgezoomt und der Flieger ist quer über der Karte.
+    h.jumpTo.length = 0;
+    act(() => {
+      rerender(<LiveMapView activeFlight={flight as never} simSnapshot={snap(60.0, 5.0) as never} />);
+    });
+    // Follow MUSS hart auf den Flieger zentrieren — egal wie weit weg.
+    expect(h.jumpTo.length).toBeGreaterThan(0);
+    const c = h.jumpTo.at(-1)!.center!;
+    expect(c[0]).toBeCloseTo(5.0, 1);
+    expect(c[1]).toBeCloseTo(60.0, 1);
+    // Field feedback (2026-08-03, "Map hängt, kann nicht rauszoomen"): DIESE
+    // große Abweichung entsteht in der Praxis oft durchs bloße Rauszoomen
+    // (MapLibre zoomt um den Cursor, nicht um die Kartenmitte) — nicht durch
+    // ein echtes "Spur verloren". Der Re-Center-jumpTo hier darf den Zoom
+    // NICHT anfassen, sonst macht er den manuellen Rauszoom-Versuch des
+    // Piloten binnen einer Sekunde wieder rückgängig — genau der Bug.
+    expect(h.jumpTo.at(-1)!.zoom).toBeUndefined();
+  });
+
+  it("ein Nutzer-Pan schaltet Follow sichtbar AUS und stoppt das Zentrieren", () => {
+    const { rerender } = render(
+      <LiveMapView activeFlight={flight as never} simSnapshot={snap(41.2, 28.7) as never} />,
+    );
+    fireLoad();
+    const follow = screen.getByRole("button", { name: "Folgen" });
+    expect(follow.getAttribute("aria-pressed")).toBe("true");
+
+    // echter Pan (originalEvent gesetzt = Nutzergeste)
+    act(() => {
+      (h.mapHandlers["dragstart"] ?? []).forEach((cb) => cb({ originalEvent: {} }));
+    });
+    expect(follow.getAttribute("aria-pressed")).toBe("false");
+
+    // weiteres Positions-Update darf NICHT mehr zentrieren
+    h.easeTo.length = 0;
+    h.jumpTo.length = 0;
+    act(() => {
+      rerender(<LiveMapView activeFlight={flight as never} simSnapshot={snap(43.0, 28.0) as never} />);
+    });
+    expect(h.easeTo.length).toBe(0);
+    expect(h.jumpTo.length).toBe(0);
+  });
+
+  it("der „Auf Flug zentrieren\"-Knopf zentriert wieder und schaltet Follow an", () => {
+    render(<LiveMapView activeFlight={flight as never} simSnapshot={snap(41.2, 28.7) as never} />);
+    fireLoad();
+    // erst Follow per Pan ausschalten
+    act(() => {
+      (h.mapHandlers["dragstart"] ?? []).forEach((cb) => cb({ originalEvent: {} }));
+    });
+    const follow = screen.getByRole("button", { name: "Folgen" });
+    expect(follow.getAttribute("aria-pressed")).toBe("false");
+
+    h.easeTo.length = 0;
+    // v1.3.5 (#Livemap-4a): the old icon-only "🎯" button (aria-label "Auf
+    // mein Flugzeug zentrieren") became a labeled text button in the new
+    // Kartenschalter-Block, README §3 — same one-shot recenter action.
+    const btn = screen.getByRole("button", { name: "Auf Flug zentrieren" });
+    act(() => fireEvent.click(btn));
+
+    expect(follow.getAttribute("aria-pressed")).toBe("true");
+    const c = h.easeTo.at(-1)!.center!;
+    expect(c[0]).toBeCloseTo(28.7, 1);
+    expect(c[1]).toBeCloseTo(41.2, 1);
+  });
+});

@@ -1,0 +1,778 @@
+// Bahndisziplin-Block: Queransicht, Ereignisliste, Grössenvergleich.
+//
+// Spec: `docs/spec/v1.7.0-bahndisziplin.md` §8.3, §8.5, §8.6.
+//
+// Sitzt unter der Längsansicht und teilt sich mit ihr die Projektion — das
+// ist der Punkt: Beide Ansichten zeigen denselben Ausschnitt mit identischen
+// Kanten, damit der Aufsetzpunkt oben senkrecht über der Marke unten liegt.
+
+import { useTranslation } from "react-i18next";
+import { ausfahrtenFuerAnzeige, bandFarbeFuer, DURCHGANG_FARBE, genutzteAusfahrt, rollwegQuelle } from "./bahnHilfen";
+import { bewertungsEnde as fruehestesEnde } from "../lib/bahnQuerMassstab";
+import { RunwayExitLupe } from "./RunwayExitLupe";
+import type { Projektion } from "../lib/runwayProjection";
+import type { BahnZoom } from "../lib/useBahnZoom";
+import type { RunwayDiagramV2Props } from "./RunwayDiagramV2";
+
+export interface DisziplinProps {
+  props: RunwayDiagramV2Props;
+  projektion: Projektion;
+  /** Derselbe Zoom-Zustand wie die Längsansicht — nicht ein zweiter.
+   *  Seit Variante B (22.10.2026) ohne Queransicht; die Draufsicht trägt den Zoom. */
+  zoom?: BahnZoom;
+  width: number;
+  tokens: {
+    tarmac: string;
+    tarmacBorder: string;
+    centerline: string;
+    rollout: string;
+    tdPerfect: string;
+    tdWarn: string;
+    tdSevere: string;
+    rollweg: string;
+    rollwegRand: string;
+  };
+}
+
+export function RunwayDisciplinePanel({
+  props: roh,
+  projektion,
+  width,
+  tokens,
+}: DisziplinProps) {
+  const { t } = useTranslation();
+
+  // Eine Spur für Bild, Liste und Legende — siehe `spurBereinigen`.
+  const props: RunwayDiagramV2Props = {
+    ...roh,
+    lateral_samples: roh.lateral_samples ? spurBereinigen(roh.lateral_samples) : roh.lateral_samples,
+  };
+  const samples = props.lateral_samples ?? [];
+  const breite = props.runway_width_m ?? null;
+  // Frühere Durchgänge — dieselbe Bereinigung wie die Spur selbst.
+  const durchgaenge = (props.vorherige_durchgaenge ?? [])
+    .map((d) => spurBereinigen(d.lateral_samples ?? []))
+    .filter((d) => d.length >= 2);
+
+  // Gründe, bei denen wirklich keine nutzbare Geometrie/Spur vorliegt — die
+  // blockieren die Grafik weiterhin sofort und vollständig.
+  //
+  // `insufficient_samples` und `implausible_lateral_track` gehören
+  // ABSICHTLICH NICHT dazu: Dort hat nur die BEWERTUNG (das Subscore-Urteil)
+  // mangels Proben im Messfenster nicht gewertet — die rohen Trackdaten
+  // liegen trotzdem oft vor (15-25 Punkte pro Landung, am Live-Korpus
+  // verifiziert). „Kein Urteil" ist nicht dasselbe wie „keine Grafik".
+  const BLOCKIERENDE_SKIP_GRUENDE = new Set([
+    "missing_lateral_track",
+    "runway_width_unknown",
+    "track_width_unknown",
+    "off_airport_landing",
+    "untrusted_geometry",
+    "unpaved_runway",
+    "water_runway",
+    "surface_unknown",
+    // Die Bahnachse selbst ist falsch — die Spur läuft schräg zu ihr. Eine
+    // Grafik gegen die falsche Achse wäre schlimmer als keine (QS-Fund,
+    // Codex 08.09.2026): das Band läge sichtbar daneben und würde als
+    // Messung gelesen.
+    "runway_axis_mismatch",
+  ]);
+
+  // Gesetzt, wenn die Bewertung einen Grund nannte, der die Grafik NICHT
+  // blockiert (s.o.) — dann rendert die Grafik ganz normal, bekommt aber
+  // einen kleinen Zusatzhinweis, dass kein Bewertungsurteil existiert.
+  let keinUrteilGrund: string | null = null;
+
+  // ── Warum hier nichts geraten wird ───────────────────────────────────
+  //
+  // Fehlt die Bahnbreite oder die Spur, entfällt die Queransicht **sichtbar**
+  // — mit dem Grund, aus dem sie entfällt. Eine leere Querachse zu malen wäre
+  // schlimmer als gar keine: Sie sähe aus wie eine Messung, die „nichts
+  // Auffälliges" ergeben hat, und genau das steht dann nicht fest.
+  const grund = ((): string | null => {
+    // ZUERST der Grund, den die BEWERTUNG gefällt hat — aber nur, wenn er
+    // zu den Gründen gehört, bei denen wirklich keine nutzbare Geometrie
+    // vorliegt. Sonst fällt die Prüfung zur Rohdatenlage durch (unten).
+    //
+    // Sie kennt sieben Gründe, die Anzeige kannte fünf. Bei
+    // `untrusted_geometry` wertete die Achse nicht — und die Grafik daneben
+    // zeichnete seelenruhig ein Band mit Randabstand, auf einer Geometrie,
+    // der die Bewertung nicht traut.
+    //
+    // Ausgelesen, nicht hergeleitet: Die Achse hat schon entschieden. Eine
+    // zweite Herleitung hier wäre eine Zweitimplementierung des Urteils,
+    // und die driftet, sobald jemand eine Schwelle anfasst.
+    if (props.lateral_skip_reason) {
+      if (BLOCKIERENDE_SKIP_GRUENDE.has(props.lateral_skip_reason)) {
+        return props.lateral_skip_reason;
+      }
+      keinUrteilGrund = props.lateral_skip_reason;
+    }
+
+    // ZUERST: Trägt dieser Flug überhaupt v1.7.0-Daten?
+    //
+    // Sonst greift die nächste Prüfung und behauptet etwas über die BAHN,
+    // was gar nicht an ihr liegt. Live gesehen am 23.08.2026 bei EDDS 07
+    // (Flug #1062): „Für diese Bahn ist keine Breite hinterlegt" — EDDS 07
+    // ist 45 m breit und steht mit Breite in den Navdaten. Der Flug kam nur
+    // von einem Client vor v1.7.0, der nichts davon sendet.
+    //
+    // Eine Meldung, die den falschen Grund nennt, schickt die Suche in die
+    // falsche Richtung: Wer sie liest, prüft die Navdaten und findet nichts.
+    const traegtBahndaten =
+      props.runway_width_m != null ||
+      props.track_width_m != null ||
+      props.clearance_point_m != null ||
+      samples.length > 0;
+    if (!traegtBahndaten) return "no_lateral_track";
+
+    if (breite == null || breite <= 0) return "runway_width_unknown";
+    if (samples.length < 2) return "no_lateral_track";
+    if (props.surface_paved === false) return "unpaved_runway";
+    if (props.surface_paved == null) return "surface_unknown";
+    if (props.track_width_m == null) return "track_width_unknown";
+    return null;
+  })();
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      {/* Zwischenstand kenntlich machen — VOR allem anderen.
+
+          Bleibt die Finalisierung aus, sind alle Bahnwerte vorläufig: Die
+          Spur bricht mitten im Ausrollen ab, der Räumpunkt fehlt, die
+          Ausrollstrecke ist die bis dahin gefahrene. Bis v1.7.1 sah das
+          aus wie ein fertiger Bericht.
+
+          EDDB 06L am 24.08.2026: 482 m Ausrollstrecke — nachgerechnet
+          0,42 g, mehr als ein Verkehrsflugzeug bremsen kann. Nichts davon
+          war falsch gemessen, es war nur noch nicht fertig.
+
+          `undefined` heisst „Flug von vor dieser Fassung" — dann wird
+          nichts behauptet. Nur ein ausdrückliches `false` meldet sich. */}
+      {props.rollout_final === false && (
+        <Hinweis
+          text={t("runway_v2.rollout_vorlaeufig", {
+            defaultValue:
+              "Zwischenstand: Das Ausrollen war beim Absenden noch nicht " +
+              "abgeschlossen. Spur, Räumpunkt und Ausrollstrecke sind " +
+              "vorläufig.",
+          })}
+        />
+      )}
+      {/* Bahnansicht 2.1.8 (Entscheidung 6): Erklärung und Legende der
+          Draufsicht stehen jetzt in EINER Legende direkt unter ihr
+          (RunwayDiagramV2) — hier stand eine zweite samt langem Fliesstext. */}
+      {grund ? (
+        <Hinweis text={t(`runway_v2.discipline_skip.${grund}`, skipText(grund))} />
+      ) : (
+        <>
+          {/* Das Abrollen im echten Massstab — die Queransicht darüber ist
+              quer überhöht und zeichnet eine Ausfahrt als Haken. Ohne
+              Abrollen (kein Räumpunkt, Spur bleibt auf der Bahn) fehlt sie. */}
+          <div style={{ marginTop: 14 }}>
+            <RunwayExitLupe
+              samples={samples}
+              runwayWidthM={breite!}
+              trackWidthM={props.track_width_m ?? null}
+              clearanceM={props.clearance_point_m}
+              clearanceSide={props.clearance_side}
+              ausfahrten={props.runway_exits}
+              // EINE Quelle für den Namen (Entscheidung 2) und die
+              // richtige Rollweg-Quelle (Szenerie/OSM).
+              genutzt={genutzteAusfahrt(props)}
+              namen={ausfahrtenFuerAnzeige(props)}
+              rollwegQuelle={rollwegQuelle(props)}
+              bandFarbe={bandFarbeFuer(tokens, props.overrun_m, props.min_edge_clearance_m)}
+              width={width}
+              schriftMindest={props.schriftMindest}
+              tokens={tokens}
+            />
+          </div>
+          {/* Die Grafik zeigt die rohe Spur — es gibt trotzdem kein
+              Bewertungsurteil zur Bahndisziplin (Messfenster o.Ä.). Klein
+              und unaufdringlich, damit es die Grafik nicht ersetzt. */}
+          {keinUrteilGrund && (
+            <KeinUrteilNotiz
+              text={t(
+                `runway_v2.discipline_skip.${keinUrteilGrund}`,
+                skipText(keinUrteilGrund),
+              )}
+            />
+          )}
+        </>
+      )}
+
+      <Ereignisliste props={props} />
+
+      {grund == null &&
+        durchgaenge.map((d, i) => (
+          <DurchgangZeile
+            key={`dg-${i}`}
+            abSchwelleM={d[0]!.laengs_m - projektion.spurVersatzM}
+            querM={d[0]!.quer_m}
+          />
+        ))}
+
+      {breite != null && breite > 0 && <Groessenvergleich props={props} breiteM={breite} />}
+    </div>
+  );
+}
+
+/** Der ausgeschriebene Grund, warum die Queransicht entfällt. */
+/**
+ * Die Spur ab dem Aufsetzen, nur vorwärts.
+ *
+ * Gespeicherte Landungen tragen zwei Fehlerbilder aus dem Client, die dort
+ * behoben sind (fix/durchstart-spur), sich im Bestand aber nicht nachbessern
+ * lassen:
+ *
+ * * **Startlauf nach dem Durchstarten** vor der Spur. EWG9503 (#1431, EDDL
+ *   23L): sechs Punkte bei 2232–2313 m, danach das Aufsetzen bei 595 m. Die
+ *   Linie lief von dort zurück und las sich als zweite Spur.
+ * * **Wiederkehrende Probe** zwischen den Live-Punkten. LPPT 02 (#1403):
+ *   976 m, 1117 m, 976 m, 1130 m … — ein Sägezahn.
+ *
+ * Gemessen über 360 Landungen: acht betroffen. Die Regel trifft beide, ohne
+ * einen Wert zu erfinden: Die Spur beginnt am kleinsten Längswert (dem
+ * Aufsetzen — früher misst sie nicht), und danach fällt nur ein SPRUNG
+ * zurück weg.
+ *
+ * ⚠ Nicht „nur vorwärts": Eine Ausfahrt, die schräg nach hinten abgeht,
+ * läuft wirklich rückwärts — in Schritten von rund zehn Metern (dem
+ * Mindestabstand der Aufzeichnung). Die Fehlerbilder springen 140 Meter
+ * und mehr. Dazwischen liegt `RUECKSPRUNG_M`.
+ */
+const RUECKSPRUNG_M = 30;
+
+export function spurBereinigen<T extends { laengs_m: number; quer_m: number }>(
+  samples: T[],
+): T[] {
+  const gueltig = samples.filter(
+    (s) => Number.isFinite(s.laengs_m) && Number.isFinite(s.quer_m),
+  );
+  if (gueltig.length < 2) return gueltig;
+  let start = 0;
+  gueltig.forEach((s, i) => {
+    if (s.laengs_m < gueltig[start]!.laengs_m) start = i;
+  });
+  const aus: T[] = [];
+  for (const s of gueltig.slice(start)) {
+    const letzter = aus[aus.length - 1];
+    if (letzter == null || s.laengs_m >= letzter.laengs_m - RUECKSPRUNG_M) aus.push(s);
+  }
+  return aus;
+}
+
+/**
+ * Wo die Marke ② steht — und ob sie den bewerteten Wert trägt.
+ *
+ * Gesucht wird der Punkt der Spur, der dem gemeldeten Grösstversatz am
+ * nächsten kommt. Trägt ihn keiner (Abstand über zwei Metern), stammt der
+ * Wert nicht aus dieser Spur: Bei EWG9503 (#1431) wurden 11,0 m bewertet,
+ * und die kamen aus den Fremdpunkten, die `spurBereinigen` entfernt; die
+ * echte Spur kommt nicht über 2,8 m.
+ *
+ * Dann steht die Marke am echten Grösstversatz der gezeichneten Spur, und
+ * die Liste sagt dazu, was bewertet wurde. Weglassen ging nicht — Thomas
+ * (19.09.2026): „Punkt 2 nicht vergessen, den bewerten wir doch." Den
+ * bewerteten Wert an eine Stelle zu setzen, an der er nie gemessen wurde,
+ * ging auch nicht.
+ *
+ * Zwei Meter Spielraum: Die Ablage dünnt auf zehn Meter aus, der
+ * Grösstwert kann zwischen zwei Punkten gelegen haben.
+ */
+export function stelleDesVersatzes(
+  samples: Array<{ laengs_m: number; quer_m: number }>,
+  max: number,
+  bewertungsEnde: number | null | undefined,
+): { probe: { laengs_m: number; quer_m: number }; belegt: boolean } | null {
+  const imFenster = samples.filter((x) => bewertungsEnde == null || x.laengs_m < bewertungsEnde);
+  const naechster = imFenster.reduce<{ laengs_m: number; quer_m: number } | null>(
+    (a, b) => (a == null || Math.abs(b.quer_m - max) < Math.abs(a.quer_m - max) ? b : a),
+    null,
+  );
+  if (naechster == null) return null;
+  if (Math.abs(naechster.quer_m - max) <= 2) return { probe: naechster, belegt: true };
+  const echt = imFenster.reduce((a, b) => (Math.abs(b.quer_m) > Math.abs(a.quer_m) ? b : a));
+  return { probe: echt, belegt: false };
+}
+
+/**
+ * Ob der gemeldete Grösstversatz nicht gilt — dann führt die Liste keinen
+ * Eintrag ②. Eine Stelle, weil auch die Nummer des Spurendes im Bild davon
+ * abhängt (siehe `endpunktNummer`).
+ */
+/**
+ * Ob die Kante den Randabstand nicht trägt — dann steht er nirgends als Zahl
+ * (Liste und Draufsicht, Variante B). Eine Stelle für beide.
+ */
+export function kanteTraegtNicht(props: RunwayDiagramV2Props): boolean {
+  return (
+    versatzUnglaubwuerdig(props) ||
+    ["unpaved_runway", "surface_unknown", "water_runway"].includes(props.lateral_skip_reason ?? "")
+  );
+}
+
+export function versatzUnglaubwuerdig(props: RunwayDiagramV2Props): boolean {
+  return [
+    // Der Versatz selbst ist unglaubwürdig.
+    "implausible_lateral_track",
+    // Die Bahnachse, auf die projiziert wurde, ist es nicht.
+    "untrusted_geometry",
+    "off_airport_landing",
+    // Aus zwei, drei Proben lässt sich kein Grösstwert ablesen.
+    "insufficient_samples",
+    // Falsche Achse, schräg dazu gemessen (QS-Fund, Codex 08.09.2026) —
+    // dieselbe Ereignisliste wird unabhängig von der Grafik oben gerendert,
+    // sie muss den Grund selbst kennen statt sich auf `grund` zu verlassen.
+    "runway_axis_mismatch",
+  ].includes(props.lateral_skip_reason ?? "");
+}
+
+/**
+ * Die Nummer, unter der die Liste das Ende der Spur führt.
+ *
+ * Bild und Liste zählen getrennt, und sie liefen auseinander: Bei EWG9503
+ * (#1431) fehlt die Ausfahrtsseite — das Bild setzte keine ③, sondern ein
+ * Spurende mit der nächsten freien Nummer, ②. Die Liste führte unter ② den
+ * Grösstversatz und unter ③ „Bahn geräumt". Zwei Nummern, zwei Bedeutungen.
+ *
+ * Die Liste ist die Vorgabe: ③, wenn es einen Räumpunkt gibt (dann IST das
+ * Spurende die Räumung, nur ohne bekannte Seite), sonst die Nummer nach
+ * Aufsetzen und — falls geführt — Grösstversatz.
+ */
+export function endpunktNummer(props: RunwayDiagramV2Props): number {
+  if (props.clearance_point_m != null) return 3;
+  const mitVersatz = !versatzUnglaubwuerdig(props) && props.max_lateral_offset_m != null;
+  return mitVersatz ? 3 : 2;
+}
+
+/**
+ * Ein früherer Durchgang in der Ereignisliste — ohne Ziffer, die Ziffern
+ * gehören der gewerteten Landung. Der offene Kreis ist derselbe wie im Bild.
+ */
+function DurchgangZeile({ abSchwelleM, querM }: { abSchwelleM: number; querM: number }) {
+  const { t } = useTranslation();
+  return (
+    <div
+      style={{ display: "flex", gap: 8, alignItems: "baseline", fontSize: "0.82rem", color: "#cbd5e1" }}
+      data-zeile="durchgang"
+    >
+      <span
+        style={{
+          flex: "0 0 auto",
+          width: 14,
+          height: 14,
+          borderRadius: "50%",
+          border: `2px solid ${DURCHGANG_FARBE}`,
+          display: "inline-block",
+          transform: "translateY(2px)",
+        }}
+      />
+      <span>
+        {t("runway_v2.durchgang_frueher", {
+          defaultValue:
+            "Früherer Durchgang · aufgesetzt {{m}} m hinter der Schwelle · {{seite}} · durchgestartet, nicht gewertet",
+          m: fmt(abSchwelleM),
+          seite: seite(querM, t),
+        })}
+      </span>
+    </div>
+  );
+}
+
+function skipText(grund: string): string {
+  switch (grund) {
+    case "runway_width_unknown":
+      return "Für diese Bahn ist keine Breite hinterlegt — die Queransicht braucht sie als Massstab.";
+    case "no_lateral_track":
+      return "Für diesen Flug ist kein Rollweg erfasst. Flüge von vor v1.7.0 haben ihn nicht.";
+    case "unpaved_runway":
+      return "Gras- oder Naturpiste: Der Rand ist fliessend, eine Kante lässt sich nicht bemassen.";
+    case "surface_unknown":
+      return "Der Belag dieser Bahn ist nicht bekannt — ohne ihn ist die Kante keine belastbare Grenze.";
+    case "track_width_unknown":
+      return "Die Spurweite dieses Musters ist nicht hinterlegt; ohne sie lässt sich die Lage der Räder nicht bestimmen.";
+    case "insufficient_samples":
+      return "Die Geschwindigkeit lag beim Aufsetzen bereits nahe der Bewertungsschwelle — für ein Bahndisziplin-Urteil reicht das Messfenster nicht, die Spur ist unten trotzdem zu sehen.";
+    case "runway_axis_mismatch":
+      return "Die Bahnachse in den Navdaten passt nicht zur Bahn im Simulator — die Rollspur läuft schräg dazu. Ein Querversatz gegen diese Achse wäre kein Pilotenfehler, sondern ein Szenerie-Versatz.";
+    case "untrusted_geometry":
+      return "Die Bahndaten dieser Landung sind nicht verlässlich — ohne sie ist die Kante keine belastbare Grenze.";
+    case "implausible_lateral_track":
+      return "Der gemessene Versatz kann nicht stimmen — vermutlich ein Messfehler, deshalb keine seitliche Bewertung.";
+    case "off_airport_landing":
+      return "Keine erkannte Bahn — ohne sie gibt es keine Kante, zu der ein Abstand messbar wäre.";
+    case "missing_lateral_track":
+      return "Für diesen Flug ist kein Rollweg erfasst. Flüge von vor v1.7.0 haben ihn nicht.";
+    default:
+      return "Die Queransicht steht für diesen Flug nicht zur Verfügung.";
+  }
+}
+
+function Hinweis({ text }: { text: string }) {
+  return (
+    <div
+      style={{
+        padding: "10px 12px",
+        borderRadius: 6,
+        background: "rgba(148,163,184,0.10)",
+        border: "1px solid rgba(148,163,184,0.25)",
+        fontSize: "0.82rem",
+        color: "#94a3b8",
+        lineHeight: 1.5,
+      }}
+    >
+      {text}
+    </div>
+  );
+}
+
+/** Kleine, unaufdringliche Notiz NEBEN der Grafik — kein Ersatz für sie.
+ *  Zeigt an, dass die Bewertung kein Urteil gefällt hat, obwohl die Spur
+ *  zu sehen ist (siehe `keinUrteilGrund` oben). */
+function KeinUrteilNotiz({ text }: { text: string }) {
+  return (
+    <div
+      style={{
+        fontSize: "0.72rem",
+        color: "#64748b",
+        lineHeight: 1.4,
+        fontStyle: "italic",
+      }}
+    >
+      {text}
+    </div>
+  );
+}
+
+// ─── Ereignisliste ─────────────────────────────────────────────────────
+//
+// §8.5: Ereignisse stehen in der Grafik nur als nummerierte Marke; der Text
+// steht darunter. Damit kann im Bild nichts überlappen, und bei einer Landung
+// mit mehr Ereignissen wächst die Liste statt des Gedränges in der Grafik.
+
+function Ereignisliste({ props }: { props: RunwayDiagramV2Props }) {
+  const { t } = useTranslation();
+  const eintraege: Array<{ n: number; text: string }> = [];
+
+  eintraege.push({
+    n: 1,
+    text: `${t("runway_v2.mark.touchdown", { defaultValue: "Aufsetzen" })} · ${fmt(
+      props.td_distance_from_threshold_m,
+    )} m ${t("runway_v2.mark.past_threshold", { defaultValue: "hinter der Schwelle" })} · ${seite(
+      props.td_centerline_offset_m,
+      t,
+    )}`,
+  });
+
+  // ── Welcher Verzicht entwertet welche Zahl ───────────────────────────
+  //
+  // Die Ereignisliste lief bis Runde 22 IMMER — auch wenn die Bewertung
+  // die seitliche Lage verworfen hatte. Sie zeigte dann „äusseres Rad
+  // 3,2 m vor der Kante" neben einem Hinweis, der genau das für
+  // unbrauchbar erklärt.
+  //
+  // Es sind aber nicht alle Gründe gleich: Auf einer Graspiste ist der
+  // gemessene VERSATZ in Ordnung, nur die Kante ist fliessend. Deshalb
+  // wird unterschieden, statt pauschal alles wegzulassen — sonst
+  // verschwände eine Messung, die stimmt.
+  const versatzEntwertet = versatzUnglaubwuerdig(props);
+  // Die Kante trägt zusätzlich dann nicht, wenn sie keine feste Grenze ist.
+  const kanteEntwertet = kanteTraegtNicht(props);
+
+  const max = versatzEntwertet ? null : props.max_lateral_offset_m;
+  if (max != null) {
+    const rand = kanteEntwertet ? null : props.min_edge_clearance_m;
+    const zusatz =
+      rand == null
+        ? ""
+        : rand < 0
+        ? ` · ${t("runway_v2.mark.off_pavement", {
+            defaultValue: "äusseres Rad {{m}} m neben der befestigten Fläche",
+            m: Math.abs(rand).toFixed(1),
+          })}`
+        : ` · ${t("runway_v2.mark.edge_distance", {
+            defaultValue: "äusseres Rad {{m}} m vor der Kante",
+            m: rand.toFixed(1),
+          })}`;
+    // Die Laengsposition gehoert dazu: „26,9 m rechts" allein sagt nicht,
+    // ob das kurz nach dem Aufsetzen passierte oder erst beim Abbiegen.
+    // Dieselbe Grenze wie in der Queransicht — sonst nennt der Text
+    // eine andere Stelle als die Marke im Bild zeigt.
+    // B3 (#1905): das FRÜHESTE der gespeicherten Enden — bei Touch-and-go-
+    // Altbestand (Client 2.1.4) stammt `mess_ende` aus dem Durchgang davor.
+    const bewertungsEnde = fruehestesEnde(
+      props.mess_ende_laengs_m,
+      props.scoring_cutoff_m,
+      props.clearance_point_m,
+    );
+    const stelle = stelleDesVersatzes(props.lateral_samples ?? [], max, bewertungsEnde);
+    const wo = stelle?.probe ?? null;
+    const beiM =
+      wo != null
+        ? `${t("runway_v2.at_position", {
+            defaultValue: "bei {{m}} m",
+            m: wo.laengs_m.toFixed(0),
+          })} · `
+        : "";
+    // ⚠ „bis zur Messschwelle" gehört in den Text, nicht in eine Fußnote.
+    //
+    // Die seitliche Messung endet, sobald die Grundgeschwindigkeit unter
+    // die Messschwelle fällt (`bahn_mess_schwelle_kt`): Wer langsamer
+    // rollt, biegt ab, und ein Abbiegen ist kein Abkommen. Die Schwelle ist
+    // richtig — ohne sie meldeten 25 % der Landungen „Rad neben der Bahn".
+    //
+    // Seit v1.7.21 ist die Schwelle NICHT mehr fest bei 60 kt, sondern
+    // relativ zur Aufsetz-Grundgeschwindigkeit (25-60 kt, siehe
+    // `bahn_mess_schwelle_kt` in lib.rs) — ein fester „60 kt" im Text wäre
+    // für langsame GA-Muster schlicht falsch. Deshalb keine Zahl mehr hier.
+    //
+    // Ohne den Zusatz liest sich die Marke aber als größter Versatz der
+    // GANZEN Landung, und das ist sie nicht. Bei DLH369 (EDDM 26L) stand
+    // dort 12,9 m bei 1.646 m, während die Spur noch geradeaus bis
+    // 15,2 m bei 1.907 m weiterlief. Über zwanzig Landungen gemessen
+    // fehlten so bis zu 2,3 m; betroffen war rund ein Drittel.
+    eintraege.push({
+      n: 2,
+      text: `${t("runway_v2.mark.max_offset", {
+        defaultValue: "Grösster Versatz bis zur Messschwelle",
+      })} · ${beiM}${
+        stelle != null && !stelle.belegt
+          ? `${seite(stelle.probe.quer_m, t)} · ${t("runway_v2.mark.max_offset_fremd", {
+              defaultValue:
+                "bewertet wurden {{wert}}{{rand}} — aus fehlerhaften Messpunkten, die hier nicht gezeichnet sind",
+              wert: seite(max, t),
+              rand: zusatz,
+            })}`
+          : `${seite(max, t)}${zusatz}`
+      }`,
+    });
+  }
+
+  if (props.clearance_point_m != null) {
+    const seiteTxt =
+      props.clearance_side === "left"
+        ? t("runway_v2.side_left_word", { defaultValue: "links" })
+        : props.clearance_side === "right"
+        ? t("runway_v2.side_right_word", { defaultValue: "rechts" })
+        : // §8.6: Stimmen Kurs und Querbewegung nicht überein, wird die
+          // Richtung NICHT behauptet. Eine falsche Seite ist schlimmer als
+          // keine — sie liest sich wie eine Messung.
+          t("runway_v2.side_unclear", { defaultValue: "Richtung nicht eindeutig" });
+    const tempo =
+      props.clearance_speed_kt != null
+        ? ` · ${props.clearance_speed_kt.toFixed(0)} kt`
+        : "";
+    eintraege.push({
+      n: 3,
+      text: `${t("runway_v2.mark.cleared", { defaultValue: "Bahn geräumt" })} · ${fmt(
+        props.clearance_point_m,
+      )} m${tempo} · ${seiteTxt}`,
+    });
+  }
+
+  // Endpunkt ohne Ausfahrt — dieselbe Bedingung wie die Marke in der
+  // Grafik, damit Bild und Liste dieselben Nummern führen.
+  // Dieselbe Bedingung wie die Marke in der Grafik — auch das Überrollen
+  // schliesst den Endpunkt aus, denn Marke ④ sitzt bereits am Bahnende.
+  if (props.clearance_point_m == null && (props.overrun_m ?? 0) <= 0) {
+    const s = props.lateral_samples ?? [];
+    const letzter = s.length >= 2 ? s[s.length - 1]! : null;
+    const max = props.max_lateral_offset_m;
+    const beiMax =
+      max != null && letzter != null && Math.abs(letzter.quer_m - max) < 0.5;
+    if (letzter && !beiMax) {
+      eintraege.push({
+        n: eintraege.length + 1,
+        text: `${t("runway_v2.mark_track_end", {
+          defaultValue: "Ende der Aufzeichnung",
+        })} · ${fmt(letzter.laengs_m)} m · ${seite(letzter.quer_m, t)} · ${t(
+          "runway_v2.mark_slowed",
+          { defaultValue: "Auf Rollgeschwindigkeit" },
+        )}`,
+      });
+    }
+  }
+
+  if (props.overrun_m != null && props.overrun_m > 0) {
+    eintraege.push({
+      n: 4,
+      text: `${t("runway_v2.mark.overrun", {
+        defaultValue: "Über das Bahnende hinaus",
+      })} · ${fmt(props.overrun_m)} m`,
+    });
+  }
+
+  return (
+    <ol
+      style={{
+        listStyle: "none",
+        margin: 0,
+        padding: 0,
+        display: "flex",
+        flexDirection: "column",
+        gap: 6,
+      }}
+    >
+      {eintraege.map((e) => (
+        <li
+          key={e.n}
+          style={{
+            display: "flex",
+            gap: 8,
+            alignItems: "baseline",
+            fontSize: "0.82rem",
+            color: "#cbd5e1",
+            lineHeight: 1.5,
+          }}
+        >
+          <span
+            style={{
+              flex: "0 0 auto",
+              width: 18,
+              height: 18,
+              borderRadius: "50%",
+              background: "rgba(148,163,184,0.18)",
+              color: "#e2e8f0",
+              fontSize: "0.7rem",
+              fontWeight: 700,
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
+          >
+            {e.n}
+          </span>
+          <span>{e.text}</span>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+// ─── Grössenvergleich ──────────────────────────────────────────────────
+//
+// §8.3: „Das Grössenverhältnis gehört als massstäblicher Balkenvergleich unter
+// die Grafik. Die Spannweite ragt dort sichtbar über die Bahnbreite hinaus —
+// nur so versteht man, warum die Fahrspur so schmal wirkt."
+//
+// §8.6.5: Auf den **grössten** Wert normiert, nicht auf die Bahnbreite. Sonst
+// schiebt der längste Balken den Container auf und die Seite scrollt seitlich
+// — genau das ist im Entwurf vom 23.08. passiert, mit 114,6 % Balkenbreite.
+
+function Groessenvergleich({
+  props,
+  breiteM,
+}: {
+  props: RunwayDiagramV2Props;
+  breiteM: number;
+}) {
+  const { t } = useTranslation();
+  const zeilen = [
+    {
+      label: t("runway_v2.scale.runway_width", { defaultValue: "Bahnbreite" }),
+      m: breiteM,
+      farbe: "#64748b",
+    },
+    props.wingspan_m != null && {
+      // Mit dem Muster dahinter: „Spannweite 51,7 m" ist eine Zahl,
+      // „Spannweite MD-11 51,7 m" ist eine Aussage — man erkennt sofort,
+      // ob der Vergleich zum eigenen Flugzeug passt.
+      label: props.aircraft_icao
+        ? `${t("runway_v2.scale.wingspan", { defaultValue: "Spannweite" })} ${props.aircraft_icao}`
+        : t("runway_v2.scale.wingspan", { defaultValue: "Spannweite" }),
+      m: props.wingspan_m,
+      farbe: "#38bdf8",
+    },
+    props.track_width_m != null && {
+      label: t("runway_v2.scale.track_width", { defaultValue: "Spurweite" }),
+      m: props.track_width_m,
+      farbe: "#22c55e",
+    },
+  ].filter(Boolean) as Array<{ label: string; m: number; farbe: string }>;
+
+  const groesster = Math.max(...zeilen.map((z) => z.m));
+  if (!Number.isFinite(groesster) || groesster <= 0) return null;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+      {zeilen.map((z) => (
+        // Raster statt Flexbox, und `minmax(0, 1fr)` für die Balkenspalte.
+        //
+        // Mit `flex: 0 0 88px` für den Namen lief die Zeile über, sobald der
+        // Name länger war als seine Spalte — „Spannweite A321" braucht mehr,
+        // und Flex-Elemente schrumpfen nicht unter ihre Inhaltsbreite. Der
+        // Block ragte damit achtunddreissig Pixel über seinen Container
+        // hinaus, und die Zahlen rechts wurden abgeschnitten (§8.6.5). Die
+        // Referenzgrafik löst es mit demselben Raster: 132 / minmax(0,1fr) / 58.
+        <div
+          key={z.label}
+          style={{
+            display: "grid",
+            gridTemplateColumns: "132px minmax(0, 1fr) 58px",
+            alignItems: "center",
+            gap: 10,
+            fontSize: "0.75rem",
+          }}
+        >
+          <span style={{ color: "#94a3b8", minWidth: 0 }}>{z.label}</span>
+          <span
+            style={{
+              minWidth: 0,
+              height: 8,
+              background: "rgba(148,163,184,0.10)",
+              borderRadius: 4,
+              overflow: "hidden",
+            }}
+          >
+            <span
+              style={{
+                display: "block",
+                height: "100%",
+                // Normiert auf den grössten Wert — nie über 100 %.
+                width: `${(z.m / groesster) * 100}%`,
+                background: z.farbe,
+                borderRadius: 4,
+              }}
+            />
+          </span>
+          <span
+            style={{
+              color: "#cbd5e1",
+              textAlign: "right",
+              fontVariantNumeric: "tabular-nums",
+            }}
+          >
+            {z.m.toFixed(1)} m
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ─── Helfer ────────────────────────────────────────────────────────────
+
+function fmt(m: number): string {
+  return Number.isFinite(m) ? m.toFixed(0) : "—";
+}
+
+/**
+ * Versatz als Seitenangabe. §8.6: Ein Pilot denkt in Seiten, nicht in
+ * Koordinaten — intern bleibt `quer > 0 = rechts`, die Umrechnung geschieht
+ * hier und in der Queransicht, sonst nirgends.
+ */
+function seite(
+  quer_m: number,
+  t: (k: string, o: { defaultValue: string }) => string,
+): string {
+  if (!Number.isFinite(quer_m)) return "—";
+  const betrag = Math.abs(quer_m).toFixed(1);
+  if (Math.abs(quer_m) < 0.5) {
+    return t("runway_v2.on_centerline", { defaultValue: "auf der Mittellinie" });
+  }
+  return quer_m > 0
+    ? `${betrag} m ${t("runway_v2.side_right_word", { defaultValue: "rechts" })}`
+    : `${betrag} m ${t("runway_v2.side_left_word", { defaultValue: "links" })}`;
+}

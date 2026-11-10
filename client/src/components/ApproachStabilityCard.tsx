@@ -1,0 +1,674 @@
+// Post-Flight Approach-Stability-Card für das LandingPanel.
+//
+// Spec-Ursprung: webapp/aeroacars-live zeigt eine 7-Kacheln-Auswertung
+// (V/S-Jerk, Bank σ, IAS σ, Sink Rate, Landing-Config, V/S vs. 3°-ILS,
+// Max V/S-Dev < 500 ft) plus eine STABLE-GATE-Pill und einen Coaching-
+// Text — diese Card portiert dieselbe Logik in den Pilot-Client. Quellen
+// für die Werte stehen alle bereits im LandingRecord (Backend rechnet sie
+// in `compute_approach_stability_v2`, lib.rs:3832); v0.11.0-dev hat 3
+// fehlende Felder ins Storage-Schema nachgezogen.
+//
+// Banding-Schwellen sind 1:1 die Toleranzen aus der Spec / dem
+// Help-Modal (siehe `landing.approach_stability_help.tiles.*.thresholds`):
+//
+//   V/S-Jerk           < 100 fpm/tick · 100–200 · > 200
+//   Bank σ (filtered)  < 3° · 3–6° · > 6°
+//   IAS σ              < 5 kt · 5–8 kt · > 8 kt
+//   Sink Rate          bool (excessive_sink)
+//   Landing-Config     bool (stable_config)
+//   V/S vs. 3°-ILS     < 100 fpm · 100–200 · > 200
+//   Max V/S-Dev <500ft < 200 fpm · 200–400 · > 400
+//
+// ⚠ Dieselben Grenzen stehen im Backend: landing_scoring::anflug_urteil
+// (deckelt Stabilitätsachse UND seit Score-Version 18 die Gesamtnote:
+// PARTIAL ≤ 80, UNSTABLE ≤ 45). Wer hier
+// eine Grenze ändert, muss dort mitziehen.
+//
+// STABLE-GATE-Pill: alles grün → STABLE; ≥ 2 bad ODER bad+ok ≥ 3 → UNSTABLE;
+// sonst PARTIAL (so rechnet auch das Backend).
+// "bad" für Bools = excessive_sink=true / stable_config=false.
+
+import { useContext, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { ApproachStabilityHelpModal } from "./ApproachStabilityHelpModal";
+import {
+  gateEinheit,
+  gateGrundTitel,
+  gateGruende,
+  gateLabel,
+  gateUrteil,
+  gateWert,
+  type GatePunkt,
+} from "../lib/stableGate";
+import { AltbestandKontext, InfoBadge } from "./InfoBadge";
+import { sinklaufSatz, windKacheln, type AnflugWind } from "../lib/anflugWind";
+
+type Band = "good" | "ok" | "bad" | "missing";
+
+interface Props {
+  vsJerkFpm?: number | null;
+  bankStddevDeg?: number | null;
+  iasStddevKt?: number | null;
+  excessiveSink?: boolean | null;
+  stableConfig?: boolean | null;
+  vsDeviationFpm?: number | null;
+  maxVsDeviationBelow500Fpm?: number | null;
+  /** True = Gate auf Height-Above-Touchdown gefiltert.
+   *  False = AGL-Fallback (Airport-Elevation unbekannt).
+   *  null/undefined = unbekannt (pre-v0.11.0 PIREP). */
+  usedHat?: boolean | null;
+  /** Anzahl Samples im Gate. Bevorzugt aus gate_window.sample_count,
+   *  Fallback auf approach_samples.length. */
+  sampleCount: number | null;
+  /** "msfs" | "xplane" | null — wird als „MSFS\" / „X-Plane\" gerendert. */
+  simKind?: string | null;
+  /** v0.15.17: echter Gleitpfad-Winkel (Navdaten). Bei ≠3° (z.B. EGLC 5,5°)
+   *  wird die V/S-vs-ILS-Kachel mit dem echten Winkel beschriftet — der Wert
+   *  selbst kommt schon winkel-korrekt aus dem Backend. null → Standard 3°. */
+  glideslopeAngleDeg?: number | null;
+  /** Score-Version 19: Prüfliste aus dem Datensatz (`sub_scores[stability]
+   *  .gate`). Vorhanden → Kacheln, Urteil und Gründe kommen von dort, die
+   *  Karte rechnet nichts nach. Fehlt sie (ältere Landungen), bleibt die
+   *  bisherige Darstellung mit sieben Kacheln. */
+  gate?: GatePunkt[] | null;
+  /** Marke der Stabilitätsachse (anflug_partial/anflug_unstable) — trägt
+   *  das eingefrorene Urteil; die Karte zählt nichts selbst. */
+  marke?: string | null;
+  /** Messwerte zur Einordnung (keine Note): Bahnwechsel unter 1500 ft,
+   *  stabil bei 200 ft (DA), Zahl der Stall-Warnungen im Anflug. */
+  runwayChangedLate?: boolean | null;
+  stableAtDa?: boolean | null;
+  stallWarningCount?: number | null;
+  /** Score-Version 23: spätes Final / Kurvenanflug erkannt — Höhe beim
+   *  Ausrichten (ft über Platz) und Kurve davor (Grad). Fehlt = gerader
+   *  Anflug, dann kein Hinweis. */
+  spaetesFinalAbFt?: number | null;
+  spaetesFinalKurveDeg?: number | null;
+  /** Score-Version 24: Wind im Anflug, Soll-Sinkrate, angewandte Sinkgrenze
+   *  und längster Sinklauf (`approach_wind`). Fehlt bei älteren Landungen —
+   *  dann ein Hinweis statt Ersatzwerten. Kontext, keine Note. */
+  wind?: AnflugWind | null;
+}
+
+function bandForRange(
+  v: number | null | undefined,
+  goodMax: number,
+  okMax: number,
+): Band {
+  if (v == null || !Number.isFinite(v)) return "missing";
+  if (v < goodMax) return "good";
+  if (v < okMax) return "ok";
+  return "bad";
+}
+
+function bandForBool(v: boolean | null | undefined, goodValue: boolean): Band {
+  if (v == null) return "missing";
+  return v === goodValue ? "good" : "bad";
+}
+
+const BAND_COLORS: Record<Band, string> = {
+  good: "#22c55e",
+  ok: "#eab308",
+  bad: "#ef4444",
+  // Theme-Farbe statt festem Weiß — auf Papier war der Strich unsichtbar
+  // (QS 06.10.2026).
+  missing: "var(--text-muted, #94a3b8)",
+};
+
+function formatSimKind(simKind: string | null | undefined): string | null {
+  if (!simKind) return null;
+  const k = simKind.toLowerCase();
+  if (k.includes("msfs")) return "MSFS";
+  if (k.includes("xplane") || k.includes("x-plane")) return "X-Plane";
+  return simKind;
+}
+
+export function ApproachStabilityCard(props: Props) {
+  const { t, i18n } = useTranslation();
+  const [helpOpen, setHelpOpen] = useState(false);
+  const gate = props.gate && props.gate.length > 0 ? props.gate : null;
+  const altbestand = useContext(AltbestandKontext);
+
+  const bands: Band[] = [
+    bandForRange(props.vsJerkFpm, 100, 200),
+    bandForRange(props.bankStddevDeg, 3, 6),
+    bandForRange(props.iasStddevKt, 5, 8),
+    bandForBool(props.excessiveSink, false),
+    bandForBool(props.stableConfig, true),
+    bandForRange(props.vsDeviationFpm, 100, 200),
+    bandForRange(props.maxVsDeviationBelow500Fpm, 200, 400),
+  ];
+
+  const badCount = bands.filter((b) => b === "bad").length;
+  const okCount = bands.filter((b) => b === "ok").length;
+  const missingCount = bands.filter((b) => b === "missing").length;
+  // Wenn ALLE 7 Werte fehlen (= Legacy-PIREP), zeigen wir keinen Pill,
+  // sondern nur den Legacy-Hinweis.
+  const isLegacy = missingCount === bands.length && !gate;
+  // STABLE = alle Werte im grünen Band.
+  // UNSTABLE = ab 2 harten Verletzungen ODER insgesamt ≥3 Werte außerhalb.
+  // Sonst PARTIAL (= 1 bad oder 1–2 ok).
+  let pillKey: "stable" | "partial" | "unstable";
+  if (badCount === 0 && okCount === 0) pillKey = "stable";
+  else if (badCount >= 2 || badCount + okCount >= 3) pillKey = "unstable";
+  else pillKey = "partial";
+  // Neue Landungen: das Urteil aus dem Datensatz, nicht nachgerechnet.
+  if (gate) pillKey = gateUrteil(gate, props.marke) ?? pillKey;
+  const gruende = gate
+    ? gateGruende(t, gate, i18n.language, { sinken: sinklaufSatz(t, props.wind, i18n.language) })
+    : [];
+  const windTeile = props.wind ? windKacheln(t, props.wind) : [];
+
+  const pillColor =
+    pillKey === "stable" ? "#22c55e" :
+    pillKey === "partial" ? "#eab308" : "#ef4444";
+  const pillBg =
+    pillKey === "stable" ? "rgba(34,197,94,0.12)" :
+    pillKey === "partial" ? "rgba(234,179,8,0.12)" :
+    "rgba(239,68,68,0.12)";
+
+  const coachKey = pillKey;
+  const coachBg = pillBg;
+  const coachBorder = pillColor;
+
+  const sim = formatSimKind(props.simKind);
+  const ohneMuster = props.sampleCount == null || props.sampleCount === 0;
+  // Mit Prüfliste (v19) gibt es das Urteil — „keine Samples" wäre dort
+  // falsch; ohne Musterzahl entfällt die Zeile dann ganz.
+  const sublineKey: string | null =
+    ohneMuster
+      ? gate ? null : "subline_no_samples"
+      : props.usedHat === false
+        ? "subline_agl"
+        : "subline_hat";
+
+  return (
+    <section className="landing-section landing-approach-stability">
+      {helpOpen && (
+        <ApproachStabilityHelpModal onClose={() => setHelpOpen(false)} />
+      )}
+
+      {/* Header: Titel + STABLE-GATE-Pill */}
+      <header
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 12,
+          marginBottom: 6,
+          flexWrap: "wrap",
+        }}
+      >
+        <h3 style={{ margin: 0, fontSize: "1rem" }}>
+          {t("landing.approach_stability_card.title")}
+          {/* Die Altfassung nach der Version (Kontext), nicht nach fehlender
+              Prüfliste — sie beschreibt selbst die damaligen Regeln, ohne
+              den gemeinsamen Hinweis (Runde 9). */}
+          {!isLegacy &&
+            (altbestand ? (
+              <InfoBadge explanation={t("landing.erklaer.gate.urteil_alt")} ohneAltHinweis />
+            ) : (
+              <InfoBadge explanation={t("landing.erklaer.gate.urteil")} />
+            ))}
+        </h3>
+        {!isLegacy && (
+          <span
+            className="farbwert"
+            style={{
+              padding: "3px 10px",
+              borderRadius: 4,
+              fontSize: "0.74rem",
+              fontWeight: 700,
+              color: pillColor,
+              background: pillBg,
+              border: `1px solid ${pillColor}55`,
+              letterSpacing: 0.4,
+            }}
+          >
+            {t(`landing.approach_stability_card.pill_${pillKey}`)}
+          </span>
+        )}
+      </header>
+
+      {/* Sub-Line: Gate-Bereich + Sample-Count */}
+      <div
+        style={{
+          fontSize: "0.78rem",
+          opacity: 0.78,
+          marginBottom: 4,
+        }}
+      >
+        {sublineKey &&
+          t(`landing.approach_stability_card.${sublineKey}`, {
+            count: props.sampleCount ?? 0,
+          })}
+      </div>
+
+      {/* Datenquelle */}
+      <div
+        style={{
+          fontSize: "0.74rem",
+          opacity: 0.6,
+          marginBottom: 12,
+        }}
+      >
+        {sim
+          ? t("landing.approach_stability_card.data_source", { sim })
+          : t("landing.approach_stability_card.data_source_unknown")}
+      </div>
+
+      {/* Score-Version 23: spätes Final / Kurvenanflug — sagen, ab wo
+          Querneigung, V/S und Gleitpfad zählen. Ob es rechtzeitig war,
+          steht in der Kachel „Final". */}
+      {props.spaetesFinalAbFt != null && (
+        <div
+          data-testid="spaetes-final"
+          style={{ fontSize: "0.84rem", lineHeight: 1.45, marginBottom: 12 }}
+        >
+          {/* Versatzanflug (Tivat, Madeira): kaum Kurve — dann ohne Gradzahl,
+              „davor 0° Kurve" läse sich wie ein Fehler. */}
+          {(props.spaetesFinalKurveDeg ?? 0) >= 30
+            ? t("landing.approach_stability_card.spaetes_final", {
+                hoehe: Math.round(props.spaetesFinalAbFt),
+                kurve: Math.round(props.spaetesFinalKurveDeg ?? 0),
+              })
+            : t("landing.approach_stability_card.spaetes_final_versatz", {
+                hoehe: Math.round(props.spaetesFinalAbFt),
+              })}
+        </div>
+      )}
+
+      {/* Legacy-Hinweis, wenn das PIREP keine Stability-Felder hat */}
+      {isLegacy && (
+        <div
+          style={{
+            padding: "10px 12px",
+            border: "1px solid rgba(255,255,255,0.12)",
+            borderRadius: 6,
+            background: "rgba(255,255,255,0.04)",
+            fontSize: "0.84rem",
+            opacity: 0.78,
+          }}
+        >
+          {t("landing.approach_stability_card.legacy_notice")}
+        </div>
+      )}
+
+      {/* Score-Version 19: sechs Prüfungen aus dem Datensatz + Gründe */}
+      {gate && (
+        <>
+          <div
+            data-testid="gate-kacheln"
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))",
+              gap: 8,
+              marginBottom: 12,
+            }}
+          >
+            {gate.map((p) => (
+              <Tile
+                key={p.key}
+                label={gateLabel(t, p.key)}
+                value={gateWert(t, p, i18n.language)}
+                unit={gateEinheit(t, p)}
+                band={p.stufe === "gut" ? "good" : p.stufe === "mittel" ? "ok" : "bad"}
+                info={t(`landing.erklaer.gate.${p.key}`)}
+              />
+            ))}
+          </div>
+          {gruende.length > 0 && (
+            <div
+              data-testid="gate-gruende"
+              style={{ fontSize: "0.84rem", marginBottom: 10, lineHeight: 1.45 }}
+            >
+              <b>{gateGrundTitel(t)}</b>
+              <ul style={{ margin: "4px 0 0", paddingLeft: 18 }}>
+                {gruende.map((g) => (
+                  <li key={g}>{g}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {/* Score-Version 24: Wind im Anflug — Kontext, zählt nicht in die
+              Note. Ältere Landungen: Hinweis, keine Nullen. */}
+          <div data-testid="anflug-wind" style={{ marginBottom: 12 }}>
+            <div style={{ fontSize: "0.78rem", opacity: 0.78, marginBottom: 6 }}>
+              {t("landing.anflug_wind.titel")}{" "}
+              <InfoBadge explanation={t("landing.erklaer.anflug_wind")} />
+            </div>
+            {windTeile.length > 0 && (
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))",
+                  gap: 8,
+                }}
+              >
+                {windTeile.map((k) => (
+                  <WindKachelAnzeige key={k.key} wert={k.wert} label={k.label} zusatz={k.zusatz} />
+                ))}
+              </div>
+            )}
+            {props.wind == null ? (
+              <div style={{ fontSize: "0.8rem", opacity: 0.7 }}>
+                {t("landing.anflug_wind.nicht_aufgezeichnet")}
+              </div>
+            ) : (
+              props.wind.wind_proben === 0 && (
+                <div style={{ fontSize: "0.8rem", opacity: 0.7, marginTop: 6 }}>
+                  {t("landing.anflug_wind.wind_nicht_gemessen")}
+                </div>
+              )
+            )}
+          </div>
+          {/* Coach-Satz wie vor dem Umbau (QS 06.10.2026: bei stabilem Anflug
+              stand sonst gar nichts, „Go-Around-Kandidat" fehlte). Die
+              Gründe oben nennen zusätzlich genau, was nicht stabil war. */}
+          <div
+            data-testid="gate-coach"
+            className="farbwert"
+            style={{
+              padding: "10px 12px",
+              borderRadius: 6,
+              background: coachBg,
+              border: `1px solid ${coachBorder}55`,
+              fontSize: "0.86rem",
+              lineHeight: 1.45,
+              color: coachBorder,
+            }}
+          >
+            {t(`landing.approach_stability_card.coach.${coachKey}`)}
+          </div>
+        </>
+      )}
+
+      {/* 7-Kacheln-Grid (Landungen vor Score-Version 19) */}
+      {!isLegacy && !gate && (
+        <>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns:
+                "repeat(auto-fit, minmax(130px, 1fr))",
+              gap: 8,
+              marginBottom: 12,
+            }}
+          >
+            <Tile
+              label={t("landing.approach_stability_card.tiles.vs_jerk.label")}
+              value={fmtNumOrDash(props.vsJerkFpm, 0)}
+              unit={t("landing.approach_stability_card.tiles.vs_jerk.unit")}
+              band={bands[0]}
+              info={t("landing.erklaer.tile.vs_jerk")}
+            />
+            <Tile
+              label={t(
+                "landing.approach_stability_card.tiles.bank_sigma.label",
+              )}
+              value={fmtNumOrDash(props.bankStddevDeg, 1)}
+              unit={t(
+                "landing.approach_stability_card.tiles.bank_sigma.unit",
+              )}
+              band={bands[1]}
+              info={t("landing.erklaer.tile.bank_sigma")}
+            />
+            <Tile
+              label={t(
+                "landing.approach_stability_card.tiles.ias_sigma.label",
+              )}
+              value={fmtNumOrDash(props.iasStddevKt, 1)}
+              unit={t(
+                "landing.approach_stability_card.tiles.ias_sigma.unit",
+              )}
+              band={bands[2]}
+              info={t("landing.erklaer.tile.ias_sigma")}
+            />
+            <Tile
+              label={t(
+                "landing.approach_stability_card.tiles.sink_rate.label",
+              )}
+              value={
+                props.excessiveSink == null
+                  ? t("landing.approach_stability_card.missing_value")
+                  : props.excessiveSink
+                    ? t(
+                        "landing.approach_stability_card.tiles.sink_rate.value_excessive",
+                      )
+                    : t(
+                        "landing.approach_stability_card.tiles.sink_rate.value_ok",
+                      )
+              }
+              band={bands[3]}
+              info={t("landing.erklaer.tile.sink_rate")}
+            />
+            <Tile
+              label={t(
+                "landing.approach_stability_card.tiles.landing_config.label",
+              )}
+              value={
+                props.stableConfig == null
+                  ? t(
+                      "landing.approach_stability_card.tiles.landing_config.value_unknown",
+                    )
+                  : props.stableConfig
+                    ? t(
+                        "landing.approach_stability_card.tiles.landing_config.value_ok",
+                      )
+                    : t(
+                        "landing.approach_stability_card.tiles.landing_config.value_partial",
+                      )
+              }
+              band={bands[4]}
+              info={t("landing.erklaer.tile.landing_config")}
+            />
+            <Tile
+              label={
+                props.glideslopeAngleDeg != null &&
+                props.glideslopeAngleDeg >= 2 &&
+                props.glideslopeAngleDeg <= 7.5 &&
+                Math.abs(props.glideslopeAngleDeg - 3) > 0.05
+                  ? t(
+                      "landing.approach_stability_card.tiles.vs_vs_ils.label_custom",
+                      { angle: String(props.glideslopeAngleDeg) },
+                    )
+                  : t("landing.approach_stability_card.tiles.vs_vs_ils.label")
+              }
+              value={fmtNumOrDash(props.vsDeviationFpm, 0)}
+              unit={t(
+                "landing.approach_stability_card.tiles.vs_vs_ils.unit",
+              )}
+              band={bands[5]}
+              info={t("landing.erklaer.tile.vs_vs_ils")}
+            />
+            <Tile
+              label={t(
+                "landing.approach_stability_card.tiles.max_vs_dev.label",
+              )}
+              value={fmtNumOrDash(props.maxVsDeviationBelow500Fpm, 0)}
+              unit={t(
+                "landing.approach_stability_card.tiles.max_vs_dev.unit",
+              )}
+              band={bands[6]}
+              info={t("landing.erklaer.tile.max_vs_dev")}
+            />
+          </div>
+
+          {/* Coaching */}
+          <div
+            className="farbwert"
+            style={{
+              padding: "10px 12px",
+              borderRadius: 6,
+              background: coachBg,
+              border: `1px solid ${coachBorder}55`,
+              fontSize: "0.86rem",
+              lineHeight: 1.45,
+              color: coachBorder,
+            }}
+          >
+            {t(`landing.approach_stability_card.coach.${coachKey}`)}
+          </div>
+        </>
+      )}
+
+      {/* Messwerte zur Einordnung — bis 05.10.2026 nur in der Webapp und dort
+          nur als Teil eigener Coaching-Sätze. Hier ohne Urteil. */}
+      {/* Nur wenn ein Eintrag erscheint: `runwayChangedLate === false`
+          zeigt nichts — sonst stand eine leere, umrandete Liste da
+          (QS 06.10.2026). */}
+      {(props.runwayChangedLate === true ||
+        props.stableAtDa != null ||
+        (props.stallWarningCount ?? 0) > 0) && (
+        <ul
+          data-testid="anflug-zusatz"
+          style={{ margin: "10px 0 0", paddingLeft: 18, fontSize: "0.82rem", lineHeight: 1.5, opacity: 0.85 }}
+        >
+          {props.runwayChangedLate === true && <li>{t("landing.approach_stability_card.extra.rwy_change")}</li>}
+          {props.stableAtDa != null && (
+            <li>
+              {t(
+                props.stableAtDa
+                  ? "landing.approach_stability_card.extra.da_stabil"
+                  : "landing.approach_stability_card.extra.da_nicht_stabil",
+              )}
+            </li>
+          )}
+          {(props.stallWarningCount ?? 0) > 0 && (
+            <li>{t("landing.approach_stability_card.extra.stall", { count: props.stallWarningCount ?? 0 })}</li>
+          )}
+        </ul>
+      )}
+
+      {/* Help-Button — immer sichtbar, auch bei Legacy */}
+      <button
+        className="nur-bildschirm"
+        type="button"
+        onClick={() => setHelpOpen(true)}
+        style={{
+          marginTop: 10,
+          padding: "4px 10px",
+          background: "color-mix(in srgb, var(--text) 6%, transparent)",
+          border: "1px solid color-mix(in srgb, var(--text) 18%, transparent)",
+          borderRadius: 4,
+          color: "var(--text)",
+          fontSize: "0.74rem",
+          cursor: "pointer",
+          alignSelf: "flex-start",
+        }}
+      >
+        {t("landing.approach_stability_card.help_button")}
+      </button>
+    </section>
+  );
+}
+
+/** Kachel des Windstreifens: neutral (keine Note, keine Ampel). */
+function WindKachelAnzeige({ wert, label, zusatz }: { wert: string; label: string; zusatz?: string }) {
+  return (
+    <div
+      style={{
+        background: "rgba(255,255,255,0.04)",
+        border: `1px solid color-mix(in srgb, ${BAND_COLORS.missing} 25%, transparent)`,
+        borderRadius: 6,
+        padding: "8px 10px",
+        display: "flex",
+        flexDirection: "column",
+        gap: 2,
+        minHeight: 64,
+      }}
+    >
+      <div
+        style={{
+          fontSize: "0.68rem",
+          letterSpacing: 0.4,
+          opacity: 0.75,
+          textTransform: "uppercase",
+          fontWeight: 600,
+        }}
+      >
+        {label}
+      </div>
+      <div style={{ fontSize: "1.05rem", fontWeight: 700 }}>{wert}</div>
+      {zusatz && <div style={{ fontSize: "0.74rem", opacity: 0.7 }}>{zusatz}</div>}
+    </div>
+  );
+}
+
+function Tile({
+  label,
+  value,
+  unit,
+  band,
+  info,
+}: {
+  label: string;
+  value: string;
+  unit?: string;
+  band: Band;
+  /** Erklärung hinter dem (i)-Knopf (05.10.2026). */
+  info?: string;
+}) {
+  const color = BAND_COLORS[band];
+  return (
+    <div
+      style={{
+        background: "rgba(255,255,255,0.04)",
+        // color-mix statt angehängtem Alpha: gilt auch für die Theme-Farbe
+        // (fehlender Wert), `rgba(..)40` war ungültig und ohne Rand.
+        border: `1px solid color-mix(in srgb, ${color} 25%, transparent)`,
+        borderRadius: 6,
+        padding: "8px 10px",
+        display: "flex",
+        flexDirection: "column",
+        gap: 2,
+        minHeight: 64,
+      }}
+    >
+      <div
+        style={{
+          fontSize: "0.68rem",
+          letterSpacing: 0.4,
+          opacity: 0.75,
+          textTransform: "uppercase",
+          fontWeight: 600,
+        }}
+      >
+        {label}
+        {info && <> <InfoBadge explanation={info} /></>}
+      </div>
+      <div
+        className="farbwert"
+        style={{
+          fontSize: "1.05rem",
+          fontWeight: 700,
+          color,
+          fontVariantNumeric: "tabular-nums",
+          lineHeight: 1.2,
+        }}
+      >
+        {value}
+        {unit && value !== "—" && (
+          <span
+            style={{
+              fontSize: "0.66rem",
+              fontWeight: 500,
+              opacity: 0.75,
+              marginLeft: 4,
+            }}
+          >
+            {unit}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function fmtNumOrDash(
+  v: number | null | undefined,
+  digits: number,
+): string {
+  if (v == null || !Number.isFinite(v)) return "—";
+  return v.toFixed(digits);
+}

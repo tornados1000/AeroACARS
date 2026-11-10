@@ -1,0 +1,581 @@
+name: Release
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  # ─── Pre-flight gate ─────────────────────────────────────────────────
+  #
+  # v0.10.0 (#release-checklist): vor jedem signed Build muessen drei
+  # Voraussetzungen erfuellt sein — sonst wird gar nicht erst gebaut.
+  # Hintergrund: v0.9.0/v0.9.1/v0.9.2 wurden mit kaputtem Update-Modal
+  # released weil niemand vor Tag-Push gegenpruefte. Mit diesem Job
+  # gibt's einen automatischen Gate gegen dieselbe Klasse von Bug:
+  #
+  #   1. Tag entspricht der Version in package.json / Cargo.toml /
+  #      tauri.conf.json — verhindert „v0.10.0 Tag aber package.json
+  #      sagt 0.9.2"-Drift
+  #   2. Release-Notes-File `docs/release-notes/v{TAG}.md` existiert
+  #      — Pilot muss im Update-Modal lesbare Notes sehen
+  #   3. Vitest laeuft sauber (insbesondere UpdateButton.test.tsx der
+  #      die Modal-Struktur-Regression verhindert)
+  #
+  # Wenn EINER der Checks failt, wird der Build NICHT gestartet.
+  # Tag bleibt, aber GitHub-Release entsteht nicht. Fixed werden muss
+  # auf dem Branch, neuer Tag, neuer Push.
+  release-preflight:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
+      - name: Verify tag matches package.json / Cargo.toml / tauri.conf.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#v}"
+          echo "Tag (sans v): $TAG"
+
+          PKG_VERSION=$(node -p "require('./client/package.json').version")
+          CARGO_VERSION=$(grep -E '^version = "' client/src-tauri/Cargo.toml | head -1 | cut -d'"' -f2)
+          TAURI_VERSION=$(node -p "require('./client/src-tauri/tauri.conf.json').version")
+
+          echo "package.json:      $PKG_VERSION"
+          echo "Cargo.toml:        $CARGO_VERSION"
+          echo "tauri.conf.json:   $TAURI_VERSION"
+
+          fail=0
+          [[ "$PKG_VERSION" == "$TAG" ]] || { echo "::error::package.json version ($PKG_VERSION) != tag ($TAG)"; fail=1; }
+          [[ "$CARGO_VERSION" == "$TAG" ]] || { echo "::error::Cargo.toml version ($CARGO_VERSION) != tag ($TAG)"; fail=1; }
+          [[ "$TAURI_VERSION" == "$TAG" ]] || { echo "::error::tauri.conf.json version ($TAURI_VERSION) != tag ($TAG)"; fail=1; }
+          [[ $fail -eq 0 ]] || exit 1
+
+      - name: Verify release-notes file exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"  # mit "v"-Prefix
+          NOTES="docs/release-notes/${TAG}.md"
+          if [[ ! -f "$NOTES" ]]; then
+            echo "::error::Release-Notes-Datei fehlt: $NOTES"
+            echo "::error::Bitte vor dem Tag eine bilinguale Release-Notes-Datei (🇩🇪 + 🇬🇧) anlegen."
+            echo "::error::Siehe docs/release-checklist.md Stufe 2."
+            exit 1
+          fi
+          # Bonus: pruefen ob bilingual (= 🇩🇪 + 🇬🇧 vorhanden)
+          if ! grep -q "🇩🇪" "$NOTES"; then
+            echo "::warning::Release-Notes ohne 🇩🇪 Deutsch-Block — bilingual gewuenscht (siehe MEMORY.md)"
+          fi
+          if ! grep -q "🇬🇧" "$NOTES"; then
+            echo "::warning::Release-Notes ohne 🇬🇧 English-Block — bilingual gewuenscht (siehe MEMORY.md)"
+          fi
+          echo "Release-Notes vorhanden: $NOTES"
+          wc -l "$NOTES"
+
+      # Ohne Recommends (= frueheres --no-install-recommends in ci.yml). Muss in
+      # ci.yml und release.yml gleich sein: gleiche Paketliste + gleiche
+      # `version` = gleicher Cache-Key, und der Release-Tag liest den Cache,
+      # den ci.yml auf main gespeichert hat. `apt-get update` (7 s, nicht der
+      # langsame Teil) macht die Action selbst nicht: ohne frische Listen
+      # liefe ein Cache-Miss auf veraltete Versionen und 404.
+      - name: apt vorbereiten (Listen aktualisieren, ohne Recommends)
+        timeout-minutes: 3
+        run: |
+          echo 'APT::Install-Recommends "false";' | sudo tee /etc/apt/apt.conf.d/99-no-recommends
+          sudo apt-get update
+
+      # Pakete aus dem Actions-Cache statt vom Ubuntu-Mirror: azure.archive.
+      # ubuntu.com lieferte in Lauf 39844274945 (v2.1.8) nur 29.8 kB/s, der
+      # apt-Download dauerte 26½ min statt 26 s. Ein Retry traefe denselben
+      # Mirror, deshalb raus aus dem kritischen Pfad. Nur ein Cache-Miss (neue
+      # Paketversion / neues Ubuntu) laedt noch vom Mirror; timeout-minutes
+      # ist die Notbremse dafuer.
+      - name: Install Tauri Linux deps (libwebkit2gtk etc.)
+        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
+        timeout-minutes: 12
+        with:
+          packages: libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+          version: tauri-deps-1
+        # v0.10.0 hotfix-2: `cargo check` weiter unten kompiliert den
+        # `aeroacars-app`-Crate (Tauri-App), der auf Linux libwebkit2gtk-
+        # 4.1, glib-2.0 etc. als System-Lib braucht. Ohne diesen Step
+        # failt cargo check auf Ubuntu mit „pkg-config: glib-2.0 not
+        # found" (siehe Run 26045741380). Platform-Build-Jobs laufen auf
+        # Windows + macOS (= keine apt-Logik), deshalb fiel das dort nie
+        # auf — nur unser Ubuntu-preflight braucht die Liste.
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: client/src-tauri -> target
+
+      - name: cargo check (Rust workspace — catches "lokal grun remote rot" durch ungestagete Files)
+        working-directory: client/src-tauri
+        run: cargo check --all-targets
+        # v0.10.0 hotfix: dieser Step ist NEU weil der erste v0.10.0
+        # Build-Versuch (Mac DMG, Run 26045269464) am `error_reporting_
+        # send_test_event`-Aufruf in src/lib.rs gefailed ist — die
+        # referenzierte `sentry_init::send_test_event`-Funktion war nur
+        # im lokalen Working-Tree des Devs, nie ans Repo committed.
+        # Lokal kompilierte alles, im sauberen CI-Checkout broke der
+        # aeroacars-app crate. Mit diesem cargo-check-Step im preflight
+        # wird die Klasse von Bug VOR den eigentlichen platform-Builds
+        # gefangen — spart 4+ Minuten Mac-Runner-Zeit pro broken Tag.
+
+      - name: Install frontend deps
+        working-directory: client
+        run: npm ci
+
+      - name: Run vitest (incl. UpdateButton-Regression-Guards)
+        working-directory: client
+        run: npm test
+        # Wenn DIESER Step rot wird, ist mit hoher Wahrscheinlichkeit
+        # entweder UpdateButton.tsx oder App.css (.update-modal*-Regeln)
+        # so geaendert dass die Svenny-Bug-Regression wieder reinkommen
+        # koennte. Vor dem Release fixen, nicht Tests anpassen.
+
+  # ---- Per-platform build job ----
+  # Each runner builds the installer for its OS, signs it with our
+  # Ed25519 updater key, and uploads the artifacts (.exe / .dmg /
+  # .app.tar.gz, plus the matching .sig) to the GitHub release that
+  # `tauri-action` creates / updates for this tag.
+  build:
+    # AP7 (29.09.2026): erst das Plugin-Paket, dann die App — die App traegt
+    # die SHA-256 des Pakets fest eingebaut und installiert nur ein Paket,
+    # das genau dazu passt (ADR-0004 §8).
+    needs: [release-preflight, plugin-zip]
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            args: --bundles nsis
+            runner-label: 'Windows x64 (NSIS)'
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+            args: --target aarch64-apple-darwin --bundles app,dmg
+            runner-label: 'macOS Apple Silicon (DMG)'
+
+    runs-on: ${{ matrix.platform }}
+    name: Build — ${{ matrix.runner-label }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: client/src-tauri -> target
+
+      - name: Install frontend deps
+        working-directory: client
+        run: npm ci
+
+      - name: Load bilingual release notes
+        id: relnotes
+        shell: bash
+        run: |
+          set -euo pipefail
+          # release-preflight has already verified this file exists +
+          # is bilingual (🇩🇪 + 🇬🇧). tauri-action writes `releaseBody`
+          # into BOTH the GitHub release body AND latest.json `notes` —
+          # so the in-app updater modal renders these notes. Heredoc to
+          # $GITHUB_OUTPUT preserves the multi-line Markdown verbatim.
+          NOTES="docs/release-notes/${GITHUB_REF_NAME}.md"
+          {
+            echo "body<<AEROACARS_NOTES_EOF"
+            cat "$NOTES"
+            echo "AEROACARS_NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # AP7 (Cloud-QS 29.09.2026): Ohne Pruefsumme installierte die App das
+      # X-Plane-Plugin nur mit Warnung ungeprueft. In einem Release darf das
+      # nicht passieren — hier ausdruecklich sperren.
+      - name: Require X-Plane plugin SHA-256
+        shell: bash
+        run: |
+          SUMME="${{ needs.plugin-zip.outputs.sha256 }}"
+          if [[ ! "$SUMME" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Keine gueltige SHA-256 des X-Plane-Plugin-Pakets ('$SUMME')"
+            exit 1
+          fi
+
+      # macOS: Apple-Signatur + Notarisierung (Developer ID). Ohne eingetragene
+      # Secrets bleibt der Mac-Build unsigniert wie bisher —
+      # siehe .github/scripts/apple-signatur-vorbereiten.sh + docs/macos-signierung.md.
+      - name: Apple-Signatur vorbereiten (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE_SECRET: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD_SECRET: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY_SECRET: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER_SECRET: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_SECRET: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_P8_SECRET: ${{ secrets.APPLE_API_KEY_P8 }}
+          # Release: signierte Mac-App ist Pflicht (Release-Notes versprechen sie).
+          AEROACARS_SIGNATUR_PFLICHT: "1"
+        run: .github/scripts/apple-signatur-vorbereiten.sh
+
+      - name: Build + sign (Tauri)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # v0.9.0 (#GlitchTip): DSNs zur Build-Zeit eingebrannt.
+          # Rust liest sie per option_env!() in src-tauri/src/sentry_init.rs,
+          # React liest sie per import.meta.env.VITE_SENTRY_DSN_CLIENT in
+          # client/src/lib/sentry.ts. Wenn Secrets nicht gesetzt sind,
+          # initialisiert Sentry sich nicht (No-Op, kein Crash) — der
+          # Build laeuft trotzdem durch.
+          AEROACARS_SENTRY_DSN: ${{ secrets.AEROACARS_SENTRY_DSN }}
+          VITE_SENTRY_DSN_CLIENT: ${{ secrets.VITE_SENTRY_DSN_CLIENT }}
+          # AP7: Pruefsumme des X-Plane-Plugin-Pakets aus `plugin-zip`. Rust
+          # liest sie per option_env!() in src-tauri/src/xplane_plugin_install.rs.
+          AEROACARS_XPLANE_PLUGIN_SHA256: ${{ needs.plugin-zip.outputs.sha256 }}
+        with:
+          projectPath: client
+          tagName: ${{ github.ref_name }}
+          releaseName: 'AeroACARS ${{ github.ref_name }}'
+          # The full bilingual (🇩🇪 + 🇬🇧) release notes from
+          # docs/release-notes/v{tag}.md — loaded in the step above.
+          # tauri-action puts this into the GitHub release body AND the
+          # latest.json `notes` field the in-app update modal renders.
+          releaseBody: ${{ steps.relnotes.outputs.body }}
+          releaseDraft: true
+          # BETA-KANAL (v0.21): Tags mit "-beta"/"-rc" werden als PRE-RELEASE
+          # markiert. Das ist keine Kosmetik, sondern die Schranke:
+          #
+          # Der Auto-Updater der Piloten fragt
+          #   /releases/latest/download/latest.json
+          # ab. GitHub fuehrt ein Pre-Release NICHT als "latest" — die
+          # Beta ist dort also unsichtbar. Wer sie testen will, laedt sie
+          # bewusst von der Releases-Seite.
+          #
+          # Ohne diese Zeile waere `prerelease: false` hart verdrahtet und
+          # ein Beta-Tag ginge an JEDEN Piloten raus. Genau das soll die
+          # Beta verhindern.
+          prerelease: ${{ contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') }}
+          includeUpdaterJson: true
+          args: ${{ matrix.args }}
+
+      # Eingerichtete Signatur muss auch greifen — sonst rot statt still
+      # unsigniert an die Piloten.
+      - name: Apple-Signatur pruefen (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: .github/scripts/apple-app-pruefen.sh client/src-tauri/target/aarch64-apple-darwin/release/bundle/macos
+
+  # ---- X-Plane Premium Plugin: per-platform build ----
+  # Builds the optional native X-Plane plugin on each platform. Produces
+  # one `.xpl` per OS:
+  #   Windows  → win.xpl  (MSVC, x86_64)
+  #   macOS    → mac.xpl  (Clang, universal x86_64+arm64)
+  #   Linux    → lin.xpl  (GCC, x86_64)
+  # The artifacts are uploaded individually so the `plugin-package`
+  # job can stitch them into the X-Plane fat-folder layout and ship
+  # one combined `.zip` to pilots.
+  plugin-build:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # windows-2022 gepinnt (2026-06-12): GitHubs windows-latest-Rollout
+          # auf das 2025er-Image liefert VMs ohne Visual-Studio-Instanz —
+          # "could not find any instance of Visual Studio" beim CMake-Configure
+          # (v0.16.12-Run 27403478349, 2x reproduziert). Zurueck auf latest,
+          # sobald das Image stabil VS traegt.
+          - platform: windows-2022
+            generator: 'Visual Studio 17 2022'
+            cmake_args: '-A x64'
+            xpl_name: 'win.xpl'
+            os_label: 'Windows x64'
+          - platform: macos-latest
+            generator: 'Unix Makefiles'
+            # Semicolon in CMake list arg must be inside double-quotes
+            # so bash doesn't split it as a command separator.
+            cmake_args: '-DCMAKE_BUILD_TYPE=Release "-DCMAKE_OSX_ARCHITECTURES=x86_64;arm64"'
+            xpl_name: 'mac.xpl'
+            os_label: 'macOS universal'
+          - platform: ubuntu-latest
+            generator: 'Unix Makefiles'
+            cmake_args: '-DCMAKE_BUILD_TYPE=Release'
+            xpl_name: 'lin.xpl'
+            os_label: 'Linux x64'
+
+    runs-on: ${{ matrix.platform }}
+    name: Plugin — ${{ matrix.os_label }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: OpenGL-Header (Linux, fuer das HUD-Band)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgl-dev
+
+      - name: Configure CMake
+        working-directory: xplane-plugin
+        shell: bash
+        run: |
+          cmake -B build -G "${{ matrix.generator }}" ${{ matrix.cmake_args }}
+
+      - name: Build plugin (Release)
+        working-directory: xplane-plugin
+        shell: bash
+        run: |
+          cmake --build build --config Release --target AeroACARS
+
+      # macOS: mit eingetragenen Apple-Secrets Developer-ID-Signatur +
+      # Notarisierung, sonst ad-hoc wie bisher (AP7, ADR-0004 §8; der Client
+      # entfernt beim Installieren die Quarantaene).
+      - name: Sign mac.xpl
+        if: matrix.xpl_name == 'mac.xpl'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE_SECRET: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD_SECRET: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY_SECRET: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER_SECRET: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_SECRET: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_P8_SECRET: ${{ secrets.APPLE_API_KEY_P8 }}
+          # Release: signierte Mac-App ist Pflicht (Release-Notes versprechen sie).
+          AEROACARS_SIGNATUR_PFLICHT: "1"
+        run: .github/scripts/apple-plugin-signieren.sh xplane-plugin/build/AeroACARS/64/mac.xpl
+
+      - name: List build output (debug)
+        working-directory: xplane-plugin
+        shell: bash
+        run: |
+          ls -la build/AeroACARS/64/
+
+      - name: Upload .xpl artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: xplane-plugin-${{ matrix.xpl_name }}
+          path: xplane-plugin/build/AeroACARS/64/${{ matrix.xpl_name }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---- X-Plane Plugin: Paket bauen + Pruefsumme (VOR der App) ----
+  # Laedt die drei .xpl, baut das X-Plane-Ordnerlayout, packt EINMAL und
+  # gibt die SHA-256 genau dieser Datei weiter. Dieselbe Datei geht spaeter
+  # unveraendert in den Draft — neu gepackt wuerde sie eine andere Summe
+  # tragen (Zeitstempel im Zip).
+  plugin-zip:
+    needs: plugin-build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      sha256: ${{ steps.summe.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download Windows .xpl
+        uses: actions/download-artifact@v8
+        with:
+          name: xplane-plugin-win.xpl
+          path: pkg/AeroACARS/64
+
+      - name: Download macOS .xpl
+        uses: actions/download-artifact@v8
+        with:
+          name: xplane-plugin-mac.xpl
+          path: pkg/AeroACARS/64
+
+      - name: Download Linux .xpl
+        uses: actions/download-artifact@v8
+        with:
+          name: xplane-plugin-lin.xpl
+          path: pkg/AeroACARS/64
+
+      - name: Stage attribution + readme
+        run: |
+          cp xplane-plugin/README.md pkg/AeroACARS/README.md
+          cp xplane-plugin/third_party/XPSDK430/license.txt pkg/AeroACARS/XPLM_SDK_LICENSE.txt
+          # Schrift im HUD-Band (Plugin 1.1.0): OFL verlangt die Lizenz bei jeder Weitergabe.
+          cp xplane-plugin/third_party/opensans/OFL.txt pkg/AeroACARS/OpenSans_OFL.txt
+          cp xplane-plugin/third_party/stb/LICENSE pkg/AeroACARS/stb_LICENSE.txt
+
+      - name: Show staged folder
+        run: |
+          find pkg -type f -printf '%p (%s bytes)\n'
+
+      - name: Zip plugin folder
+        working-directory: pkg
+        run: |
+          zip -r ../AeroACARS-XPlane-Plugin-${{ github.ref_name }}.zip AeroACARS
+
+      - name: SHA-256
+        id: summe
+        run: |
+          set -euo pipefail
+          SUMME=$(sha256sum "AeroACARS-XPlane-Plugin-${{ github.ref_name }}.zip" | cut -d' ' -f1)
+          echo "sha256=$SUMME" >> "$GITHUB_OUTPUT"
+          echo "Plugin-Paket SHA-256: $SUMME"
+
+      - name: Upload zip artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: xplane-plugin-zip
+          path: AeroACARS-XPlane-Plugin-${{ github.ref_name }}.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---- X-Plane Plugin + Flow-Widget: in den Draft hochladen (NACH der App) ----
+  # Der Draft entsteht erst im `build`-Job (tauri-action). Das Plugin-Paket
+  # ist dasselbe, dessen Summe in der App steckt — hier nur noch geprueft
+  # und hochgeladen.
+  plugin-package:
+    needs: [plugin-zip, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download plugin zip
+        uses: actions/download-artifact@v8
+        with:
+          name: xplane-plugin-zip
+          path: .
+
+      - name: Verify SHA-256 against the app build
+        run: |
+          set -euo pipefail
+          IST=$(sha256sum "AeroACARS-XPlane-Plugin-${{ github.ref_name }}.zip" | cut -d' ' -f1)
+          SOLL="${{ needs.plugin-zip.outputs.sha256 }}"
+          echo "ist=$IST soll=$SOLL"
+          test "$IST" = "$SOLL"
+
+      - name: Upload zip to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.ref_name }}" \
+            "AeroACARS-XPlane-Plugin-${{ github.ref_name }}.zip" \
+            --clobber
+
+      # Das MSFS-Flow-Widget hing bisher an KEINEM Release. Es wurde von
+      # Hand ueber einen Tauschordner verteilt — wer es suchte, fand es
+      # nicht, und es veraltete lautlos (Thomas, 16.08.2026). Ab hier faellt
+      # es bei jedem Tag mit ab, aus demselben Stand wie der Client.
+      # ⚠ `qs-flow-kompat.js` haelt sechs Flow-Eigenheiten fest, jede aus
+      # einem echten Feldbefund (Coherent-GT-Renderer: kein const/let,
+      # keine Arrow-Functions, kein flex-gap, Drag frisst Klicks ...).
+      # Bis 28.08.2026 wurde es von NIEMANDEM aufgerufen — nicht in der
+      # CI, nicht hier, nicht in der Checkliste. Ein Widget mit modernem
+      # JS waere still ausgeliefert worden und im Sim einfach leer
+      # geblieben. Jetzt bricht der Export, bevor das passiert.
+      - name: Flow compatibility QA
+        run: node msfs-panel/flow-widget/qs-flow-kompat.js
+
+      - name: Zip MSFS Flow widget
+        run: |
+          mkdir -p flowpkg/aeroacars-flow-widget
+          cp msfs-panel/flow-widget/code.html \
+             msfs-panel/flow-widget/code.js \
+             msfs-panel/flow-widget/code.css \
+             msfs-panel/flow-widget/README.md \
+             flowpkg/aeroacars-flow-widget/
+          cd flowpkg
+          zip -r ../AeroACARS-MSFS-Flow-Widget-${{ github.ref_name }}.zip \
+            aeroacars-flow-widget
+
+      - name: Upload Flow widget to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.ref_name }}" \
+            "AeroACARS-MSFS-Flow-Widget-${{ github.ref_name }}.zip" \
+            --clobber
+
+      # Das native MSFS-2024-Panel ist ein GEBAUTES Paket (fspackagetool aus
+      # dem MSFS-SDK laeuft nur auf Windows mit SDK, nicht in dieser CI). Das
+      # fertige Ergebnis liegt in msfs-panel/paket/ und faellt hier mit dem
+      # Release ab, wie das Flow-Widget. Wer das Panel aendert, baut es neu
+      # (msfs-panel/BAUEN.bat) und ersetzt msfs-panel/paket/aeroacars-panel.
+      - name: Check built MSFS panel package
+        run: |
+          set -euo pipefail
+          P=msfs-panel/paket/aeroacars-panel
+          test -f "$P/manifest.json"
+          test -f "$P/layout.json"
+          test -f "$P/InGamePanels/aeroacars-panel.spb"
+          grep -o '"package_version": *"[0-9.]*"' "$P/manifest.json"
+
+      - name: Zip MSFS panel
+        run: |
+          cd msfs-panel/paket
+          zip -r ../../AeroACARS-MSFS-Panel-${{ github.ref_name }}.zip \
+            aeroacars-panel INSTALLATION.txt
+
+      - name: Upload MSFS panel to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.ref_name }}" \
+            "AeroACARS-MSFS-Panel-${{ github.ref_name }}.zip" \
+            --clobber
+
+  # ---- Finalise the release (manual gate ab v0.9.0) ----
+  #
+  # **QS-Hotfix F1 (v0.9.0):** vorher hat dieser Job den Draft sofort nach
+  # Build-Ende auto-published. Beim v0.9.0-Tag-Push ging dadurch ein
+  # ungestestetes Release ~15 min an `releases/latest`, bevor manuelles QS
+  # ueberhaupt anfing. Auto-Updater-Polling ist zwar harmlos vorbeigelaufen
+  # (0 Pilots-Downloads in dem Fenster), aber das Risiko ist real.
+  #
+  # Neues Verhalten: der Promote-Step lebt jetzt unter `workflow_dispatch`,
+  # NICHT mehr im tag-push-Trigger. Tag-Push baut nur noch den Draft,
+  # der dann von Thomas manuell via UI ("Publish Release"-Button) ODER via
+  # `gh workflow run promote-release.yml -f tag=v0.9.0` freigegeben wird.
+  #
+  # Falls in v0.10+ wieder auto-publish gewuenscht ist: dieser Block bekommt
+  # `if: ${{ github.event_name == 'workflow_dispatch' }}` und einen separaten
+  # `workflow_dispatch:`-Trigger oben. Aber Standard ist und bleibt
+  # human-in-the-loop.
+  #
+  # Job-Definition bewusst stehen gelassen aber inaktiv (= laeuft nie weil
+  # `if: false`). Loescht nicht damit der Diff zur v0.8.5-release.yml klar
+  # bleibt und ein zukuenftiger Auto-Publish-Switch nur das `if:` wechseln muss.
+  publish:
+    if: false  # Manual-Gate aktiv — siehe QS-Hotfix F1 Kommentar oben
+    needs: [build, plugin-package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Promote draft → public
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "${{ github.ref_name }}" --draft=false --latest

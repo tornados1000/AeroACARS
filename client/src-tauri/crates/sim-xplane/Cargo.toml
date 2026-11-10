@@ -1,0 +1,40 @@
+[package]
+name = "sim-xplane"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "X-Plane 11/12 adapter — native UDP DataRef streaming (no plugin needed)"
+
+[dependencies]
+# Synchronous std::net + std::thread implementation — sim-xplane
+# does NOT depend on tokio. The Tauri side calls into us from sync
+# command handlers (where no async runtime is bound to the calling
+# thread) and an early tokio-based version crashed on sim switch.
+sim-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# parking_lot: poison-free Mutex for the UDP-ingest worker threads — a panic
+# in one ingest thread must not cascade-poison every subsequent lock.
+parking_lot = "0.12"
+# ureq for the X-Plane 12.1+ Web API client (string DataRefs that
+# the UDP RREF protocol can't read — aircraft type / registration /
+# author etc.). Sync, single-purpose, no tokio runtime. The localhost
+# Web API is plain HTTP, no TLS needed.
+ureq = { version = "2", default-features = false, features = ["json"] }
+# Base64 decoder for the X-Plane Web API: byte-array DataRefs come
+# back as `{"data":"<base64>"}` (e.g. "QTEzOQ==" for "A139"). Tiny,
+# no_std-friendly, no transitive deps.
+base64 = "0.22"
+# „Flugzeug vermessen": Web-API v2 per WebSocket (alle Werte live). Synchron,
+# ohne tokio; dieselbe Version wie im übrigen Baum (keine neue Abhängigkeit).
+tungstenite = "0.29"
+# Plugin-Socket (Protokoll 2): groesserer Empfangspuffer fuer LISTE- und
+# Vermessungsschuebe. Steckt schon im Baum (tokio/mio), keine neue Kiste.
+socket2 = "0.6"
+
+[lints]
+workspace = true

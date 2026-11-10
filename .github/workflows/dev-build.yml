@@ -1,0 +1,116 @@
+name: Dev Build (unsigned, manual)
+
+# Manueller, UNSIGNIERTER Build (Windows + macOS Apple Silicon) zum lokalen
+# Testen — kein Tag, kein GitHub-Release, kein Auto-Updater-Eintrag
+# (createUpdaterArtifacts wird nur fuer diesen Lauf per --config auf false
+# gesetzt, tauri.conf.json bleibt unberuehrt). Fuer schnelle Iterationen
+# (z. B. Aircraft-Scan-Fixes), die Thomas auf seiner echten Maschine mit
+# echtem MSFS/X-Plane pruefen soll, BEVOR ein offizieller signierter
+# Release-Tag geschnitten wird (siehe release.yml — der bleibt der einzige
+# Weg zu einem echten, an Piloten ausgelieferten Release). Artefakte liegen
+# 7 Tage im Actions-Run zum Download bereit und verschwinden danach
+# automatisch — bewusst kein Distributionskanal.
+#
+# macOS-Hinweis: das .app/.dmg ist UNSIGNIERT — Gatekeeper blockiert den
+# ersten Start ("nicht identifizierter Entwickler" / "beschaedigt"). Vor dem
+# ersten Oeffnen im Terminal: `xattr -cr /Pfad/zu/AeroACARS.app` (entfernt
+# das Quarantaene-Flag), dann normal per Doppelklick oeffnen.
+on:
+  workflow_dispatch:
+    inputs:
+      apple_signieren:
+        description: 'macOS mit Apple Developer ID signieren + notarisieren (Secrets noetig)'
+        type: boolean
+        default: false
+
+jobs:
+  dev-build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: client/src-tauri -> target
+
+      - name: Install frontend deps
+        working-directory: client
+        run: npm ci
+
+      - name: Build (unsigned, no updater artifacts)
+        shell: bash
+        working-directory: client
+        run: npx tauri build --bundles nsis --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: AeroACARS-dev-build-windows-${{ github.sha }}
+          path: client/src-tauri/target/release/bundle/nsis/*.exe
+          retention-days: 7
+
+  dev-build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: client/src-tauri -> target
+
+      - name: Install frontend deps
+        working-directory: client
+        run: npm ci
+
+      # Nur auf Wunsch (Schalter beim Starten des Laufs): gleiche Signatur wie
+      # im Release, um sie ohne Tag zu pruefen.
+      - name: Apple-Signatur vorbereiten
+        if: inputs.apple_signieren
+        shell: bash
+        env:
+          APPLE_CERTIFICATE_SECRET: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD_SECRET: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY_SECRET: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER_SECRET: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_SECRET: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_P8_SECRET: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: .github/scripts/apple-signatur-vorbereiten.sh
+
+      - name: Build (no updater artifacts)
+        shell: bash
+        working-directory: client
+        run: npx tauri build --target aarch64-apple-darwin --bundles app,dmg --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Apple-Signatur pruefen
+        if: inputs.apple_signieren
+        shell: bash
+        run: .github/scripts/apple-app-pruefen.sh client/src-tauri/target/aarch64-apple-darwin/release/bundle/macos
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v7
+        with:
+          name: AeroACARS-dev-build-macos-${{ github.sha }}
+          path: client/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          retention-days: 7

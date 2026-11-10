@@ -1,0 +1,29 @@
+{
+  "scenario": "navigraph-full",
+  "hint": "MS713-Anchor (OLBA RWY 17). Alle v0.8.0-Felder gesetzt, TDZ-Treffer, Aim leicht zu kurz, TCH on-profile, kein DDS-Verstoss.",
+  "props": {
+    "airport_ident": "OLBA",
+    "airport_name": "Beirut-Rafic Hariri",
+    "runway_ident": "17",
+    "length_m": 3250,
+    "surface": "ASP",
+    "source": "navigraph",
+    "nav_cycle": "2604",
+    "displaced_threshold_m": 0,
+    "td_distance_from_threshold_m": 358,
+    "td_centerline_offset_m": -6.6,
+    "td_in_tdz": true,
+    "td_third": 1,
+    "td_tdz_length_m": 900,
+    "aim_point_m": 400,
+    "aim_delta_m": -42,
+    "aim_class": "perfect",
+    "tch_actual_ft": 47,
+    "tch_expected_ft": 49,
+    "tch_delta_ft": -2,
+    "tch_class": "on_profile",
+    "pre_displaced_threshold": false,
+    "rollout_m": 1979,
+    "locale": "de"
+  }
+}

@@ -1,0 +1,1139 @@
+import { useEffect, useState } from "react";
+import { syncedSet, syncedRemove } from "../lib/syncedStorage";
+import { invoke, isTauri, formatIpcError, listen } from "../lib/ipc";
+import { useTranslation } from "react-i18next";
+import { setLanguage, SUPPORTED_LANGUAGES, LANGUAGE_LABELS, type SupportedLanguage } from "../i18n";
+import type { ActiveFlightInfo, SimKind, SimStatus } from "../types";
+import type { Theme } from "../theme";
+import { SimDebugPanel } from "./SimDebugPanel";
+import { PmdgPremiumPanel } from "./PmdgPremiumPanel";
+import { AircraftScanPanel } from "./AircraftScanPanel";
+import { XPlanePremiumPanel } from "./XPlanePremiumPanel";
+import { OrphanFlightsPanel } from "./OrphanFlightsPanel";
+import { useConfirm } from "./ConfirmDialog";
+import { getConsent, setConsent } from "../lib/sentry";
+import { DiscordRpcPanel } from "./DiscordRpcPanel";
+import { RemoteServerPanel } from "./RemoteServerPanel";
+import { MsfsHudPanel } from "./MsfsHudPanel";
+import { XplaneBandPanel } from "./XplaneBandPanel";
+import { HoppieSettingsPanel } from "./HoppieSettingsPanel";
+import { KabinenSettingsPanel } from "./KabinenSettingsPanel";
+import { BordbuchEinstellungen } from "./bordbuch/BordbuchEinstellungen";
+import { FlugzeugVermessen } from "./vermessen/FlugzeugVermessen";
+
+const ALL_KINDS: SimKind[] = [
+  "msfs2024",
+  "msfs2020",
+  "xplane11",
+  "xplane12",
+  "off",
+];
+
+interface Props {
+  debugMode: boolean;
+  onDebugModeChange: (next: boolean) => void;
+  /** Auto-file the PIREP once the FSM reaches Arrived. Persisted
+   *  via the App.tsx storage helpers. */
+  autoFile: boolean;
+  onAutoFileChange: (next: boolean) => void;
+  /** Auto-start a flight when the aircraft is parked at one of the
+   *  bid's departure airports. Persisted via App.tsx storage helpers. */
+  autoStart: boolean;
+  onAutoStartChange: (next: boolean) => void;
+  /** Auto-purge per-flight JSONL log files older than 30 days on
+   *  every app start. Persisted via App.tsx storage helpers; the
+   *  actual sweep call is fired once at mount inside App.tsx. */
+  autoDeleteFlightLogs: boolean;
+  onAutoDeleteFlightLogsChange: (next: boolean) => void;
+  /** When true, clicking the close button hides the window into the
+   *  system tray (Win) / menubar (Mac) instead of quitting. Default
+   *  off; toggle persisted in localStorage and synced to the Rust
+   *  backend so the close-handler reads it directly. */
+  minimizeToTray: boolean;
+  chatAn: boolean;
+  onChatAnChange: (next: boolean) => void;
+  /** Kabinenansagen (Beta) ein/aus — für den Reiter „Kabine“. */
+  onKabineAnChange?: (next: boolean) => void;
+  chatTon: boolean;
+  onChatTonChange: (next: boolean) => void;
+  onMinimizeToTrayChange: (next: boolean) => void;
+  /** v0.5.38: Stable-Approach-Banner im Cockpit-Tab. Default ON. */
+  approachAdvisoriesEnabled: boolean;
+  onApproachAdvisoriesEnabledChange: (next: boolean) => void;
+  theme: Theme;
+  onThemeChange: (next: Theme) => void;
+  /** Latest sim telemetry — surfaced in the debug section when the
+   *  user has enabled debug mode. Polled centrally by `useSimSession`. */
+  simStatus: SimStatus | null;
+  /** Active flight, used to surface heartbeat / position-post timing
+   *  in the debug panel. Null when no flight is in progress. */
+  activeFlight: ActiveFlightInfo | null;
+}
+
+export function SettingsPanel({
+  debugMode,
+  onDebugModeChange,
+  autoFile,
+  onAutoFileChange,
+  autoStart,
+  onAutoStartChange,
+  autoDeleteFlightLogs,
+  onAutoDeleteFlightLogsChange,
+  minimizeToTray,
+  onMinimizeToTrayChange,
+  chatAn,
+  onChatAnChange,
+  onKabineAnChange,
+  chatTon,
+  onChatTonChange,
+  approachAdvisoriesEnabled,
+  onApproachAdvisoriesEnabledChange,
+  theme,
+  onThemeChange,
+  simStatus,
+  activeFlight,
+}: Props) {
+  const { t, i18n } = useTranslation();
+  const [kind, setKind] = useState<SimKind | null>(null);
+  // v1.9.14: „Automatisch“ — `kind` ist dann der erkannte Simulator.
+  const [automatisch, setAutomatisch] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  // v0.7.8: SimBrief Integration Settings — Username + User-ID.
+  // Persistence: localStorage Frontend-side, Backend-State wird per
+  // set_simbrief_settings befuellt. App.tsx pusht beim Login-Mount
+  // (Spec §4.2). Spec docs/spec/ofp-refresh-simbrief-direct-v0.7.8.md.
+  const [simbriefUsername, setSimbriefUsername] = useState<string>(
+    () => localStorage.getItem("simbrief_username") ?? "",
+  );
+  const [simbriefUserId, setSimbriefUserId] = useState<string>(
+    () => localStorage.getItem("simbrief_user_id") ?? "",
+  );
+
+  // v0.7.17 (F-001): Fenix A32x Beta is no longer an opt-in toggle —
+  // the backend auto-detects Fenix profiles and applies the LVAR
+  // overrides unconditionally. localStorage key `fenix_beta_enabled`
+  // becomes a no-op and gets cleaned up here so leftover state from
+  // v0.7.16 doesn't sit around.
+  useEffect(() => {
+    localStorage.removeItem("fenix_beta_enabled");
+  }, []);
+  const [verifying, setVerifying] = useState(false);
+  const [verifyStatus, setVerifyStatus] = useState<{
+    tone: "ok" | "err";
+    text: string;
+  } | null>(null);
+
+  // v0.7.14: Discord-Webhook-UI entfernt. Discord-Posts macht ab v0.7.14
+  // der Recorder auf live.kant.ovh zentral — VA-Owner setzt die URL einmal
+  // im Webapp-Admin (https://live.kant.ovh/admin/ → Settings → Discord),
+  // Pilots tun nichts. Audit C1.
+
+  // v0.7.8: Auto-clear verify-status nach 8s.
+  useEffect(() => {
+    if (!verifyStatus) return;
+    const id = window.setTimeout(() => setVerifyStatus(null), 8000);
+    return () => window.clearTimeout(id);
+  }, [verifyStatus]);
+
+  // v0.7.8: Persistiere SimBrief-Settings bei onBlur in localStorage +
+  // Backend. KEIN Test-Fetch hier (= Pilot druckt Pruefen-Button
+  // explizit, Spec §4.4 Punkt 1).
+  function persistSimbriefSettings(username: string, userId: string) {
+    const u = username.trim();
+    const i = userId.trim();
+    // v1.5.6 (#lan-bruecke-1zu1): über den Host spiegeln, sonst sieht das
+    // Tablet leere SimBrief-Felder (eigener Browser-Speicher).
+    if (u) syncedSet("simbrief_username", u);
+    else syncedRemove("simbrief_username");
+    if (i) syncedSet("simbrief_user_id", i);
+    else syncedRemove("simbrief_user_id");
+    void invoke("set_simbrief_settings", {
+      username: u || null,
+      userId: i || null,
+    }).catch(() => null);
+  }
+
+  async function handleVerifySimbrief() {
+    if (verifying) return;
+    setVerifying(true);
+    setVerifyStatus(null);
+    try {
+      const result = await invoke<{
+        ok: boolean;
+        origin?: string;
+        destination?: string;
+        callsign?: string;
+        error_code?: string;
+      }>("verify_simbrief_identifier", {
+        username: simbriefUsername.trim() || null,
+        userId: simbriefUserId.trim() || null,
+      });
+      if (result.ok) {
+        setVerifyStatus({
+          tone: "ok",
+          text: t("settings.simbrief.verify_ok", {
+            origin: result.origin ?? "—",
+            destination: result.destination ?? "—",
+            callsign: result.callsign ?? "—",
+          }),
+        });
+      } else {
+        const errCode = result.error_code ?? "unknown";
+        setVerifyStatus({
+          tone: "err",
+          text: t(`settings.simbrief.verify_err_${errCode}`),
+        });
+      }
+    } catch (err: unknown) {
+      const msg =
+        typeof err === "object" && err !== null && "message" in err
+          ? String((err as { message: string }).message)
+          : String(err);
+      setVerifyStatus({ tone: "err", text: msg });
+    } finally {
+      setVerifying(false);
+    }
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    const laden = async () => {
+      try {
+        const a = await invoke<{ automatisch: boolean; kind: string }>("sim_get_auswahl");
+        if (!cancelled) {
+          setKind(a.kind as SimKind);
+          setAutomatisch(a.automatisch);
+        }
+      } catch {
+        if (!cancelled) setKind("off");
+      }
+    };
+    void laden();
+    // Der Waechter hat umgestellt → den erkannten Simulator nachziehen.
+    let weg: (() => void) | undefined;
+    try {
+      void listen("sim-auswahl-geaendert", () => void laden())
+        .then((f) => {
+          if (cancelled) f();
+          else weg = f;
+        })
+        .catch(() => {});
+    } catch {
+      // ohne Ereigniskanal (Test, Browser) bleibt es beim ersten Stand
+    }
+    return () => {
+      cancelled = true;
+      weg?.();
+    };
+  }, []);
+
+  async function handleKindChange(next: SimKind | "auto") {
+    if (busy) return;
+    setBusy(true);
+    if (next === "auto") {
+      setAutomatisch(true);
+    } else {
+      setAutomatisch(false);
+      setKind(next);
+    }
+    try {
+      await invoke("sim_set_kind", { kind: next });
+    } catch {
+      // ignore
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const language = i18n.resolvedLanguage ?? "en";
+
+  // v0.11.0-dev: Tab-Navigation für die Settings, weil das alles auf
+  // einer endlos langen Liste „zu durcheinander" war (Pilot-Feedback).
+  // Drei Gruppen:
+  //   - required: SimBrief + Simulator + Filing → was AeroACARS zwingend
+  //     braucht damit Flight-Tracking funktioniert
+  //   - extras: Sprache/Theme + Verhalten + Pilotenchat + Discord-RPC
+  //   - cockpit (17.10.2026, „Komfort“ war zu lang): was im Flug
+  //     mitspielt — PDC/CPDLC, Kabinenansagen, HUDs, LAN-Fernbedienung
+  //   - tech: Speicher + Fehler-Telemetrie + Entwickler-Debug + Orphan-
+  //     Flights-Cleanup → selten gebraucht, primär für Troubleshooting
+  // Tab-Wahl wird in localStorage gemerkt, damit der Pilot beim nächsten
+  // Settings-Öffnen wieder dort landet wo er war.
+  type SettingsTab = "simulator" | "required" | "extras" | "cockpit" | "bordbuch" | "plugins" | "vermessen" | "tech";
+  const [activeTab, setActiveTab] = useState<SettingsTab>(() => {
+    try {
+      const saved = localStorage.getItem("aeroacars.settings.activeTab");
+      if (
+        saved === "simulator" ||
+        saved === "required" ||
+        saved === "extras" ||
+        saved === "cockpit" ||
+        saved === "bordbuch" ||
+        saved === "plugins" ||
+        saved === "vermessen" ||
+        saved === "tech"
+      ) {
+        return saved;
+      }
+    } catch {
+      /* noop */
+    }
+    // Default für Erst-Nutzer: Simulator-Tab, weil das die allerwichtigste
+    // erste Einstellung ist (ohne Sim funktioniert nichts).
+    return "simulator";
+  });
+  const switchTab = (next: SettingsTab) => {
+    setActiveTab(next);
+    try {
+      localStorage.setItem("aeroacars.settings.activeTab", next);
+    } catch {
+      /* noop */
+    }
+  };
+
+  const tabHintKey = `settings.tabs.${activeTab}_hint` as const;
+
+  return (
+    <section className="settings">
+      <header className="settings__header">
+        <h2>{t("settings.title")}</h2>
+        <p className="settings__hint">{t("settings.description")}</p>
+      </header>
+
+      {/* Tab-Bar — Pills, aktive in Akzent-Farbe. v0.13.15: theme-aware
+          CSS-Klassen statt hart verdrahteter Dark-Mode-Inline-Farben (waren
+          im Light-Mode weiß-auf-weiß = unlesbar, Pilot-Befund). */}
+      <div className="settings__tabs-huelle">
+      <div
+        className="settings__tabs"
+        role="tablist"
+        aria-label={t("settings.title") ?? "Settings"}
+      >
+        {(["simulator", "required", "extras", "cockpit", "bordbuch", "plugins", "vermessen", "tech"] as SettingsTab[]).map((tab) => {
+          const isActive = activeTab === tab;
+          // „🎧 Cockpit“ → Symbol und Text getrennt, damit der Abstand fest
+          // ist und ein zu langer Text gekürzt wird, nicht das Symbol.
+          const label = t(`settings.tabs.${tab}`);
+          const teile = /^(\S+)\s+(.+)$/u.exec(label);
+          const symbol = teile && !/\p{L}/u.test(teile[1]) ? teile[1] : null;
+          const text = symbol && teile ? teile[2] : label;
+          return (
+            <button
+              key={tab}
+              type="button"
+              role="tab"
+              aria-selected={isActive}
+              onClick={() => switchTab(tab)}
+              className={`settings__tab${isActive ? " settings__tab--active" : ""}`}
+              title={label}
+            >
+              {symbol && <span className="settings__tab-symbol" aria-hidden="true">{symbol}</span>}
+              <span className="settings__tab-text">{text}</span>
+            </button>
+          );
+        })}
+      </div>
+      </div>
+      <p
+        className="settings__hint"
+        style={{
+          marginTop: 0,
+          marginBottom: 14,
+          fontSize: "0.82rem",
+          opacity: 0.7,
+        }}
+      >
+        {t(tabHintKey)}
+      </p>
+
+      {/* ─── Tab: Simulator ────────────────────────────────────────
+          v0.11.0-dev: eigener Tab nur für die Sim-Auswahl. Das ist die
+          allererste Einstellung die ein neuer Pilot braucht — wenn
+          falsch oder nicht gesetzt, hilft AeroACARS nicht. Default-
+          Tab für Erst-Nutzer, damit der Sim sofort ins Auge sticht.
+      */}
+      {activeTab === "simulator" && (
+        <div className="settings__section">
+          <h3>{t("settings.simulator_section")}</h3>
+          <p className="settings__row-hint">{t("settings.simulator_hint")}</p>
+          <label className="settings__field">
+            <span className="settings__field-label">
+              {t("settings.simulator_label")}
+            </span>
+            <select
+              value={automatisch ? "auto" : (kind ?? "off")}
+              onChange={(e) => handleKindChange(e.target.value as SimKind | "auto")}
+              disabled={busy || kind === null}
+            >
+              <option value="auto">{t("sim.kinds.auto")}</option>
+              {ALL_KINDS.map((k) => (
+                <option key={k} value={k}>
+                  {t(`sim.kinds.${k}`)}
+                </option>
+              ))}
+            </select>
+          </label>
+          <SimVerbindungsStatus
+            automatisch={automatisch}
+            kind={simStatus?.kind ?? kind}
+            status={simStatus}
+          />
+        </div>
+      )}
+
+      {/* ─── Tab: Benötigt ────────────────────────────────────────
+          SimBrief + Flug-Aufzeichnungs-Verhalten. Simulator-Auswahl
+          ist in einen eigenen Tab umgezogen (v0.11.0-dev).
+      */}
+      {activeTab === "required" && (
+        <>
+          {/* v0.7.8: SimBrief Integration — fuer Direct-OFP-Refresh
+              ohne phpVMS-Bid-Pointer (W5-Workaround). */}
+          <div className="settings__section">
+            <h3>{t("settings.simbrief.title")}</h3>
+            <p className="settings__row-hint">{t("settings.simbrief.intro")}</p>
+
+            <label className="settings__field">
+              <span className="settings__field-label">
+                {t("settings.simbrief.username_label")}
+              </span>
+              <input
+                type="text"
+                value={simbriefUsername}
+                onChange={(e) => setSimbriefUsername(e.target.value)}
+                onBlur={() => persistSimbriefSettings(simbriefUsername, simbriefUserId)}
+                placeholder={t("settings.simbrief.username_placeholder")}
+                autoComplete="off"
+                spellCheck={false}
+              />
+              <small>{t("settings.simbrief.username_hint")}</small>
+            </label>
+
+            <label className="settings__field">
+              <span className="settings__field-label">
+                {t("settings.simbrief.userid_label")}
+              </span>
+              <input
+                type="text"
+                inputMode="numeric"
+                value={simbriefUserId}
+                onChange={(e) =>
+                  setSimbriefUserId(e.target.value.replace(/[^0-9]/g, ""))
+                }
+                onBlur={() => persistSimbriefSettings(simbriefUsername, simbriefUserId)}
+                placeholder={t("settings.simbrief.userid_placeholder")}
+                autoComplete="off"
+                spellCheck={false}
+              />
+              <small>{t("settings.simbrief.userid_hint")}</small>
+            </label>
+
+            <div className="settings__field" style={{ flexDirection: "row", gap: 10, alignItems: "center" }}>
+              <button
+                type="button"
+                onClick={handleVerifySimbrief}
+                disabled={
+                  verifying ||
+                  (!simbriefUsername.trim() && !simbriefUserId.trim())
+                }
+              >
+                {verifying ? "…" : t("settings.simbrief.verify_button")}
+              </button>
+              {verifyStatus && (
+                <span
+                  style={{
+                    fontSize: "0.85rem",
+                    color: verifyStatus.tone === "ok" ? "#4ade80" : "#f87171",
+                  }}
+                >
+                  {verifyStatus.tone === "ok" ? "✓ " : "⚠ "}
+                  {verifyStatus.text}
+                </span>
+              )}
+            </div>
+          </div>
+
+          <div className="settings__section">
+            <h3>{t("settings.filing_section")}</h3>
+            <label className="settings__checkbox">
+              <input
+                type="checkbox"
+                checked={autoFile}
+                onChange={(e) => onAutoFileChange(e.target.checked)}
+              />
+              <span>
+                <strong>{t("settings.auto_file_label")}</strong>
+                <span className="settings__row-hint">
+                  {t("settings.auto_file_hint")}
+                </span>
+              </span>
+            </label>
+            <label className="settings__checkbox">
+              <input
+                type="checkbox"
+                checked={autoStart}
+                onChange={(e) => onAutoStartChange(e.target.checked)}
+              />
+              {/* QS 2026-08-04: einzige Zeile in den Einstellungen, die nicht
+                  übersetzt war — englische/italienische Piloten sahen genau
+                  hier deutschen Text zwischen lauter übersetzten Zeilen. */}
+              <span>
+                <strong>{t("settings.auto_start_label")}</strong>
+                <span className="settings__row-hint">
+                  {t("settings.auto_start_hint")}
+                </span>
+              </span>
+            </label>
+            <label className="settings__checkbox">
+              <input
+                type="checkbox"
+                checked={approachAdvisoriesEnabled}
+                onChange={(e) => onApproachAdvisoriesEnabledChange(e.target.checked)}
+              />
+              <span>
+                <strong>{t("approach_advisory.settings_label")}</strong>
+                <span className="settings__row-hint">
+                  {t("approach_advisory.settings_hint")}
+                </span>
+              </span>
+            </label>
+          </div>
+        </>
+      )}
+
+      {/* ─── Tab: Komfort ─────────────────────────────────────────
+          Sprache/Theme, Pilotenchat, Verhalten, Discord-RPC — optionale
+          Qualität-Verbesserungen. Speicher und Fehler-Telemetrie stehen
+          seit 17.10.2026 unter „Technik“, das Cockpit-Zubehör unter
+          „Cockpit“.
+      */}
+      {activeTab === "extras" && (
+        <>
+          <div className="settings__section">
+            <h3>{t("settings.appearance_section")}</h3>
+
+            <label className="settings__field">
+              <span className="settings__field-label">
+                {t("settings.language_label")}
+              </span>
+              <select
+                value={language}
+                onChange={(e) => setLanguage(e.target.value as SupportedLanguage)}
+              >
+                {SUPPORTED_LANGUAGES.map((lng) => (
+                  <option key={lng} value={lng}>{LANGUAGE_LABELS[lng]}</option>
+                ))}
+              </select>
+            </label>
+
+            <label className="settings__field">
+              <span className="settings__field-label">
+                {t("settings.theme_label")}
+              </span>
+              <select
+                value={theme}
+                onChange={(e) => onThemeChange(e.target.value as Theme)}
+              >
+                <option value="dark">{t("settings.theme_dark")}</option>
+                <option value="light">{t("settings.theme_light")}</option>
+              </select>
+            </label>
+          </div>
+
+          {/* QS-Abschluss 12.08.2026: Auf der Datenschutzseite steht seit
+              heute "Sie koennen den Chat in den Einstellungen des Clients
+              abschalten." Diesen Schalter gab es nicht — nur einen
+              gespeicherten Wert ohne Bedienelement. Eine Zusage auf einer
+              Rechtsseite muss man einloesen koennen. */}
+          <div className="settings__section">
+            <h3>{t("chat.settings_title", "Pilotenchat")}</h3>
+            <label className="settings__checkbox">
+              <input
+                type="checkbox"
+                checked={chatAn}
+                onChange={(e) => onChatAnChange(e.target.checked)}
+              />
+              <span>
+                <strong>{t("chat.settings_an_label", "Pilotenchat verwenden")}</strong>
+                <span className="settings__row-hint">
+                  {t(
+                    "chat.settings_an_hint",
+                    "Aus: kein Chat-Reiter, keine eingehenden Nachrichten, kein Senden. Nachrichten werden nach zwölf Stunden ohnehin gelöscht; die Flugleitung kann mitlesen.",
+                  )}
+                </span>
+              </span>
+            </label>
+            <label className="settings__checkbox">
+              <input
+                type="checkbox"
+                checked={chatTon}
+                disabled={!chatAn}
+                onChange={(e) => onChatTonChange(e.target.checked)}
+              />
+              <span>
+                <strong>{t("chat.settings_ton_label", "Ton bei neuen Nachrichten")}</strong>
+                <span className="settings__row-hint">
+                  {t(
+                    "chat.settings_ton_hint",
+                    "Im Sinkflug leiser, im Endanflug immer still — unabhängig von dieser Einstellung.",
+                  )}
+                </span>
+              </span>
+            </label>
+          </div>
+
+          <div className="settings__section">
+            <h3>{t("behaviour.section_title")}</h3>
+            <label className="settings__checkbox">
+              <input
+                type="checkbox"
+                checked={minimizeToTray}
+                onChange={(e) => onMinimizeToTrayChange(e.target.checked)}
+              />
+              <span>
+                <strong>{t("behaviour.minimize_to_tray_label")}</strong>
+                <span
+                  className="settings__row-hint"
+                  dangerouslySetInnerHTML={{
+                    __html: t("behaviour.minimize_to_tray_hint"),
+                  }}
+                />
+              </span>
+            </label>
+          </div>
+
+          {/* v0.9.0 (#Discord-RPC): Rich-Presence im Discord-Profil.
+              Opt-In, Default = aus. */}
+          <DiscordRpcPanel />
+
+        </>
+      )}
+
+      {/* ─── Tab: Cockpit ─────────────────────────────────────────
+          Was im Flug mitspielt: Funk mit der Flugleitung, Kabine, HUDs
+          im Sim, Tablet als Fernbedienung. Reihenfolge nach Gebrauch.
+      */}
+      {activeTab === "cockpit" && (
+        <>
+          {/* v1.3.0 (#Hoppie-PDC-CPDLC): PDC/CPDLC-Client ueber das
+              Hoppie-ACARS-Netzwerk. Opt-In, Default = aus. */}
+          <HoppieSettingsPanel />
+          {isTauri && <KabinenSettingsPanel onAnChange={onKabineAnChange} />}
+
+          {/* v1.5.0 (#msfs-hud): Diagnose-Schalter für den lokalen
+              Panel-Server des In-Sim-HUD. Default = an; wirkt beim
+              nächsten Start. */}
+          {isTauri && <MsfsHudPanel />}
+
+          {/* ADR-0005: Schalter für das X-Plane-HUD-Band. Default = an. */}
+          {isTauri && <XplaneBandPanel />}
+
+          {/* v0.16.0 (#LAN-Remote): LAN-Fernbedienung. Nur im Tauri-Build —
+              ein Browser kann keinen Server hosten. Im LAN-Browser (Tablet)
+              ist diese Sektion ausgeblendet. */}
+          {isTauri && <RemoteServerPanel />}
+        </>
+      )}
+
+      {/* ─── Tab: Plugins ─────────────────────────────────────────
+          Flugzeug-spezifische Add-ons (PMDG SDK, AeroACARS-X-Plane-
+          Plugin). v0.11.0-dev: in eigenen Tab gezogen — vorher
+          waren die unter „Developer → Debug" versteckt, obwohl sie
+          für PMDG-/X-Plane-Piloten ein normaler Settings-Bereich
+          sind. Beide Panels rendern jetzt unabhängig vom Debug-Mode
+          (die Sichtbarkeit der Karten selbst hängt nur am Sim-
+          State und ob das passende Plugin/Aircraft erkannt wird).
+      */}
+      {activeTab === "plugins" && (
+        <>
+          <PmdgPremiumPanel
+            simState={simStatus?.state ?? "disconnected"}
+            simSnapshot={simStatus?.snapshot ?? null}
+          />
+          <XPlanePremiumPanel
+            simState={simStatus?.state ?? "disconnected"}
+          />
+          <AircraftScanPanel />
+        </>
+      )}
+
+      {/* ─── Tab: Technik ─────────────────────────────────────────
+          Speicher + Fehler-Telemetrie (seit 17.10.2026, vorher Komfort),
+          Debug-Mode + Sim-Debug + phpVMS-Heartbeat und Orphan-Flight-
+          Cleanup — selten gebraucht, primär für Dev/Troubleshooting.
+          PMDG-/X-Plane-Premium-Panels sind nicht mehr hier (siehe
+          „Plugins"-Tab).
+      */}
+      {activeTab === "bordbuch" && <BordbuchEinstellungen />}
+      {activeTab === "vermessen" && <FlugzeugVermessen />}
+
+      {activeTab === "tech" && (
+        <>
+          <div className="settings__section">
+            <h3>{t("settings.storage_section")}</h3>
+            <LandingBackupManager />
+            <FlightLogsManager
+              autoDelete={autoDeleteFlightLogs}
+              onAutoDeleteChange={onAutoDeleteFlightLogsChange}
+            />
+          </div>
+
+          {/* v0.9.0 (#GlitchTip): Anonyme Fehler-Telemetrie.
+              Opt-In, Default = aus. Pflicht laut DSGVO Art. 6 (1) a. */}
+          <ErrorReportingPanel />
+
+          <div className="settings__section">
+            <h3>{t("settings.developer_section")}</h3>
+            <label className="settings__checkbox">
+              <input
+                type="checkbox"
+                checked={debugMode}
+                onChange={(e) => onDebugModeChange(e.target.checked)}
+              />
+              <span>
+                <strong>{t("settings.debug_mode_label")}</strong>
+                <span className="settings__row-hint">
+                  {t("settings.debug_mode_hint")}
+                </span>
+              </span>
+            </label>
+
+            {debugMode && (
+              <div className="settings__debug-panel">
+                <SimDebugPanel status={simStatus} />
+                <PhpvmsHeartbeatDebug activeFlight={activeFlight} />
+              </div>
+            )}
+          </div>
+
+          {/* v0.7.18 (B-011) — Orphan-Flight-Cleanup. Notnagel-
+              Funktion, deshalb im Tech-Tab. */}
+          <OrphanFlightsPanel />
+        </>
+      )}
+    </section>
+  );
+}
+
+/**
+ * v0.9.0 (#GlitchTip) — Anonyme Fehler-Telemetrie an unseren self-hosted
+ * GlitchTip-Server. Opt-In, Default = aus. Wenn an: nur anonymisierte
+ * Crash/Error-Events ohne PII, Auth-Header, Position oder Routen-
+ * Details. Tag-Allowlist + Redaction-Hook strippen alles vor dem Send.
+ *
+ * Spec: docs/spec/v0.9.0-glitchtip-self-hosted.md (LE4)
+ *     + docs/spec/v0.9.0-telemetry-contract.md Sektion 9 (DSGVO).
+ *
+ * Persistence: localStorage `aeroacars.errorReporting.enabled`
+ * + Mirror in den Rust-Backend per `error_reporting_set_consent`.
+ * UI-Hint zeigt sofort an dass der Toggle sofort wirkt (vor jedem
+ * Sentry-Event wird die Consent-Atomic geprueft).
+ */
+function ErrorReportingPanel() {
+  const { t } = useTranslation();
+  const [enabled, setEnabledState] = useState<boolean>(() => getConsent());
+
+  const handleToggle = (next: boolean) => {
+    setEnabledState(next);
+    setConsent(next);
+    // Mirror in Rust-Backend (Atomic-Gate). Wenn der Command nicht
+    // existiert (alter Build), ignorieren — Default bleibt OFF.
+    void invoke("error_reporting_set_consent", { enabled: next }).catch(
+      () => undefined,
+    );
+  };
+
+  return (
+    <div className="settings__section">
+      <h3>{t("error_reporting.section_title")}</h3>
+      <p className="settings__row-hint">{t("error_reporting.intro")}</p>
+      <label className="settings__checkbox">
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={(e) => handleToggle(e.target.checked)}
+        />
+        <span>
+          <strong>{t("error_reporting.toggle_label")}</strong>
+          <span
+            className="settings__row-hint"
+            dangerouslySetInnerHTML={{
+              __html: t("error_reporting.toggle_hint"),
+            }}
+          />
+        </span>
+      </label>
+    </div>
+  );
+}
+
+/**
+ * Live status card for the phpVMS API connection — keeps the same
+ * visual language as the SimDebugPanel above so the Settings → Debug
+ * area reads as a single coherent block. Re-renders once a second to
+ * keep the relative ages live.
+ *
+ * State-color mapping mirrors the simulator card:
+ *   - no active flight        → disconnected (grey)
+ *   - heartbeat ≤ 45 s ago    → connected (green pulse)
+ *   - heartbeat 45-90 s       → connecting (yellow pulse, "stale")
+ *   - heartbeat > 90 s / never→ connecting (yellow, but with a stale label)
+ * "Connecting" is reused for both warn cases because phpVMS doesn't
+ * have an "error" CSS variant in the sim-panel system; a yellow pulse
+ * is the right level of "this is fishy, look at me" without false-
+ * alarming red on a single dropped packet.
+ */
+function PhpvmsHeartbeatDebug({ activeFlight }: { activeFlight: ActiveFlightInfo | null }) {
+  const { t } = useTranslation();
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  const ageSec = (iso: string | null): number | null => {
+    if (!iso) return null;
+    return Math.max(0, Math.floor((now - new Date(iso).getTime()) / 1000));
+  };
+  const fmtAge = (sec: number | null): string => {
+    if (sec === null) return t("phpvms_status.age_unknown");
+    if (sec < 60) return t("phpvms_status.age_seconds", { seconds: sec });
+    const m = Math.floor(sec / 60);
+    const r = sec % 60;
+    return r === 0
+      ? t("phpvms_status.age_minutes", { minutes: m })
+      : t("phpvms_status.age_minutes_seconds", { minutes: m, seconds: r });
+  };
+
+  if (!activeFlight) {
+    return (
+      <section className="sim-panel sim-panel--disconnected">
+        <header className="sim-panel__header">
+          <div className="sim-panel__header-left">
+            <h2>{t("phpvms_status.title")}</h2>
+            <span className="sim-panel__kind">{t("phpvms_status.badge_heartbeat")}</span>
+          </div>
+          <span className="sim-panel__state">
+            <span className="sim-panel__dot" /> {t("phpvms_status.state_inactive")}
+          </span>
+        </header>
+        <p className="sim-panel__hint">{t("phpvms_status.no_active_flight")}</p>
+      </section>
+    );
+  }
+
+  const heartbeatAge = ageSec(activeFlight.last_heartbeat_at);
+  const positionAge = ageSec(activeFlight.last_position_at);
+  // Heartbeat fires every 30s by design — anything beyond ~45s means a
+  // posted call failed or the streamer hasn't gotten its first one in yet.
+  const isStale = heartbeatAge === null || heartbeatAge > 45;
+  const state = isStale ? "connecting" : "connected";
+  const stateLabel = isStale
+    ? t("phpvms_status.state_waiting")
+    : t("phpvms_status.state_active");
+  // Truncate the PIREP id for the badge — full id is ~16 chars, that's
+  // too wide for a header pill. The first 6 chars are enough to
+  // disambiguate in practice.
+  const pirepBadge = activeFlight.pirep_id.length > 8
+    ? `${activeFlight.pirep_id.slice(0, 6)}…`
+    : activeFlight.pirep_id;
+
+  return (
+    <section className={`sim-panel sim-panel--${state}`}>
+      <header className="sim-panel__header">
+        <div className="sim-panel__header-left">
+          <h2>{t("phpvms_status.title")}</h2>
+          <span className="sim-panel__kind">
+            {t("phpvms_status.badge_pirep_prefix")} {pirepBadge}
+          </span>
+        </div>
+        <span className={`sim-panel__state sim-panel__state--${state}`}>
+          <span className="sim-panel__dot" /> {stateLabel}
+        </span>
+      </header>
+      <dl className="sim-panel__compact">
+        <dt>{t("phpvms_status.row_last_position")}</dt>
+        <dd>
+          {fmtAge(positionAge)}
+          {positionAge !== null && positionAge > 60 && (
+            <span className="sim-panel__compact-muted"> · {t("phpvms_status.muted_stale")}</span>
+          )}
+        </dd>
+        <dt>{t("phpvms_status.row_last_heartbeat")}</dt>
+        <dd>
+          {fmtAge(heartbeatAge)}
+          {heartbeatAge === null && (
+            <span className="sim-panel__compact-muted"> · {t("phpvms_status.muted_not_yet_sent")}</span>
+          )}
+        </dd>
+        {activeFlight.queued_position_count > 0 && (
+          <>
+            <dt>{t("phpvms_status.row_position_queue")}</dt>
+            <dd>
+              {activeFlight.queued_position_count}{" "}
+              {/* v0.6.2 — Label hängt am echten Connection-State, nicht
+                 nur am Backlog. „queued (offline)" für jeden Backlog war
+                 missverständlich (= Pilot dachte Connection weg). */}
+              <span className="sim-panel__compact-muted">
+                {activeFlight.connection_state === "failing"
+                  ? t("phpvms_status.muted_pending_offline")
+                  : t("phpvms_status.muted_pending_sync")}
+              </span>
+            </dd>
+          </>
+        )}
+      </dl>
+    </section>
+  );
+}
+
+/**
+ * Settings → Speicher: lets the pilot manage on-disk per-flight JSONL
+ * recorder files. Two controls:
+ *  - Toggle for the auto-purge sweep that the App.tsx mount triggers
+ *    (default ON, threshold 30 days).
+ *  - "Alle löschen jetzt" button (with confirm) for the manual nuke.
+ *
+ * The backing files are at `<app_data_dir>/flight_logs/<pirep_id>.jsonl`
+ * — see README → Troubleshooting for the exact OS-specific paths.
+ * Stats are loaded once on mount and re-fetched after a successful
+ * delete so the user sees the file count drop immediately.
+ */
+
+/**
+ * Settings → Speicher: Landungs-Sicherung.
+ *
+ * Läuft automatisch (nach jeder Landung sichern, beim Start holen); die
+ * beiden Knöpfe sind nur für den Fall, dass jemand nicht warten will oder
+ * nach einer Neuinstallation sofort seine Historie sehen möchte.
+ */
+function LandingBackupManager() {
+  const { t } = useTranslation();
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const run = async (which: "save" | "restore") => {
+    setBusy(true);
+    setError(null);
+    setMsg(null);
+    try {
+      if (which === "save") {
+        const n = await invoke<number>("landing_backup_now");
+        setMsg(t("settings.landing_backup_saved", { count: n }));
+      } else {
+        const n = await invoke<number>("landing_backup_restore");
+        setMsg(
+          n === 0
+            ? t("settings.landing_backup_nothing_new")
+            : t("settings.landing_backup_restored", { count: n }),
+        );
+      }
+    } catch (e) {
+      setError(formatIpcError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="settings-block">
+      <div className="settings-label">{t("settings.landing_backup_label")}</div>
+      <p className="settings-hint">{t("settings.landing_backup_hint")}</p>
+      <div className="settings-row" style={{ gap: 8 }}>
+        <button type="button" className="button" disabled={busy} onClick={() => void run("save")}>
+          {t("settings.landing_backup_now")}
+        </button>
+        <button type="button" className="button" disabled={busy} onClick={() => void run("restore")}>
+          {t("settings.landing_backup_restore")}
+        </button>
+      </div>
+      {msg && <p className="settings-hint" style={{ color: "var(--success)" }}>{msg}</p>}
+      {error && <p className="settings-hint" style={{ color: "var(--danger)" }}>{error}</p>}
+    </div>
+  );
+}
+
+function FlightLogsManager({
+  autoDelete,
+  onAutoDeleteChange,
+}: {
+  autoDelete: boolean;
+  onAutoDeleteChange: (next: boolean) => void;
+}) {
+  const { t } = useTranslation();
+  const { confirm, dialog: confirmDialog } = useConfirm();
+  const [stats, setStats] = useState<{ count: number; total_bytes: number } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // Inline success-feedback shown right under the delete button.
+  // Replaces the v0.3.1 `window.alert()` which is silently dropped on
+  // macOS WKWebView (same bug class as `confirm()`). Cleared on next
+  // refresh, so the user sees it briefly and then it goes away.
+  const [doneMsg, setDoneMsg] = useState<string | null>(null);
+
+  const refresh = async () => {
+    try {
+      const s = await invoke<{ count: number; total_bytes: number }>("flight_logs_stats");
+      setStats(s);
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  useEffect(() => {
+    void refresh();
+  }, []);
+
+  const handleDeleteAll = async () => {
+    const ok = await confirm({
+      message: t("settings.delete_all_logs_confirm"),
+      destructive: true,
+    });
+    if (!ok) return;
+    setBusy(true);
+    setDoneMsg(null);
+    try {
+      const res = await invoke<{ deleted: number }>("flight_logs_delete_all");
+      await refresh();
+      // v0.11.0-dev (QS-Audit): direkt i18next-Plural-Resolution nutzen.
+      // i18next-V4 mappt `count` automatisch auf `_one`/`_other` —
+      // der vorherige defaultValue-Hack mit manuellem Branching war ein
+      // Code-Smell und triggerte den Audit-„missing-in-EN"-False-Positive
+      // weil der Base-Key `delete_all_logs_done` nie existieren musste.
+      setDoneMsg(
+        t("settings.delete_all_logs_done", { count: res.deleted }),
+      );
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const fmtSize = (bytes: number): string => {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  };
+
+  const usageText = (() => {
+    if (stats === null) return t("settings.storage_usage_loading");
+    if (stats.count === 0) return t("settings.storage_usage_empty");
+    const key = stats.count === 1
+      ? "settings.storage_usage_count_one"
+      : "settings.storage_usage_count_other";
+    return t(key, { count: stats.count, size: fmtSize(stats.total_bytes) });
+  })();
+
+  return (
+    <>
+      {confirmDialog}
+      <label className="settings__checkbox">
+        <input
+          type="checkbox"
+          checked={autoDelete}
+          onChange={(e) => onAutoDeleteChange(e.target.checked)}
+        />
+        <span>
+          <strong>{t("settings.auto_delete_logs_label")}</strong>
+          <span
+            className="settings__row-hint"
+            dangerouslySetInnerHTML={{ __html: t("settings.auto_delete_logs_hint") }}
+          />
+        </span>
+      </label>
+
+      <div className="storage-card">
+        <div className="storage-card__row">
+          <span className="storage-card__label">{t("settings.storage_usage_label")}</span>
+          <span className="storage-card__value">{usageText}</span>
+        </div>
+        <div className="storage-card__actions">
+          <button
+            type="button"
+            className="storage-card__btn storage-card__btn--danger"
+            onClick={handleDeleteAll}
+            disabled={busy || stats === null || stats.count === 0}
+          >
+            {busy ? t("settings.delete_all_logs_busy") : t("settings.delete_all_logs_button")}
+          </button>
+          <button
+            type="button"
+            className="storage-card__btn"
+            onClick={() => void refresh()}
+            disabled={busy}
+            aria-label={t("settings.refresh_button_label")}
+            title={t("settings.refresh_button_title")}
+          >
+            ↻
+          </button>
+        </div>
+        {error && <p className="storage-card__error">{error}</p>}
+        {doneMsg && <p className="storage-card__done">{doneMsg}</p>}
+      </div>
+    </>
+  );
+}
+
+/**
+ * Verbindungsstand gross und deutlich unter der Simulator-Auswahl
+ * (v1.9.14, Feldbefund Thomas 30.09.2026: der kleine Hinweis „Automatisch
+ * eingestellt: MSFS 2024“ war kaum zu lesen und sagte nicht, ob die
+ * Verbindung wirklich steht). Zeigt den ECHTEN Zustand aus `sim_status`.
+ */
+function SimVerbindungsStatus({
+  automatisch,
+  kind,
+  status,
+}: {
+  automatisch: boolean;
+  kind: SimKind | null;
+  status: SimStatus | null;
+}) {
+  const { t } = useTranslation();
+  if (kind === null || kind === "off") return null;
+  const sim = t(`sim.kinds.${kind}`);
+  const zustand = status?.state ?? "disconnected";
+  const flugzeug = status?.snapshot?.aircraft_title?.trim();
+  let titel: string;
+  let detail: string;
+  if (zustand === "connected") {
+    titel = t("settings.sim_status.verbunden", { sim });
+    detail = flugzeug
+      ? t("settings.sim_status.flugzeug", { flugzeug })
+      : t("settings.sim_status.verbunden_ohne_flugzeug");
+  } else if (!automatisch && status && !status.available) {
+    // Nur bei Handwahl: Im Automatik-Modus stellt der Waechter selbst um,
+    // sobald X-Plane laeuft — dort waere „bitte X-Plane waehlen“ falsch.
+    titel = t("settings.sim_status.nicht_verfuegbar", { sim });
+    detail = t("settings.sim_status.nicht_verfuegbar_detail");
+  } else if (zustand === "connecting") {
+    titel = t("settings.sim_status.verbindet", { sim });
+    detail = t("settings.sim_status.verbindet_detail");
+  } else if (automatisch) {
+    titel = t("settings.sim_status.auto_keiner");
+    detail = t("settings.sim_status.auto_keiner_detail");
+  } else {
+    titel = t("settings.sim_status.nicht_verbunden", { sim });
+    detail = t("settings.sim_status.nicht_verbunden_detail");
+  }
+  const art = automatisch ? t("settings.sim_status.art_auto") : t("settings.sim_status.art_fest");
+  return (
+    <div
+      className={`settings__sim-status settings__sim-status--${zustand}`}
+      role="status"
+      aria-live="polite"
+    >
+      <span className="settings__sim-status-punkt" aria-hidden="true" />
+      <div className="settings__sim-status-text">
+        <strong>{titel}</strong>
+        <span>{detail}</span>
+        <span className="settings__sim-status-art">{art}</span>
+      </div>
+    </div>
+  );
+}

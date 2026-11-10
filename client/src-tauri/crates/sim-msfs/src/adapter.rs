@@ -1,0 +1,4154 @@
+//! Windows-only raw SimConnect adapter.
+//!
+//! Owns a worker thread that connects to SimConnect, registers a
+//! single data definition, subscribes to per-second updates and
+//! pushes parsed [`SimSnapshot`]s into a shared mutex. The public
+//! [`MsfsAdapter`] API is the same as the legacy adapter so the rest
+//! of the application doesn't need to change.
+
+use parking_lot::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use crate::facility;
+use chrono::Utc;
+use serde::Serialize;
+use sim_core::{AircraftProfile, SimKind, SimSnapshot, Simulator};
+
+mod sys;
+mod telemetry;
+
+use telemetry::{InspectorState, Touchdown, OPTIONALE_FELDER, TELEMETRY_FIELDS, TOUCHDOWN_FIELDS};
+pub use telemetry::{InspectorWatch, WatchKind, WatchValue};
+
+// IDs used in our SimConnect calls — chosen freely as long as they're
+// unique within the connection. Data definition #1 holds the per-tick
+// telemetry; #2 the touchdown snapshot, which only the simulation
+// itself fills (and only at the moment the gear hits the ground).
+// Splitting them means a touchdown SimVar rejection can never shift
+// the live telemetry layout — same reason we left the old crate
+// behind.
+const DEFINITION_ID: sys::SIMCONNECT_DATA_DEFINITION_ID = 1;
+const REQUEST_ID: sys::SIMCONNECT_DATA_REQUEST_ID = 1;
+const TOUCHDOWN_DEFINITION_ID: sys::SIMCONNECT_DATA_DEFINITION_ID = 2;
+const TOUCHDOWN_REQUEST_ID: sys::SIMCONNECT_DATA_REQUEST_ID = 2;
+/// Definition #3: live inspector watchlist, re-registered on every
+/// add/remove. Lives in its own slot so a typo in a user-supplied
+/// SimVar name can't take down the per-tick telemetry.
+const INSPECTOR_DEFINITION_ID: sys::SIMCONNECT_DATA_DEFINITION_ID = 3;
+const INSPECTOR_REQUEST_ID: sys::SIMCONNECT_DATA_REQUEST_ID = 3;
+/// Definition #4: Zusatzwerte des Telemetrie-Monitors (v1.8). Existiert nur,
+/// solange der Monitor offen ist; eigener Platz aus demselben Grund wie der
+/// Inspector — eine abgelehnte SimVar trifft nur diese Definition.
+const ZUSATZ_DEFINITION_ID: sys::SIMCONNECT_DATA_DEFINITION_ID = 4;
+const ZUSATZ_REQUEST_ID: sys::SIMCONNECT_DATA_REQUEST_ID = 4;
+/// Definitionen #20..: je EINE SimVar aus `telemetry::OPTIONALE_FELDER`
+/// (z. B. EX1, das MSFS 2020 nicht kennt). Eine Ablehnung laesst nur
+/// diesen Wert None — die Hauptdefinition kann nicht verrutschen.
+const OPTIONAL_DEFINITION_BASE: sys::SIMCONNECT_DATA_DEFINITION_ID = 20;
+const OPTIONAL_REQUEST_BASE: sys::SIMCONNECT_DATA_REQUEST_ID = 20;
+/// Definition #10: Bahnen und Rollwege aus der geladenen Szenerie
+/// (v1.7.8). Eigener Platz, damit ein abgelehnter Feldname weder die
+/// Telemetrie noch die Aufsetzprobe verschiebt — dieselbe Ueberlegung
+/// wie bei der Trennung von Telemetrie und Touchdown.
+const FACILITY_DEFINITION_ID: sys::SIMCONNECT_DATA_DEFINITION_ID = 10;
+/// Basis der Facility-Anfragekennungen.
+///
+/// ⚠ Jeder VERSUCH bekommt `BASIS + Auftragskennung`. Eine feste
+/// Kennung fuer alle Anfragen liess eine nach der Wartezeit
+/// eintreffende Antwort nicht mehr von der laufenden unterscheiden
+/// (QS-Befund 1, 01.09.2026). Die 1000 liegt ueber allen anderen
+/// vergebenen Kennungen (1, 2, 3, 100, 101, 200).
+const FACILITY_REQUEST_BASE: sys::SIMCONNECT_DATA_REQUEST_ID = 1000;
+
+// ---- PMDG SDK ClientData IDs (Phase H.4) ----
+//
+// The PMDG NG3 + 777X SDKs use SimConnect ClientData (NOT the
+// standard SimObject data). They define their own data area names
+// + IDs in the SDK header (constants from `pmdg::ng3` /
+// `pmdg::x777`). We re-use the IDs defined by PMDG verbatim so the
+// `MapClientDataNameToID` call binds correctly. Definition + request
+// IDs we choose ourselves (must be unique within our own SimConnect
+// session). 100+ keeps them out of the existing telemetry-id range.
+const PMDG_NG3_DEFINITION_ID: sys::SIMCONNECT_DATA_DEFINITION_ID = 100;
+const PMDG_NG3_REQUEST_ID: sys::SIMCONNECT_DATA_REQUEST_ID = 100;
+const PMDG_X777_DEFINITION_ID: sys::SIMCONNECT_DATA_DEFINITION_ID = 101;
+const PMDG_X777_REQUEST_ID: sys::SIMCONNECT_DATA_REQUEST_ID = 101;
+const AIRCRAFT_LOADED_REQUEST_ID: sys::SIMCONNECT_DATA_REQUEST_ID = 200;
+const SIM_START_EVENT_ID: u32 = 300;
+/// Spec v0.7.15 F5 (QS-Round-2): SimConnect `Pause_EX1`-Event statt der
+/// zwei separaten `Paused`/`Unpaused`-Events. `Pause_EX1` schickt
+/// sofort den aktuellen Pause-State + bei jedem Wechsel ein Update
+/// mit `dwData`-Flag-Set:
+///   bit 0 (0x01) = SIMCONNECT_PAUSE_FLAG_PAUSE         (Full Pause)
+///   bit 1 (0x02) = SIMCONNECT_PAUSE_FLAG_PAUSE_WITH_SOUND
+///   bit 2 (0x04) = SIMCONNECT_PAUSE_FLAG_ACTIVE_PAUSE
+///   bit 3 (0x08) = SIMCONNECT_PAUSE_FLAG_SIM_PAUSE
+/// = 0 → kein Pause. != 0 → irgendeine Pause-Variante.
+///
+/// Vorteil ggue. `Paused`+`Unpaused`: wenn AeroACARS connectet
+/// waehrend MSFS schon pausiert ist, kommt sofort ein initialer
+/// Pause_EX1-Event mit dem aktuellen State. Bei den zwei separaten
+/// Events haette `sim_pause` bis zum naechsten Toggle weiter `false`
+/// gezeigt.
+///
+/// SDK-Doku: https://docs.flightsimulator.com/html/Programming_Tools/SimConnect/API_Reference/Events_And_Data/SimConnect_SubscribeToSystemEvent.htm
+const PAUSE_EX1_EVENT_ID: u32 = 301;
+/// v0.7.19 GAF-707 Accident-Detection: SimConnect-`Crashed`-System-
+/// Event. Wird gefeuert wenn der User-Aircraft im Sim crashed (Boden-
+/// kontakt mit nicht-ueberlebbaren Parametern, Stall ins Terrain etc).
+/// Adapter latcht das in `shared.crashed` — `CrashReset` (= MSFS-UI
+/// Cut-Scene fertig) loescht den raw Flag wieder, aber der aktive
+/// Flug behaelt seinen accident_detected-Latch in lib.rs/FlightStats.
+/// SDK-Doku siehe oben SubscribeToSystemEvent Link.
+const CRASHED_EVENT_ID: u32 = 302;
+const CRASH_RESET_EVENT_ID: u32 = 303;
+/// 2.0.14: SimConnect-Systemereignis `Frame` — kommt mit jedem Bild und
+/// traegt die Bildrate, die der Simulator selbst misst (`fFrameRate`).
+/// Nur fuer die Diagnose, siehe `SimSnapshot::sim_bildrate_hz`.
+const FRAME_EVENT_ID: u32 = 304;
+/// Flow-Ereignisse, bei denen die Telemetrie nicht den geflogenen Zustand
+/// beschreibt. Werte aus `SimConnect.h`, Enum `SIMCONNECT_FLOW_EVENT`.
+///
+/// Bewusst ueber die bindgen-Konstanten und nicht ueber Zahlen: die
+/// Reihenfolge im Enum ist SDK-Sache und darf sich aendern.
+const FLOW_REPLAY_START: u32 = sys::SIMCONNECT_FLOW_EVENT_SIMCONNECT_FLOW_EVENT_REPLAY_START as u32;
+const FLOW_REPLAY_END: u32 = sys::SIMCONNECT_FLOW_EVENT_SIMCONNECT_FLOW_EVENT_REPLAY_END as u32;
+const FLOW_TELEPORT_START: u32 =
+    sys::SIMCONNECT_FLOW_EVENT_SIMCONNECT_FLOW_EVENT_TELEPORT_START as u32;
+const FLOW_TELEPORT_DONE: u32 =
+    sys::SIMCONNECT_FLOW_EVENT_SIMCONNECT_FLOW_EVENT_TELEPORT_DONE as u32;
+const FLOW_SKIP_START: u32 = sys::SIMCONNECT_FLOW_EVENT_SIMCONNECT_FLOW_EVENT_SKIP_START as u32;
+const FLOW_SKIP_DONE: u32 = sys::SIMCONNECT_FLOW_EVENT_SIMCONNECT_FLOW_EVENT_SKIP_DONE as u32;
+
+const STALE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Public connection state mirrored to the frontend.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionState {
+    Disconnected,
+    Connecting,
+    Connected,
+}
+
+/// External-facing MSFS adapter. Cheap to clone-state; drives a
+/// background worker thread that talks to SimConnect.
+
+pub struct MsfsAdapter {
+    shared: Arc<Shared>,
+    worker: Option<JoinHandle<()>>,
+    stop: Arc<AtomicBool>,
+}
+
+struct Shared {
+    state: Mutex<ConnectionState>,
+    snapshot: Mutex<Option<SimSnapshot>>,
+    last_error: Mutex<Option<String>>,
+    /// v1.7.8 — die zuletzt vollstaendig gelieferte Szenerie-Auskunft.
+    ///
+    /// ⚠ Wird ERST bei `FacilityDataEnde` gefuellt. Die Lieferung kommt
+    /// stueckweise; eine halbe Bahnliste saehe aus wie ein Flughafen mit
+    /// einer Bahn — und die Bewertung wuerde gegen die falsche messen,
+    /// ohne dass etwas anschlaegt.
+    ///
+    /// ⚠ Seit v1.7.14 ein Buch nach Platz statt eines einzelnen Fachs.
+    /// Der Grund steht bei `Auftragsbuch`: Start und Ziel haben sich
+    /// gegenseitig verdraengt, eine Lieferung wurde mit dem falschen
+    /// Platz beschriftet, und ein stummer Platz wurde nie wieder
+    /// gefragt.
+    szenerie: Mutex<sim_core::szenerie::Auftragsbuch>,
+    /// Steht eine Anfrage aus, die der Verbindungsfaden noch stellen muss?
+    szenerie_offen: AtomicBool,
+    // ⚠ Hier stand `szenerie_diagnose: Mutex<SzenerieDiagnose>` — eine
+    // ZWEITE Zustandsquelle neben dem Auftragsbuch. Ersatzlos
+    // gestrichen; die Diagnose kommt aus dem Schnappschuss
+    // (QS-Befund, zehnte Runde).
+    /// Name und Version, mit denen sich der Simulator beim Verbinden
+    /// meldet (aus `SIMCONNECT_RECV_OPEN`). MSFS 2020 und 2024 melden
+    /// sich unterschiedlich — und die Feldnamen der Facility-Abfrage
+    /// stammen aus der 2024er-SDK-Doku. Ohne diese Kennung laesst sich
+    /// nicht sagen, ob eine Ablehnung an der Fassung liegt.
+    // ⚠ Hier stand `sim_kennung: Mutex<Option<String>>`. Ersatzlos
+    // gestrichen: Die Kennung liegt jetzt IM Auftragsbuch, damit der
+    // Schnappschuss sie unter derselben Sperre bekommt. Ein zweiter
+    // Mutex daneben braucht eine Reihenfolge, die man bewachen muss —
+    // und ein Waechter belegte nur die Reihenfolge, nicht die
+    // Atomarität (QS-Befund 3, zwoelfte Runde).
+    /// Spec v0.7.15 F5: SimConnect-`Paused`/`Unpaused`-System-Events
+    /// melden hierher. `snapshot()` liest daraus `snap.paused`, damit
+    /// der Streamer-Loop in `lib.rs` ueber den bestehenden Snapshot-
+    /// Pfad lesen kann (= keine zweite IPC-Schiene noetig). Default
+    /// „laeuft" bis der Sim das erste Mal pausiert.
+    ///
+    /// 26.10.2026 (LTU 154): entprellt — eine Pause gilt erst nach
+    /// `sim_core::pause::ENTPRELLZEIT`. Gilt damit fuer JEDEN Leser von
+    /// `snap.paused`: Aufsetz-Abtaster, Phasen-Engine, Auto-Start, Streamer.
+    sim_pause: Mutex<sim_core::pause::PausenEntpreller>,
+    /// v1.6.12 — der Simulator spielt eine Aufzeichnung ab oder versetzt das
+    /// Flugzeug, statt es fliegen zu lassen.
+    ///
+    /// Quelle sind die Flow-Ereignisse des SimConnect-SDK
+    /// (`REPLAY_START`/`REPLAY_END`, `TELEPORT_START`/`TELEPORT_DONE`,
+    /// `SKIP_START`/`SKIP_DONE`). Behandelt wird das wie eine Pause — genau so
+    /// haelt es der X-Plane-Adapter seit Spec v0.7.15 F6 mit
+    /// `sim/time/is_in_replay`: aus AeroACARS-Sicht ist das „die Telemetrie ist
+    /// gerade nicht echt".
+    ///
+    /// Zaehler statt Ja/Nein: die Ereignisse koennen sich ueberlappen (ein
+    /// Teleport waehrend eines Replays). Ein einzelnes `..._DONE` wuerde sonst
+    /// den noch laufenden anderen Vorgang mit abraeumen.
+    sim_unecht_tiefe: AtomicI32,
+    /// 2.0.14 — die zuletzt gemeldete Bildrate (Ereignis `Frame`) als
+    /// `f32`-Bits; 0 heisst „noch keine". Nur Diagnose.
+    sim_bildrate_bits: AtomicU32,
+    /// v0.7.19 GAF-707 Accident-Detection: SimConnect-`Crashed`-
+    /// System-Event setzt das Atomic. Wird beim Snapshot-Build in
+    /// `snap.crashed` gelesen. `CrashReset` (= MSFS-UI Cut-Scene
+    /// quittiert) loescht den raw Flag wieder, aber der aktive Flug
+    /// behaelt seinen `accident_detected`-Latch in lib.rs unabhaengig
+    /// davon bis Flight-End/Cleanup (Spec §Leitentscheidung 6).
+    sim_crashed: AtomicBool,
+    /// Last touchdown sample as seen on data definition #2. Updated
+    /// asynchronously by SimConnect — we merge it into each emitted
+    /// `SimSnapshot` so downstream consumers see a unified view.
+    touchdown: Mutex<Option<Touchdown>>,
+    /// Werte der optionalen Definitionen (#20..), siehe
+    /// `telemetry::OPTIONALE_FELDER`.
+    optionale: Mutex<telemetry::OptionaleWerte>,
+    /// User-driven SimVar/LVar inspector watchlist. UI mutates the
+    /// vec via add_watch / remove_watch (which sets `dirty=true`),
+    /// the worker re-registers definition #3 on the next tick.
+    inspector: Mutex<InspectorState>,
+    /// Zusatzwerte des Telemetrie-Monitors (Definition #4).
+    zusatz: Mutex<crate::zusatz::ZusatzState>,
+    /// PMDG SDK live data, available only when a PMDG aircraft is
+    /// loaded AND the user has set `EnableDataBroadcast=1` in the
+    /// aircraft's options ini. Variant tells which PMDG family
+    /// is currently parsed; the bytes are decoded at consume-time
+    /// to the appropriate `Pmdg738Snapshot` / `Pmdg777XSnapshot`.
+    /// `None` when no PMDG aircraft is loaded.
+    /// Phase 5.2 — wired into the dispatch loop in this commit.
+    pmdg: Mutex<PmdgSharedState>,
+    /// MSFS-2024-Input-Events (B:-Variablen) des geladenen Flugzeugs,
+    /// 26.09.2026. Aufzaehlen/Abonnieren nach `AircraftLoaded`, verworfen
+    /// bei Flugzeugwechsel und Neuverbinden. Ablauf und Deutung in
+    /// `crate::eingabe_events`.
+    eingaben: Mutex<crate::eingabe_events::EingabeState>,
+    /// „Flugzeug vermessen" (28.09.2026): L:/A:-Messkanal in Bloecken ab
+    /// Definition/Anfrage `crate::vermessung::ID_BASIS`. Leer ausser
+    /// waehrend einer Messung.
+    messung: Mutex<crate::vermessung::MessState>,
+}
+
+impl Shared {
+    fn neu() -> Self {
+        Shared {
+            state: Mutex::new(ConnectionState::Disconnected),
+            snapshot: Mutex::new(None),
+            last_error: Mutex::new(None),
+            szenerie: Mutex::new(sim_core::szenerie::Auftragsbuch::neu()),
+            szenerie_offen: AtomicBool::new(false),
+            sim_pause: Mutex::new(sim_core::pause::PausenEntpreller::default()),
+            sim_unecht_tiefe: AtomicI32::new(0),
+            sim_bildrate_bits: AtomicU32::new(0),
+            sim_crashed: AtomicBool::new(false),
+            touchdown: Mutex::new(None),
+            optionale: Mutex::new(telemetry::OptionaleWerte::default()),
+            inspector: Mutex::new(InspectorState::default()),
+            zusatz: Mutex::new(crate::zusatz::ZusatzState::default()),
+            pmdg: Mutex::new(PmdgSharedState::default()),
+            eingaben: Mutex::new(crate::eingabe_events::EingabeState::default()),
+            messung: Mutex::new(crate::vermessung::MessState::default()),
+        }
+    }
+}
+
+/// So lange darf der Worker zum Beenden brauchen. Ein normales Ende
+/// (Stopp-Flag, SimConnect_Close) dauert Millisekunden.
+const STOPP_FRIST: Duration = Duration::from_secs(3);
+
+/// Ein angehaltener Worker auf dem Weg hinaus — siehe
+/// [`MsfsAdapter::stopp_anstossen`]. Wird ohne Sperre abgewartet.
+#[must_use]
+pub struct WorkerAbschied {
+    handle: JoinHandle<()>,
+}
+
+impl WorkerAbschied {
+    /// Wartet höchstens [`STOPP_FRIST`]. Bis v1.9.23 stand hier ein
+    /// unbegrenztes `join()` (trotz gegenteiligem Kommentar):
+    /// SimConnect_Close kann hängen, wenn MSFS selbst weg ist.
+    /// `false` = Worker hängt (wird abgekoppelt).
+    pub fn abwarten(self) -> bool {
+        if worker_endet_binnen(&self.handle, STOPP_FRIST) {
+            let _ = self.handle.join();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// `true`, wenn der Faden binnen `frist` fertig ist (dann blockiert ein
+/// anschließendes `join` nicht mehr).
+fn worker_endet_binnen(h: &JoinHandle<()>, frist: Duration) -> bool {
+    let t0 = Instant::now();
+    while !h.is_finished() {
+        if t0.elapsed() >= frist {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    true
+}
+
+/// Convert a PMDG NG3 (737-specific) snapshot to the generic
+/// `sim_core::PmdgState` shape. The FSM, activity log, and PIREP
+/// code consume `PmdgState` so they don't have to branch on
+/// 737 vs. 777 — this is the boundary that makes that work.
+///
+/// FMA-mode strings: 737 NG MCP shows the active mode via boolean
+/// annunciator lights (one per mode — VNAV, LVL CHG, ALT HOLD,
+/// VS, HDG SEL, LNAV, VOR/LOC, APP, SPEED, N1). We pick the
+/// "most active" one in priority order matching what the real
+/// FMA shows when multiple are momentarily active.
+fn ng3_to_pmdg_state(s: &crate::pmdg::ng3::Pmdg738Snapshot) -> sim_core::PmdgState {
+    use sim_core::PmdgState;
+
+    // Speed-mode: FMA-priority order. SPD wins over N1 if both
+    // (rare; usually only one). Real cockpit shows N1 during
+    // takeoff, SPD during climb/cruise, etc.
+    let fma_speed_mode = if s.fma.speed_n1 {
+        "N1"
+    } else if s.fma.speed {
+        "SPD"
+    } else {
+        ""
+    };
+    // Roll-mode: LNAV wins over VOR/LOC over HDG SEL.
+    let fma_roll_mode = if s.fma.lnav {
+        "LNAV"
+    } else if s.fma.vor_loc {
+        "VOR/LOC"
+    } else if s.fma.app {
+        "APP"
+    } else if s.fma.hdg_sel {
+        "HDG SEL"
+    } else {
+        ""
+    };
+    // Pitch-mode: VNAV / LVL CHG / VS / ALT HOLD priority.
+    let fma_pitch_mode = if s.fma.vnav {
+        "VNAV"
+    } else if s.fma.lvl_chg {
+        "LVL CHG"
+    } else if s.fma.alt_hold {
+        "ALT HOLD"
+    } else if s.fma.vs {
+        "V/S"
+    } else if s.fma.app {
+        "G/S"
+    } else {
+        ""
+    };
+
+    PmdgState {
+        variant_label: s.variant.label().to_string(),
+
+        // MCP — None when blanked or unpowered.
+        mcp_speed_raw: if s.mcp_speed_blanked || !s.mcp_powered {
+            None
+        } else {
+            Some(s.mcp_speed_raw)
+        },
+        mcp_heading_deg: if s.mcp_powered {
+            Some(s.mcp_heading_deg)
+        } else {
+            None
+        },
+        mcp_altitude_ft: if s.mcp_powered {
+            Some(s.mcp_altitude_ft)
+        } else {
+            None
+        },
+        mcp_vs_fpm: if s.mcp_vs_blanked || !s.mcp_powered {
+            None
+        } else {
+            Some(s.mcp_vs_fpm)
+        },
+
+        // FMA modes
+        fma_speed_mode: fma_speed_mode.to_string(),
+        fma_roll_mode: fma_roll_mode.to_string(),
+        fma_pitch_mode: fma_pitch_mode.to_string(),
+        at_armed: s.fma.at_armed,
+        ap_engaged: s.fma.cmd_a || s.fma.cmd_b,
+        fd_on: s.fma.fd_capt || s.fma.fd_fo,
+
+        // FMC plan
+        fmc_takeoff_flaps_deg: if s.fmc_takeoff_flaps_deg == 0 {
+            None
+        } else {
+            Some(s.fmc_takeoff_flaps_deg)
+        },
+        fmc_landing_flaps_deg: if s.fmc_landing_flaps_deg == 0 {
+            None
+        } else {
+            Some(s.fmc_landing_flaps_deg)
+        },
+        fmc_v1_kt: s.fmc_v_speeds.v1_kt,
+        fmc_vr_kt: s.fmc_v_speeds.vr_kt,
+        fmc_v2_kt: s.fmc_v_speeds.v2_kt,
+        fmc_vref_kt: s.fmc_v_speeds.vref_kt,
+        fmc_cruise_alt_ft: if s.fmc_cruise_alt_ft == 0 {
+            None
+        } else {
+            Some(s.fmc_cruise_alt_ft)
+        },
+        fmc_distance_to_tod_nm: if s.fmc_distance_to_tod_nm < 0.0 {
+            None
+        } else {
+            Some(s.fmc_distance_to_tod_nm)
+        },
+        fmc_distance_to_dest_nm: if s.fmc_distance_to_dest_nm < 0.0 {
+            None
+        } else {
+            Some(s.fmc_distance_to_dest_nm)
+        },
+        fmc_flight_number: s.fmc_flight_number.clone(),
+        fmc_perf_input_complete: s.fmc_perf_input_complete,
+
+        // Controls
+        flap_angle_deg: s.flap_angle_deg,
+        flap_handle_label: s.flap_handle_label.to_string(),
+        speedbrake_lever_pos: Some(s.speedbrake_lever_pos),
+        autobrake_label: s.autobrake.label().to_string(),
+        speedbrake_armed: s.speedbrake_armed,
+        speedbrake_extended: s.speedbrake_extended,
+        takeoff_config_warning: s.takeoff_config_warning,
+        xpdr_mode_label: crate::pmdg::pmdg_xpdr_mode_label(s.xpdr_mode).to_string(),
+
+        // NG3 doesn't have a dedicated `APURunning` bool in the
+        // SDK header (777 does), but we have something better
+        // than the standard SimVar APU_PCT_RPM heuristic:
+        // `Pmdg738Snapshot::apu_running` derives from
+        // (APU_Selector==ON && APU_EGTNeedle>350°C). That's a
+        // PMDG-cockpit-aware signal. Surface it here so the
+        // generic activity-log path uses it.
+        apu_running: Some(s.apu_running),
+        // Genuine NG3 SDK gaps — fields below don't exist in
+        // PMDG_NG3_SDK.h at all. Leave None so downstream code
+        // skips the matching activity-log entries silently.
+        thrust_limit_mode: String::new(),
+        ecl_complete: None,
+        wheel_chocks_set: None,
+        // ---- Cockpit overrides (Premium-First) ----
+        light_landing: Some(s.light_landing),
+        light_beacon: Some(s.light_beacon),
+        light_strobe: Some(s.light_strobe),
+        light_taxi: Some(s.light_taxi),
+        light_nav: Some(s.light_nav),
+        light_logo: Some(s.light_logo),
+        light_wing: Some(s.light_wing),
+        light_wheel_well: Some(s.light_wheel_well), // NG3-bonus
+        wing_anti_ice: Some(s.wing_anti_ice),
+        engine_anti_ice: Some(s.engine_anti_ice),
+        pitot_heat: Some(s.pitot_heat),
+        battery_master: Some(s.battery_master),
+        parking_brake: Some(s.parking_brake_set),
+
+        // ---- v0.16.10 (#Premium): deep-data carrier fields ----
+        // Annunciator booleans are always `Some(..)` while a PMDG
+        // aircraft is active — `Some(false)` = "light is off", a
+        // real cockpit observation. Presence-gating happens one
+        // level up (`snap.pmdg == None` ⇒ the premium override is
+        // a no-op), so an absent SDK block never injects fake
+        // `false` signals, and lit→off transitions stay
+        // distinguishable from "no data".
+        reverser_deployed: Some(s.reverser_deployed),
+        master_caution: Some(s.master_caution),
+        // The 737 NG has no MASTER WARNING light — the red master
+        // on the glareshield IS the FIRE WARN light, so it maps to
+        // the generic master_warning carrier.
+        master_warning: Some(s.fire_warn),
+        below_gs: Some(s.below_gs),
+        cabin_altitude_warning: Some(s.cabin_altitude_warning),
+        stab_out_of_trim: Some(s.stab_out_of_trim),
+        // Tank order: [left, center, right] — already canonical kg
+        // (WeightInKg handling lives in `Pmdg738Snapshot::from_raw`).
+        fuel_per_tank_kg: Some(s.fuel_per_tank_kg.to_vec()),
+        // Genuine NG3 SDK gaps: PMDG_NG3_SDK.h has no numeric
+        // minimums field (only the BARO/RADIO selector switch
+        // `EFIS_MinsSelBARO`) and no GND PROX annunciator (only
+        // `GPWS_annunINOP`). None ⇒ the override keeps whatever
+        // the generic telemetry provides.
+        minimums_baro_ft: None,
+        gnd_prox_warning: None,
+        // Audit 26.09.2026: FASTEN BELTS aus dem SDK (0=OFF 1=AUTO 2=ON).
+        seatbelts_sign: Some(s.seatbelts_selector.min(2)),
+        // NG3-Autobrake ist vollständig belegt (0..5) — kein Rohwert nötig.
+        autobrake_selector_roh: None,
+    }
+}
+
+/// Convert a PMDG 777X snapshot to the generic `sim_core::PmdgState`
+/// shape. 777 differs from NG3 in autoflight modes — instead of
+/// CMD A/B engagement annunciators, the 777 has push-button
+/// engagement with a single AP annunciator per side, and the
+/// FMA modes are FLCH / HDG HOLD / VS_FPA instead of LVL CHG /
+/// HDG SEL / VS. We map them to the closest generic equivalents.
+fn x777_to_pmdg_state(s: &crate::pmdg::x777::Pmdg777XSnapshot) -> sim_core::PmdgState {
+    use sim_core::PmdgState;
+
+    // Speed-mode label. 777 doesn't have a separate "N1" annunciator
+    // (uses FMC ThrustLimitMode for that). When AT is engaged + AP
+    // is engaged, FMA usually shows the active sub-mode label.
+    let fma_speed_mode = if s.fma.at { "SPD" } else { "" };
+    // Roll-mode priority: APP > LOC > LNAV > HDG HOLD.
+    let fma_roll_mode = if s.fma.app {
+        "APP"
+    } else if s.fma.loc {
+        "LOC"
+    } else if s.fma.lnav {
+        "LNAV"
+    } else if s.fma.hdg_hold {
+        "HDG HOLD"
+    } else {
+        ""
+    };
+    // Pitch-mode: VNAV > FLCH > VS_FPA > ALT_HOLD.
+    let fma_pitch_mode = if s.fma.vnav {
+        "VNAV"
+    } else if s.fma.flch {
+        "FLCH"
+    } else if s.fma.alt_hold {
+        "ALT HOLD"
+    } else if s.fma.vs_fpa {
+        if s.mcp_dial_in_fpa_mode {
+            "FPA"
+        } else {
+            "V/S"
+        }
+    } else {
+        ""
+    };
+
+    // Convert 777 flap handle to an approximate degree value for
+    // the generic `flap_angle_deg` field. The actual flap surface
+    // angle isn't in the SDK; we use the canonical handle-to-
+    // degree mapping (0=UP, 1=1°, 2=5°, 3=15°, 4=20°, 5=25°, 6=30°)
+    // which IS what the cockpit FLAP indicator shows.
+    let flap_angle_deg = match s.flap_handle_pos {
+        0 => 0.0,
+        1 => 1.0,
+        2 => 5.0,
+        3 => 15.0,
+        4 => 20.0,
+        5 => 25.0,
+        6 => 30.0,
+        _ => 0.0,
+    };
+
+    PmdgState {
+        variant_label: s.model.label().to_string(),
+
+        mcp_speed_raw: if s.mcp_speed_blanked {
+            None
+        } else {
+            Some(s.mcp_speed_raw)
+        },
+        mcp_heading_deg: Some(s.mcp_heading_deg),
+        mcp_altitude_ft: Some(s.mcp_altitude_ft),
+        mcp_vs_fpm: if s.mcp_vs_blanked {
+            None
+        } else {
+            Some(s.mcp_vs_fpm)
+        },
+
+        fma_speed_mode: fma_speed_mode.to_string(),
+        fma_roll_mode: fma_roll_mode.to_string(),
+        fma_pitch_mode: fma_pitch_mode.to_string(),
+        at_armed: s.fma.at,
+        ap_engaged: s.fma.ap_capt || s.fma.ap_fo,
+        fd_on: s.fma.fd_capt || s.fma.fd_fo,
+
+        fmc_takeoff_flaps_deg: if s.fmc_takeoff_flaps_deg == 0 {
+            None
+        } else {
+            Some(s.fmc_takeoff_flaps_deg)
+        },
+        fmc_landing_flaps_deg: if s.fmc_landing_flaps_deg == 0 {
+            None
+        } else {
+            Some(s.fmc_landing_flaps_deg)
+        },
+        fmc_v1_kt: s.fmc_v_speeds.v1_kt,
+        fmc_vr_kt: s.fmc_v_speeds.vr_kt,
+        fmc_v2_kt: s.fmc_v_speeds.v2_kt,
+        fmc_vref_kt: s.fmc_v_speeds.vref_kt,
+        fmc_cruise_alt_ft: if s.fmc_cruise_alt_ft == 0 {
+            None
+        } else {
+            Some(s.fmc_cruise_alt_ft)
+        },
+        fmc_distance_to_tod_nm: if s.fmc_distance_to_tod_nm < 0.0 {
+            None
+        } else {
+            Some(s.fmc_distance_to_tod_nm)
+        },
+        fmc_distance_to_dest_nm: if s.fmc_distance_to_dest_nm < 0.0 {
+            None
+        } else {
+            Some(s.fmc_distance_to_dest_nm)
+        },
+        fmc_flight_number: s.fmc_flight_number.clone(),
+        fmc_perf_input_complete: s.fmc_perf_input_complete,
+
+        flap_angle_deg,
+        flap_handle_label: s.flap_handle_label.to_string(),
+        // 777 SDK gives the lever as 0..100. Audit 26.09.2026: 50 ist die
+        // ARMED-Raste — der Handle-Wert ist darum der AUSFAHRGRAD ab der
+        // Raste (0 bei ARMED), nicht mehr lever/100. Vorher las jeder
+        // armierte Anflug 0.5 → "Spoilers DEPLOYED Handle 50%".
+        speedbrake_lever_pos: Some(s.speedbrake_handle_fraction),
+        autobrake_label: s.autobrake.label().to_string(),
+        speedbrake_armed: s.speedbrake_armed,
+        speedbrake_extended: s.speedbrake_extended,
+        // 777 doesn't have a "TAKEOFF CONFIG" annunciator the
+        // same way NG3 does — closest equivalents are GPWS
+        // bottom warnings during ground-roll, but those aren't
+        // a perfect match. Leave `false` for now; if needed,
+        // we can derive from EICAS messages later.
+        takeoff_config_warning: false,
+        xpdr_mode_label: crate::pmdg::pmdg_xpdr_mode_label(s.xpdr_mode).to_string(),
+
+        // 777-specific extras (Phase 5.5b — wider integration).
+        thrust_limit_mode: crate::pmdg::x777::x777_thrust_limit_label(s.fmc_thrust_limit_mode)
+            .to_string(),
+        ecl_complete: Some(s.ecl_complete),
+        apu_running: Some(s.apu_running),
+        wheel_chocks_set: Some(s.wheel_chocks_set),
+
+        // ---- Cockpit overrides (Premium-First, v0.2.3) ----
+        // Same overrides as NG3, but the 777 SDK has no dedicated
+        // wheel-well light bool — leave None there.
+        light_landing: Some(s.light_landing),
+        light_beacon: Some(s.light_beacon),
+        light_strobe: Some(s.light_strobe),
+        light_taxi: Some(s.light_taxi),
+        light_nav: Some(s.light_nav),
+        light_logo: Some(s.light_logo),
+        light_wing: Some(s.light_wing),
+        light_wheel_well: None,
+        wing_anti_ice: Some(s.wing_anti_ice),
+        engine_anti_ice: Some(s.engine_anti_ice),
+        pitot_heat: Some(s.pitot_heat),
+        battery_master: Some(s.battery_master),
+        parking_brake: Some(s.parking_brake_set),
+
+        // ---- v0.16.10 (#Premium): deep-data carrier fields ----
+        // Booleans are always `Some(..)` while a PMDG 777 is active
+        // (Some(false) = light off) — see the NG3 mapper for the
+        // presence-gating rationale.
+        //
+        // PMDG_777X_SDK.h exposes NO thrust-reverser annunciator or
+        // state anywhere in PMDG_777X_Data (verified against the
+        // v3.x header: the only "reverse" hit is the CDU reverse-
+        // video display flag). None ⇒ the generic SimVar-based
+        // reverser detection stays in charge.
+        reverser_deployed: None,
+        master_caution: Some(s.master_caution),
+        master_warning: Some(s.master_warning),
+        // More genuine 777X SDK gaps: no BELOW G/S annunciator
+        // (`GPWS_GSInhibit_Sw` is a switch, not a light), no CABIN
+        // ALTITUDE annunciator, no STAB OUT OF TRIM annunciator.
+        below_gs: None,
+        cabin_altitude_warning: None,
+        stab_out_of_trim: None,
+        // Tank order: [left, center, right, aux] — already canonical
+        // kg (WeightInKg handling in `Pmdg777XSnapshot::from_raw`).
+        fuel_per_tank_kg: Some(s.fuel_per_tank_kg.to_vec()),
+        // Captain-side EFIS baro minimums (DA/MDA); None until
+        // dialed — the `EFIS_BaroMinimumsSet[0]` gate lives in
+        // `Pmdg777XSnapshot::from_raw`.
+        minimums_baro_ft: s.minimums_baro_ft.map(f64::from),
+        // GPWS GND PROX: top or bottom annunciator lit.
+        gnd_prox_warning: Some(s.gpws_top_warn || s.gpws_bottom_warn),
+        // Audit 26.09.2026: SEAT BELTS aus dem SDK (0=OFF 1=AUTO 2=ON).
+        seatbelts_sign: Some(s.seatbelts_selector.min(2)),
+        // Autobrake ab Byte 3 unverifiziert ("?") — Rohbyte mitschreiben.
+        autobrake_selector_roh: Some(s.autobrake_selector_raw),
+    }
+}
+
+/// Public PMDG SDK status — exposed via `MsfsAdapter::pmdg_status()`
+/// so the UI can show "SDK enabled?" hints, log warnings, etc.
+#[derive(Debug, Clone)]
+pub struct PmdgStatus {
+    /// Detected PMDG variant from the most recent AircraftLoaded.
+    pub variant: Option<crate::pmdg::PmdgVariant>,
+    /// True once `RequestClientData` has succeeded for the variant.
+    pub subscribed: bool,
+    /// True once at least one ClientData packet has arrived (i.e.
+    /// the SDK is genuinely active and broadcasting).
+    pub ever_received: bool,
+    /// Seconds since the last ClientData packet. `u64::MAX` when
+    /// no packet has ever arrived.
+    pub stale_secs: u64,
+}
+
+impl PmdgStatus {
+    /// True when PMDG aircraft is loaded but no data is flowing.
+    /// Drives the "SDK probably not enabled" hint in the UI.
+    pub fn looks_like_sdk_disabled(&self) -> bool {
+        self.variant.is_some() && self.subscribed && !self.ever_received && self.stale_secs > 5
+    }
+}
+
+/// Tracking state for the PMDG SDK ClientData subscription.
+#[derive(Debug, Default)]
+struct PmdgSharedState {
+    /// Detected PMDG variant from the most recent AircraftLoaded
+    /// event. `None` if no PMDG aircraft is loaded.
+    variant: Option<crate::pmdg::PmdgVariant>,
+    /// True once we've successfully called
+    /// `RequestClientData` for the current variant. Cleared on
+    /// aircraft change so the next dispatch re-subscribes.
+    subscribed: bool,
+    /// Most recent NG3 raw data bytes. Stored as the raw 916-byte
+    /// block; decoded on demand via `Pmdg738Snapshot::from_raw()`.
+    /// `None` until the first frame arrives.
+    ng3_raw: Option<Box<crate::pmdg::ng3::Pmdg738RawData>>,
+    /// Most recent 777X raw data bytes (684-byte block; decoded
+    /// on demand via `Pmdg777XSnapshot::from_raw()`).
+    x777_raw: Option<Box<crate::pmdg::x777::Pmdg777XRawData>>,
+    /// Timestamp of the last PMDG ClientData packet. Used by the
+    /// "SDK appears not enabled" UI hint — if we know the variant
+    /// (= aircraft loaded) but no packets for >5 s, the user
+    /// probably hasn't enabled the SDK.
+    last_packet_at: Option<std::time::Instant>,
+    /// aircraft.cfg-Pfad aus dem letzten `AircraftLoaded` (Audit
+    /// 26.09.2026). Dient der Profilerkennung für MSFS-2024-Titel ohne
+    /// Hersteller (`AircraftProfile::detect_mit_pfad`) und läuft als
+    /// Diagnose-Rohwert ins Flug-Log. Bei SimStart und Neuverbindung
+    /// geleert, damit ein Pfad des vorigen Flugzeugs nicht stehen bleibt.
+    air_path: Option<String>,
+}
+
+impl Default for MsfsAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MsfsAdapter {
+    pub fn new() -> Self {
+        Self {
+            shared: Arc::new(Shared::neu()),
+            worker: None,
+            stop: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Start the worker thread. Idempotent: a second call is a no-op
+    /// while a worker is already running.
+    pub fn start(&mut self, kind: SimKind) {
+        if self.worker.is_some() {
+            return;
+        }
+        if !kind.is_msfs() {
+            *self.shared.state.lock() = ConnectionState::Disconnected;
+            return;
+        }
+        self.stop = Arc::new(AtomicBool::new(false));
+        let shared = Arc::clone(&self.shared);
+        let stop = Arc::clone(&self.stop);
+        *shared.state.lock() = ConnectionState::Connecting;
+        *shared.last_error.lock() = None;
+        tracing::info!(?kind, "MSFS raw adapter started");
+        let handle = thread::Builder::new()
+            .name("sim-msfs-worker".into())
+            .spawn(move || worker_loop(shared, stop, kind))
+            .expect("could not spawn sim-msfs worker thread");
+        self.worker = Some(handle);
+    }
+
+    /// Stoppt und wartet begrenzt ([`STOPP_FRIST`]). Wer den Adapter hinter
+    /// einer Sperre hält, nimmt stattdessen [`Self::stopp_anstossen`] und
+    /// wartet AUSSERHALB der Sperre — sonst hängen alle anderen Leser bis
+    /// zu 3 s mit (QS v1.9.24: `sim_status` fragt alle 500 ms).
+    pub fn stop(&mut self) {
+        let sauber = self
+            .stopp_anstossen()
+            .map(WorkerAbschied::abwarten)
+            .unwrap_or(true);
+        self.nach_abschied(sauber);
+    }
+
+    /// Erster Teil des Stopps, sofort: Stopp-Flag setzen und den Worker
+    /// herausgeben. Bis [`Self::nach_abschied`] darf niemand `start` rufen
+    /// (lib.rs: alle Aufrufer halten `SIM_WAHL_SPERRE`).
+    #[must_use]
+    pub fn stopp_anstossen(&mut self) -> Option<WorkerAbschied> {
+        self.stop.store(true, Ordering::SeqCst);
+        self.worker.take().map(|handle| WorkerAbschied { handle })
+    }
+
+    /// Letzter Teil des Stopps. `sauber == false` (Worker hing): abkoppeln.
+    /// Der alte Worker räumt beim späten Aufwachen seinen Zustand ab
+    /// (Snapshot, Touchdown, PMDG) — darum bekommt alles Weitere einen
+    /// frischen gemeinsamen Zustand; der alte schreibt nur noch in seinen
+    /// verwaisten.
+    pub fn nach_abschied(&mut self, sauber: bool) {
+        if !sauber {
+            tracing::warn!(
+                frist_s = STOPP_FRIST.as_secs(),
+                "MSFS-Worker endet nicht (SimConnect_Close hängt?) — abgekoppelt, frischer Zustand"
+            );
+            self.shared = Arc::new(Shared::neu());
+        }
+        *self.shared.state.lock() = ConnectionState::Disconnected;
+        tracing::info!("MSFS raw adapter stopped");
+    }
+
+    pub fn state(&self) -> ConnectionState {
+        *self.shared.state.lock()
+    }
+
+    pub fn snapshot(&self) -> Option<SimSnapshot> {
+        let mut snap = self.shared.snapshot.lock().clone()?;
+        // Pause beim LESEN entprellen, nicht nur beim Bauen: Schickt MSFS in
+        // einer echten Pause keine Daten mehr, traegt der gespeicherte
+        // Schnappschuss noch den Stand von davor (LTU 154, 26.10.2026).
+        // Replay/Teleport bleibt sofort wirksam.
+        snap.paused = self.shared.sim_pause.lock().pausiert(Instant::now())
+            || self.shared.sim_unecht_tiefe.load(Ordering::Relaxed) > 0;
+        // Merge PMDG SDK data when available (Phase 5.4 + 5.4b).
+        // The standard SimVar telemetry fills the SimSnapshot's
+        // main body; PMDG fills the optional `pmdg` field with
+        // cockpit-exact values. NG3 wins if both are somehow
+        // present (would be a bug — only one PMDG aircraft can
+        // be loaded at a time — but defensive).
+        if let Some(ng3_state) = self.pmdg_ng3_snapshot() {
+            snap.pmdg = Some(ng3_to_pmdg_state(&ng3_state));
+        } else if let Some(x777_state) = self.pmdg_x777_snapshot() {
+            snap.pmdg = Some(x777_to_pmdg_state(&x777_state));
+        }
+
+        // ---- Premium-First Override (v0.2.3) ----
+        // Where PMDG provides a cockpit-exact value for a field that
+        // the Standard SimVar telemetry also fills, prefer the PMDG
+        // value. This keeps every downstream consumer (FSM,
+        // activity-log, PIREP fields, UI) on the most accurate
+        // signal we have, without each consumer needing to know
+        // about PMDG. The override is silent when PMDG is absent
+        // or the specific field isn't supported (NG3 doesn't have
+        // wheel_well in the override path? actually it does; 777
+        // doesn't — `light_wheel_well` is only set when present).
+        if let Some(pmdg) = snap.pmdg.as_ref() {
+            if let Some(v) = pmdg.light_landing {
+                snap.light_landing = Some(v);
+            }
+            if let Some(v) = pmdg.light_beacon {
+                snap.light_beacon = Some(v);
+            }
+            if let Some(v) = pmdg.light_strobe {
+                snap.light_strobe = Some(v);
+            }
+            if let Some(v) = pmdg.light_taxi {
+                snap.light_taxi = Some(v);
+            }
+            if let Some(v) = pmdg.light_nav {
+                snap.light_nav = Some(v);
+            }
+            if let Some(v) = pmdg.light_logo {
+                snap.light_logo = Some(v);
+            }
+            // SimSnapshot has no top-level light_wing — only PMDG
+            // exposes it; downstream reads it from snap.pmdg.
+            if let Some(v) = pmdg.wing_anti_ice {
+                snap.wing_anti_ice = Some(v);
+            }
+            if let Some(v) = pmdg.engine_anti_ice {
+                snap.engine_anti_ice = Some(v);
+            }
+            if let Some(v) = pmdg.pitot_heat {
+                snap.pitot_heat = Some(v);
+            }
+            if let Some(v) = pmdg.battery_master {
+                snap.battery_master = Some(v);
+            }
+            if let Some(v) = pmdg.parking_brake {
+                snap.parking_brake = v;
+            }
+            // APU: SimSnapshot stores `apu_switch` (selector ON?)
+            // and `apu_pct_rpm` (rising/running heuristic). PMDG's
+            // `apu_running` is the cockpit-truth boolean — surface
+            // it via apu_switch so the FSM picks it up.
+            if let Some(v) = pmdg.apu_running {
+                snap.apu_switch = Some(v);
+            }
+            // Spoilers/autobrake: PMDG has cockpit-exact values for
+            // `speedbrake_armed` and `autobrake_label`. Mirror them
+            // into the standard fields so generic consumers benefit.
+            snap.spoilers_armed = Some(pmdg.speedbrake_armed);
+            // v0.2.4: prefer PMDG-derived lever position too — the
+            // Standard SimVar `SPOILERS HANDLE POSITION` jitters
+            // around the ARMED detent, causing flicker entries
+            // ("DEPLOYED 76% / RETRACTED") in the activity log.
+            // PMDG gives a stable lever value (NG3 synthesised
+            // from the bools, 777 from the raw 0..100 lever).
+            if let Some(v) = pmdg.speedbrake_lever_pos {
+                snap.spoilers_handle_position = Some(v);
+            }
+            if !pmdg.autobrake_label.is_empty() {
+                snap.autobrake = Some(pmdg.autobrake_label.clone());
+            }
+            // v0.3.0: surface PMDG light_wing / light_wheel_well /
+            // xpdr_mode_label / takeoff_config_warning via the
+            // top-level SimSnapshot fields (the same fields X-Plane
+            // also fills). Lets the generic activity-log code share
+            // a single path across simulators.
+            if let Some(v) = pmdg.light_wing {
+                snap.light_wing = Some(v);
+            }
+            if let Some(v) = pmdg.light_wheel_well {
+                snap.light_wheel_well = Some(v);
+            }
+            if !pmdg.xpdr_mode_label.is_empty() {
+                snap.xpdr_mode_label = Some(pmdg.xpdr_mode_label.clone());
+            }
+            // PMDG NG3 has a real takeoff-config bit; 777 leaves it
+            // false (no equivalent annunciator). Surface either way
+            // so the X-Plane / MSFS activity-log path can fire on it.
+            snap.takeoff_config_warning = Some(pmdg.takeoff_config_warning);
+        }
+        // v0.16.7: AP master + A/THR from the PMDG annunciators (737
+        // CMD A/B + A/T ARM, 777 AP L/R + AT), OR'd with the standard
+        // SimVars. Data-audit 2026-06-11: the standard `AUTOPILOT
+        // MASTER` SimVar reads permanently false on PMDG 737/777, so
+        // the "Autopilot ENGAGED/OFF" / "A/THR" activity-log lines
+        // never fired for those pilots. Presence-gated no-op when
+        // `snap.pmdg` is None — semantics + tests live in
+        // `SimSnapshot::apply_pmdg_autoflight_override` (sim-core,
+        // cross-platform tested; this adapter is Windows-only).
+        snap.apply_pmdg_autoflight_override();
+        // v0.16.10 (#Premium): sibling override for the deep-data
+        // fields (FMA labels, warn annunciators, reverser, per-tank
+        // fuel, V-speeds, baro minimums, ground spoilers). Same
+        // presence-gating — no-op when `snap.pmdg` is None.
+        // Semantics + tests live in
+        // `SimSnapshot::apply_pmdg_premium_override` (sim-core,
+        // cross-platform tested; this adapter is Windows-only).
+        snap.apply_pmdg_premium_override();
+
+        Some(snap)
+    }
+
+    /// Latest PMDG 777X cockpit state, if a PMDG 777 is loaded
+    /// AND the SDK is enabled in `777X_Options.ini`. Same on-
+    /// demand decoding semantics as the NG3 variant.
+    pub fn pmdg_x777_snapshot(&self) -> Option<crate::pmdg::x777::Pmdg777XSnapshot> {
+        let g = self.shared.pmdg.lock();
+        g.x777_raw
+            .as_ref()
+            .map(|raw| crate::pmdg::x777::Pmdg777XSnapshot::from_raw(raw))
+    }
+
+    /// Latest PMDG NG3 cockpit state, if a PMDG 737 is loaded AND
+    /// the SDK is enabled in `737NG3_Options.ini`. Returns the
+    /// "useful subset" view (`Pmdg738Snapshot`), not the raw 916-
+    /// byte struct — so callers don't have to know about layout.
+    /// `None` when no PMDG NG3 is loaded or no data has arrived yet.
+    pub fn pmdg_ng3_snapshot(&self) -> Option<crate::pmdg::ng3::Pmdg738Snapshot> {
+        let g = self.shared.pmdg.lock();
+        g.ng3_raw
+            .as_ref()
+            .map(|raw| crate::pmdg::ng3::Pmdg738Snapshot::from_raw(raw))
+    }
+
+    /// PMDG SDK status report — what variant is loaded (if any),
+    /// whether we've subscribed, and how stale the most recent
+    /// data is. Drives the Settings-tab "SDK enabled?" hint.
+    pub fn pmdg_status(&self) -> PmdgStatus {
+        let g = self.shared.pmdg.lock();
+        let stale_secs = g
+            .last_packet_at
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(u64::MAX);
+        PmdgStatus {
+            variant: g.variant,
+            subscribed: g.subscribed,
+            ever_received: g.ng3_raw.is_some() || g.x777_raw.is_some(),
+            stale_secs,
+        }
+    }
+
+    /// Force-clear the cached snapshot + touchdown so the next read
+    /// returns `None` until SimConnect delivers a fresh frame. Used by
+    /// the UI's "Re-check sim position" button when the pilot suspects
+    /// the cached lat/lon is stale (e.g. flight changed in MSFS but
+    /// our 5 s stale-timeout hasn't fired because SimConnect kept
+    /// trickling data through the pause). State is downgraded to
+    /// Connecting so the UI shows "waiting for sim position …" until
+    /// the next real packet lands.
+    pub fn clear_snapshot(&self) {
+        *self.shared.snapshot.lock() = None;
+        *self.shared.touchdown.lock() = None;
+        // PMDG raw data is part of the same "stale snapshot"
+        // problem — clear it on manual re-sync too. Variant
+        // stays (we still know what aircraft is loaded), but
+        // we clear `subscribed=false` so the next dispatch
+        // re-subscribes and gets a fresh data block.
+        {
+            let mut g = self.shared.pmdg.lock();
+            g.ng3_raw = None;
+            g.x777_raw = None;
+            g.subscribed = false;
+            g.last_packet_at = None;
+        }
+        *self.shared.state.lock() = ConnectionState::Connecting;
+        tracing::info!("MSFS snapshot cleared by user (force-resync)");
+    }
+
+    /// v1.7.8 — die Szenerie-Auskunft fuer einen Flughafen anfordern.
+    ///
+    /// Der Aufruf hinterlegt nur den Wunsch; die Anfrage stellt der
+    /// Verbindungsfaden beim naechsten Durchlauf, und die Antwort kommt
+    /// asynchron. `szenerie()` liefert sie, sobald sie vollstaendig ist.
+    ///
+    /// Gedacht fuer den Anflug: Dann ist das Ziel bekannt, es ist Zeit
+    /// im Ueberfluss, und beim Aufsetzen liegt die Auskunft bereit.
+    /// Beim Aufsetzen anzufordern waere zu spaet — die Antwort kommt
+    /// stueckweise ueber mehrere Durchlaeufe.
+    /// ⚠ Mehrfach aufzurufen ist ausdruecklich richtig. Bis v1.7.13
+    /// stand hier `if wunsch == icao { return }` — damit war ein Ziel,
+    /// das am Gate nicht antwortete, fuer den Rest des Fluges tot. Das
+    /// Buch entscheidet jetzt, ob und wann wirklich gefragt wird.
+    pub fn szenerie_anfordern(&self, icao: &str) {
+        self.szenerie_anfordern_mit_rang(icao, 0);
+    }
+
+    /// Wie `szenerie_anfordern`, aber mit Rangfolge — kleiner heisst
+    /// frueher dran. Das Ausweichziel gehoert vor das geplante.
+    pub fn szenerie_anfordern_mit_rang(&self, icao: &str, rang: u8) {
+        let icao = icao.trim().to_ascii_uppercase();
+        if icao.is_empty() {
+            return;
+        }
+        self.shared.szenerie.lock().wunsch_mit_rang(&icao, rang);
+        self.shared.szenerie_offen.store(true, Ordering::Relaxed);
+    }
+
+    /// Generation, Auskunft, Stand, Diagnose und Simulator-Kennung —
+    /// EIN Zugriff.
+    ///
+    /// ⚠ Der EINZIGE Weg fuer den Abholer. Die frueheren Einzel-Zugaenge
+    /// (`szenerie_fuer`, `szenerie_stand`, `szenerie_mit_stand`,
+    /// `szenerie_generation`, `szenerie_diagnose_fuer`) sind bewusst
+    /// GESTRICHEN: Solange es sie gibt, laesst sich der Riss jederzeit
+    /// neu verdrahten, und genau das ist zweimal passiert.
+    ///
+    /// Die Sperrreihenfolge ist Szenerie → Kennung, und zwar an dieser
+    /// einen Stelle. Umgekehrt nimmt sie niemand.
+    pub fn szenerie_schnappschuss(&self, icao: &str) -> sim_core::szenerie::Schnappschuss {
+        self.shared.szenerie.lock().schnappschuss(icao)
+    }
+
+    /// Einen neuen Versuchsvorrat oeffnen (Eintritt in den Anflug).
+    pub fn szenerie_neues_versuchsfenster(&self) -> usize {
+        self.shared.szenerie.lock().neues_versuchsfenster()
+    }
+
+    /// Fenster, Zielmenge und Raenge in EINEM Zug — eine Sperre.
+    pub fn szenerie_anflug_ausrichten(&self, ziele: &[(String, u8)], fenster: bool) -> usize {
+        self.shared
+            .szenerie
+            .lock()
+            .anflug_ausrichten(ziele, fenster)
+    }
+
+    /// Wie `szenerie_anflug_ausrichten`, aber `geschuetzt` bleibt von der
+    /// Anflug-Aufraeumung unberuehrt (Rang UND laufender Auftrag) — siehe
+    /// `Auftragsbuch::anflug_ausrichten_mit_schutz`. v1.7.17: fuer den
+    /// Abflugplatz, der im selben Buch steht, aber kein Anflug-Kandidat
+    /// ist.
+    pub fn szenerie_anflug_ausrichten_mit_schutz(
+        &self,
+        ziele: &[(String, u8)],
+        geschuetzt: &[String],
+        fenster: bool,
+    ) -> usize {
+        self.shared
+            .szenerie
+            .lock()
+            .anflug_ausrichten_mit_schutz(ziele, geschuetzt, fenster)
+    }
+
+    /// Das Auftragsbuch leeren — neuer Flug.
+    ///
+    /// ⚠ Der Anfragezustand gehoert dem Flug und der Verbindung, nicht
+    /// dem Adapter. Ohne diesen Schnitt ueberdauern verbrauchte
+    /// Versuche, dauerhafte Ablehnungen und die Szenerie des vorigen
+    /// Fluges (QS-Befund 2, dritte Runde).
+    pub fn szenerie_zuruecksetzen(&self) {
+        self.shared.szenerie.lock().zuruecksetzen();
+    }
+
+    // ⚠ Hier stand `sim_kennung()`. Ersatzlos gestrichen: Die Kennung
+    // kommt aus `szenerie_schnappschuss`, damit sie zum selben Kontext
+    // gehoert wie Generation und Auskunft. Ein eigener Getter waere der
+    // Rueckweg zu genau dem Riss, den der Schnappschuss schliesst.
+
+    /// Wie oft dieser Platz schon gefragt wurde — fuer die Diagnose.
+    pub fn szenerie_versuche(&self, icao: &str) -> u8 {
+        self.shared.szenerie.lock().versuche(icao)
+    }
+
+    pub fn last_error(&self) -> Option<String> {
+        self.shared.last_error.lock().clone()
+    }
+
+    // ---- Inspector (Phase B) ----
+
+    /// Add a SimVar/LVar to the live inspector watchlist. Returns the
+    /// stable id assigned to this entry — pass it to `remove_watch`.
+    /// Re-registration of SimConnect data definition #3 happens on the
+    /// next worker tick (asynchronous, sub-second).
+    pub fn add_watch(&self, name: String, unit: String, kind: WatchKind) -> u32 {
+        let mut g = self.shared.inspector.lock();
+        g.add(name, unit, kind)
+    }
+
+    pub fn remove_watch(&self, id: u32) {
+        let mut g = self.shared.inspector.lock();
+        g.remove(id);
+    }
+
+    /// Snapshot of the current watchlist (cloning so the caller doesn't
+    /// hold the inspector mutex). Each entry carries its latest value
+    /// — `value: None` means we haven't received a tick yet.
+    pub fn watches(&self) -> Vec<InspectorWatch> {
+        self.shared.inspector.lock().watches.clone()
+    }
+
+    // ---- Telemetrie-Monitor (v1.8) ----
+
+    /// Zusatzfelder setzen: (Kanal-ID, SimVar, Einheit). Eine leere Liste
+    /// beendet die Abfrage. Die Definition wird im naechsten Tick des
+    /// Arbeitsthreads angelegt.
+    pub fn zusatz_setzen(&self, felder: Vec<(String, String, String)>) {
+        let felder = felder
+            .into_iter()
+            .map(|(kanal, simvar, einheit)| crate::zusatz::ZusatzFeld {
+                kanal,
+                simvar,
+                einheit,
+            })
+            .collect();
+        self.shared.zusatz.lock().setzen(felder);
+    }
+
+    /// Aktuelle Zusatzwerte: (Kanal-ID, Wert in der angeforderten Einheit).
+    pub fn zusatz_werte(&self) -> Vec<(String, f64)> {
+        self.shared.zusatz.lock().werte()
+    }
+
+    /// SimVars, die der Simulator in dieser Verbindung abgelehnt hat.
+    pub fn zusatz_abgelehnt(&self) -> Vec<String> {
+        self.shared.zusatz.lock().abgelehnt()
+    }
+
+    // ---- „Flugzeug vermessen" (28.09.2026) ----
+
+    /// Messung starten: Standard-SimVars der Schalter, die L:-Variablen
+    /// aller Client-Profile und diese L:-Namen (Scan) blockweise lesen,
+    /// dazu ALLE Input-Events abonnieren. Liefert, wie viele Profilnamen
+    /// mitgelesen werden.
+    pub fn vermessung_starten(&self, l_namen: Vec<String>) -> usize {
+        let mut felder = crate::vermessung::standard_felder();
+        let (l, profil) =
+            crate::vermessung::l_felder_mit_profil(&telemetry::profil_lvar_namen(), &l_namen);
+        felder.extend(l);
+        self.shared.messung.lock().setzen(felder);
+        self.shared
+            .eingaben
+            .lock()
+            .alle_setzen(true, Instant::now());
+        profil
+    }
+
+    /// Messung beenden: Bloecke abbauen, zusaetzliche Abos abmelden.
+    pub fn vermessung_stoppen(&self) {
+        self.shared.messung.lock().setzen(Vec::new());
+        self.shared
+            .eingaben
+            .lock()
+            .alle_setzen(false, Instant::now());
+    }
+
+    /// Aktuelle Messwerte: `L:…`/`A:…` aus den Bloecken, `B:…` aus den
+    /// Input-Events.
+    pub fn vermessung_werte(&self) -> Vec<(String, f64)> {
+        let mut v = self.shared.messung.lock().werte();
+        v.extend(
+            self.shared
+                .eingaben
+                .lock()
+                .werte()
+                .iter()
+                .map(|(n, w)| (format!("B:{n}"), *w)),
+        );
+        v
+    }
+
+    /// Zahl der beobachteten Variablen (Anzeige).
+    pub fn vermessung_anzahl(&self) -> usize {
+        self.shared.messung.lock().anzahl() + self.shared.eingaben.lock().anzahl_abonniert()
+    }
+}
+
+impl Drop for MsfsAdapter {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+// ---- Worker loop ----
+
+fn worker_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>, kind: SimKind) {
+    // Outer reconnect loop. SimConnect_Open returns E_FAIL while MSFS
+    // isn't running; we simply retry every 2s until it's up.
+    let mut letzter_open_fehler: Option<String> = None;
+    // Hauptfelder, die der Simulator asynchron abgelehnt hat — bleiben
+    // fuer die dadurch ausgeloeste Neuverbindung ausgelassen (None), damit
+    // eine Ablehnung nie zum Dauerausfall aus Verwerfen und Neuverbinden
+    // wird. Synchron abgelehnte laesst `register_telemetry` selbst aus.
+    let mut haupt_ausgelassen: Vec<usize> = Vec::new();
+    while !stop.load(Ordering::Relaxed) {
+        match Connection::open("AeroACARS") {
+            Ok(mut conn) => {
+                letzter_open_fehler = None;
+                tracing::info!("SimConnect_Open succeeded — registering data definition");
+                // ⚠ Neue Verbindung heisst neuer Kontext. Der Simulator
+                // kann neu gestartet, ein anderer sein (MSFS 2020 gegen
+                // 2024) oder eine andere Szenerie geladen haben. Ohne
+                // diesen Schnitt gaelte die Szenerie der vorigen
+                // Verbindung als „geliefert" und wuerde nie erneut
+                // angefordert; verbrauchte Versuche und dauerhafte
+                // Ablehnungen ueberdauerten ebenfalls (QS-Befund 2,
+                // dritte Runde).
+                // ⚠ `verbindung_zuruecksetzen`, nicht `zuruecksetzen`:
+                // Hier wird die Felddefinition gleich neu registriert,
+                // also darf auch ein alter Definitionsfehler fallen. Bei
+                // einem blossen Flugwechsel waere das falsch.
+                // ⚠ Und die Simulator-Kennung MIT. Sie gehoert der
+                // Verbindung; bleibt sie stehen, liefert der
+                // Schnappschuss bis zum naechsten `Open` eine neue
+                // Generation zusammen mit der Kennung der ALTEN
+                // Verbindung (QS-Befund 1, elfte Runde).
+                //
+                // Dieselbe Sperrreihenfolge wie im Schnappschuss:
+                // Szenerie → Kennung. Umgekehrt nimmt sie niemand.
+                // ⚠ EINE Sperre. `verbindung_zuruecksetzen` leert Buch
+                // UND Kennung, weil die Kennung im Buch liegt — es gibt
+                // keine Reihenfolge mehr, die schiefgehen koennte.
+                shared.szenerie.lock().verbindung_zuruecksetzen();
+                if let Err(e) = conn.register_telemetry(&haupt_ausgelassen) {
+                    set_error(&shared, format!("RegisterDataDefinition failed: {e}"));
+                    tracing::error!(error = %e, "register_telemetry failed");
+                    drop(conn);
+                    sleep_or_stop(&stop, Duration::from_secs(2));
+                    continue;
+                }
+                // Touchdown registration is best-effort: a failure
+                // there should NOT take down live telemetry. Log and
+                // proceed.
+                if let Err(e) = conn.register_touchdown() {
+                    tracing::warn!(error = %e, "register_touchdown failed — touchdown values will stay None");
+                }
+                // Best-effort wie der Touchdown: fehlt ein optionaler
+                // Wert, greift sein Rueckfall (EX1 → Legacy-Kraftstoff).
+                if let Err(e) = conn.register_optionale() {
+                    tracing::warn!(error = %e, "register_optionale failed — optionale Werte bleiben None");
+                }
+                // v1.7.8 — die Facility-Definition einmal je Verbindung
+                // registrieren. Ohne diesen Aufruf gaebe es die
+                // Definition nicht, und jede Anfrage liefe ins Leere —
+                // still, denn `RequestFacilityData` scheitert dann nicht,
+                // es kommt nur nie eine Antwort.
+                //
+                // Ein Fehlschlag ist hier kein Grund, die Verbindung
+                // aufzugeben: Die Navdaten bleiben der Rueckfall, und
+                // Telemetrie und Aufsetzprobe sind davon unberuehrt.
+                if let Err(e) = conn.register_facility() {
+                    tracing::warn!(
+                        error = %e,
+                        "register_facility fehlgeschlagen — Bahndaten kommen weiter aus den Navdaten"
+                    );
+                    // ⚠ Und das Buch MUSS es erfahren.
+                    //
+                    // Vorher wurde hier nur gewarnt: Die Definition war
+                    // nachweislich nicht registriert, das Buch wusste
+                    // nichts davon und stellte munter Facility-Anfragen.
+                    // Der harte Riegel griff nur bei den SPAETEREN,
+                    // asynchronen Ausnahmen — der synchrone Fehlschlag,
+                    // der den Weg genauso sicher schliesst, lief durch
+                    // (QS-Befund 3, vierte Runde).
+                    shared
+                        .szenerie
+                        .lock()
+                        .definition_abgelehnt("register_facility".into(), e.clone());
+                    // ⚠ Hier KEINE Sammler zu verwerfen ist richtig, und
+                    // zwar nicht aus Nachlaessigkeit: Diese Stelle liegt
+                    // in `worker_loop`, VOR `run_dispatch`, und dort
+                    // entsteht die Ablage `facility_lieferungen` je
+                    // Verbindung neu. Es gibt an dieser Stelle also
+                    // keine offenen Sammler — und die Variable
+                    // existiert hier gar nicht.
+                }
+                if let Err(e) = conn.request_data_per_second() {
+                    set_error(&shared, format!("RequestDataOnSimObject failed: {e}"));
+                    tracing::error!(error = %e, "request_data_per_second failed");
+                    drop(conn);
+                    sleep_or_stop(&stop, Duration::from_secs(2));
+                    continue;
+                }
+                if let Err(e) = conn.request_touchdown_per_second() {
+                    tracing::warn!(error = %e, "request_touchdown_per_second failed — touchdown values will stay None");
+                }
+                // PMDG SDK preflight (Phase 5.2/5.3): subscribe to
+                // AircraftLoaded so the dispatch loop can detect
+                // PMDG variants. This is best-effort — if it fails
+                // we just lose PMDG-specific data, the standard
+                // telemetry continues to work.
+                if let Err(e) = conn.subscribe_aircraft_loaded() {
+                    tracing::warn!(
+                        error = %e,
+                        "AircraftLoaded subscribe failed — PMDG variant detection disabled"
+                    );
+                }
+                run_dispatch(&shared, &stop, &mut conn, kind);
+                // Nur eine Neuverbindung, die WIR wegen einer Ablehnung
+                // ausgeloest haben, behaelt die Auslassliste. Jede andere
+                // (Sim beendet/neu gestartet, 2020 ↔ 2024, Watchdog) beginnt
+                // eine neue Sitzung mit der vollen Definition — sonst
+                // blieben Felder unter MSFS 2024 dauerhaft None.
+                if conn.haupt_abgelehnt.is_empty() {
+                    haupt_ausgelassen.clear();
+                } else {
+                    for idx in conn.haupt_abgelehnt.drain(..) {
+                        if !haupt_ausgelassen.contains(&idx) {
+                            haupt_ausgelassen.push(idx);
+                        }
+                    }
+                }
+                // run_dispatch only returns when stop is signalled or
+                // the connection has gone stale. Either way, drop and
+                // try again at the top of the loop.
+                //
+                // CRITICAL: clear the cached snapshot + touchdown so a
+                // post-reconnect read can't return stale data from the
+                // pre-disconnect session. Without this, a pilot who
+                // loaded MSFS at the default airport (KSEA), then
+                // changed the flight to a remote airport (SCEL),
+                // would see a phantom "3142.5 nm from SCEL" check
+                // failure because our cached snapshot still showed
+                // the old KSEA position from before the load. Live
+                // bug 2026-05-03. State stays "Disconnected" until
+                // the next snapshot lands.
+                *shared.snapshot.lock() = None;
+                *shared.touchdown.lock() = None;
+                *shared.optionale.lock() = telemetry::OptionaleWerte::default();
+                // PMDG state too — variant + raw + subscribed flag
+                // all reset so the next dispatch session re-detects
+                // and re-subscribes from scratch.
+                *shared.pmdg.lock() = PmdgSharedState::default();
+                // Input-Events gelten nur fuer die Verbindung, in der sie
+                // abonniert wurden.
+                // Ein laufender Messmodus bleibt an (QS Codex, 28.09.2026).
+                shared.eingaben.lock().neue_verbindung(Instant::now());
+                // Pause und „Telemetrie nicht echt" (Replay/Teleport/Vorspulen)
+                // gelten nur für die Verbindung, in der sie gemeldet wurden.
+                // Riss sie z. B. zwischen TELEPORT_START und _DONE ab, blieb die
+                // Tiefe > 0 und jeder spätere Snapshot hieß `paused` — für
+                // Phasen-Engine und Auto-Start bis zum App-Neustart. Dasselbe
+                // gilt für `sim_pause`, wenn nach dem Neuaufbau kein
+                // Pause_EX1 kommt (Abo gescheitert) (QS Codex, 21.09.2026).
+                //
+                // Abwägung: Zurücksetzen ist der einzige Zustand, der nie für
+                // immer sperrt. Preis: Bis MSFS Pause_EX1 neu meldet (in allen
+                // Logs direkt nach dem Handshake), kann ein Snapshot „läuft"
+                // heißen; ein Vorgang, der den Abriss überdauert, zählt bis zu
+                // seinem DONE als echt (max(0) fängt das DONE ab). Der Auto-
+                // Start ist dagegen abgesichert (20 s SimRuhe + Sprungerkennung
+                // + Pause-Prüfung in flight_start_mit). Kein zweiter Schreiber:
+                // run_dispatch ist hier zurückgekehrt.
+                *shared.sim_pause.lock() = sim_core::pause::PausenEntpreller::default();
+                shared.sim_unecht_tiefe.store(0, Ordering::Relaxed);
+                // Die Bildrate gehoert zur alten Verbindung.
+                shared.sim_bildrate_bits.store(0, Ordering::Relaxed);
+                *shared.state.lock() = ConnectionState::Connecting;
+            }
+            Err(e) => {
+                // Kein Simulator erreichbar: die naechste Verbindung ist
+                // eine neue Sitzung, ohne alte Auslassungen.
+                haupt_ausgelassen.clear();
+                let msg = format!("SimConnect_Open failed: {e}");
+                // Bisher stumm: ein Dauer-Gelb liess sich im Log nicht
+                // von „MSFS laeuft nicht“ unterscheiden. Nur bei neuem
+                // Text melden, der Versuch kommt alle 2 s.
+                if letzter_open_fehler.as_deref() != Some(msg.as_str()) {
+                    tracing::info!(fehler = %msg, "SimConnect_Open gescheitert — versuche weiter");
+                    letzter_open_fehler = Some(msg.clone());
+                }
+                set_error(&shared, msg);
+                *shared.state.lock() = ConnectionState::Connecting;
+            }
+        }
+        sleep_or_stop(&stop, Duration::from_secs(2));
+    }
+    *shared.state.lock() = ConnectionState::Disconnected;
+    *shared.snapshot.lock() = None;
+    *shared.touchdown.lock() = None;
+    *shared.pmdg.lock() = PmdgSharedState::default();
+}
+
+fn run_dispatch(
+    shared: &Arc<Shared>,
+    stop: &Arc<AtomicBool>,
+    conn: &mut Connection,
+    kind: SimKind,
+) {
+    let mut last_data = Instant::now();
+    let mut letztes_lebenszeichen = Instant::now();
+    let mut handshake_gesehen = false;
+    let mut got_first = false;
+    // Log-Durchsicht 26.09.2026: blinkende MASTER-Lampen im schnellen Takt
+    // zusammenfassen, bevor der 3-s-Streamer sie abtastet (sim_core::lampen).
+    let mut halter_warning = sim_core::lampen::LampenHalter::default();
+    let mut halter_caution = sim_core::lampen::LampenHalter::default();
+    // 26.10.2026: Standard-Anschnallzeichen erst nach einmal AN gueltig.
+    let mut anschnall_sperre = telemetry::StandardAnschnallSperre::default();
+    let simulator = kind.as_simulator();
+    // Force inspector re-registration after a reconnect — the new
+    // SimConnect handle starts with an empty definition table even
+    // if the user already populated the watchlist before the drop.
+    if !shared.inspector.lock().watches.is_empty() {
+        shared.inspector.lock().dirty = true;
+    }
+    // Dasselbe fuer die Zusatzwerte des Telemetrie-Monitors.
+    shared.zusatz.lock().neue_verbindung();
+    shared.messung.lock().neue_verbindung();
+    // MSFS-2024-Input-Events: frischer Zustand je Verbindung. MSFS 2020 kennt
+    // keine — dort wird gar nicht erst gefragt, alles bleibt wie bisher.
+    // Aufgezaehlt wird, sobald `AircraftLoaded` eintrifft. Ein laufender
+    // Messmodus bleibt erhalten.
+    shared.eingaben.lock().neue_verbindung(Instant::now());
+    if simulator == Simulator::Msfs2020 {
+        shared.eingaben.lock().nicht_verfuegbar();
+    }
+    // Paketkennung des letzten `EnumerateInputEvents` — lehnt der Simulator
+    // ihn mit einer Ausnahme ab, kennt er keine Input-Events.
+    let mut eingabe_send_id: Option<u32> = None;
+
+    // Telemetrie-Monitor: scheitert das Anlegen, wird erst nach einer Pause
+    // erneut versucht und der Fehler nur EINMAL je Serie gemeldet. Ohne
+    // Bremse kam bei jedem Tick eine Warnung (Log-Flut im Health-Report).
+    let mut zusatz_naechster_versuch = Instant::now();
+    let mut zusatz_fehler_gemeldet = false;
+    // Dieselbe Bremse fuer Inspector, Messung und PMDG: Die Schleife laeuft
+    // seit dem ereignisgesteuerten Warten im Frametakt, ein dauerhaft
+    // scheiternder Versuch kaeme sonst bei jedem Frame (Codex-Abnahme
+    // 1b3711c7). Gesperrt wird nur der gescheiterte Stand (`fassung`):
+    // Aendert der Pilot die Liste, geht die neue sofort raus (Codex-
+    // Abnahme 6acd2824).
+    let mut inspector_sperre: Option<(Instant, u64)> = None;
+    let mut messung_sperre: Option<(Instant, u64)> = None;
+    let mut pmdg_sperre: Option<(Instant, crate::pmdg::PmdgVariant)> = None;
+
+    // v1.7.14 — die offenen Facility-Lieferungen, nach Anfragekennung
+    // getrennt.
+    //
+    // ⚠ AUSSERHALB der Tick-Schleife. Eine Lieferung kommt stueckweise
+    // und kann sich ueber mehrere Durchlaeufe ziehen; wuerde sie je Tick
+    // neu angelegt, ginge der Anfang verloren.
+    //
+    // Getrennt nach Kennung, weil sich sonst eine nach der Wartezeit
+    // eintreffende Antwort mit der laufenden vermischt — die drei
+    // Rollweglisten haengen ueber Indizes zusammen, und zwei Lieferungen
+    // in denselben Listen verschieben jede Kante. Siehe `Lieferungen`.
+    let mut facility_lieferungen = facility::Lieferungen::neu();
+    // Paketkennung → Auftragskennung, damit eine spaetere Ausnahme dem
+    // richtigen Platz zugeordnet werden kann. Siehe `auftrag_zu_paket`.
+    let mut facility_pakete: Vec<(u32, u32)> = Vec::new();
+
+    while !stop.load(Ordering::Relaxed) {
+        // Re-register the inspector watchlist whenever the UI has
+        // mutated it. The dirty flag avoids hot-looping the
+        // SimConnect call in the steady state.
+        let (needs_inspector_register, inspector_fassung) = {
+            let g = shared.inspector.lock();
+            (g.dirty, g.fassung)
+        };
+        let inspector_frei = inspector_sperre
+            .is_none_or(|(bis, f)| Instant::now() >= bis || f != inspector_fassung);
+        if needs_inspector_register && inspector_frei {
+            let (watches, versucht) = {
+                // Fresh registration attempt — clear stale errors so a
+                // name the pilot just corrected (or a transient
+                // SimConnect hiccup) gets a clean slate instead of
+                // showing yesterday's exception forever.
+                let mut g = shared.inspector.lock();
+                g.clear_errors();
+                (g.watches.clone(), g.fassung)
+            };
+            match conn.register_inspector(&watches) {
+                Ok(()) => {
+                    if !watches.is_empty() {
+                        if let Err(e) = conn.request_inspector_per_second() {
+                            tracing::warn!(error = %e, "request_inspector failed");
+                        }
+                    }
+                    // Nur erledigt, wenn die Liste waehrend der Anmeldung
+                    // gleich blieb — sonst ginge eine Aenderung verloren.
+                    let mut g = shared.inspector.lock();
+                    if g.fassung == versucht {
+                        g.dirty = false;
+                    }
+                    inspector_sperre = None;
+                }
+                Err(e) => {
+                    inspector_sperre = Some((Instant::now() + Duration::from_secs(5), versucht));
+                    tracing::warn!(error = %e, "register_inspector failed; will retry");
+                }
+            }
+        }
+
+        // Telemetrie-Monitor: Zusatzdefinition anlegen, neu anlegen oder
+        // abbauen. Scheitert es, bleibt `dirty` stehen und der naechste
+        // Tick versucht es erneut.
+        let zusatz_offen = shared.zusatz.lock().dirty;
+        if zusatz_offen && Instant::now() >= zusatz_naechster_versuch {
+            let felder = shared.zusatz.lock().zu_registrieren();
+            match conn.register_zusatz(&felder) {
+                Ok(kennungen) => {
+                    let reihenfolge = felder.iter().map(|(i, _)| *i).collect();
+                    shared
+                        .zusatz
+                        .lock()
+                        .registriert(reihenfolge, kennungen, Instant::now());
+                    zusatz_fehler_gemeldet = false;
+                }
+                Err(e) => {
+                    zusatz_naechster_versuch = Instant::now() + Duration::from_secs(5);
+                    if !zusatz_fehler_gemeldet {
+                        zusatz_fehler_gemeldet = true;
+                        tracing::warn!(error = %e, "Zusatzwerte fuer den Telemetrie-Monitor nicht angelegt");
+                    }
+                }
+            }
+        }
+
+        // „Flugzeug vermessen": Messbloecke anlegen/abbauen, und nach dem
+        // Ende des Messmodus die zusaetzlichen Input-Event-Abos abmelden.
+        let (mess_offen, mess_fassung) = {
+            let g = shared.messung.lock();
+            (g.dirty, g.fassung)
+        };
+        let messung_frei =
+            messung_sperre.is_none_or(|(bis, f)| Instant::now() >= bis || f != mess_fassung);
+        if mess_offen && messung_frei {
+            let (bloecke, alt, versucht) = {
+                let g = shared.messung.lock();
+                let (bloecke, alt) = g.zu_registrieren();
+                (bloecke, alt, g.fassung)
+            };
+            match conn.register_messung(&bloecke, alt) {
+                Ok(kennungen) => {
+                    let belegung = bloecke
+                        .iter()
+                        .map(|b| b.iter().map(|(i, _)| *i).collect())
+                        .collect();
+                    shared
+                        .messung
+                        .lock()
+                        .registriert(belegung, kennungen, Instant::now(), versucht);
+                    messung_sperre = None;
+                }
+                Err(e) => {
+                    messung_sperre = Some((Instant::now() + Duration::from_secs(5), versucht));
+                    tracing::warn!(error = %e, "Messbloecke fuer „Flugzeug vermessen\" nicht angelegt");
+                }
+            }
+        }
+        {
+            let weg = shared.eingaben.lock().abmelden_nehmen();
+            if !weg.is_empty() {
+                conn.eingaben_abmelden(&weg);
+            }
+        }
+
+        // MSFS-2024-Input-Events: Aufzaehlung starten, wenn faellig (nach
+        // `AircraftLoaded` bzw. als begrenzte Wiederholung).
+        {
+            let jetzt = Instant::now();
+            let req = {
+                let mut g = shared.eingaben.lock();
+                g.frist_pruefen(jetzt);
+                g.aufzaehlung_starten(jetzt)
+            };
+            if let Some(req) = req {
+                match conn.eingaben_aufzaehlen(req) {
+                    Ok(send_id) => eingabe_send_id = send_id,
+                    Err(e) => {
+                        tracing::info!(
+                            error = %e,
+                            "Input-Events nicht verfuegbar — Schalter kommen weiter aus LVars/SimVars"
+                        );
+                        shared.eingaben.lock().nicht_verfuegbar();
+                    }
+                }
+            }
+        }
+
+        // v1.7.14 — die offenen Lieferungen, nach Anfragekennung
+        // getrennt. Sie liegen in `facility.rs`, weil DIESER Block hinter
+        // `cfg(target_os = "windows")` steht und hier nichts pruefbar ist.
+        // Getrennt, weil sich sonst eine verspaetete Antwort mit der
+        // laufenden vermischt — siehe `Lieferungen`.
+        //
+        // v1.7.8 — eine ausstehende Szenerie-Anfrage stellen.
+        //
+        // Erst hier, im Faden mit dem Verbindungsgriff: `szenerie_anfordern`
+        // laeuft im Aufrufer-Faden und darf SimConnect nicht anfassen.
+        //
+        // ⚠ Seit v1.7.14 bei JEDEM Durchlauf, nicht nur wenn das Flag
+        // gesetzt ist. Das Flag sagte "jemand hat etwas angemeldet";
+        // eine Wiederholung nach ausgebliebener Antwort haette es nie
+        // ausgeloest. Das Buch gibt von sich aus nur dann einen Auftrag
+        // heraus, wenn wirklich einer faellig ist — es ist ein Vergleich
+        // je Durchlauf.
+        shared.szenerie_offen.store(false, Ordering::Relaxed);
+        {
+            let jetzt_ms = chrono::Utc::now().timestamp_millis();
+            // ⚠ Auswaehlen und Stellen in EINEM Zug — sonst kann ein
+            // Flugwechsel dazwischen das Buch leeren, und der Auftrag
+            // entstuende fuer einen Platz, den es nicht mehr gibt.
+            let faellig = shared.szenerie.lock().naechsten_stellen(jetzt_ms);
+            if let Some((icao, auftrag_id)) = faellig {
+                // ⚠ EIGENE Kennung je VERSUCH. Mit einer festen Kennung
+                // fuer alle Anfragen liesse sich eine nach der Wartezeit
+                // eintreffende Antwort nicht mehr von der laufenden
+                // unterscheiden — sie wuerde dem falschen Platz
+                // zugeschlagen, und ueberlappende Bloecke koennten sich
+                // sogar vermischen. Das SDK gibt die clientdefinierte
+                // Kennung in JEDER Nachricht zurueck, genau dafuer.
+                let request_id = FACILITY_REQUEST_BASE + auftrag_id;
+                match conn.request_facility(&icao, request_id) {
+                    Ok(paket) => {
+                        // ⚠ Der Sammler wird IMMER eroeffnet — die
+                        // Anfrage lief, die Lieferung kommt ueber die
+                        // Anfragekennung.
+                        facility_lieferungen.eroeffnen(request_id);
+                        if let Some(send_id) = paket {
+                            facility_pakete.push((send_id, auftrag_id));
+                            while facility_pakete.len() > facility::PAKETE_GEDAECHTNIS {
+                                facility_pakete.remove(0);
+                            }
+                        }
+                        tracing::info!(
+                            %icao,
+                            request_id,
+                            versuch = shared.szenerie.lock().versuche(&icao),
+                            "Szenerie-Auskunft angefordert"
+                        );
+                    }
+                    Err(e) => {
+                        // Nicht erneut versuchen: Ein Platz, den der
+                        // Simulator nicht kennt, wird beim naechsten
+                        // Durchlauf auch nicht bekannt. Die Navdaten
+                        // bleiben, und das ist der richtige Rueckfall.
+                        //
+                        // ⚠ Aber festhalten, WARUM. Bis v1.7.9 stand am
+                        // Flug nur "navdaten", und eine Ablehnung sah
+                        // genauso aus wie "nie gefragt".
+                        // ⚠ Ein sofortiger Fehler sagt NICHTS ueber den
+                        // Platz.
+                        //
+                        // Ein unmittelbarer HRESULT-Fehler ist
+                        // clientseitig; erst `SIMCONNECT_RECV_EXCEPTION`
+                        // beschreibt den serverseitigen Grund. Aus einem
+                        // synchronen `E_FAIL` einen ungueltigen Flughafen
+                        // abzuleiten sperrte ihn fuer den restlichen Flug
+                        // aus (QS-Befund 1, sechste Runde).
+                        //
+                        // Also freigeben, nicht ablehnen — der naechste
+                        // Versuch ist der richtige Umgang damit.
+                        shared
+                            .szenerie
+                            .lock()
+                            .freigeben_zu_kennung(auftrag_id, jetzt_ms);
+                        facility_lieferungen.abschliessen(request_id);
+                        tracing::warn!(
+                            %icao,
+                            error = %e,
+                            "Szenerie-Anfrage scheiterte sofort — wird erneut versucht"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Drain whatever messages SimConnect has queued for us.
+        loop {
+            let vorher = conn.empfangen;
+            let nachricht = conn.get_next_dispatch();
+            // Jede Nachricht — auch Pause, AircraftLoaded, Facility und
+            // unbekannte IDs — ist ein Lebenszeichen des Handles (Codex-
+            // Befunde 03.10.2026: eine absolute Frist ab Open kappte einen
+            // lebenden Handle; unbekannte Nachrichten zaehlten nicht).
+            if conn.empfangen != vorher {
+                letztes_lebenszeichen = Instant::now();
+            }
+            match nachricht {
+                Ok(None) => break, // queue empty
+                Ok(Some(DispatchMsg::Open { kennung })) => {
+                    tracing::info!(%kennung, "SimConnect_RECV_OPEN — handshake done");
+                    handshake_gesehen = true;
+                    shared.szenerie.lock().kennung_setzen(Some(kennung));
+                }
+                Ok(Some(DispatchMsg::Quit)) => {
+                    tracing::warn!("SimConnect sent QUIT — dropping connection");
+                    return;
+                }
+                // v1.7.8 — ein Element aus der Facility-Lieferung.
+                //
+                // Gesammelt wird nur, was wir angefordert haben; alles
+                // andere wird verworfen statt geraten. Der Sammler
+                // liegt im ungattierten Teil, damit das Zerlegen ohne
+                // Simulator pruefbar bleibt.
+                Ok(Some(DispatchMsg::FacilityData {
+                    request_id,
+                    typ,
+                    bytes,
+                    ..
+                })) => {
+                    // ⚠ Nachrichten ohne offene Lieferung werden
+                    // VERWORFEN, nicht geraten. Eine Antwort, deren
+                    // Anfrage abgelaufen ist, gehoert niemandem mehr.
+                    let Some(lieferung) = facility_lieferungen.zu(request_id) else {
+                        if request_id >= FACILITY_REQUEST_BASE {
+                            tracing::debug!(
+                                request_id,
+                                "Facility-Nachricht ohne offene Lieferung — verworfen"
+                            );
+                        }
+                        continue;
+                    };
+                    if typ == sys::FACILITY_DATA_AIRPORT {
+                        // Der Referenzpunkt — ohne ihn sind die
+                        // Rollwegpunkte nicht umrechenbar. Die
+                        // Missweisung (v1.7.19) haengt an keinem Index,
+                        // ist also unkritisch, wenn sie fehlt.
+                        if let Some(w) = facility::zerlege(facility::FLUGHAFEN_FELDER, &bytes) {
+                            lieferung.referenz = Some((w[0].als_f64(), w[1].als_f64()));
+                            lieferung.magvar = Some(w[3].als_f64() as f32);
+                        }
+                    } else if typ == sys::FACILITY_DATA_START {
+                        // v1.7.19 — wie `staende_roh`: kein Index-Verweis,
+                        // ein unlesbarer Satz wird verworfen statt
+                        // erfunden.
+                        match facility::zerlege(facility::START_FELDER, &bytes)
+                            .and_then(|w| facility::start_aus_werten(&w))
+                        {
+                            Some(s) => lieferung.starts_roh.push(s),
+                            None => tracing::warn!(
+                                laenge = bytes.len(),
+                                "START-Block passt nicht zur Definition — verworfen"
+                            ),
+                        }
+                    } else if typ == sys::FACILITY_DATA_TAXI_POINT {
+                        // ⚠ Auch ein unlesbarer Punkt muss einen Platz
+                        // belegen. `START`/`END` sind POSITIONEN in
+                        // dieser Liste — wer einen Eintrag auslaesst,
+                        // verschiebt jede Kante danach auf einen anderen
+                        // Punkt. Lieber ein unmoeglicher Punkt, den der
+                        // Zusammenbau verwirft, als eine verschobene
+                        // Liste.
+                        match facility::zerlege(facility::ROLLWEG_PUNKT_FELDER, &bytes) {
+                            Some(w) => lieferung.punkte.push((w[1].als_f64(), w[2].als_f64())),
+                            None => lieferung.punkte.push((f64::NAN, f64::NAN)),
+                        }
+                    } else if typ == sys::FACILITY_DATA_TAXI_NAME {
+                        // Ebenso: Der Index zaehlt, nicht der Inhalt.
+                        lieferung.namen.push(facility::name_aus_bytes(&bytes));
+                    } else if typ == sys::FACILITY_DATA_TAXI_PATH {
+                        if let Some(w) = facility::zerlege(facility::ROLLWEG_KANTE_FELDER, &bytes) {
+                            let (a, b, n) = (w[2].als_i32(), w[3].als_i32(), w[4].als_i32());
+                            if a >= 0 && b >= 0 && n >= 0 {
+                                lieferung.kanten.push((a as usize, b as usize, n as usize));
+                            }
+                        }
+                    } else if typ == sys::FACILITY_DATA_TAXI_PARKING {
+                        // ⚠ Ein unlesbarer Satz wird verworfen, nicht als
+                        // Platzhalter belegt: Parkpositionen haengen — anders
+                        // als Rollwegkanten — an KEINEM Index, ein
+                        // uebersprungener Satz verschiebt also nichts.
+                        match facility::zerlege(facility::STAND_FELDER, &bytes)
+                            .and_then(|w| facility::stand_aus_werten(&w))
+                        {
+                            Some(s) => lieferung.staende_roh.push(s),
+                            None => tracing::warn!(
+                                laenge = bytes.len(),
+                                "TAXI_PARKING-Block passt nicht zur Definition — verworfen"
+                            ),
+                        }
+                    } else if typ == sys::FACILITY_DATA_PAVEMENT {
+                        // Die versetzte Schwelle — EIGENE Satzart, keine
+                        // eingebetteten Felder. Sie kommt nach ihrem
+                        // Bahnsatz, in der Reihenfolge der Definition:
+                        // erst PRIMARY_THRESHOLD, dann SECONDARY.
+                        if !lieferung.sammler.pavementsatz(&bytes) {
+                            tracing::warn!(
+                                laenge = bytes.len(),
+                                "PAVEMENT-Satz ohne passende Bahn — verworfen"
+                            );
+                        }
+                    } else if typ == sys::FACILITY_DATA_RUNWAY {
+                        if !lieferung.sammler.bahnsatz(&bytes) {
+                            // Kein stiller Verlust: Ein Block, der nicht
+                            // zur Definition passt, heisst, dass die
+                            // Feldliste nicht stimmt.
+                            tracing::warn!(
+                                laenge = bytes.len(),
+                                "Facility-Bahnblock passt nicht zur Definition — \
+                                 Feldliste pruefen"
+                            );
+                        }
+                    }
+                }
+                Ok(Some(DispatchMsg::FacilityDataEnde { request_id })) => {
+                    // ⚠ Nur die Lieferung ZU DIESER Kennung. Ist sie
+                    // nicht mehr offen, gehoert die Antwort niemandem —
+                    // verwerfen, nicht dem laufenden Auftrag zuschlagen.
+                    if let Some(lieferung) = facility_lieferungen.abschliessen(request_id) {
+                        // ⚠ Der Platz kommt aus der KENNUNG, nicht aus
+                        // `laufender()`. Nach der Wartezeit laeuft
+                        // laengst ein anderer Auftrag; eine verspaetete
+                        // Antwort bekaeme sonst dessen Namen — derselbe
+                        // Fehler wie in v1.7.13, nur verschoben.
+                        let auftrag_id = request_id.wrapping_sub(FACILITY_REQUEST_BASE);
+                        let Some(icao) = shared.szenerie.lock().platz_zu_kennung(auftrag_id) else {
+                            tracing::warn!(
+                                request_id,
+                                "Facility-Lieferung ohne bekannten Platz — verworfen"
+                            );
+                            continue;
+                        };
+                        tracing::info!(
+                            %icao,
+                            request_id,
+                            bahnen = lieferung.sammler.anzahl(),
+                            "Facility-Lieferung vollstaendig"
+                        );
+                        // Erst JETZT sichtbar machen — vorher waere es
+                        // eine halbe Wahrheit.
+                        // Rollwege erst hier zusammensetzen: Vorher
+                        // sind die drei Listen nicht vollstaendig, und
+                        // eine Kante koennte auf einen Punkt zeigen, der
+                        // noch nicht eingetroffen ist.
+                        let rollwege = match lieferung.referenz {
+                            Some(r) => facility::rollwege_zusammensetzen(
+                                r,
+                                &lieferung.punkte,
+                                &lieferung.namen,
+                                &lieferung.kanten,
+                            ),
+                            None => {
+                                if !lieferung.punkte.is_empty() {
+                                    tracing::warn!(
+                                        "Rollwegpunkte ohne Referenzpunkt — nicht umrechenbar"
+                                    );
+                                }
+                                Vec::new()
+                            }
+                        };
+                        tracing::info!(rollwege = rollwege.len(), "Rollwege zusammengesetzt");
+                        // Parkpositionen brauchen denselben Referenzpunkt wie
+                        // Rollwege — ohne ihn sind BIAS_X/BIAS_Z nicht
+                        // umrechenbar (derselbe Grund wie oben).
+                        let staende = match lieferung.referenz {
+                            Some(r) => facility::staende_zusammensetzen(r, &lieferung.staende_roh),
+                            None => {
+                                if !lieferung.staende_roh.is_empty() {
+                                    tracing::warn!(
+                                        "Parkpositionen ohne Referenzpunkt — nicht umrechenbar"
+                                    );
+                                }
+                                Vec::new()
+                            }
+                        };
+                        tracing::info!(staende = staende.len(), "Parkpositionen zusammengesetzt");
+                        // v1.7.19 — Schattenmodus: den Kurs beider Enden
+                        // gegen START-Koordinaten/MAGVAR pruefen, OHNE
+                        // `kurs_grad` selbst zu veraendern. `bahnen`
+                        // bleibt fuer `achse_belastbar` (szenerie_bahn.rs)
+                        // unveraendert — siehe dessen Doku.
+                        let mut bahnen = lieferung.sammler.fertig();
+                        facility::bestaetige_kurse(
+                            &mut bahnen,
+                            &lieferung.starts_roh,
+                            lieferung.magvar,
+                            lieferung.referenz,
+                        );
+                        for b in &bahnen {
+                            if b.kurs_bestaetigt_grad.is_some() {
+                                tracing::info!(
+                                    %icao,
+                                    bezeichner = %b.bezeichner,
+                                    heading_facility = b.kurs_grad,
+                                    kurs_bestaetigt = ?b.kurs_bestaetigt_grad,
+                                    quelle = ?b.kurs_quelle,
+                                    "MSFS-Kurs bestaetigt (Schattenmodus, wirkungslos fuer achse_belastbar)"
+                                );
+                            }
+                        }
+                        let auskunft = sim_core::szenerie::SzenerieFlughafen {
+                            icao,
+                            bahnen,
+                            rollwege,
+                            staende,
+                            quelle: "msfs".to_string(),
+                        };
+                        shared
+                            .szenerie
+                            .lock()
+                            .geliefert_zu_kennung(auftrag_id, auskunft);
+                    }
+                }
+                Ok(Some(DispatchMsg::Exception {
+                    exception,
+                    send_id,
+                    index,
+                })) => {
+                    // Input-Events: lehnt der Simulator die Aufzaehlung ab,
+                    // still und begrenzt wiederholen — kein Fehler. MSFS 2020
+                    // ist oben schon als „nicht verfuegbar" markiert.
+                    if eingabe_send_id.is_some_and(|id| id == send_id) {
+                        tracing::info!(
+                            exception,
+                            "EnumerateInputEvents abgelehnt — spaeter erneut, Schalter bis dahin aus LVars/SimVars"
+                        );
+                        shared.eingaben.lock().abgelehnt(Instant::now());
+                        eingabe_send_id = None;
+                        continue;
+                    }
+                    // ⚠ ZUERST fragen, ob die Ausnahme zu einem
+                    // Facility-FELDNAMEN gehoert. Der `index` waere
+                    // sonst ueber die TELEMETRIE-Feldliste gedeutet, und
+                    // ein falsch geschriebenes Facility-Feld saehe aus
+                    // wie ein fremdes SimVar-Problem.
+                    if let Some(feld) =
+                        facility::feld_zu_paket(&conn.facility_feld_send_ids, send_id)
+                    {
+                        tracing::error!(
+                            exception,
+                            send_id,
+                            %feld,
+                            "Facility-Feldname vom Simulator zurueckgewiesen — \
+                             die Feldliste passt nicht zu dieser Fassung des \
+                             Simulators"
+                        );
+                        // ⚠ HART behandeln, nicht nur protokollieren.
+                        // Ist ein Feld der Definition abgelehnt, ist der
+                        // ganze Facility-Weg unbrauchbar: Jede Antwort
+                        // haette ein anderes Raster als erwartet. Vorher
+                        // lief er weiter, und Auftraege meldeten
+                        // „unterwegs" oder „geliefert", obwohl die
+                        // Definition nachweislich zurueckgewiesen war
+                        // (QS-Befund 4, dritte Runde).
+                        shared
+                            .szenerie
+                            .lock()
+                            .definition_abgelehnt(feld, format!("Ausnahme {exception}"));
+                        facility_lieferungen = facility::Lieferungen::neu();
+                        continue;
+                    }
+                    // ⚠ `index` ist bei SimConnect die Nummer des
+                    // PARAMETERS im abgelehnten Aufruf — nicht die eines
+                    // Telemetriefelds. Bis v1.7.44 wurde JEDE Ausnahme mit
+                    // index=1 als „ATC MODEL" (Feld 1) ausgegeben; die 212
+                    // Meldungen in den Diagnose-Logs waren in Wahrheit
+                    // `EVENT_ID_DUPLICATE` aus doppelten Event-Abos
+                    // (Befund 21.09.2026).
+                    let name = facility::ausnahme_name(exception);
+                    if conn.abmelde_pakete.erwartet_abgelehnt(name, send_id) {
+                        tracing::debug!(
+                            send_id,
+                            "Abmeldung eines Input-Events des vorigen Flugzeugs abgelehnt (erwartet)"
+                        );
+                        continue;
+                    }
+                    // Feld aus der Paketkennung — nur fuers Log. Die fruehere
+                    // Deutung ueber `index` nannte bei MSFS 2020 „ATC ID“
+                    // statt EX1 (Befund 16.10.2026).
+                    let feld = conn
+                        .telemetrie_send_ids
+                        .iter()
+                        .find(|(id, _)| *id == send_id)
+                        .map(|(_, n)| *n);
+                    // Ein Feld der HAUPTdefinition: ab ihm waere jeder Block
+                    // zu kurz. Sofort neu verbinden und es dabei auslassen
+                    // (None) — statt Verwerfen bis zum Dauerausfall.
+                    if let Some(idx) = conn.haupt_pakete.feld(send_id) {
+                        tracing::error!(
+                            send_id,
+                            feld = TELEMETRY_FIELDS[idx].name,
+                            "Hauptfeld vom Simulator abgelehnt — neu verbinden, \
+                             Feld bleibt kuenftig ausgelassen (None)"
+                        );
+                        conn.haupt_abgelehnt.push(idx);
+                        return;
+                    }
+                    if feld.is_some_and(|n| OPTIONALE_FELDER.iter().any(|f| f.name == n)) {
+                        // Erwartet (z. B. EX1 unter MSFS 2020) und folgenlos:
+                        // nur dieser Wert bleibt None.
+                        tracing::info!(
+                            send_id,
+                            ?feld,
+                            "Optionale SimVar vom Simulator nicht unterstuetzt"
+                        );
+                        continue;
+                    }
+                    tracing::warn!(
+                        exception,
+                        ausnahme = name,
+                        send_id,
+                        index,
+                        ?feld,
+                        "SIMCONNECT_RECV_EXCEPTION — Aufruf vom Simulator abgelehnt"
+                    );
+                    // ⚠ Gehoert sie zu einer Szenerie-Anfrage, ist der
+                    // Platz damit ABGELEHNT — nicht weiter „unterwegs".
+                    // Sonst fragt das Buch zehnmal nach einem Flughafen,
+                    // den der Simulator nicht kennt, und die Diagnose am
+                    // Flug behauptet die ganze Zeit, es sei noch etwas
+                    // unterwegs.
+                    // ⚠ Die ART der Ausnahme entscheidet, was folgt.
+                    //
+                    // Vorher wurde JEDE dem Flughafen angelastet und der
+                    // Platz dauerhaft abgelehnt — und ein neues Fenster
+                    // laesst abgelehnte Plaetze bewusst geschlossen.
+                    // Damit sperrte eine voruebergehende Ueberlast
+                    // (`TOO_MANY_REQUESTS`) den Platz fuer den Rest des
+                    // Fluges aus, und ein Fehler der DEFINITION sah aus
+                    // wie ein Problem des Platzes (QS-Befund 3, fuenfte
+                    // Runde).
+                    if let Some(auftrag_id) = facility::auftrag_zu_paket(&facility_pakete, send_id)
+                    {
+                        let art = facility::ausnahme_einordnen(exception);
+                        let platz = shared.szenerie.lock().platz_zu_kennung(auftrag_id);
+                        match art {
+                            facility::Ausnahmeart::Definition => {
+                                tracing::error!(
+                                    ?platz,
+                                    exception,
+                                    "Facility-Definition zurueckgewiesen — der Weg ist \
+                                     fuer diese Verbindung zu"
+                                );
+                                shared.szenerie.lock().definition_abgelehnt(
+                                    "Anfrage".into(),
+                                    format!("Ausnahme {exception}"),
+                                );
+                                // ⚠ Und die offenen Sammler verwerfen.
+                                // Sonst koennte ein spaeteres
+                                // `FACILITY_DATA_END` trotz nachgewiesen
+                                // ungueltiger Definition noch eine
+                                // Auskunft ablegen.
+                                facility_lieferungen = facility::Lieferungen::neu();
+                            }
+                            facility::Ausnahmeart::Platz => {
+                                tracing::warn!(
+                                    ?platz,
+                                    exception,
+                                    "Platz vom Simulator zurueckgewiesen — dauerhaft"
+                                );
+                                shared.szenerie.lock().abgelehnt_zu_kennung(
+                                    auftrag_id,
+                                    format!("Platz ungueltig (Ausnahme {exception})"),
+                                );
+                            }
+                            facility::Ausnahmeart::Voruebergehend => {
+                                // ⚠ NICHT ablehnen. Der naechste Versuch
+                                // ist der richtige Umgang damit.
+                                tracing::warn!(
+                                    ?platz,
+                                    exception,
+                                    "Szenerie-Anfrage voruebergehend abgewiesen — wird \
+                                     erneut versucht"
+                                );
+                                shared.szenerie.lock().freigeben_zu_kennung(
+                                    auftrag_id,
+                                    chrono::Utc::now().timestamp_millis(),
+                                );
+                            }
+                            facility::Ausnahmeart::Unklar => {
+                                tracing::warn!(
+                                    ?platz,
+                                    exception,
+                                    "Szenerie-Ausnahme nicht einzuordnen — nur vermerkt"
+                                );
+                            }
+                        }
+                    }
+                    // Telemetrie-Monitor: abgelehnte Zusatz-SimVar aussortieren,
+                    // die Definition wird im naechsten Tick ohne sie angelegt.
+                    if let Some(simvar) = shared.messung.lock().ausnahme(send_id) {
+                        tracing::debug!(exception, %simvar, "Messvariable vom Simulator abgelehnt");
+                    }
+                    if let Some(simvar) = shared.zusatz.lock().ausnahme(send_id) {
+                        tracing::info!(
+                            exception,
+                            %simvar,
+                            "Zusatzwert vom Simulator abgelehnt — aus dem Telemetrie-Monitor genommen"
+                        );
+                    }
+                    // Route it to the Inspector tool too, if this
+                    // exception's send_id matches one of its watches'
+                    // AddToDataDefinition calls — otherwise the pilot
+                    // sees the mistyped LVar just sit at "no value"
+                    // forever, indistinguishable from "sim hasn't sent
+                    // data yet" (see InspectorWatch::error).
+                    if let Some(watch_id) =
+                        telemetry::inspector_watch_for_exception(&conn.inspector_send_ids, send_id)
+                    {
+                        shared.inspector.lock().set_error(
+                            watch_id,
+                            format!("SimConnect exception #{exception} (send_id {send_id})"),
+                        );
+                    }
+                }
+                Ok(Some(DispatchMsg::SimObjectData { request_id, bytes })) => {
+                    last_data = Instant::now();
+                    match request_id {
+                        REQUEST_ID => {
+                            // v0.7.17 (F-001): no more Fenix-Beta flag — the
+                            // adapter always applies the Fenix-A32x extension
+                            // LVARs when the aircraft profile is Fenix.
+                            // Audit 26.09.2026: aircraft.cfg-Pfad fuer die
+                            // Profilerkennung (MSFS-2024-Titel ohne Hersteller).
+                            let air_path = shared.pmdg.lock().air_path.clone();
+                            // 26.09.2026: Werte der abonnierten MSFS-2024-
+                            // Input-Events (leer bei MSFS 2020).
+                            let eingaben = shared.eingaben.lock().werte().clone();
+                            // ⚠ Zu kurz = ein Datum der Hauptdefinition fehlt,
+                            // ab dort stuende jedes Feld auf dem Platz seines
+                            // Nachfolgers (Wind 1013 kt). NIE parsen; haelt es
+                            // an, neu verbinden und neu registrieren.
+                            let erwartet = telemetry::blocklaenge(&conn.haupt_ausgelassen);
+                            match conn.blockwaechter.pruefen(bytes.len(), erwartet) {
+                                telemetry::Blockpruefung::Lesen => {}
+                                telemetry::Blockpruefung::Verwerfen { erstmals } => {
+                                    if erstmals {
+                                        tracing::warn!(
+                                            erhalten = bytes.len(),
+                                            erwartet,
+                                            "Telemetrie-Block zu kurz — verworfen \
+                                             (Datum der Hauptdefinition abgelehnt?)"
+                                        );
+                                    }
+                                    continue;
+                                }
+                                telemetry::Blockpruefung::NeuVerbinden => {
+                                    tracing::error!(
+                                        verworfen = conn.blockwaechter.verworfen_gesamt,
+                                        "Telemetrie-Bloecke anhaltend zu kurz — neu verbinden"
+                                    );
+                                    return;
+                                }
+                            }
+                            let optionale = *shared.optionale.lock();
+                            let mut snap = telemetry::parse_mit_eingaben(
+                                &bytes,
+                                simulator,
+                                air_path.as_deref(),
+                                &eingaben,
+                                &optionale,
+                                &conn.haupt_ausgelassen,
+                                &mut anschnall_sperre,
+                            );
+                            // Spec v0.7.15 F5: Pause-State aus dem Atomic
+                            // in den Snapshot kopieren — wird vom Streamer-
+                            // Loop in lib.rs ausgewertet damit der Pause-
+                            // Akkumulator auch waehrend MSFS-Esc-Pause
+                            // (= eingefrorene Snapshots) korrekt zaehlt.
+                            // v1.6.12: Replay/Teleport/Vorspulen zaehlen wie
+                            // Pause. Der Streamer in lib.rs friert damit die
+                            // Phasen-Engine ein, statt eine abgespielte
+                            // Aufzeichnung als Flug zu werten — dieselbe
+                            // Behandlung wie im X-Plane-Adapter.
+                            snap.paused = shared.sim_pause.lock().pausiert(Instant::now())
+                                || shared.sim_unecht_tiefe.load(Ordering::Relaxed) > 0;
+                            // v0.7.19 GAF-707: Crash-Latch aus dem Shared-
+                            // State in den Snapshot mergen. Caller in
+                            // lib.rs/step_flight reagiert auf den Flip
+                            // false→true und setzt FlightStats.accident_*.
+                            // CrashReset setzt das Flag zurueck, ohne den
+                            // FlightStats-Latch zu beruehren (Spec §Leit-
+                            // entscheidung 6).
+                            snap.crashed = shared.sim_crashed.load(Ordering::Relaxed);
+                            // 2.0.14: Bildrate aus dem `Frame`-Ereignis.
+                            snap.sim_bildrate_hz =
+                                bildrate_aus_bits(shared.sim_bildrate_bits.load(Ordering::Relaxed));
+                            let jetzt = std::time::Instant::now();
+                            snap.master_warning = halter_warning.update(snap.master_warning, jetzt);
+                            snap.master_caution = halter_caution.update(snap.master_caution, jetzt);
+                            snap.crash_source = if snap.crashed {
+                                Some("msfs_crashed_event".into())
+                            } else {
+                                None
+                            };
+                            // Merge in the most recent touchdown sample
+                            // so consumers see a unified snapshot.
+                            if let Some(td) = *shared.touchdown.lock() {
+                                if !td.is_uninitialised() {
+                                    // PLANE TOUCHDOWN NORMAL VELOCITY in MSFS
+                                    // returns the touchdown impact velocity as
+                                    // a POSITIVE magnitude (verified against
+                                    // LandingToast: pilot lands at -234 fpm,
+                                    // SimVar reports +234). Conventional V/S
+                                    // notation is negative for descent, so we
+                                    // negate. Take the absolute value first to
+                                    // be defensive against odd addons that
+                                    // might report signed — we always want a
+                                    // descent (negative) value at touchdown.
+                                    snap.touchdown_vs_fpm =
+                                        Some(-((td.vs_fps * 60.0).abs()) as f32);
+                                    // v0.5.24: invert MSFS pitch — same
+                                    // convention bug as live PLANE PITCH
+                                    // DEGREES (positive=nose-down in
+                                    // MSFS, but universal aviation
+                                    // expects positive=nose-up). Without
+                                    // this an A321 flare with +5° real
+                                    // pitch was stored as -5° in PIREPs.
+                                    snap.touchdown_pitch_deg = Some(-(td.pitch_deg as f32));
+                                    snap.touchdown_bank_deg = Some(td.bank_deg as f32);
+                                    snap.touchdown_heading_mag_deg =
+                                        Some(td.heading_mag_deg as f32);
+                                    snap.touchdown_lat = Some(td.lat_rad.to_degrees());
+                                    snap.touchdown_lon = Some(td.lon_rad.to_degrees());
+                                }
+                            }
+                            // First-frame logging: fire once per dispatch
+                            // session (= per SimConnect handle) so we get
+                            // an info-line per real reconnect but don't
+                            // log on every snap. Driven by the local
+                            // `got_first` flag.
+                            if !got_first {
+                                got_first = true;
+                                tracing::info!(
+                                    aircraft = ?snap.aircraft_title,
+                                    profile = ?snap.aircraft_profile,
+                                    "MSFS first snapshot received"
+                                );
+                                log_first_snapshot_diagnostics(&snap);
+                            }
+                            // Connection-state bump: read SHARED state on
+                            // every frame so a manual `clear_snapshot()`
+                            // (Fix #8 user button) which set state to
+                            // Connecting gets correctly transitioned back
+                            // to Connected on the next live frame.
+                            // Without this, a local-only `got_first` flag
+                            // would stay true across the manual clear,
+                            // and the state would freeze at Connecting
+                            // until the next reconnect cycle even though
+                            // fresh snapshots are flowing again.
+                            // Mirrors how the X-Plane listener handles
+                            // this exact case.
+                            {
+                                let mut s = shared.state.lock();
+                                if *s != ConnectionState::Connected {
+                                    *s = ConnectionState::Connected;
+                                }
+                            }
+                            *shared.snapshot.lock() = Some(snap);
+                        }
+                        TOUCHDOWN_REQUEST_ID => {
+                            let td = Touchdown::from_block(&bytes);
+                            *shared.touchdown.lock() = Some(td);
+                        }
+                        INSPECTOR_REQUEST_ID => {
+                            shared.inspector.lock().ingest(&bytes);
+                        }
+                        id if (OPTIONAL_REQUEST_BASE
+                            ..OPTIONAL_REQUEST_BASE + OPTIONALE_FELDER.len() as u32)
+                            .contains(&id) =>
+                        {
+                            shared
+                                .optionale
+                                .lock()
+                                .einlesen((id - OPTIONAL_REQUEST_BASE) as usize, &bytes);
+                        }
+                        ZUSATZ_REQUEST_ID => {
+                            shared.zusatz.lock().einlesen(&bytes, Instant::now());
+                        }
+                        other if crate::vermessung::MessState::ist_mess_anfrage(other) => {
+                            shared
+                                .messung
+                                .lock()
+                                .einlesen(other, &bytes, Instant::now());
+                        }
+                        other => {
+                            tracing::trace!(request_id = other, "unknown SimObjectData request_id");
+                        }
+                    }
+                }
+                Ok(Some(DispatchMsg::ClientData { request_id, bytes })) => {
+                    // PMDG SDK ClientData arrived. The 916-byte
+                    // NG3 block (or future 777X block) gets stored
+                    // verbatim in `shared.pmdg.{ng3,x777}_raw`;
+                    // higher layers (snapshot integration in
+                    // Phase 5.4) decode on demand via
+                    // `Pmdg738Snapshot::from_raw()`.
+                    match request_id {
+                        PMDG_NG3_REQUEST_ID => {
+                            let expected_len =
+                                std::mem::size_of::<crate::pmdg::ng3::Pmdg738RawData>();
+                            if bytes.len() < expected_len {
+                                tracing::warn!(
+                                    got = bytes.len(),
+                                    expected = expected_len,
+                                    "PMDG NG3 ClientData payload too short — ignoring"
+                                );
+                            } else {
+                                // Safety: `Pmdg738RawData` is `#[repr(C)]`,
+                                // matches MSVC layout, and we just verified
+                                // the payload has at least `size_of()` bytes.
+                                // The struct is `Copy + Clone` so a bytewise
+                                // copy is safe. We Box it because the struct
+                                // is ~1 KB and we don't want it on the stack.
+                                let raw: Box<crate::pmdg::ng3::Pmdg738RawData> = unsafe {
+                                    let mut b: Box<
+                                        std::mem::MaybeUninit<crate::pmdg::ng3::Pmdg738RawData>,
+                                    > = Box::new(std::mem::MaybeUninit::uninit());
+                                    std::ptr::copy_nonoverlapping(
+                                        bytes.as_ptr(),
+                                        b.as_mut_ptr() as *mut u8,
+                                        expected_len,
+                                    );
+                                    Box::from_raw(
+                                        Box::into_raw(b) as *mut crate::pmdg::ng3::Pmdg738RawData
+                                    )
+                                };
+                                let mut g = shared.pmdg.lock();
+                                g.ng3_raw = Some(raw);
+                                g.last_packet_at = Some(Instant::now());
+                            }
+                        }
+                        PMDG_X777_REQUEST_ID => {
+                            let expected_len =
+                                std::mem::size_of::<crate::pmdg::x777::Pmdg777XRawData>();
+                            if bytes.len() < expected_len {
+                                tracing::warn!(
+                                    got = bytes.len(),
+                                    expected = expected_len,
+                                    "PMDG 777X ClientData payload too short — ignoring"
+                                );
+                            } else {
+                                let raw: Box<crate::pmdg::x777::Pmdg777XRawData> = unsafe {
+                                    let mut b: Box<
+                                        std::mem::MaybeUninit<crate::pmdg::x777::Pmdg777XRawData>,
+                                    > = Box::new(std::mem::MaybeUninit::uninit());
+                                    std::ptr::copy_nonoverlapping(
+                                        bytes.as_ptr(),
+                                        b.as_mut_ptr() as *mut u8,
+                                        expected_len,
+                                    );
+                                    Box::from_raw(
+                                        Box::into_raw(b) as *mut crate::pmdg::x777::Pmdg777XRawData
+                                    )
+                                };
+                                let mut g = shared.pmdg.lock();
+                                g.x777_raw = Some(raw);
+                                g.last_packet_at = Some(Instant::now());
+                            }
+                        }
+                        other => {
+                            tracing::trace!(request_id = other, "unknown ClientData request_id");
+                        }
+                    }
+                }
+                Ok(Some(DispatchMsg::SystemState {
+                    request_id,
+                    air_path,
+                })) => {
+                    if request_id == AIRCRAFT_LOADED_REQUEST_ID {
+                        // Input-Events des (neuen) Flugzeugs: alte Abos
+                        // abmelden, Werte verwerfen, nach kurzem Anlauf neu
+                        // aufzaehlen.
+                        // Eine noch gehaltene MASTER-Lampe gehoert dem alten Muster.
+                        halter_warning = sim_core::lampen::LampenHalter::default();
+                        halter_caution = sim_core::lampen::LampenHalter::default();
+                        let alt = shared.eingaben.lock().flugzeug_gewechselt(Instant::now());
+                        conn.eingaben_abmelden(&alt);
+                        let detected = crate::pmdg::PmdgVariant::detect_from_air_path(&air_path);
+                        let mut g = shared.pmdg.lock();
+                        let neuer_pfad = Some(air_path.clone()).filter(|p| !p.trim().is_empty());
+                        // Nur ein echter Flugzeugwechsel setzt die Sperre
+                        // zurueck, nicht jede wiederholte Antwort.
+                        if g.air_path != neuer_pfad {
+                            anschnall_sperre = telemetry::StandardAnschnallSperre::default();
+                        }
+                        g.air_path = neuer_pfad;
+                        if g.variant != detected {
+                            tracing::info!(
+                                ?detected,
+                                old = ?g.variant,
+                                air_path = %air_path,
+                                "PMDG variant change detected"
+                            );
+                            g.variant = detected;
+                            // Aircraft changed → drop any cached
+                            // raw data + reset subscribed flag so
+                            // the worker re-subscribes for the new
+                            // variant on the next loop iteration.
+                            g.ng3_raw = None;
+                            g.x777_raw = None;
+                            g.subscribed = false;
+                            g.last_packet_at = None;
+                        }
+                    }
+                }
+                Ok(Some(DispatchMsg::EingabeListe(roh))) => {
+                    let abos = shared.eingaben.lock().liste_aufnehmen(&roh, Instant::now());
+                    if let Some(abos) = abos {
+                        eingabe_send_id = None;
+                        let namen: Vec<&str> =
+                            abos.neu.iter().map(|(_, n, _)| n.as_str()).collect();
+                        tracing::info!(?namen, "Input-Events (B:) abonniert");
+                        for (hash, _, get_req) in &abos.neu {
+                            conn.eingabe_abonnieren(*hash, *get_req);
+                        }
+                    }
+                }
+                Ok(Some(DispatchMsg::EingabeWert(roh))) => {
+                    shared.eingaben.lock().get_aufnehmen(&roh);
+                }
+                Ok(Some(DispatchMsg::EingabeAbo(roh))) => {
+                    shared.eingaben.lock().abo_aufnehmen(&roh);
+                }
+                Ok(Some(DispatchMsg::Bildrate(hz))) => {
+                    shared
+                        .sim_bildrate_bits
+                        .store(hz.to_bits(), Ordering::Relaxed);
+                }
+                Ok(Some(DispatchMsg::FlowEvent { event })) => {
+                    // Der Simulator sagt uns selbst, dass die Telemetrie
+                    // gerade nicht den geflogenen Zustand beschreibt. Behandelt
+                    // wie eine Pause — dieselbe Entscheidung wie im X-Plane-
+                    // Adapter fuer `sim/time/is_in_replay`.
+                    //
+                    // Tiefenzaehler statt Ja/Nein: die Vorgaenge koennen sich
+                    // ueberlappen (Teleport waehrend eines Replays). Ein
+                    // einzelnes _DONE wuerde sonst den noch laufenden anderen
+                    // Vorgang mit abraeumen. Nie unter null, damit ein
+                    // verpasstes _START (Abonnement erst mitten im Replay) den
+                    // Zaehler nicht negativ und damit taub macht.
+                    let (delta, name): (i32, &str) = match event {
+                        e if e == FLOW_REPLAY_START => (1, "Replay"),
+                        e if e == FLOW_REPLAY_END => (-1, "Replay"),
+                        e if e == FLOW_TELEPORT_START => (1, "Teleport"),
+                        e if e == FLOW_TELEPORT_DONE => (-1, "Teleport"),
+                        e if e == FLOW_SKIP_START => (1, "Vorspulen"),
+                        e if e == FLOW_SKIP_DONE => (-1, "Vorspulen"),
+                        _ => (0, ""),
+                    };
+                    if delta != 0 {
+                        // Getrenntes Lesen und Schreiben, KEIN atomares
+                        // Aendern: zulaessig nur, weil genau dieser eine
+                        // Dispatch-Faden schreibt. Kommt je ein zweiter dazu
+                        // (weitere Ereignisquelle, Ruecksetzen beim
+                        // Verbindungsabbruch), muss das auf `fetch_add` mit
+                        // Klemmen umgestellt werden — sonst ueberschreiben
+                        // sich zwei Aenderungen, der Zaehler bleibt auf 1 und
+                        // die Telemetrie gilt fuer immer als unecht
+                        // (QS-Befund 21.08.2026).
+                        let vorher = shared.sim_unecht_tiefe.load(Ordering::Relaxed);
+                        let nachher = (vorher + delta).max(0);
+                        shared.sim_unecht_tiefe.store(nachher, Ordering::Relaxed);
+                        tracing::info!(
+                            vorgang = name,
+                            beginnt = delta > 0,
+                            tiefe = nachher,
+                            "Sim meldet: Telemetrie gerade nicht echt"
+                        );
+                    }
+                }
+                Ok(Some(DispatchMsg::SystemEvent { event_id, data })) => {
+                    if event_id == SIM_START_EVENT_ID {
+                        // SimStart fires when the user loads a new
+                        // flight. Re-request AircraftLoaded so we
+                        // pick up any aircraft change. Nur die Abfrage —
+                        // die Abos stehen seit dem Verbindungsaufbau (siehe
+                        // `subscribe_aircraft_loaded`).
+                        //
+                        // Den alten Pfad sofort verwerfen: bis die Antwort
+                        // da ist, soll die Profilerkennung lieber nur den
+                        // Titel sehen als den Pfad des vorigen Flugzeugs.
+                        shared.pmdg.lock().air_path = None;
+                        // Dasselbe fuer die Input-Events: Werte des vorigen
+                        // Flugzeugs sofort verwerfen.
+                        // Eine noch gehaltene MASTER-Lampe gehoert dem alten Muster.
+                        anschnall_sperre = telemetry::StandardAnschnallSperre::default();
+                        halter_warning = sim_core::lampen::LampenHalter::default();
+                        halter_caution = sim_core::lampen::LampenHalter::default();
+                        let alt = shared.eingaben.lock().flugzeug_gewechselt(Instant::now());
+                        conn.eingaben_abmelden(&alt);
+                        if let Err(e) = conn.request_aircraft_loaded() {
+                            tracing::warn!(error = %e, "re-request AircraftLoaded failed");
+                        }
+                    } else if event_id == PAUSE_EX1_EVENT_ID {
+                        // Spec v0.7.15 F5 (QS-Round-2): Pause_EX1 sendet
+                        // bei jedem Pause-Wechsel ein Event mit Flag-Set
+                        // im dwData. Wir behandeln jedes != 0 als
+                        // "Pause aktiv" — Full/Active/Sim-Pause-
+                        // Unterscheidung kommt erst mit einer
+                        // spaeteren Iteration falls relevant.
+                        let paused = data != 0;
+                        shared.sim_pause.lock().melden(paused, Instant::now());
+                        tracing::info!(
+                            data = format!("0x{:x}", data),
+                            paused,
+                            "MSFS SimConnect Pause_EX1-Event empfangen"
+                        );
+                    } else if event_id == CRASHED_EVENT_ID {
+                        // v0.7.19 GAF-707: latch im Shared-State, der
+                        // Snapshot-Builder mergt ihn ein. Spec §Detection.
+                        shared.sim_crashed.store(true, Ordering::Relaxed);
+                        tracing::warn!(
+                            data = format!("0x{:x}", data),
+                            "MSFS SimConnect Crashed-Event empfangen — Accident wird gelatcht"
+                        );
+                    } else if event_id == CRASH_RESET_EVENT_ID {
+                        // v0.7.19 GAF-707: Adapter-Raw-Flag wieder loeschen.
+                        // Der aktive Flug in lib.rs behaelt seinen
+                        // accident_detected-Latch unabhaengig davon
+                        // (Spec §Leitentscheidung 6).
+                        shared.sim_crashed.store(false, Ordering::Relaxed);
+                        tracing::info!(
+                            data = format!("0x{:x}", data),
+                            "MSFS SimConnect CrashReset-Event empfangen — Adapter-Flag geloescht"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "SimConnect dispatch error");
+                    return;
+                }
+            }
+        }
+
+        // PMDG subscription gate. Once we know which variant is
+        // loaded AND we haven't yet subscribed for it, register
+        // the ClientData definition + request data. Best-effort —
+        // an FFI failure logs a warning but doesn't kill the
+        // dispatch loop. Subscribed flag prevents redundant
+        // re-subscriptions on every iteration.
+        let pmdg_action = {
+            let g = shared.pmdg.lock();
+            if !g.subscribed {
+                g.variant
+            } else {
+                None
+            }
+        };
+        let pmdg_action = pmdg_action.filter(|v| {
+            pmdg_sperre.is_none_or(|(bis, gesperrt)| Instant::now() >= bis || gesperrt != *v)
+        });
+        if let Some(variant) = pmdg_action {
+            // Scheitert die Anmeldung (SDK aus), erst nach 5 s erneut —
+            // nicht in jedem Frame mit einer Warnung.
+            match variant {
+                crate::pmdg::PmdgVariant::Ng3 => {
+                    if let Err(e) = conn.register_pmdg_ng3() {
+                        pmdg_sperre = Some((Instant::now() + Duration::from_secs(5), variant));
+                        tracing::warn!(
+                            error = %e,
+                            "PMDG NG3 ClientData subscription failed (SDK probably not enabled in 737NG3_Options.ini)"
+                        );
+                    } else {
+                        tracing::info!("PMDG NG3 ClientData subscription registered");
+                        shared.pmdg.lock().subscribed = true;
+                    }
+                }
+                crate::pmdg::PmdgVariant::X777 => {
+                    if let Err(e) = conn.register_pmdg_x777() {
+                        pmdg_sperre = Some((Instant::now() + Duration::from_secs(5), variant));
+                        tracing::warn!(
+                            error = %e,
+                            "PMDG 777X ClientData subscription failed (SDK probably not enabled in 777X_Options.ini)"
+                        );
+                    } else {
+                        tracing::info!("PMDG 777X ClientData subscription registered");
+                        shared.pmdg.lock().subscribed = true;
+                    }
+                }
+            }
+        }
+
+        // Stale watchdog: if no data has arrived for a while assume
+        // MSFS crashed or the pipe died, and let the outer loop
+        // re-open the connection.
+        if got_first && last_data.elapsed() > STALE_TIMEOUT {
+            tracing::warn!("no SimConnect data for {:?} — reconnecting", STALE_TIMEOUT);
+            return;
+        }
+        // Nie Daten gesehen: der Handle kann tot sein, ohne dass je ein
+        // QUIT kam. Neu oeffnen statt ewig zu warten.
+        if !got_first
+            && crate::handle_frist::erste_daten_ueberfaellig(
+                handshake_gesehen,
+                letztes_lebenszeichen.elapsed(),
+            )
+        {
+            tracing::warn!(
+                handshake_gesehen,
+                seit_s = letztes_lebenszeichen.elapsed().as_secs(),
+                "SimConnect offen, aber nie Daten — oeffne neu"
+            );
+            return;
+        }
+
+        // Bis zum naechsten Frame warten, nicht fest 50 ms.
+        //
+        // Die Daten sind je Frame abonniert (`VISUAL_FRAME`), hier stand
+        // aber seit dem 01.05.2026 eine feste Pause von 50 ms — aus der
+        // Zeit, als sie nur einmal pro Sekunde kamen. Jeder Durchlauf
+        // uebernimmt nur den letzten Stand; die Frames dazwischen
+        // ueberschrieben sich. Der Aufsetz-Sampler fragte zwar alle 20 ms,
+        // sah aber nur alle 40–60 ms neue Werte, effektiv ~20 Hz
+        // (gemessen an SIA 436 und fuenf weiteren MSFS-Fluegen, 12.10.2026).
+        // X-Plane hatte das nie: Dort wartet der Adapter auf jedes Paket.
+        conn.auf_nachrichten_warten(Duration::from_millis(50));
+    }
+}
+
+fn log_first_snapshot_diagnostics(snap: &SimSnapshot) {
+    tracing::info!(
+        fuel_total_kg = snap.fuel_total_kg,
+        total_weight_kg = ?snap.total_weight_kg,
+        aircraft_title = ?snap.aircraft_title,
+        aircraft_profile = ?snap.aircraft_profile,
+        "raw SimConnect first-snapshot fuel/weight diagnostic"
+    );
+}
+
+/// Bildrate aus den gespeicherten Bits — oder nichts.
+///
+/// 0 heisst „noch nichts gemeldet"; ein nicht endlicher oder nicht
+/// positiver Wert ist keine Bildrate.
+fn bildrate_aus_bits(bits: u32) -> Option<f32> {
+    let hz = f32::from_bits(bits);
+    (hz.is_finite() && hz > 0.0).then_some(hz)
+}
+
+fn set_error(shared: &Arc<Shared>, msg: String) {
+    *shared.last_error.lock() = Some(msg);
+}
+
+fn sleep_or_stop(stop: &Arc<AtomicBool>, dur: Duration) {
+    let step = Duration::from_millis(100);
+    let mut left = dur;
+    while !left.is_zero() {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let s = std::cmp::min(step, left);
+        thread::sleep(s);
+        left = left.saturating_sub(s);
+    }
+}
+
+// ---- Connection wrapper ----
+
+/// Owns the SimConnect handle and provides the higher-level operations
+/// the worker loop drives. `Drop` calls `SimConnect_Close`.
+struct Connection {
+    handle: sys::HANDLE,
+    /// Win32-Ereignis, das SimConnect bei jeder neuen Nachricht setzt
+    /// (s. `auf_nachrichten_warten`). Null, wenn es sich nicht anlegen
+    /// liess — dann wird wie frueher fest gewartet.
+    ereignis: sys::HANDLE,
+    /// Wie viele Nachrichten dieser Handle bisher geliefert hat — auch
+    /// unbekannte, die `get_next_dispatch` als `None` zurueckgibt. Nur fuer
+    /// die Lebenszeichen-Uhr in `run_dispatch`.
+    empfangen: u64,
+    /// `(send_id, watch_id)` captured while registering the inspector
+    /// data definition — lets a later async SIMCONNECT_RECV_EXCEPTION be
+    /// attributed back to the specific watch whose AddToDataDefinition
+    /// call produced it. Rebuilt from scratch on every
+    /// `register_inspector()` call. See `telemetry::inspector_watch_for_exception`.
+    /// Keyed on the watch's stable `id`, not its name — two watches can
+    /// legitimately share a name (see `InspectorState::set_error`'s doc).
+    /// Paketkennung → Facility-FELDNAME, fuer asynchrone
+    /// Zurueckweisungen von `AddToFacilityDefinition`.
+    facility_feld_send_ids: Vec<(u32, String)>,
+    inspector_send_ids: Vec<(u32, u32)>,
+    /// Paketkennungen der letzten `UnsubscribeInputEvent`-Aufrufe.
+    ///
+    /// Beim Flugzeugwechsel werden die Abos des VORIGEN Flugzeugs
+    /// abgemeldet; das neue kennt diese Events oft nicht, und MSFS lehnt
+    /// jede Abmeldung mit `UNRECOGNIZED_ID` ab. Das ist erwartet — stand
+    /// aber als Warnung im Log und kam im Health-Report als „neues
+    /// Fehlermuster“ an (54-mal bei 4 Piloten, 30.09.2026). Nur Ablehnungen
+    /// GENAU dieser Pakete gelten als erwartet; alle anderen bleiben Warnung.
+    abmelde_pakete: crate::eingabe_events::AbmeldePakete,
+    /// Gibt es auf DIESER Verbindung schon die Zusatzdefinition (Telemetrie-
+    /// Monitor)? Nur dann wird sie vor dem Umbau gestoppt und geleert.
+    ///
+    /// Vorher geschah das auch beim allerersten Mal. Der Rueckgabewert war
+    /// zwar 0, MSFS lehnte beide Aufrufe aber spaeter asynchron mit
+    /// `UNRECOGNIZED_ID` ab — das Paar im Health-Report (69× bei fuenf
+    /// Piloten, auch mit 1.9.14; Befund 30.09.2026).
+    zusatz_angelegt: bool,
+    /// Dasselbe fuer die Inspektor-Definition (Debug-Modus).
+    inspektor_angelegt: bool,
+    /// Hoechste Zahl Messbloecke, die auf dieser Verbindung angefasst
+    /// wurden — auch in einem abgebrochenen Aufbau. So werden beim naechsten
+    /// Versuch auch halb angelegte Bloecke gestoppt und geleert (QS 01.10.).
+    mess_bloecke_beruehrt: usize,
+    /// Laengenwaechter des Hauptblocks — je Verbindung neu.
+    blockwaechter: telemetry::Blockwaechter,
+    /// Paketkennung → SimVar je `AddToDataDefinition` der Telemetrie- und
+    /// optionalen Definitionen. NUR fuers Log: der `index` einer Ausnahme
+    /// ist die Nummer des PARAMETERS, nicht die eines Felds.
+    telemetrie_send_ids: Vec<(u32, &'static str)>,
+    /// Paketkennungen der Hauptdefinition — entscheidet, welches Feld
+    /// nach einer Ablehnung beim Neuregistrieren ausgelassen wird.
+    haupt_pakete: telemetry::Paketbuch,
+    /// Bei DIESER Verbindung nicht registrierte Hauptfelder.
+    haupt_ausgelassen: Vec<usize>,
+    /// Waehrend dieser Verbindung abgelehnte Hauptfelder; `worker_loop`
+    /// uebernimmt sie fuer die naechste Registrierung.
+    haupt_abgelehnt: Vec<usize>,
+}
+
+impl Connection {
+    fn open(name: &str) -> Result<Self, String> {
+        let cname = std::ffi::CString::new(name).expect("connection name must be plain ASCII");
+        let mut handle: sys::HANDLE = std::ptr::null_mut();
+        // Selbst zuruecksetzend: Ein Warten verbraucht das Signal.
+        let ereignis =
+            unsafe { sys::CreateEventW(std::ptr::null_mut(), 0, 0, std::ptr::null()) };
+        if ereignis.is_null() {
+            tracing::warn!("SimConnect: Ereignis nicht anlegbar — Daten nur alle 50 ms");
+        }
+        let hr = unsafe {
+            sys::SimConnect_Open(
+                &mut handle,
+                cname.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+                ereignis,
+                0,
+            )
+        };
+        if hr != 0 {
+            if !ereignis.is_null() {
+                unsafe { sys::CloseHandle(ereignis) };
+            }
+            return Err(format!("HRESULT 0x{hr:08X}"));
+        }
+        Ok(Self {
+            empfangen: 0,
+            handle,
+            ereignis,
+            facility_feld_send_ids: Vec::new(),
+            inspector_send_ids: Vec::new(),
+            abmelde_pakete: Default::default(),
+            zusatz_angelegt: false,
+            inspektor_angelegt: false,
+            mess_bloecke_beruehrt: 0,
+            blockwaechter: telemetry::Blockwaechter::default(),
+            telemetrie_send_ids: Vec::new(),
+            haupt_pakete: telemetry::Paketbuch::default(),
+            haupt_ausgelassen: Vec::new(),
+            haupt_abgelehnt: Vec::new(),
+        })
+    }
+
+    /// Warten, bis SimConnect eine neue Nachricht meldet — hoechstens
+    /// `frist`, damit Wachhund, Szenerie- und Abo-Pflege weiterlaufen.
+    fn auf_nachrichten_warten(&self, frist: Duration) {
+        if self.ereignis.is_null() {
+            thread::sleep(frist);
+            return;
+        }
+        let ms = u32::try_from(frist.as_millis()).unwrap_or(u32::MAX);
+        unsafe { sys::WaitForSingleObject(self.ereignis, ms) };
+    }
+
+    /// Register every entry in `TELEMETRY_FIELDS` in order.
+    fn register_telemetry(&mut self, ausgelassen: &[usize]) -> Result<(), String> {
+        let handle = self.handle;
+        let mut send_ids: Vec<(u32, &'static str)> = Vec::new();
+        let r = telemetry::hauptdefinition_registrieren(ausgelassen, |field| {
+            let (Ok(cname), Ok(cunit)) = (
+                std::ffi::CString::new(field.name),
+                std::ffi::CString::new(field.unit),
+            ) else {
+                return Err(-1);
+            };
+            let datatype = match field.kind {
+                telemetry::FieldKind::Float64 => sys::SIMCONNECT_DATATYPE_FLOAT64,
+                telemetry::FieldKind::Int32 => sys::SIMCONNECT_DATATYPE_INT32,
+                telemetry::FieldKind::String256 => sys::SIMCONNECT_DATATYPE_STRING256,
+            };
+            let hr = unsafe {
+                sys::SimConnect_AddToDataDefinition(
+                    handle,
+                    DEFINITION_ID,
+                    cname.as_ptr(),
+                    cunit.as_ptr(),
+                    datatype,
+                    0.0,
+                    u32::MAX,
+                )
+            };
+            if hr != 0 {
+                tracing::error!(
+                    feld = field.name,
+                    "AddToDataDefinition returned 0x{hr:08X} — Hauptfeld ausgelassen (None)"
+                );
+                return Err(hr);
+            }
+            let mut send_id: sys::DWORD = 0;
+            if unsafe { sys::SimConnect_GetLastSentPacketID(handle, &mut send_id) } == 0 {
+                send_ids.push((send_id, field.name));
+                Ok(Some(send_id))
+            } else {
+                tracing::warn!(feld = field.name, "GetLastSentPacketID fehlgeschlagen");
+                Ok(None)
+            }
+        });
+        self.telemetrie_send_ids.extend(send_ids);
+        if !r.ausgelassen.is_empty() {
+            tracing::warn!(
+                felder = ?r.ausgelassen.iter().map(|i| TELEMETRY_FIELDS[*i].name).collect::<Vec<_>>(),
+                "Hauptfelder nach Ablehnung ausgelassen — bleiben None"
+            );
+        }
+        self.haupt_ausgelassen = r.ausgelassen;
+        self.haupt_pakete = r.pakete;
+        Ok(())
+    }
+
+    /// Paketkennung des letzten Aufrufs fuer `name` merken (Log) und
+    /// zurueckgeben.
+    fn paket_merken(&mut self, name: &'static str) -> Option<u32> {
+        let mut send_id: sys::DWORD = 0;
+        if unsafe { sys::SimConnect_GetLastSentPacketID(self.handle, &mut send_id) } == 0 {
+            self.telemetrie_send_ids.push((send_id, name));
+            Some(send_id)
+        } else {
+            tracing::warn!(feld = name, "GetLastSentPacketID fehlgeschlagen");
+            None
+        }
+    }
+
+    /// Je optionale SimVar eine eigene Definition und Anfrage (1 Hz).
+    fn register_optionale(&mut self) -> Result<(), String> {
+        for (i, field) in OPTIONALE_FELDER.iter().enumerate() {
+            let cname = std::ffi::CString::new(field.name)
+                .map_err(|_| "SimVar name contained NUL".to_string())?;
+            let cunit = std::ffi::CString::new(field.unit)
+                .map_err(|_| "Unit string contained NUL".to_string())?;
+            let datatype = match field.kind {
+                telemetry::FieldKind::Float64 => sys::SIMCONNECT_DATATYPE_FLOAT64,
+                telemetry::FieldKind::Int32 => sys::SIMCONNECT_DATATYPE_INT32,
+                telemetry::FieldKind::String256 => sys::SIMCONNECT_DATATYPE_STRING256,
+            };
+            let definition = OPTIONAL_DEFINITION_BASE + i as u32;
+            let hr = unsafe {
+                sys::SimConnect_AddToDataDefinition(
+                    self.handle,
+                    definition,
+                    cname.as_ptr(),
+                    cunit.as_ptr(),
+                    datatype,
+                    0.0,
+                    u32::MAX,
+                )
+            };
+            if hr != 0 {
+                return Err(format!(
+                    "AddToDataDefinition for optional SimVar \"{}\" returned 0x{hr:08X}",
+                    field.name
+                ));
+            }
+            self.paket_merken(field.name);
+            let hr = unsafe {
+                sys::SimConnect_RequestDataOnSimObject(
+                    self.handle,
+                    OPTIONAL_REQUEST_BASE + i as u32,
+                    definition,
+                    sys::SIMCONNECT_OBJECT_ID_USER,
+                    sys::SIMCONNECT_PERIOD_SECOND,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+            };
+            if hr != 0 {
+                return Err(format!(
+                    "RequestDataOnSimObject for optional SimVar \"{}\" returned 0x{hr:08X}",
+                    field.name
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Die Facility-Definition zusammensetzen — Bahnen und Rollwege.
+    ///
+    /// # Wie die Schnittstelle arbeitet
+    ///
+    /// Die Definition besteht aus Feldnamen und Klammern:
+    /// `OPEN AIRPORT` … `OPEN RUNWAY` … `CLOSE RUNWAY` … `CLOSE AIRPORT`.
+    /// Danach liefert `RequestFacilityData` die Elemente einzeln, in der
+    /// Reihenfolge der Definition, als rohe Datenbloecke.
+    ///
+    /// ⚠ Die Feldnamen stehen NICHT in `SimConnect.h`, sondern in der
+    /// SDK-Dokumentation, und sie sind GROSS_MIT_UNTERSTRICH. Ich hatte
+    /// sie zuerst als `Latitude`/`Heading` geraten — jeder dieser Namen
+    /// waere hier abgelehnt worden, und zwar erst zur Laufzeit.
+    ///
+    /// Ein abgelehntes Feld ist deshalb ein **harter** Fehler und kein
+    /// „best effort": Faehlt `WIDTH`, kommt die Bahn ohne Breite zurueck
+    /// — und die Breite ist genau das Mass, mit dem entschieden wird, ob
+    /// eine Rollspur die befestigte Flaeche verlaesst.
+    fn register_facility(&mut self) -> Result<(), String> {
+        let mut eintraege: Vec<&str> = vec!["OPEN AIRPORT"];
+        // Der Referenzpunkt des Platzes — ohne ihn sind die
+        // Rollwegpunkte nicht umrechenbar, sie kommen als Versatz in
+        // Metern (`BIAS_X`/`BIAS_Z`).
+        eintraege.extend(facility::FLUGHAFEN_FELDER.iter().map(|(n, _)| *n));
+        eintraege.push("OPEN RUNWAY");
+        // ⚠ `BAHN_DEFINITION`, NICHT `BAHN_FELDER`: Die versetzte
+        // Schwelle liegt in einem PAVEMENT-Untersatz, der mit
+        // OPEN/CLOSE PRIMARY_THRESHOLD geoeffnet wird. Diese Marken
+        // liefern keine Bytes und stehen darum nicht im Byte-Raster.
+        eintraege.extend(facility::BAHN_DEFINITION.iter().copied());
+        eintraege.push("CLOSE RUNWAY");
+        // v1.7.19 — Startpositionen. Kind von AIRPORT, nicht von RUNWAY
+        // (siehe `facility::START_FELDER`) — deshalb ein eigener
+        // Klammerblock auf derselben Ebene wie TAXI_POINT etc., nicht
+        // innerhalb OPEN/CLOSE RUNWAY.
+        eintraege.push("OPEN START");
+        eintraege.extend(facility::START_FELDER.iter().map(|(n, _)| *n));
+        eintraege.push("CLOSE START");
+        // Rollwege: Punkte, Kanten, Namen — drei Listen, die ueber
+        // Indizes zusammenhaengen, genau wie X-Planes 1201/1202.
+        eintraege.push("OPEN TAXI_POINT");
+        eintraege.extend(facility::ROLLWEG_PUNKT_FELDER.iter().map(|(n, _)| *n));
+        eintraege.push("CLOSE TAXI_POINT");
+        eintraege.push("OPEN TAXI_NAME");
+        eintraege.extend(facility::ROLLWEG_NAME_FELDER.iter().map(|(n, _)| *n));
+        eintraege.push("CLOSE TAXI_NAME");
+        eintraege.push("OPEN TAXI_PATH");
+        eintraege.extend(facility::ROLLWEG_KANTE_FELDER.iter().map(|(n, _)| *n));
+        eintraege.push("CLOSE TAXI_PATH");
+        // v1.7.16 — Parkpositionen (Gates/Rampen), unabhaengig von OSM.
+        eintraege.push("OPEN TAXI_PARKING");
+        eintraege.extend(facility::STAND_FELDER.iter().map(|(n, _)| *n));
+        eintraege.push("CLOSE TAXI_PARKING");
+        eintraege.push("CLOSE AIRPORT");
+
+        for name in eintraege {
+            let cname =
+                std::ffi::CString::new(name).map_err(|_| "Feldname enthielt NUL".to_string())?;
+            let hr = unsafe {
+                sys::SimConnect_AddToFacilityDefinition(
+                    self.handle,
+                    FACILITY_DEFINITION_ID,
+                    cname.as_ptr(),
+                )
+            };
+            if hr != 0 {
+                return Err(format!(
+                    "AddToFacilityDefinition fuer \"{name}\" gab 0x{hr:08X} zurueck — \
+                     Feldname pruefen (SDK-Doku, GROSS_MIT_UNTERSTRICH)"
+                ));
+            }
+            // ⚠ Ein `hr == 0` heisst NICHT, dass der Feldname stimmt.
+            // Das SDK nennt eine asynchrone Ausnahme ausdruecklich als
+            // moeglichen Ausgang dieses Aufrufs — sie kommt spaeter und
+            // verweist auf die Paketkennung DIESES Aufrufs.
+            //
+            // Ohne diese Zuordnung deutet der Ausnahmezweig ihren
+            // `index` ueber die TELEMETRIE-Feldliste und nennt einen
+            // voellig fremden SimVar-Namen. Ein falsch geschriebenes
+            // Facility-Feld sieht dann aus wie ein Telemetrie-Problem
+            // (QS-Befund 4, zweite Runde).
+            let mut send_id: sys::DWORD = 0;
+            let hr = unsafe { sys::SimConnect_GetLastSentPacketID(self.handle, &mut send_id) };
+            if hr == 0 {
+                self.facility_feld_send_ids
+                    .push((send_id, name.to_string()));
+            } else {
+                // ⚠ HART scheitern, nicht nur warnen.
+                //
+                // Die Paketkennung ist die Voraussetzung der Zusage
+                // „ein abgelehntes Feld schliesst den Weg". Fehlt sie,
+                // erreicht eine spaeter eintreffende Feld-Ausnahme
+                // `definition_abgelehnt` nie — die Sperre haette einen
+                // offenen Eingang, und der Weg liefe mit einer
+                // Definition weiter, deren Ablehnung niemand mehr
+                // zuordnen kann (QS-Befund 4, fuenfte Runde).
+                return Err(format!(
+                    "GetLastSentPacketID nach AddToFacilityDefinition({name}) \
+                     fehlgeschlagen — ohne Paketkennung ist eine Zurueckweisung \
+                     dieses Feldes nicht zuzuordnen"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Die Bahnen eines Flughafens anfordern.
+    ///
+    /// Die Antworten kommen asynchron ueber die Empfangsschleife als
+    /// `DispatchMsg::FacilityData`, abgeschlossen von
+    /// `FacilityDataEnde`. Der Aufruf selbst kehrt sofort zurueck.
+    fn request_facility(
+        &mut self,
+        icao: &str,
+        request_id: sys::SIMCONNECT_DATA_REQUEST_ID,
+    ) -> Result<Option<u32>, String> {
+        let cicao = std::ffi::CString::new(icao).map_err(|_| "ICAO enthielt NUL".to_string())?;
+        let leer = std::ffi::CString::new("").expect("leere Zeichenkette");
+        let hr = unsafe {
+            sys::SimConnect_RequestFacilityData(
+                self.handle,
+                FACILITY_DEFINITION_ID,
+                request_id,
+                cicao.as_ptr(),
+                leer.as_ptr(),
+            )
+        };
+        if hr != 0 {
+            return Err(format!(
+                "RequestFacilityData({icao}) gab 0x{hr:08X} zurueck"
+            ));
+        }
+        // ⚠ Ein `hr == 0` heisst NICHT, dass der Simulator den Platz
+        // kennt. Eine Zurueckweisung kommt spaeter und asynchron als
+        // `SIMCONNECT_RECV_EXCEPTION`, und sie verweist auf die
+        // Paketkennung DIESES Aufrufs. Ohne sie bliebe der Auftrag
+        // „unterwegs", und das Buch fragte zehnmal nach einem Platz, den
+        // es nicht gibt.
+        // ⚠ `Err` heisst NICHT GESENDET. Hier ist schon gesendet.
+        //
+        // Die vorige Fassung gab `Err` zurueck, wenn nur
+        // `GetLastSentPacketID` scheiterte — obwohl
+        // `RequestFacilityData` bereits `S_OK` gemeldet hatte. Der
+        // Aufrufer eroeffnete daraufhin keinen Sammler, gab den Auftrag
+        // frei und sendete erneut; die Daten der bereits erfolgreich
+        // gesendeten Anfrage fielen mangels Sammler weg (QS-Befund 3,
+        // siebte Runde).
+        //
+        // `Ok(None)` heisst also: gesendet, aber eine spaetere Ausnahme
+        // waere nicht zuzuordnen. Die Lieferung kommt trotzdem an — sie
+        // laeuft ueber die Anfragekennung, nicht ueber die Paketkennung.
+        //
+        // ⚠ Bei den DEFINITIONSeintraegen ist das anders und bleibt
+        // hart: Dort haengt die Zusage „ein abgelehntes Feld schliesst
+        // den Weg" an der Zuordnung. Ohne sie liefe der Weg mit einer
+        // ungueltigen Definition weiter und lieferte Daten, die niemand
+        // deuten kann. Hier ist der schlimmste Fall eine einzelne
+        // unzuordenbare Ausnahme.
+        let mut send_id: sys::DWORD = 0;
+        let hr = unsafe { sys::SimConnect_GetLastSentPacketID(self.handle, &mut send_id) };
+        if hr != 0 {
+            tracing::warn!(
+                %icao,
+                "GetLastSentPacketID nach RequestFacilityData fehlgeschlagen — \
+                 die Anfrage LIEF, nur eine spaetere Ausnahme waere nicht \
+                 zuzuordnen"
+            );
+            return Ok(None);
+        }
+        Ok(Some(send_id))
+    }
+
+    /// Register the touchdown sample fields under definition #2.
+    /// Best-effort: we already log per-field exceptions in the
+    /// dispatch loop, so a partial registration here is recoverable.
+    fn register_touchdown(&mut self) -> Result<(), String> {
+        for (idx, field) in TOUCHDOWN_FIELDS.iter().enumerate() {
+            let cname = std::ffi::CString::new(field.name)
+                .map_err(|_| "SimVar name contained NUL".to_string())?;
+            let cunit = std::ffi::CString::new(field.unit)
+                .map_err(|_| "Unit string contained NUL".to_string())?;
+            let datatype = match field.kind {
+                telemetry::FieldKind::Float64 => sys::SIMCONNECT_DATATYPE_FLOAT64,
+                telemetry::FieldKind::Int32 => sys::SIMCONNECT_DATATYPE_INT32,
+                telemetry::FieldKind::String256 => sys::SIMCONNECT_DATATYPE_STRING256,
+            };
+            let hr = unsafe {
+                sys::SimConnect_AddToDataDefinition(
+                    self.handle,
+                    TOUCHDOWN_DEFINITION_ID,
+                    cname.as_ptr(),
+                    cunit.as_ptr(),
+                    datatype,
+                    0.0,
+                    u32::MAX,
+                )
+            };
+            if hr != 0 {
+                return Err(format!(
+                    "AddToDataDefinition for touchdown SimVar #{idx} \"{}\" returned 0x{hr:08X}",
+                    field.name
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-register the inspector data definition from scratch using
+    /// the supplied watchlist. Always clears the existing definition
+    /// first so a removed entry actually goes away — SimConnect has
+    /// no per-field "remove" call. An empty watchlist is valid (just
+    /// clears the definition and skips the request).
+    fn register_inspector(&mut self, watches: &[InspectorWatch]) -> Result<(), String> {
+        // Nur leeren, was es gibt: ClearDataDefinition gibt zwar auch fuer
+        // eine noch nicht vorhandene Definition S_OK zurueck, MSFS lehnt sie
+        // dann aber asynchron mit UNRECOGNIZED_ID ab (Befund 30.09.2026).
+        if self.inspektor_angelegt {
+            let hr = unsafe {
+                sys::SimConnect_ClearDataDefinition(self.handle, INSPECTOR_DEFINITION_ID)
+            };
+            // Non-zero is a real error.
+            if hr != 0 {
+                return Err(format!("ClearDataDefinition returned 0x{hr:08X}"));
+            }
+            self.inspektor_angelegt = false;
+        }
+        // Rebuilt below, one entry per successfully-issued
+        // AddToDataDefinition call — this is what lets a later async
+        // exception be attributed back to the right watch.
+        self.inspector_send_ids.clear();
+        for (idx, w) in watches.iter().enumerate() {
+            let cname = std::ffi::CString::new(w.name.as_str())
+                .map_err(|_| format!("watch #{idx} name contained NUL"))?;
+            let cunit = std::ffi::CString::new(w.unit.as_str())
+                .map_err(|_| format!("watch #{idx} unit contained NUL"))?;
+            let datatype = match w.kind {
+                WatchKind::Number => sys::SIMCONNECT_DATATYPE_FLOAT64,
+                WatchKind::Bool => sys::SIMCONNECT_DATATYPE_INT32,
+                WatchKind::String => sys::SIMCONNECT_DATATYPE_STRING256,
+            };
+            let hr = unsafe {
+                sys::SimConnect_AddToDataDefinition(
+                    self.handle,
+                    INSPECTOR_DEFINITION_ID,
+                    cname.as_ptr(),
+                    cunit.as_ptr(),
+                    datatype,
+                    0.0,
+                    u32::MAX,
+                )
+            };
+            if hr != 0 {
+                return Err(format!(
+                    "AddToDataDefinition for inspector watch \"{}\" returned 0x{hr:08X}",
+                    w.name
+                ));
+            }
+            self.inspektor_angelegt = true;
+            // AddToDataDefinition frequently reports success (hr == 0)
+            // synchronously even for a name SimConnect can't actually
+            // resolve — MSFS only raises SIMCONNECT_RECV_EXCEPTION for
+            // that later, asynchronously, referencing this call's own
+            // send ID. Capture it now so the dispatch loop can route
+            // that exception back to watch `w`.
+            let mut send_id: sys::DWORD = 0;
+            let hr = unsafe { sys::SimConnect_GetLastSentPacketID(self.handle, &mut send_id) };
+            if hr == 0 {
+                self.inspector_send_ids.push((send_id, w.id));
+            } else {
+                tracing::warn!(
+                    watch = %w.name,
+                    "GetLastSentPacketID failed after AddToDataDefinition; this watch's exceptions won't be attributable"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Zusatzdefinition #4 neu anlegen (Telemetrie-Monitor). Leere Liste =
+    /// Abfrage beenden. Gibt je Feld (Paketkennung, Index) zurueck, damit
+    /// eine spaetere Ausnahme dem Feld zugeordnet werden kann.
+    fn register_zusatz(
+        &mut self,
+        felder: &[(usize, crate::zusatz::ZusatzFeld)],
+    ) -> Result<Vec<(u32, usize)>, String> {
+        // Laufende Anfrage zuerst stoppen, sonst liefert SimConnect waehrend
+        // des Umbaus Bloecke im alten Raster. Nur wenn es sie gibt — siehe
+        // `zusatz_angelegt`.
+        if self.zusatz_angelegt {
+            let hr = unsafe {
+                sys::SimConnect_RequestDataOnSimObject(
+                    self.handle,
+                    ZUSATZ_REQUEST_ID,
+                    ZUSATZ_DEFINITION_ID,
+                    sys::SIMCONNECT_OBJECT_ID_USER,
+                    sys::SIMCONNECT_PERIOD_NEVER,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+            };
+            if hr != 0 {
+                tracing::debug!("Zusatzanfrage stoppen: 0x{hr:08X}");
+            }
+            let hr =
+                unsafe { sys::SimConnect_ClearDataDefinition(self.handle, ZUSATZ_DEFINITION_ID) };
+            // Eine Ablehnung ist KEIN Grund abzubrechen: ohne Abbruch lief die
+            // Schleife 11 min lang im Takt von ~20/s auf denselben Fehler
+            // (13240 Warnungen, 30.09.2026). `register_messung` macht es so.
+            if hr != 0 {
+                tracing::debug!("Zusatzdefinition leeren: 0x{hr:08X}");
+            }
+            self.zusatz_angelegt = false;
+        }
+        let mut kennungen = Vec::with_capacity(felder.len());
+        if felder.is_empty() {
+            return Ok(kennungen);
+        }
+        for (idx, feld) in felder {
+            let cname = std::ffi::CString::new(feld.simvar.as_str())
+                .map_err(|_| format!("Zusatzfeld {} enthaelt NUL", feld.kanal))?;
+            let cunit = std::ffi::CString::new(feld.einheit.as_str())
+                .map_err(|_| format!("Einheit von {} enthaelt NUL", feld.kanal))?;
+            let hr = unsafe {
+                sys::SimConnect_AddToDataDefinition(
+                    self.handle,
+                    ZUSATZ_DEFINITION_ID,
+                    cname.as_ptr(),
+                    cunit.as_ptr(),
+                    sys::SIMCONNECT_DATATYPE_FLOAT64,
+                    0.0,
+                    u32::MAX,
+                )
+            };
+            if hr != 0 {
+                return Err(format!(
+                    "AddToDataDefinition (Zusatz) \"{}\" returned 0x{hr:08X}",
+                    feld.simvar
+                ));
+            }
+            // Ab dem ersten Feld gibt es die Definition — auch wenn ein
+            // spaeteres Feld scheitert, muss der naechste Versuch sie leeren,
+            // sonst wuerde sie doppelt befuellt (QS 01.10.2026).
+            self.zusatz_angelegt = true;
+            let mut send_id: sys::DWORD = 0;
+            let hr = unsafe { sys::SimConnect_GetLastSentPacketID(self.handle, &mut send_id) };
+            if hr == 0 {
+                kennungen.push((send_id, *idx));
+            }
+        }
+        let hr = unsafe {
+            sys::SimConnect_RequestDataOnSimObject(
+                self.handle,
+                ZUSATZ_REQUEST_ID,
+                ZUSATZ_DEFINITION_ID,
+                sys::SIMCONNECT_OBJECT_ID_USER,
+                sys::SIMCONNECT_PERIOD_VISUAL_FRAME,
+                0,
+                0,
+                0,
+                0,
+            )
+        };
+        if hr != 0 {
+            return Err(format!(
+                "RequestDataOnSimObject (Zusatz) returned 0x{hr:08X}"
+            ));
+        }
+        Ok(kennungen)
+    }
+
+    /// Messbloecke fuer „Flugzeug vermessen" (neu) anlegen. Erst die `alt`
+    /// bisher angelegten Bloecke stoppen und leeren, dann je Block eine
+    /// Definition mit Abfrage einmal pro Sekunde. Liefert je Feld
+    /// (Paketkennung, Block, Position) fuer die Zuordnung von Ausnahmen.
+    fn register_messung(
+        &mut self,
+        bloecke: &[Vec<(usize, crate::vermessung::MessFeld)>],
+        alt: usize,
+    ) -> Result<Vec<(u32, usize, usize)>, String> {
+        // Nur die `alt` wirklich angelegten Bloecke stoppen und leeren. Bis
+        // v1.9.14 ging die Schleife bis `alt.max(bloecke.len())` — beim Start
+        // einer Messung also auch ueber Bloecke, die es noch nicht gab; MSFS
+        // lehnte jeden davon zweifach mit `UNRECOGNIZED_ID` ab (Befund
+        // 30.09.2026: 8 Ablehnungen = 4 Bloecke × Stoppen + Leeren).
+        // `mess_bloecke_beruehrt` deckt einen vorher abgebrochenen Aufbau ab.
+        for b in 0..alt.max(self.mess_bloecke_beruehrt) {
+            let id = crate::vermessung::ID_BASIS + b as u32;
+            unsafe {
+                sys::SimConnect_RequestDataOnSimObject(
+                    self.handle,
+                    id,
+                    id,
+                    sys::SIMCONNECT_OBJECT_ID_USER,
+                    sys::SIMCONNECT_PERIOD_NEVER,
+                    0,
+                    0,
+                    0,
+                    0,
+                );
+                sys::SimConnect_ClearDataDefinition(self.handle, id);
+            }
+        }
+        self.mess_bloecke_beruehrt = 0;
+        let mut kennungen = Vec::new();
+        for (b, block) in bloecke.iter().enumerate() {
+            let id = crate::vermessung::ID_BASIS + b as u32;
+            self.mess_bloecke_beruehrt = b + 1;
+            for (p, (_, feld)) in block.iter().enumerate() {
+                let (Ok(cname), Ok(cunit)) = (
+                    std::ffi::CString::new(feld.simvar.as_str()),
+                    std::ffi::CString::new(feld.einheit.as_str()),
+                ) else {
+                    continue;
+                };
+                let hr = unsafe {
+                    sys::SimConnect_AddToDataDefinition(
+                        self.handle,
+                        id,
+                        cname.as_ptr(),
+                        cunit.as_ptr(),
+                        sys::SIMCONNECT_DATATYPE_FLOAT64,
+                        0.0,
+                        u32::MAX,
+                    )
+                };
+                if hr != 0 {
+                    return Err(format!(
+                        "AddToDataDefinition (Messung) \"{}\" returned 0x{hr:08X}",
+                        feld.simvar
+                    ));
+                }
+                let mut send_id: sys::DWORD = 0;
+                if unsafe { sys::SimConnect_GetLastSentPacketID(self.handle, &mut send_id) } == 0 {
+                    kennungen.push((send_id, b, p));
+                }
+            }
+            let hr = unsafe {
+                sys::SimConnect_RequestDataOnSimObject(
+                    self.handle,
+                    id,
+                    id,
+                    sys::SIMCONNECT_OBJECT_ID_USER,
+                    sys::SIMCONNECT_PERIOD_SECOND,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+            };
+            if hr != 0 {
+                return Err(format!(
+                    "RequestDataOnSimObject (Messung) returned 0x{hr:08X}"
+                ));
+            }
+        }
+        Ok(kennungen)
+    }
+
+    fn request_inspector_per_second(&mut self) -> Result<(), String> {
+        let hr = unsafe {
+            sys::SimConnect_RequestDataOnSimObject(
+                self.handle,
+                INSPECTOR_REQUEST_ID,
+                INSPECTOR_DEFINITION_ID,
+                sys::SIMCONNECT_OBJECT_ID_USER,
+                sys::SIMCONNECT_PERIOD_SECOND,
+                0,
+                0,
+                0,
+                0,
+            )
+        };
+        if hr != 0 {
+            return Err(format!("HRESULT 0x{hr:08X}"));
+        }
+        Ok(())
+    }
+
+    fn request_touchdown_per_second(&mut self) -> Result<(), String> {
+        // Bumped from SECOND to VISUAL_FRAME (~30 Hz) for the same
+        // reason the main telemetry runs that fast: the FSM's
+        // Final → Landing tick can fire just before the next
+        // SECOND-period touchdown update has propagated the freshly
+        // latched values into shared.touchdown, leaving the V/S
+        // capture stale by up to 1 second. At ~30 Hz the latch is
+        // visible to the next snapshot within ~33 ms.
+        let hr = unsafe {
+            sys::SimConnect_RequestDataOnSimObject(
+                self.handle,
+                TOUCHDOWN_REQUEST_ID,
+                TOUCHDOWN_DEFINITION_ID,
+                sys::SIMCONNECT_OBJECT_ID_USER,
+                sys::SIMCONNECT_PERIOD_VISUAL_FRAME,
+                0,
+                0,
+                0,
+                0,
+            )
+        };
+        if hr != 0 {
+            return Err(format!("HRESULT 0x{hr:08X}"));
+        }
+        Ok(())
+    }
+
+    /// Subscribe to live telemetry at VISUAL_FRAME cadence (~30 Hz).
+    /// The 1 Hz SECOND rate we ran on previously was too sparse for
+    /// touchdown capture: the actual ground-contact subframe dropped
+    /// between two snapshots, the ring buffer only had 5 entries in
+    /// the 5-second look-back window, and the recorded V/S routinely
+    /// caught the bounce-rebound rather than the impact (logged
+    /// "V/S -4 fpm" while MSFS reported -114 fpm). At 30 Hz the
+    /// buffer holds 150 entries → impossible to miss the actual
+    /// touchdown frame.
+    ///
+    /// CPU cost is negligible: the dispatch loop already drains all
+    /// queued messages each tick via `get_next_dispatch`, so the
+    /// only difference is more byte-level parsing per second
+    /// (~30 KB/s of data).
+    fn request_data_per_second(&mut self) -> Result<(), String> {
+        let hr = unsafe {
+            sys::SimConnect_RequestDataOnSimObject(
+                self.handle,
+                REQUEST_ID,
+                DEFINITION_ID,
+                sys::SIMCONNECT_OBJECT_ID_USER,
+                sys::SIMCONNECT_PERIOD_VISUAL_FRAME,
+                0,
+                0,
+                0,
+                0,
+            )
+        };
+        if hr != 0 {
+            return Err(format!("HRESULT 0x{hr:08X}"));
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------
+    // PMDG SDK ClientData (Phase 5.2)
+    // ------------------------------------------------------------
+
+    /// Subscribe to the PMDG NG3 `PMDG_NG3_Data` ClientData channel.
+    ///
+    /// Three-step setup per the SDK reference (`PMDG_NG3_ConnectionTest.cpp`):
+    ///   1. Map the well-known data area name to PMDG's reserved ID.
+    ///   2. Define the area shape (one big 916-byte block at offset 0).
+    ///   3. Request data on change (`PERIOD_ON_SET + FLAG_CHANGED`).
+    ///
+    /// Returns `Err(_)` for any FFI failure. Note that even a perfect
+    /// subscription returns silently if the user hasn't enabled
+    /// `EnableDataBroadcast=1` in the PMDG options ini — the
+    /// `last_packet_at` field of `PmdgSharedState` is the way to
+    /// detect "subscription succeeded but no data flowing".
+    fn register_pmdg_ng3(&mut self) -> Result<(), String> {
+        let cname = std::ffi::CString::new(crate::pmdg::ng3::PMDG_NG3_DATA_NAME)
+            .expect("PMDG_NG3_Data is plain ASCII");
+        let hr = unsafe {
+            sys::SimConnect_MapClientDataNameToID(
+                self.handle,
+                cname.as_ptr(),
+                crate::pmdg::ng3::PMDG_NG3_DATA_ID,
+            )
+        };
+        if hr != 0 {
+            return Err(format!("MapClientDataNameToID returned 0x{hr:08X}"));
+        }
+
+        let hr = unsafe {
+            sys::SimConnect_AddToClientDataDefinition(
+                self.handle,
+                PMDG_NG3_DEFINITION_ID,
+                0, // offset 0 — entire struct in one shot
+                std::mem::size_of::<crate::pmdg::ng3::Pmdg738RawData>() as sys::DWORD,
+                0.0,      // fEpsilon (unused for this layout)
+                u32::MAX, // DatumID (unused)
+            )
+        };
+        if hr != 0 {
+            return Err(format!("AddToClientDataDefinition returned 0x{hr:08X}"));
+        }
+
+        // PERIOD_ON_SET means "send only when PMDG actually pushes
+        // a new value" (NOT once per second), and FLAG_CHANGED
+        // further filters to "only when bytes differ from last".
+        // Combined: zero traffic when nothing changes; near-instant
+        // when something does.
+        let period_on_set: sys::SIMCONNECT_CLIENT_DATA_PERIOD =
+            sys::SIMCONNECT_CLIENT_DATA_PERIOD_SIMCONNECT_CLIENT_DATA_PERIOD_ON_SET;
+        let flag_changed: sys::SIMCONNECT_CLIENT_DATA_REQUEST_FLAG =
+            sys::SIMCONNECT_CLIENT_DATA_REQUEST_FLAG_CHANGED;
+        let hr = unsafe {
+            sys::SimConnect_RequestClientData(
+                self.handle,
+                crate::pmdg::ng3::PMDG_NG3_DATA_ID,
+                PMDG_NG3_REQUEST_ID,
+                PMDG_NG3_DEFINITION_ID,
+                period_on_set,
+                flag_changed,
+                0,
+                0,
+                0,
+            )
+        };
+        if hr != 0 {
+            return Err(format!("RequestClientData returned 0x{hr:08X}"));
+        }
+        Ok(())
+    }
+
+    /// Subscribe to the PMDG 777X `PMDG_777X_Data` ClientData channel.
+    /// Same 3-step pattern as `register_pmdg_ng3` but with the 777X
+    /// names + IDs and a different struct size (684 bytes vs 916).
+    fn register_pmdg_x777(&mut self) -> Result<(), String> {
+        let cname = std::ffi::CString::new(crate::pmdg::x777::PMDG_777X_DATA_NAME)
+            .expect("PMDG_777X_Data is plain ASCII");
+        let hr = unsafe {
+            sys::SimConnect_MapClientDataNameToID(
+                self.handle,
+                cname.as_ptr(),
+                crate::pmdg::x777::PMDG_777X_DATA_ID,
+            )
+        };
+        if hr != 0 {
+            return Err(format!("MapClientDataNameToID(777X) returned 0x{hr:08X}"));
+        }
+
+        let hr = unsafe {
+            sys::SimConnect_AddToClientDataDefinition(
+                self.handle,
+                PMDG_X777_DEFINITION_ID,
+                0,
+                std::mem::size_of::<crate::pmdg::x777::Pmdg777XRawData>() as sys::DWORD,
+                0.0,
+                u32::MAX,
+            )
+        };
+        if hr != 0 {
+            return Err(format!(
+                "AddToClientDataDefinition(777X) returned 0x{hr:08X}"
+            ));
+        }
+
+        let period_on_set: sys::SIMCONNECT_CLIENT_DATA_PERIOD =
+            sys::SIMCONNECT_CLIENT_DATA_PERIOD_SIMCONNECT_CLIENT_DATA_PERIOD_ON_SET;
+        let flag_changed: sys::SIMCONNECT_CLIENT_DATA_REQUEST_FLAG =
+            sys::SIMCONNECT_CLIENT_DATA_REQUEST_FLAG_CHANGED;
+        let hr = unsafe {
+            sys::SimConnect_RequestClientData(
+                self.handle,
+                crate::pmdg::x777::PMDG_777X_DATA_ID,
+                PMDG_X777_REQUEST_ID,
+                PMDG_X777_DEFINITION_ID,
+                period_on_set,
+                flag_changed,
+                0,
+                0,
+                0,
+            )
+        };
+        if hr != 0 {
+            return Err(format!("RequestClientData(777X) returned 0x{hr:08X}"));
+        }
+        Ok(())
+    }
+
+    /// MSFS-2024-Input-Events aufzaehlen. Liefert die Paketkennung, damit
+    /// eine asynchrone Ablehnung (MSFS 2020) zugeordnet werden kann.
+    fn eingaben_aufzaehlen(&mut self, req: u32) -> Result<Option<u32>, String> {
+        let hr = unsafe { sys::SimConnect_EnumerateInputEvents(self.handle, req) };
+        if hr != 0 {
+            return Err(format!("EnumerateInputEvents returned 0x{hr:08X}"));
+        }
+        let mut id: sys::DWORD = 0;
+        let hr = unsafe { sys::SimConnect_GetLastSentPacketID(self.handle, &mut id) };
+        Ok((hr == 0).then_some(id))
+    }
+
+    /// Ein Input-Event auf Aenderungen abonnieren und den Startwert einmal
+    /// abfragen. Nur lesen — `SetInputEvent` gibt es hier nicht.
+    fn eingabe_abonnieren(&mut self, hash: u64, get_req: u32) {
+        let hr = unsafe { sys::SimConnect_SubscribeInputEvent(self.handle, hash) };
+        if hr != 0 {
+            tracing::warn!(hash, "SubscribeInputEvent returned 0x{hr:08X}");
+        }
+        let hr = unsafe { sys::SimConnect_GetInputEvent(self.handle, get_req, hash) };
+        if hr != 0 {
+            tracing::warn!(hash, "GetInputEvent returned 0x{hr:08X}");
+        }
+    }
+
+    /// Abos des vorigen Flugzeugs abmelden (Fehler egal — das Flugzeug
+    /// kann schon weg sein).
+    fn eingaben_abmelden(&mut self, hashes: &[u64]) {
+        for h in hashes {
+            let hr = unsafe { sys::SimConnect_UnsubscribeInputEvent(self.handle, *h) };
+            if hr != 0 {
+                continue;
+            }
+            let mut id: sys::DWORD = 0;
+            if unsafe { sys::SimConnect_GetLastSentPacketID(self.handle, &mut id) } == 0 {
+                self.abmelde_pakete.merken(id);
+            }
+        }
+    }
+
+    /// One-shot request for the AircraftLoaded system state. Safe to
+    /// repeat — used on every SimStart to pick up an aircraft change.
+    fn request_aircraft_loaded(&mut self) -> Result<(), String> {
+        let cstate =
+            std::ffi::CString::new("AircraftLoaded").expect("AircraftLoaded is plain ASCII");
+        let hr = unsafe {
+            sys::SimConnect_RequestSystemState(
+                self.handle,
+                AIRCRAFT_LOADED_REQUEST_ID,
+                cstate.as_ptr(),
+            )
+        };
+        if hr != 0 {
+            return Err(format!(
+                "RequestSystemState(AircraftLoaded) returned 0x{hr:08X}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Subscribe to the AircraftLoaded system state — both as a
+    /// one-shot request (so we know what's loaded right now) and as
+    /// a subscription to "SimStart" for live aircraft changes.
+    ///
+    /// ⚠ NUR EINMAL je Verbindung aufrufen. Die Abos bleiben bestehen;
+    /// ein zweiter Aufruf meldet jedes Abo erneut unter derselben Event-ID
+    /// an, und MSFS antwortet mit Ausnahme 9 (`EVENT_ID_DUPLICATE`). Bis
+    /// v1.7.44 geschah das bei jedem SimStart — 212 falsch als
+    /// „ATC MODEL abgelehnt" beschriftete Warnungen in neun Diagnose-Logs
+    /// (Befund 21.09.2026). Fuer SimStart reicht `request_aircraft_loaded`.
+    fn subscribe_aircraft_loaded(&mut self) -> Result<(), String> {
+        self.request_aircraft_loaded()?;
+
+        let cevent = std::ffi::CString::new("SimStart").expect("SimStart is plain ASCII");
+        let hr = unsafe {
+            sys::SimConnect_SubscribeToSystemEvent(self.handle, SIM_START_EVENT_ID, cevent.as_ptr())
+        };
+        if hr != 0 {
+            return Err(format!(
+                "SubscribeToSystemEvent(SimStart) returned 0x{hr:08X}"
+            ));
+        }
+
+        // Spec v0.7.15 F5 (QS-Round-2): `Pause_EX1`-Event statt der
+        // zwei separaten `Paused`/`Unpaused`-Events. Pause_EX1 sendet
+        // sofort beim Subscribe den aktuellen Pause-State + bei jedem
+        // Wechsel ein Update mit `dwData`-Flag-Set. Damit ist die
+        // Pause-Detection korrekt auch wenn AeroACARS connectet
+        // waehrend MSFS schon pausiert ist.
+        let cevent = std::ffi::CString::new("Pause_EX1").expect("ASCII");
+        let hr = unsafe {
+            sys::SimConnect_SubscribeToSystemEvent(self.handle, PAUSE_EX1_EVENT_ID, cevent.as_ptr())
+        };
+        if hr != 0 {
+            return Err(format!(
+                "SubscribeToSystemEvent(Pause_EX1) returned 0x{hr:08X}"
+            ));
+        }
+
+        // v0.7.19 GAF-707 Accident-Detection: SimConnect-`Crashed` und
+        // `CrashReset` abonnieren. Crashed feuert beim Bodenkontakt mit
+        // nicht-ueberlebbaren Parametern, CrashReset wenn die Cut-Scene
+        // im MSFS-UI quittiert wird.
+        let cevent = std::ffi::CString::new("Crashed").expect("ASCII");
+        let hr = unsafe {
+            sys::SimConnect_SubscribeToSystemEvent(self.handle, CRASHED_EVENT_ID, cevent.as_ptr())
+        };
+        if hr != 0 {
+            return Err(format!(
+                "SubscribeToSystemEvent(Crashed) returned 0x{hr:08X}"
+            ));
+        }
+        let cevent = std::ffi::CString::new("CrashReset").expect("ASCII");
+        let hr = unsafe {
+            sys::SimConnect_SubscribeToSystemEvent(
+                self.handle,
+                CRASH_RESET_EVENT_ID,
+                cevent.as_ptr(),
+            )
+        };
+        if hr != 0 {
+            return Err(format!(
+                "SubscribeToSystemEvent(CrashReset) returned 0x{hr:08X}"
+            ));
+        }
+        // v1.6.12 — Flow-Ereignisse des SDK: der Simulator meldet selbst,
+        // wenn er eine Aufzeichnung abspielt, das Flugzeug versetzt oder
+        // vorspult. Autoritativer als jede Ableitung aus der Telemetrie.
+        //
+        // BEWUSST NICHT FATAL: MSFS 2020 kennt diese Ereignisse nicht. Ein
+        // `return Err` haette dort die ganze Verbindung gerissen — fuer einen
+        // Zugewinn, den es auf 2020 ohnehin nicht gibt. Schlaegt es fehl,
+        // bleibt der kinematische Rueckfall (`replay_erkennung`) zustaendig.
+        // 2.0.14 — die Bildrate, wie MSFS sie selbst misst. Ebenfalls NICHT
+        // fatal: Sie dient nur der Diagnose und darf keine Verbindung kosten.
+        let cevent = std::ffi::CString::new("Frame").expect("ASCII");
+        let hr = unsafe {
+            sys::SimConnect_SubscribeToSystemEvent(self.handle, FRAME_EVENT_ID, cevent.as_ptr())
+        };
+        if hr != 0 {
+            tracing::info!(
+                hr = format!("0x{hr:08X}"),
+                "SubscribeToSystemEvent(Frame) nicht verfuegbar — keine Bildrate im Diagnoselog"
+            );
+        }
+        let hr = unsafe { sys::SimConnect_SubscribeToFlowEvent(self.handle) };
+        if hr != 0 {
+            tracing::info!(
+                hr = format!("0x{hr:08X}"),
+                "SubscribeToFlowEvent nicht verfuegbar (aelteres SimConnect) — Replay-Erkennung laeuft ueber die Telemetrie"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Pull one message off the SimConnect queue, returning None when
+    /// the queue is empty. Distinguishes the receiver IDs we actually
+    /// care about; the rest are logged at trace level and dropped.
+    fn get_next_dispatch(&mut self) -> Result<Option<DispatchMsg>, String> {
+        let mut p_data: *mut sys::SIMCONNECT_RECV = std::ptr::null_mut();
+        let mut cb_data: sys::DWORD = 0;
+        let hr = unsafe { sys::SimConnect_GetNextDispatch(self.handle, &mut p_data, &mut cb_data) };
+        if hr == sys::E_FAIL {
+            // Empty queue — not an error in SimConnect-land.
+            return Ok(None);
+        }
+        if hr != 0 {
+            return Err(format!("GetNextDispatch returned 0x{hr:08X}"));
+        }
+        if p_data.is_null() || cb_data == 0 {
+            return Ok(None);
+        }
+        // Eine echte Nachricht ist da — gleich welcher Art. Zaehlt als
+        // Lebenszeichen, auch wenn sie unten als unbekannt verworfen wird.
+        self.empfangen = self.empfangen.wrapping_add(1);
+        let recv = unsafe { &*p_data };
+        let id = recv.dwID;
+        let msg = match id {
+            sys::SIMCONNECT_RECV_ID_OPEN => {
+                // ⚠ Bis v1.7.9 wurde der Inhalt weggeworfen. Darin steht,
+                // WOMIT wir reden — MSFS 2020 und 2024 melden sich
+                // verschieden, und die Feldnamen der Facility-Abfrage
+                // stammen aus der 2024er-SDK-Doku. Ohne diese Kennung ist
+                // eine Ablehnung nicht einzuordnen.
+                let o = unsafe { &*(p_data as *const sys::SIMCONNECT_RECV_OPEN) };
+                // Auch das Namensfeld erst kopieren. Es ist zwar
+                // byteweise ausgerichtet und `.iter()` daher zulaessig —
+                // aber ein Feld eines gepackten Typs ueberhaupt zu
+                // referenzieren ist die Sorte Zeile, die genau hier schon
+                // einmal die CI gekostet hat. Ein Array aus `char` ist
+                // `Copy`; das Kopieren kostet nichts.
+                let namensfeld = o.szApplicationName;
+                let name = namensfeld
+                    .iter()
+                    .take_while(|c| **c != 0)
+                    .map(|c| *c as u8 as char)
+                    .collect::<String>();
+                // ⚠ Erst kopieren, dann formatieren. `SIMCONNECT_RECV_OPEN`
+                // ist ein GEPACKTER Typ, und `format!` nimmt Referenzen auf
+                // seine Argumente — eine Referenz auf ein Feld darin ist
+                // nicht ausgerichtet (E0793). Ein Lesen BY VALUE ist
+                // erlaubt, wie ein paar Zeilen tiefer bei `exc.dwException`.
+                let major = o.dwApplicationVersionMajor;
+                let minor = o.dwApplicationVersionMinor;
+                Some(DispatchMsg::Open {
+                    kennung: format!("{} {}.{}", name.trim(), major, minor),
+                })
+            }
+            sys::SIMCONNECT_RECV_ID_QUIT => Some(DispatchMsg::Quit),
+            sys::SIMCONNECT_RECV_ID_EXCEPTION => {
+                let exc = unsafe { &*(p_data as *const sys::SIMCONNECT_RECV_EXCEPTION) };
+                Some(DispatchMsg::Exception {
+                    exception: exc.dwException,
+                    send_id: exc.dwSendID,
+                    index: exc.dwIndex,
+                })
+            }
+            sys::SIMCONNECT_RECV_ID_SIMOBJECT_DATA => {
+                // dwData[1] in the SDK header — first byte of the
+                // payload — is at the same offset as
+                // `SIMCONNECT_RECV_SIMOBJECT_DATA::dwData`. We copy
+                // the bytes out so the dispatch ptr can be reused.
+                let recv_data = unsafe { &*(p_data as *const sys::SIMCONNECT_RECV_SIMOBJECT_DATA) };
+                let request_id = recv_data.dwRequestID;
+                let header_size = std::mem::size_of::<sys::SIMCONNECT_RECV_SIMOBJECT_DATA>();
+                let total = cb_data as usize;
+                if total < header_size {
+                    return Ok(None);
+                }
+                let payload_start = header_size - std::mem::size_of::<sys::DWORD>();
+                let payload_len = total - payload_start;
+                let bytes = unsafe {
+                    let base = p_data as *const u8;
+                    std::slice::from_raw_parts(base.add(payload_start), payload_len)
+                };
+                Some(DispatchMsg::SimObjectData {
+                    request_id,
+                    bytes: bytes.to_vec(),
+                })
+            }
+            id if id == SIMCONNECT_RECV_ID_CLIENT_DATA => {
+                // ClientData has the same payload layout as
+                // SimObjectData. bindgen represents the C++ class
+                // inheritance as `_base` — `_base.dwRequestID` is
+                // the field on the parent SIMOBJECT_DATA struct.
+                let recv_data = unsafe { &*(p_data as *const sys::SIMCONNECT_RECV_CLIENT_DATA) };
+                let request_id = recv_data._base.dwRequestID;
+                let header_size = std::mem::size_of::<sys::SIMCONNECT_RECV_CLIENT_DATA>();
+                let total = cb_data as usize;
+                if total < header_size {
+                    return Ok(None);
+                }
+                let payload_start = header_size - std::mem::size_of::<sys::DWORD>();
+                let payload_len = total - payload_start;
+                let bytes = unsafe {
+                    let base = p_data as *const u8;
+                    std::slice::from_raw_parts(base.add(payload_start), payload_len)
+                };
+                Some(DispatchMsg::ClientData {
+                    request_id,
+                    bytes: bytes.to_vec(),
+                })
+            }
+            id if id == SIMCONNECT_RECV_ID_SYSTEM_STATE => {
+                // szString is a fixed-size char buffer in the
+                // SIMCONNECT_RECV_SYSTEM_STATE struct. For
+                // AircraftLoaded that's the .air file path (Windows
+                // path with backslashes). We read it as a NUL-
+                // terminated C-string.
+                let recv = unsafe { &*(p_data as *const sys::SIMCONNECT_RECV_SYSTEM_STATE) };
+                let request_id = recv.dwRequestID;
+                // szString length is implementation-defined in the
+                // SDK; SimConnect docs guarantee NUL-termination.
+                let cstr = unsafe { std::ffi::CStr::from_ptr(recv.szString.as_ptr()) };
+                let air_path = cstr.to_string_lossy().to_string();
+                Some(DispatchMsg::SystemState {
+                    request_id,
+                    air_path,
+                })
+            }
+            id if id == SIMCONNECT_RECV_ID_EVENT => {
+                let evt = unsafe { &*(p_data as *const sys::SIMCONNECT_RECV_EVENT) };
+                Some(DispatchMsg::SystemEvent {
+                    event_id: evt.uEventID,
+                    data: evt.dwData,
+                })
+            }
+            // 2.0.14 — `Frame` kommt NICHT als `RECV_ID_EVENT`, sondern mit
+            // eigener Kennung und eigener Struktur.
+            id if id == SIMCONNECT_RECV_ID_EVENT_FRAME => {
+                let evt = unsafe { &*(p_data as *const sys::SIMCONNECT_RECV_EVENT_FRAME) };
+                Some(DispatchMsg::Bildrate(evt.fFrameRate))
+            }
+            id if id == SIMCONNECT_RECV_ID_FLOW_EVENT => {
+                let evt = unsafe { &*(p_data as *const sys::SIMCONNECT_RECV_FLOW_EVENT) };
+                Some(DispatchMsg::FlowEvent {
+                    event: evt.FlowEvent as u32,
+                })
+            }
+            // v1.7.8 — ein Element der Facility-Lieferung (Bahn,
+            // Rollwegpunkt, …). Die Nutzdaten haengen als variabler
+            // Schwanz hinter der Struktur; `SIMCONNECT_DATAV` ist ein
+            // Ein-Element-Feld, das in Wahrheit weiterlaeuft.
+            //
+            // ⚠ `dwSize` ist die GESAMTgroesse der Nachricht. Die
+            // Nutzdaten beginnen dort, wo das Feld `Data` liegt — nicht
+            // am Ende der Struktur, denn `Data` IST schon Teil von ihr.
+            id if id == sys::SIMCONNECT_RECV_ID_FACILITY_DATA => {
+                let fd = unsafe { &*(p_data as *const sys::SIMCONNECT_RECV_FACILITY_DATA) };
+                let kopf = std::mem::offset_of!(sys::SIMCONNECT_RECV_FACILITY_DATA, Data);
+                let gesamt = fd._base.dwSize as usize;
+                let laenge = gesamt.saturating_sub(kopf);
+                let bytes =
+                    unsafe { std::slice::from_raw_parts((p_data as *const u8).add(kopf), laenge) }
+                        .to_vec();
+                Some(DispatchMsg::FacilityData {
+                    request_id: fd.UserRequestId,
+                    typ: fd.Type,
+                    ist_listeneintrag: fd.IsListItem != 0,
+                    index: fd.ItemIndex,
+                    bytes,
+                })
+            }
+            id if id == sys::SIMCONNECT_RECV_ID_ENUMERATE_INPUT_EVENTS
+                || id == sys::SIMCONNECT_RECV_ID_GET_INPUT_EVENT
+                || id == sys::SIMCONNECT_RECV_ID_SUBSCRIBE_INPUT_EVENT =>
+            {
+                // Komplette Nachricht kopieren; Layout (pack 1) siehe
+                // `crate::eingabe_events`.
+                let roh =
+                    unsafe { std::slice::from_raw_parts(p_data as *const u8, cb_data as usize) }
+                        .to_vec();
+                Some(if id == sys::SIMCONNECT_RECV_ID_ENUMERATE_INPUT_EVENTS {
+                    DispatchMsg::EingabeListe(roh)
+                } else if id == sys::SIMCONNECT_RECV_ID_GET_INPUT_EVENT {
+                    DispatchMsg::EingabeWert(roh)
+                } else {
+                    DispatchMsg::EingabeAbo(roh)
+                })
+            }
+            id if id == sys::SIMCONNECT_RECV_ID_FACILITY_DATA_END => {
+                let fd = unsafe { &*(p_data as *const sys::SIMCONNECT_RECV_FACILITY_DATA_END) };
+                Some(DispatchMsg::FacilityDataEnde {
+                    request_id: fd.RequestId,
+                })
+            }
+            _ => None,
+        };
+        Ok(msg)
+    }
+}
+
+// SimConnect RECV_ID constants we look up dynamically — `sys.rs`
+// doesn't yet export these as named DWORD constants because they
+// were added with the PMDG SDK work. Pulled directly from the
+// bindgen output.
+const SIMCONNECT_RECV_ID_CLIENT_DATA: sys::DWORD =
+    sys::SIMCONNECT_RECV_ID_SIMCONNECT_RECV_ID_CLIENT_DATA as sys::DWORD;
+const SIMCONNECT_RECV_ID_SYSTEM_STATE: sys::DWORD =
+    sys::SIMCONNECT_RECV_ID_SIMCONNECT_RECV_ID_SYSTEM_STATE as sys::DWORD;
+const SIMCONNECT_RECV_ID_EVENT: sys::DWORD =
+    sys::SIMCONNECT_RECV_ID_SIMCONNECT_RECV_ID_EVENT as sys::DWORD;
+const SIMCONNECT_RECV_ID_FLOW_EVENT: sys::DWORD =
+    sys::SIMCONNECT_RECV_ID_SIMCONNECT_RECV_ID_FLOW_EVENT as sys::DWORD;
+const SIMCONNECT_RECV_ID_EVENT_FRAME: sys::DWORD =
+    sys::SIMCONNECT_RECV_ID_SIMCONNECT_RECV_ID_EVENT_FRAME as sys::DWORD;
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { sys::SimConnect_Close(self.handle) };
+            self.handle = std::ptr::null_mut();
+        }
+        // Erst nach dem Schliessen: SimConnect setzt das Ereignis bis dahin.
+        if !self.ereignis.is_null() {
+            unsafe { sys::CloseHandle(self.ereignis) };
+            self.ereignis = std::ptr::null_mut();
+        }
+    }
+}
+
+unsafe impl Send for Connection {}
+unsafe impl Sync for Connection {}
+
+#[derive(Debug)]
+enum DispatchMsg {
+    Open {
+        /// Name + Version, wie der Simulator sich meldet.
+        kennung: String,
+    },
+    Quit,
+    Exception {
+        exception: u32,
+        send_id: u32,
+        index: u32,
+    },
+    SimObjectData {
+        request_id: u32,
+        bytes: Vec<u8>,
+    },
+    /// PMDG ClientData arrived (or any other ClientData if we ever
+    /// subscribe to additional channels). RECV_ID is
+    /// `SIMCONNECT_RECV_ID_CLIENT_DATA = 16`. Same byte-layout as
+    /// SimObjectData but a different RECV_ID.
+    /// v1.6.12 — Flow-Ereignis des SDK (RECV_ID 27). Der Simulator meldet
+    /// Replay, Teleport, Vorspulen und aehnliche Vorgaenge, waehrend derer
+    /// die Telemetrie nicht den geflogenen Zustand beschreibt.
+    FlowEvent {
+        event: u32,
+    },
+    /// 2.0.14 — Bildrate aus dem Systemereignis `Frame`.
+    Bildrate(f32),
+    /// v1.7.8 — ein Element aus einer Facility-Lieferung. `typ` ist eine
+    /// `SIMCONNECT_FACILITY_DATA_TYPE`; `bytes` folgt der Definition,
+    /// die wir vorher zusammengesetzt haben.
+    FacilityData {
+        request_id: u32,
+        typ: u32,
+        ist_listeneintrag: bool,
+        index: u32,
+        bytes: Vec<u8>,
+    },
+    /// Ende einer Facility-Lieferung.
+    FacilityDataEnde {
+        request_id: u32,
+    },
+    ClientData {
+        request_id: u32,
+        bytes: Vec<u8>,
+    },
+    /// 26.09.2026 — MSFS-2024-Input-Events, jeweils die KOMPLETTE
+    /// Rohnachricht ab `dwSize`; gedeutet in `crate::eingabe_events`.
+    /// Ein Teil der Liste aus `EnumerateInputEvents`.
+    EingabeListe(Vec<u8>),
+    /// Antwort auf `GetInputEvent` (Startwert).
+    EingabeWert(Vec<u8>),
+    /// Aenderungsmeldung eines abonnierten Events.
+    EingabeAbo(Vec<u8>),
+    /// Response to `RequestSystemState`. We use this to read the
+    /// `.air` file path of the loaded aircraft for PMDG variant
+    /// detection. The `request_id` will be `AIRCRAFT_LOADED_REQUEST_ID`.
+    SystemState {
+        request_id: u32,
+        air_path: String,
+    },
+    /// Subscribed system event fired (e.g. `SimStart` when the user
+    /// loads a new flight or changes aircraft). On a SimStart we
+    /// re-request AircraftLoaded to pick up any variant change.
+    /// SimConnect-System-Event (= subscribed via
+    /// `SimConnect_SubscribeToSystemEvent`). `data` ist der `dwData`-Wert
+    /// aus `SIMCONNECT_RECV_EVENT` — Bedeutung event-spezifisch.
+    /// Fuer `Pause_EX1` ist es das Flag-Set (siehe PAUSE_EX1_EVENT_ID-
+    /// Konstanten-Doku), fuer `SimStart` u.a. 0.
+    SystemEvent {
+        event_id: u32,
+        data: u32,
+    },
+}
+
+// Marker so the file always references kind/Utc when stub'd out.
+#[allow(dead_code)]
+fn _link_assertions() {
+    let _ = Utc::now();
+    let _ = Simulator::Msfs2024;
+    let _ = AircraftProfile::Default;
+}
+
+#[cfg(test)]
+mod bildrate_tests {
+    use super::*;
+
+    #[test]
+    fn bildrate_aus_den_gespeicherten_bits() {
+        assert_eq!(bildrate_aus_bits(0), None, "0 = noch nichts gemeldet");
+        assert_eq!(bildrate_aus_bits(42.5f32.to_bits()), Some(42.5));
+        for unsinn in [-3.0f32, f32::NAN, f32::INFINITY] {
+            assert_eq!(bildrate_aus_bits(unsinn.to_bits()), None, "{unsinn}");
+        }
+    }
+
+    /// Die Struktur aus `SimConnect.h`: das Ereignis plus zwei `float`
+    /// (`fFrameRate`, `fSimSpeed`). Stimmt die Bindung nicht, liest der
+    /// Dispatch an der falschen Stelle.
+    #[test]
+    fn frame_ereignis_hat_die_groesse_aus_dem_header() {
+        assert_eq!(
+            std::mem::size_of::<sys::SIMCONNECT_RECV_EVENT_FRAME>(),
+            std::mem::size_of::<sys::SIMCONNECT_RECV_EVENT>() + 8
+        );
+    }
+}
+
+#[cfg(test)]
+mod stopp_tests {
+    use super::*;
+
+    /// Feldbefund-Klasse (QS v1.9.24): hängt SimConnect_Close, darf `stop`
+    /// nicht ewig warten — es läuft unter der msfs-Sperre, an der auch
+    /// Oberflächen-Befehle hängen. Mit dem alten unbegrenzten join() dauert
+    /// dieser Test 6 s und wird rot.
+    #[test]
+    fn haengender_worker_wird_nach_der_frist_abgekoppelt() {
+        let mut a = MsfsAdapter::new();
+        let alt = Arc::clone(&a.shared);
+        a.worker = Some(thread::spawn(|| thread::sleep(Duration::from_secs(6))));
+        let t0 = Instant::now();
+        a.stop();
+        let dauer = t0.elapsed();
+        assert!(
+            dauer < Duration::from_millis(4500),
+            "stop wartete {dauer:?}"
+        );
+        assert!(
+            dauer >= STOPP_FRIST,
+            "Frist muss abgewartet werden, war {dauer:?}"
+        );
+        // Der abgekoppelte Worker schreibt nur noch in seinen alten Zustand.
+        assert!(!Arc::ptr_eq(&alt, &a.shared), "frischer Zustand fehlt");
+        assert_eq!(a.state(), ConnectionState::Disconnected);
+        assert!(a.worker.is_none());
+    }
+
+    /// So nutzt lib.rs `apply_sim_kind` den Adapter hinter einer Sperre:
+    /// anstoßen unter der Sperre, abwarten OHNE. Ein Leser (wie `sim_status`
+    /// alle 500 ms) kommt während des Wartens sofort an die Sperre.
+    ///
+    /// ⚠ Grenze: belegt die geteilte API, NICHT, dass `apply_sim_kind` sie so
+    /// benutzt (dort hängt `tauri::State` dran). Wer dort wieder
+    /// `state.msfs.lock().stop()` schreibt, bleibt hier grün.
+    #[test]
+    fn abwarten_ohne_sperre_haelt_leser_nicht_auf() {
+        let m = Arc::new(std::sync::Mutex::new(MsfsAdapter::new()));
+        m.lock().unwrap().worker =
+            Some(thread::spawn(|| thread::sleep(Duration::from_millis(1500))));
+        let abschied = m.lock().unwrap().stopp_anstossen();
+        let m2 = Arc::clone(&m);
+        let leser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200)); // mitten ins Warten
+            let t0 = Instant::now();
+            let a = m2.lock().unwrap();
+            let _ = a.state();
+            t0.elapsed()
+        });
+        let sauber = abschied.map(WorkerAbschied::abwarten).unwrap_or(true);
+        assert!(sauber, "Worker endet nach 1,5 s, also binnen der Frist");
+        let gewartet = leser.join().unwrap();
+        assert!(
+            gewartet < Duration::from_millis(200),
+            "Leser wartete {gewartet:?}"
+        );
+        m.lock().unwrap().nach_abschied(sauber);
+        assert_eq!(m.lock().unwrap().state(), ConnectionState::Disconnected);
+    }
+
+    #[test]
+    fn normales_ende_behaelt_den_zustand() {
+        let mut a = MsfsAdapter::new();
+        let alt = Arc::clone(&a.shared);
+        a.worker = Some(thread::spawn(|| {}));
+        let t0 = Instant::now();
+        a.stop();
+        assert!(t0.elapsed() < Duration::from_secs(1));
+        assert!(
+            Arc::ptr_eq(&alt, &a.shared),
+            "ohne Hänger kein neuer Zustand"
+        );
+    }
+}

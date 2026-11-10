@@ -1,0 +1,29 @@
+{
+  "scenario": "pre-v080",
+  "hint": "Legacy-PIREP aus v0.7.x. Keine v0.8.0-Felder vorhanden (source/nav_cycle/TDZ/Aim/TCH/DDS alle null). Component muss graceful degraden: nur Basis-Geometrie + Touchdown-Punkt rendern, keine TDZ-Box, kein Aim-Marker, keine TCH-Card.",
+  "props": {
+    "airport_ident": "EDDF",
+    "airport_name": "Frankfurt Main",
+    "runway_ident": "07C",
+    "length_m": 4000,
+    "surface": "ASP",
+    "source": null,
+    "nav_cycle": null,
+    "displaced_threshold_m": 0,
+    "td_distance_from_threshold_m": 520,
+    "td_centerline_offset_m": -2.1,
+    "td_in_tdz": null,
+    "td_third": null,
+    "td_tdz_length_m": null,
+    "aim_point_m": null,
+    "aim_delta_m": null,
+    "aim_class": null,
+    "tch_actual_ft": null,
+    "tch_expected_ft": null,
+    "tch_delta_ft": null,
+    "tch_class": null,
+    "pre_displaced_threshold": null,
+    "rollout_m": 1450,
+    "locale": "de"
+  }
+}

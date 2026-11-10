@@ -1,0 +1,51 @@
+[package]
+name = "aeroacars-mqtt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "MQTT publisher for AeroACARS — feeds aeroacars-live monitor relay"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+# v0.5.23: gzip-Compression fuer Client-Log-Upload nach PIREP-File.
+# Transitive ueber andere Crates schon im Workspace, hier direkt deklariert.
+flate2 = "1"
+# Basic-Auth Encoding fuer den Upload-Endpoint. Auch transitive verfuegbar.
+base64 = "0.22"
+
+# rumqttc 0.25: async MQTT-Client. Features:
+# - websocket  → MQTT-over-WebSocket (für wss:// gegen Caddy)
+# - use-rustls → TLS via rustls (kein OpenSSL-dep, gleicher TLS-Stack
+#                wie reqwest im api-client crate)
+# v0.13.7: bump 0.24 → 0.25 + rustls 0.22 → 0.23.
+# Hinweis: rumqttc 0.25.1 pinned intern noch rustls-webpki 0.102.* (cargo
+# audit-Warnung). Konkrete CVEs (RUSTSEC-2026-0049/0098/0099/0104) sind
+# fuer unseren TLS-Pfad (WSS gegen Caddy + Let's-Encrypt-Cert, kein
+# CRL-Handling, keine Name-Constraints) nicht ausnutzbar. Behoben sobald
+# upstream rumqttc auf rustls-webpki 0.103 zieht (issue tracked,
+# RustSec-Audit-Note Q3-2026).
+rumqttc = { version = "0.25", default-features = false, features = ["websocket", "use-rustls"] }
+
+# rustls 0.22 weil rumqttc 0.24 intern auf 0.22 pinned. Nach 0.25-Bump
+# behalten wir den expliziten rustls-Eintrag bewusst — rumqttc reexportiert
+# kein eigenes ClientConfig-API mehr, aber wir bauen kein TLS-Config-Surface
+# selber. Falls Compile-Errors auftreten, hier mitziehen.
+rustls = "0.23"
+webpki-roots = "0.26"
+
+url = "2"
+sim-core = { path = "../sim-core" }
+# v0.7.1: SubScoreEntry-Wire-Format kommt aus der landing-scoring Crate
+# (Spec §3.1 SSoT). PirepPayload re-exportiert die SubScores 1:1.
+landing-scoring = { path = "../landing-scoring" }

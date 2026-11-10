@@ -1,0 +1,4158 @@
+//! Simulator-agnostic abstractions.
+//!
+//! All simulator adapters (`sim-msfs`, `sim-xplane`, future `sim-prepar3d`, …) implement
+//! the `SimAdapter` trait and emit `SimSnapshot`s at a configurable rate. The flight phase
+//! FSM and recorder consume these snapshots without knowing which simulator they came from.
+
+#![allow(dead_code)] // Phase 1 stub.
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+pub mod lampen;
+pub mod pause;
+pub mod process_probe;
+/// v0.20 (Process-Integrity): cross-platform "is the sim's OS process
+/// still alive?" probe, keyed off `SimKind`. Lives here (not in
+/// `sim-msfs`/`sim-xplane`) so both adapters' heterogeneous disconnect
+/// signals can be disambiguated from one shared, cross-platform place.
+pub mod szenerie;
+
+/// One sample of simulator telemetry.
+///
+/// Field set tracks the requirements spec §8 ("Simulator-Daten und Telemetrie").
+/// Adapters fill what's available; downstream consumers tolerate `None`.
+///
+/// `Default` is provided to make unit testing of the FSM and detectors
+/// painless — tests build a baseline snapshot via `SimSnapshot::default()`
+/// and override only the fields they care about. The default body is
+/// "parked, engines off, on the ground at 0/0" — never produced by a
+/// real simulator, but a stable reference state. Manual impl because
+/// `chrono::DateTime` doesn't impl Default; we use the unix epoch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimSnapshot {
+    pub timestamp: DateTime<Utc>,
+
+    // Position
+    pub lat: f64,
+    pub lon: f64,
+    pub altitude_msl_ft: f64,
+    pub altitude_agl_ft: f64,
+    /// v0.7.17 (B-003): MSFS `INDICATED ALTITUDE` SimVar — what the
+    /// cockpit PFD reads with the current baro setting. Diverges from
+    /// `altitude_msl_ft` (geometric MSL) by 1–2k ft in arctic cold or
+    /// strong ISA deviations. `None` for sims that don't wire it.
+    #[serde(default)]
+    pub altitude_indicated_ft: Option<f64>,
+    /// v0.7.17 (B-003): MSFS `PRESSURE ALTITUDE` SimVar — always STD
+    /// (29.92 inHg / 1013 hPa). What Mode-C transponders and VATSIM
+    /// transmit. `None` for sims that don't wire it.
+    #[serde(default)]
+    pub altitude_pressure_ft: Option<f64>,
+
+    // Attitude / motion
+    pub heading_deg_true: f32,
+    pub heading_deg_magnetic: f32,
+    pub pitch_deg: f32,
+    pub bank_deg: f32,
+    /// Vertical speed for DISPLAY / phase-FSM / approach-stability (fpm).
+    /// On X-Plane this is the instrument VVI (`vvi_fpm_pilot`), which reads ~0
+    /// in level flight; the previous source (`local_vy`, OpenGL world-frame)
+    /// carried a ground-speed-proportional bias that mis-read level cruise as a
+    /// few-hundred-fpm descent. On MSFS this is the true earth-frame `VERTICAL
+    /// SPEED` SimVar (unchanged). Use [`Self::touchdown_vs_source_fpm`] for the
+    /// responsive touchdown signal.
+    pub vertical_speed_fpm: f32,
+    /// Raw, lag-free vertical speed for the TOUCHDOWN capture (fpm). On X-Plane
+    /// this is `local_vy × 196.85` (responsive, no VSI damping — the v0.4.3
+    /// reason for moving off the laggy `vh_ind_fpm`). `None` on sims whose
+    /// `vertical_speed_fpm` is already raw+responsive (MSFS `VERTICAL SPEED`),
+    /// in which case the touchdown path falls back to `vertical_speed_fpm`.
+    #[serde(default)]
+    pub vertical_speed_raw_fpm: Option<f32>,
+    /// Body-frame velocity components in feet per second.
+    /// X = right (+) / left (−) component; Z = forward (+) / aft (−).
+    /// Used to compute touchdown sideslip natively
+    /// (`atan2(VEL_BODY_X, VEL_BODY_Z) × 180/π`) — same approach as
+    /// GEES. None for sims/addons that don't wire them.
+    pub velocity_body_x_fps: Option<f32>,
+    pub velocity_body_z_fps: Option<f32>,
+
+    // Speeds
+    pub groundspeed_kt: f32,
+    pub indicated_airspeed_kt: f32,
+    pub true_airspeed_kt: f32,
+    /// Koerperfeste Windkomponenten in Knoten. Positiver
+    /// `aircraft_wind_x_kt` = Wind von RECHTS, positiver
+    /// `aircraft_wind_z_kt` = Rueckenwind.
+    ///
+    /// Der Vertrag galt schon immer so — eingehalten hat ihn bis zum
+    /// 14.08.2026 keiner der beiden Adapter: MSFS lieferte das Vorzeichen
+    /// der Seitenkomponente verkehrt herum, X-Plane sogar den ganzen
+    /// Vektor im Weltsystem (Nord/Ost statt vorn/rechts). Beide Adapter
+    /// rechnen jetzt um; wer hier einen dritten Simulator anbindet, muss
+    /// dasselbe tun. `None`, wenn die Quelle fehlt.
+    pub aircraft_wind_x_kt: Option<f32>,
+    pub aircraft_wind_z_kt: Option<f32>,
+
+    // Forces & flags
+    pub g_force: f32,
+    /// Zweiter G-Kanal (MSFS `SEMIBODY LOADFACTOR Y`), nur zum Vergleich
+    /// mit `g_force` — fliesst nicht in die Note. `None` bei X-Plane und
+    /// wenn MSFS ihn nicht liefert (Lernpaket vmsACARS, AP1a, 29.09.2026).
+    #[serde(default)]
+    pub g_semibody: Option<f32>,
+    pub on_ground: bool,
+    /// v0.7.19 (Accident-Detection): Adapter-Snapshot-Flag, true wenn
+    /// der Sim ein hartes Crash-Signal liefert. MSFS setzt das aus dem
+    /// `Crashed` System-Event (gelatcht im Adapter-Shared-State).
+    /// X-Plane seit v1.9.12 aus `sim/flightmodel2/misc/has_crashed`, nur
+    /// die Flanke 0 → 1 (vorher immer false; die gemeinsame Heuristik
+    /// greift bei beiden weiter). `CrashReset` darf den
+    /// Adapter-Flag fuer neue Snapshots loeschen — der aktive Flug
+    /// behaelt seinen Accident-Latch unabhaengig davon bis Flight-End/
+    /// Cleanup. Spec docs/spec/v0.7.19-gaf707-crash-accident-detection.md.
+    #[serde(default)]
+    pub crashed: bool,
+    /// v0.7.19: Welcher Pfad hat den `crashed`-Flag gesetzt? Werte:
+    /// "msfs_crashed_event" | "xplane_crash_dataref" | "heuristic" |
+    /// `None` wenn `crashed=false`.
+    #[serde(default)]
+    pub crash_source: Option<String>,
+    /// v0.4.4: X-Plane only — Normal force on the landing gear (N).
+    /// 0 in the air, spikes the moment a wheel touches the runway.
+    /// Used by the touchdown sampler for sub-frame-accurate edge
+    /// detection (xgs-style). MSFS doesn't provide this — `None` there,
+    /// the existing `PLANE TOUCHDOWN NORMAL VELOCITY` SimVar is the
+    /// MSFS-equivalent (already wired).
+    #[serde(default)]
+    pub gear_normal_force_n: Option<f32>,
+    pub parking_brake: bool,
+    pub stall_warning: bool,
+    pub overspeed_warning: bool,
+    pub paused: bool,
+    pub slew_mode: bool,
+    pub simulation_rate: f32,
+    /// Bilder pro Sekunde, wie der Simulator sie selbst meldet (2.0.14).
+    ///
+    /// X-Plane: `sim/time/framerate_period` (geglaettete Zeichenzeit je
+    /// Bild, Kehrwert). MSFS: SimConnect-Systemereignis `Frame`
+    /// (`fFrameRate`). `None`, solange der Simulator nichts geliefert hat.
+    ///
+    /// ⚠ Nur Diagnose: Sie erklaert, warum bei einer Landung wenige neue
+    /// Messwerte ankommen (der Simulator rechnet nicht oefter). Sie geht
+    /// in keine Bewertung, nicht in den PIREP und nicht an Recorder oder
+    /// Webseite (Thomas, 13.10.2026).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sim_bildrate_hz: Option<f32>,
+
+    // Configuration
+    pub gear_position: f32, // 0.0 = up, 1.0 = down
+    pub flaps_position: f32,
+    /// v1.5.3 (#ifly-audit): Rasten-Index des Klappenhebels (0 = UP)
+    /// und Anzahl der Rasten laut Sim (`FLAPS NUM HANDLE POSITIONS`).
+    /// Zusammen erlauben sie RASTERBEWUSSTE Labels: 8 Rasten = Boeing
+    /// 737 (UP/1/2/5/10/15/25/30/40), 4 = Airbus. `None` bei Sims/
+    /// Adaptern ohne die SimVars — dann greift die alte Prozent-
+    /// Heuristik. Anlass: iFly-Flug 11.08.2026, "Flaps 5" wurde als
+    /// Airbus-"1+F" geloggt.
+    pub flap_handle_index: Option<u8>,
+    pub flap_num_positions: Option<u8>,
+    pub engines_running: u8,
+
+    // Fuel & weight
+    pub fuel_total_kg: f32,
+    pub fuel_used_kg: f32,
+    pub zfw_kg: Option<f32>,
+    pub payload_kg: Option<f32>,
+    /// Gross weight in kg (`TOTAL WEIGHT` SimVar). Includes fuel + payload.
+    /// `None` for aircraft addons that don't wire it (notably Fenix —
+    /// then we fall back to addon LVars or leave the PIREP field blank).
+    pub total_weight_kg: Option<f32>,
+
+    // ---- Touchdown sample (latched by MSFS at the moment the gear
+    // touches the ground; values stay valid until the next takeoff).
+    // Reading these is more reliable than sampling V/S continuously
+    // and trying to guess which frame was the actual touchdown — the
+    // sim itself takes the snapshot for us. ----
+    /// Vertical velocity at touchdown, fpm. Negative on a real landing
+    /// (we mirror MSFS' sign convention).
+    pub touchdown_vs_fpm: Option<f32>,
+    pub touchdown_pitch_deg: Option<f32>,
+    pub touchdown_bank_deg: Option<f32>,
+    pub touchdown_heading_mag_deg: Option<f32>,
+    pub touchdown_lat: Option<f64>,
+    pub touchdown_lon: Option<f64>,
+
+    // Environment
+    pub wind_direction_deg: Option<f32>,
+    pub wind_speed_kt: Option<f32>,
+    pub qnh_hpa: Option<f32>,
+    pub outside_air_temp_c: Option<f32>,
+    /// Total Air Temperature — corrected for compression heating.
+    pub total_air_temp_c: Option<f32>,
+    /// Current Mach number.
+    pub mach: Option<f32>,
+    /// Aircraft empty weight in kg, sourced from `EMPTY WEIGHT`.
+    /// `None` when the value looks bogus (Asobo's default airliners
+    /// return ~1400 kg here — clearly not a real OEW).
+    pub empty_weight_kg: Option<f32>,
+
+    // Identity
+    pub aircraft_title: Option<String>,
+    /// X-Plane: `acf_ui_name` (Name wie in der Oberflaeche und im Aircraft-
+    /// Scan). Nur fuer die Zuordnung „Flugzeug vermessen“ — die Messung
+    /// traegt diesen Titel (29.09.2026). `aircraft_title` bleibt
+    /// `acf_descrip` (Profilerkennung, Buchungsabgleich). MSFS: `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aircraft_ui_name: Option<String>,
+    pub aircraft_icao: Option<String>,
+    /// Aircraft registration / tail number as set in the sim (e.g. "D-AILU").
+    pub aircraft_registration: Option<String>,
+    pub simulator: Simulator,
+    pub sim_version: Option<String>,
+
+    // ---- Avionics (Phase H.1) ----
+    /// 4-digit transponder / squawk code, e.g. 7000.
+    pub transponder_code: Option<u16>,
+    /// Active COM1 frequency in MHz (e.g. 121.500).
+    pub com1_mhz: Option<f32>,
+    pub com2_mhz: Option<f32>,
+    pub nav1_mhz: Option<f32>,
+    pub nav2_mhz: Option<f32>,
+
+    // ---- Exterior lights ----
+    pub light_landing: Option<bool>,
+    pub light_beacon: Option<bool>,
+    pub light_strobe: Option<bool>,
+    pub light_taxi: Option<bool>,
+    pub light_nav: Option<bool>,
+    pub light_logo: Option<bool>,
+    /// 3-state strobe selector: 0 = OFF, 1 = AUTO, 2 = ON. Set on
+    /// aircraft profiles whose LVar exposes the position (Fenix).
+    /// `None` when only the binary `light_strobe` is available, so
+    /// the activity log can fall back to ON/OFF labels.
+    pub strobe_state: Option<u8>,
+
+    // ---- Autopilot ----
+    pub autopilot_master: Option<bool>,
+    pub autopilot_heading: Option<bool>,
+    pub autopilot_altitude: Option<bool>,
+    pub autopilot_nav: Option<bool>,
+    pub autopilot_approach: Option<bool>,
+    /// Autothrottle / Airbus A/THR engaged. Only filled by profiles
+    /// with a verified state source: Aerosoft A346 (`L:AB_AP_ATHR_
+    /// LIGHT_ON` FCU annunciator) and Fenix (`L:S_FCU_ATHR`). `None`
+    /// everywhere else (incl. X-Plane) so the activity log stays
+    /// silent instead of logging a dead default. `serde(default)`
+    /// keeps pre-existing JSONL flight-log replays deserializable.
+    #[serde(default)]
+    pub autothrottle_on: Option<bool>,
+    /// v1.5.3 (#ifly-audit): true, wenn `autothrottle_on` semantisch
+    /// ein ARM-Zustand ist (iFly: A/T-ARM-Schalter) und kein aktives
+    /// Engagement — die Logzeile textet dann "ARMED" statt "ENGAGED"
+    /// (Thomas' Protokoll 11.08.: "A/THR ENGAGED" um 10:22 am Gate).
+    pub autothrottle_is_arm: bool,
+
+    // ---- Powerplant (totals — per-engine arrays land later) ----
+    /// Total fuel-flow across all running engines, kg/h.
+    pub fuel_flow_kg_per_h: Option<f32>,
+
+    // ---- Surfaces ----
+    /// 0.0..1.0, current position of the spoiler / speed-brake handle.
+    /// Drives both ground-spoiler and in-flight speed-brake feedback.
+    pub spoilers_handle_position: Option<f32>,
+    /// Auto-spoilers armed for landing.
+    pub spoilers_armed: Option<bool>,
+    /// MSFS pushback state — 0/1/2 = pushing (straight/left/right),
+    /// 3 = no pushback (tug disconnected). Drives the Pushback →
+    /// TaxiOut FSM transition.
+    pub pushback_state: Option<u8>,
+    /// Cabin SEAT BELTS sign — 0=OFF, 1=AUTO, 2=ON.
+    pub seatbelts_sign: Option<u8>,
+    /// Cabin NO SMOKING sign — 0=OFF, 1=AUTO, 2=ON.
+    pub no_smoking_sign: Option<u8>,
+    /// FCU selected altitude (feet). e.g. 36000.
+    pub fcu_selected_altitude_ft: Option<i32>,
+    /// FCU selected heading (deg).
+    pub fcu_selected_heading_deg: Option<i32>,
+    /// FCU selected airspeed (kt).
+    pub fcu_selected_speed_kt: Option<i32>,
+    /// FCU selected vertical speed (fpm).
+    pub fcu_selected_vs_fpm: Option<i32>,
+    /// Autobrake setting — None means we don't know, "OFF"/"LO"/
+    /// "MED"/"MAX" otherwise.
+    pub autobrake: Option<String>,
+
+    // ---- Systems ----
+    pub apu_switch: Option<bool>,
+    /// 0..100. Useful to tell "starting" (rising) from "running" (~95).
+    pub apu_pct_rpm: Option<f32>,
+    pub battery_master: Option<bool>,
+    pub avionics_master: Option<bool>,
+    pub pitot_heat: Option<bool>,
+    /// "any engine has anti-ice on" — combined per-engine readings.
+    pub engine_anti_ice: Option<bool>,
+    /// Wing / structural deice (Airbus "WING ANTI ICE").
+    pub wing_anti_ice: Option<bool>,
+    /// Wing-illumination switch (Boeing). Some Airbus profiles also
+    /// expose it. None when the source platform doesn't report it
+    /// — generic SimVars / X-Plane base catalog don't, but PMDG
+    /// (MSFS) and Zibo/LevelUp 737 (X-Plane) do.
+    pub light_wing: Option<bool>,
+    /// Wheel-well light switch — Boeing 737-only feature in practice.
+    /// None on most aircraft.
+    pub light_wheel_well: Option<bool>,
+    /// Transponder mode label as shown on the cockpit panel:
+    /// "OFF"/"STBY"/"XPNDR"/"TEST"/"ALT"/"TA"/"TA-RA". Empty/None
+    /// when the source platform doesn't expose the mode separately
+    /// from the squawk code. Filled by both the PMDG SDK (MSFS) and
+    /// the X-Plane standard `transponder_mode` DataRef.
+    pub xpdr_mode_label: Option<String>,
+    /// Boeing "TAKEOFF CONFIG" annunciator — fires on the ground
+    /// when the aircraft is mis-configured for takeoff (flaps/trim/
+    /// parking-brake/spoilers wrong). 737 NG3 + Zibo/LevelUp 737
+    /// expose this via SDK / `laminar/B738/annunciator/takeoff_config`.
+    /// None on aircraft that don't have an EICAS takeoff-config check.
+    pub takeoff_config_warning: Option<bool>,
+
+    // ---- ATC / Gate info (from MSFS ATC system) ----
+    /// Stand identifier from `ATC PARKING NAME` (e.g. "GATE_HEAVY").
+    /// Only filled while the aircraft sits on a named stand; goes
+    /// empty after pushback. The recorder snapshots it at flight
+    /// start (departure gate) and on BlocksOn (arrival gate).
+    pub parking_name: Option<String>,
+    /// Stand number suffix (e.g. "12", "A 8") to combine with the name.
+    pub parking_number: Option<String>,
+    /// `ATC RUNWAY SELECTED` — the runway the MSFS ATC system
+    /// currently has the aircraft cleared for. Useful to record the
+    /// approach runway at touchdown.
+    pub selected_runway: Option<String>,
+    /// Uhrzeit IM SIMULATOR (UTC) — weicht von `timestamp` (Rechneruhr) ab,
+    /// wenn der Pilot mit anderer Tageszeit fliegt. MSFS `ZULU TIME` +
+    /// `ZULU DAY OF YEAR` + `ZULU YEAR`, X-Plane `sim/time/zulu_time_sec` +
+    /// `sim/time/local_date_days`. Bordbuch (26.09.2026): Tag/Nacht aus dem
+    /// Sonnenstand. `None` = Sim liefert keine Zeit → Rechneruhr.
+    #[serde(default)]
+    pub sim_zeit_utc: Option<DateTime<Utc>>,
+
+    // ---- Aircraft profile (Phase H.4) ----
+    /// Detected aircraft profile. Drives which set of variables (default
+    /// MSFS SimVars vs add-on-specific LVars) the adapter reads from.
+    /// `Default` covers Asobo + most payware that pipes state into the
+    /// standard SimVars (e.g. PMDG 737/777 mostly do); the named variants
+    /// cover study-level add-ons that pull state from their own LVars.
+    pub aircraft_profile: AircraftProfile,
+
+    // ---- PMDG SDK premium telemetry (Phase H.4) ----
+    /// Live cockpit state from a PMDG aircraft's SimConnect SDK
+    /// (737 NG3 or 777X). `None` when no PMDG aircraft is loaded
+    /// OR the user hasn't enabled `EnableDataBroadcast=1` in the
+    /// aircraft's options ini. When `Some`, the consumer (FSM,
+    /// activity log, PIREP fields) gets cockpit values that
+    /// standard MSFS SimVars don't expose: A/T FMA modes, MCP
+    /// selected values, FMC-computed V-speeds, exact flap angle.
+    /// See `pmdg-sdk-integration.md` for the full mapping.
+    pub pmdg: Option<PmdgState>,
+
+    // ---- Gear type / surface contact (category-aware landing) ----
+    // Live signals that distinguish rotorcraft / seaplane / amphibian from
+    // wheeled fixed-wing so the touchdown pipeline can branch. All `None`
+    // when the sim doesn't expose them (older JSONL replays, X-Plane with
+    // the Web API off). Purely additive — fixed-wing behaviour is unchanged.
+    /// MSFS `IS GEAR SKIDS` (true ⇒ rotorcraft hint). X-Plane sets this from
+    /// `sim/aircraft/gear/acf_gear_is_skid`.
+    #[serde(default)]
+    pub gear_is_skid: Option<bool>,
+    /// MSFS `IS GEAR FLOATS` (true ⇒ seaplane/float hint). None on X-Plane
+    /// (no float boolean — we infer water-capability from the water rudder).
+    #[serde(default)]
+    pub gear_is_floats: Option<bool>,
+    /// MSFS `IS GEAR WHEELS`. Lets us tell an amphibian (floats+wheels) from
+    /// a pure seaplane. None on X-Plane (no equivalent dataref).
+    #[serde(default)]
+    pub gear_is_wheels: Option<bool>,
+    /// MSFS `CONTACT POINT IS ON GROUND` aggregated over the contact points —
+    /// true if any wheel/skid/float is on the surface. Unlike the wheeled
+    /// `on_ground` flag this asserts on WATER too, so it is the
+    /// surface-agnostic touchdown signal for seaplanes/floats. None on
+    /// X-Plane (no per-contact-point ground dataref confirmed in the SDK).
+    #[serde(default)]
+    pub contact_point_on_ground: Option<bool>,
+    /// MSFS `GEAR WATER DEPTH` converted to metres — depth of the gear/floats
+    /// in the water. >0 when immersed → a positive water-contact signal for a
+    /// seaplane touchdown. Reads 0 when floats skip across water at speed, so
+    /// it supplements (does not replace) the descent-arrest heuristic. None on
+    /// X-Plane.
+    #[serde(default)]
+    pub gear_water_depth_m: Option<f32>,
+    /// Water rudder present — MSFS `WATER RUDDER HANDLE POSITION` != -1, or
+    /// X-Plane `acf_water_rud_area` > 0. A static seaplane/amphibian
+    /// discriminator (NOT a touchdown detector — it reflects a handle
+    /// position, not water contact).
+    #[serde(default)]
+    pub water_rudder_present: Option<bool>,
+
+    // ---- v0.16.10 (#Premium): Autoflight-/Cockpit-Tiefendaten ----
+    // Premium cockpit state from study-level addons (FMA modes, V-speeds,
+    // warnings, …). Carrier fields only in this phase — the per-addon
+    // mappers (PMDG SDK, FBW/Fenix/iniBuilds LVars, TFDi) fill them in
+    // later phases. All `Option` + `serde(default)` so existing JSONL
+    // replays and every downstream consumer stay compatible; `None` =
+    // "source doesn't expose it", never "off".
+    /// Normalized FMA lateral/roll-mode label, e.g. "LNAV", "LOC", "NAV".
+    #[serde(default)]
+    pub fma_lateral_mode: Option<String>,
+    /// Normalized FMA vertical/pitch-mode label, e.g. "VNAV PTH", "G/S", "ALT".
+    #[serde(default)]
+    pub fma_vertical_mode: Option<String>,
+    /// Normalized FMA thrust/speed-mode label, e.g. "N1", "SPEED",
+    /// "THR CLB", "MAN FLX".
+    #[serde(default)]
+    pub fma_thrust_mode: Option<String>,
+    /// Aircraft-authoritative FMGC/FWC flight-phase label (Airbus
+    /// "TAKEOFF"/"CLIMB"/…). Info only — never drives our phase FSM.
+    #[serde(default)]
+    pub flight_phase_aircraft: Option<String>,
+    /// Takeoff decision speed V1 (kt), as entered/computed in the FMS.
+    #[serde(default)]
+    pub v1_kt: Option<f64>,
+    /// Rotation speed VR (kt).
+    #[serde(default)]
+    pub vr_kt: Option<f64>,
+    /// Takeoff safety speed V2 (kt).
+    #[serde(default)]
+    pub v2_kt: Option<f64>,
+    /// Approach speed VAPP (kt, Airbus).
+    #[serde(default)]
+    pub vapp_kt: Option<f64>,
+    /// Lowest selectable speed VLS (kt, Airbus).
+    #[serde(default)]
+    pub vls_kt: Option<f64>,
+    /// Landing reference speed VREF (kt, Boeing).
+    #[serde(default)]
+    pub vref_kt: Option<f64>,
+    /// Überziehgeschwindigkeit in Landekonfiguration aus dem Flugmodell
+    /// (MSFS `DESIGN SPEED VS0`, X-Plane `acf_Vso`), kt. Wird nur
+    /// mitgeschrieben, bis die Vref daraus je Add-on an Messungen bestätigt
+    /// ist (`landing_scoring::vref`).
+    #[serde(default)]
+    pub design_vs0_kt: Option<f64>,
+    /// FLEX / assumed temperature (°C). `Some(>0)` ⇒ FLEX/derated takeoff.
+    #[serde(default)]
+    pub flex_temp_c: Option<f64>,
+    /// Thrust-lever detent label: "TOGA"/"FLX/MCT"/"CL"/"MAN".
+    #[serde(default)]
+    pub thrust_gate: Option<String>,
+    /// MASTER CAUTION annunciator lit.
+    #[serde(default)]
+    pub master_caution: Option<bool>,
+    /// MASTER WARNING annunciator lit.
+    #[serde(default)]
+    pub master_warning: Option<bool>,
+    /// Airbus managed (dot) vs. selected speed target on the FCU.
+    #[serde(default)]
+    pub managed_speed: Option<bool>,
+    /// Airbus managed vs. selected heading (NAV vs. HDG).
+    #[serde(default)]
+    pub managed_heading: Option<bool>,
+    /// Airbus managed vs. selected altitude.
+    #[serde(default)]
+    pub managed_altitude: Option<bool>,
+    /// Any engine thrust reverser unlocked/deployed.
+    #[serde(default)]
+    pub reverser_deployed: Option<bool>,
+    /// Auto ground-spoiler deployment at touchdown/RTO — distinct from
+    /// `spoilers_armed` (armed ≠ deployed) and from an in-flight speedbrake.
+    #[serde(default)]
+    pub ground_spoilers_active: Option<bool>,
+    /// Per-engine N1 in % from premium sources (len = engine count).
+    #[serde(default)]
+    pub eng_n1_pct: Option<Vec<f64>>,
+    /// Baro reference is STD (above transition) vs. QNH.
+    #[serde(default)]
+    pub baro_std: Option<bool>,
+    /// Per-tank fuel in kg (tank order is addon-specific — for the
+    /// imbalance display, not for totals; `fuel_total_kg` stays the sum).
+    #[serde(default)]
+    pub fuel_per_tank_kg: Option<Vec<f64>>,
+    /// Below-glideslope annunciator (PMDG etc.).
+    #[serde(default)]
+    pub below_gs_alert: Option<bool>,
+    /// Cabin-altitude warning horn/annunciator.
+    #[serde(default)]
+    pub cabin_altitude_warning: Option<bool>,
+    /// Stabilizer out-of-trim annunciator.
+    #[serde(default)]
+    pub stab_out_of_trim: Option<bool>,
+    /// Numeric baro minimums (DA/MDA, ft) where exposed (PMDG 777).
+    #[serde(default)]
+    pub minimums_baro_ft: Option<f64>,
+
+    // ---- v0.16.12 (#phase-v2): Schatten-Phasen-Engine ----
+    // Beide Felder werden vom STREAMER nach dem Schatten-Engine-Tick
+    // gestempelt — NIE von den Sim-Adaptern (die bauen den Snapshot mit
+    // `None`). Sie landen so additiv in der Position-JSONL (lokaler
+    // Recorder → VPS-Log-Upload), womit der Schatten-Diff alte-FSM-Phase
+    // (PhaseChanged-Events) vs. v2-Sicht pro Tick auswertbar ist.
+    // `serde(default)` + skip-if-None: alte JSONLs deserialisieren
+    // unverändert, Nicht-Flug-Snapshots bleiben sauber.
+    /// snake_case-Phase der Schatten-Engine v2 (z. B. "climb").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_phase: Option<String>,
+    /// Fenster-Segment der Schatten-Engine v2 ("ground" / "climbing" /
+    /// "level" / "descending" / "insufficient").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_segment: Option<String>,
+    /// Rohsignale zum Triebwerkszustand, genau so, wie der Simulator sie
+    /// liefert — je Triebwerk, ohne Auswertung. `engines_running` ist das
+    /// Urteil daraus; dieses Feld ist der Beleg, damit ein falsches Urteil
+    /// im Flug-Log nachvollziehbar ist, ohne dass jemand das Flugzeug
+    /// besitzen oder im Inspektor nachmessen muss (Anlass: PC-12,
+    /// Thorben 16.09.2026). `None` bei Adaptern, die es nicht füllen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_signals: Option<EngineSignals>,
+    /// Diagnose-Rohwerte unklar belegter Cockpit-Schalter + aircraft.cfg-
+    /// Pfad (siehe [`CockpitRohwerte`]). `None` bei Adaptern, die es nicht
+    /// füllen, und im Flug-Log bei jedem Tick ohne Änderung.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cockpit_rohwerte: Option<CockpitRohwerte>,
+}
+
+/// PMDG aircraft "premium telemetry" — generic across 737 NG3 and
+/// 777X. The `sim-msfs` crate fills this struct from variant-
+/// specific raw data (`Pmdg738RawData` / `Pmdg777XRawData`); the
+/// FSM and PIREP code consume this generic shape so they don't
+/// need PMDG-variant-specific code paths.
+///
+/// Field choice: only the cockpit values that EITHER aren't in
+/// standard MSFS SimVars at all (FMA modes, MCP selected speed
+/// when blanked, FMC V-speeds) OR are more accurate from PMDG
+/// (autobrake setting, flap angle in degrees vs. handle ratio).
+///
+/// `Default` (all-off / all-None) exists for tests that need a
+/// PmdgState carrier without filling ~50 fields — production code
+/// always builds it from a real SDK raw block in `sim-msfs`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PmdgState {
+    /// Which PMDG variant produced this state — useful for the
+    /// activity log ("PMDG 737-800: …") and for PIREP custom
+    /// fields that want to record the exact aircraft.
+    pub variant_label: String,
+
+    // ---- MCP (Mode Control Panel) — selected autopilot targets ----
+    /// MCP IAS/Mach window value. Above 10.0 = knots; below 10.0
+    /// = Mach. None when the MCP is blanked.
+    pub mcp_speed_raw: Option<f32>,
+    /// MCP heading bug, degrees true. None when MCP is unpowered.
+    pub mcp_heading_deg: Option<u16>,
+    /// MCP altitude window, feet. None when MCP is unpowered.
+    pub mcp_altitude_ft: Option<u16>,
+    /// MCP V/S window, fpm. None when V/S is blanked.
+    pub mcp_vs_fpm: Option<i16>,
+
+    // ---- FMA (Flight Mode Annunciator) — active autoflight modes ----
+    /// Speed-mode label as shown on FMA. Empty string when no
+    /// speed mode is engaged (= cockpit shows nothing). Possible
+    /// values: "N1", "SPD", "TOGA" (when AT pushed at takeoff),
+    /// "RETARD", "IDLE", etc. — exact labels are variant-specific.
+    pub fma_speed_mode: String,
+    /// Roll-mode label: "HDG SEL", "HDG HOLD", "LNAV", "VOR/LOC",
+    /// "APP", "" (none). Non-empty only when AP is engaged.
+    pub fma_roll_mode: String,
+    /// Pitch-mode label: "VNAV", "LVL CHG", "ALT HOLD", "VS",
+    /// "APP", "" (none).
+    pub fma_pitch_mode: String,
+    /// Auto-Throttle armed.
+    pub at_armed: bool,
+    /// At least one AP CMD channel engaged (CMD_A or CMD_B).
+    pub ap_engaged: bool,
+    /// Flight Director on (either side).
+    pub fd_on: bool,
+
+    // ---- FMC (Flight Management Computer) — pilot's plan ----
+    /// FMC takeoff flap setting in degrees. None if not entered.
+    pub fmc_takeoff_flaps_deg: Option<u8>,
+    /// FMC landing flap setting in degrees. None if not entered.
+    pub fmc_landing_flaps_deg: Option<u8>,
+    /// FMC V1 speed in knots. None if not entered.
+    pub fmc_v1_kt: Option<u8>,
+    /// FMC VR (rotate) speed in knots.
+    pub fmc_vr_kt: Option<u8>,
+    /// FMC V2 (takeoff safety) speed in knots.
+    pub fmc_v2_kt: Option<u8>,
+    /// FMC VREF (landing reference) speed in knots.
+    pub fmc_vref_kt: Option<u8>,
+    /// FMC cruise altitude, feet. None if not set.
+    pub fmc_cruise_alt_ft: Option<u16>,
+    /// Distance to top of descent, nautical miles. None when
+    /// already past TOD or not yet computed.
+    pub fmc_distance_to_tod_nm: Option<f32>,
+    /// Distance to destination, nautical miles. None when not
+    /// yet computed.
+    pub fmc_distance_to_dest_nm: Option<f32>,
+    /// FMC flight number (whatever the pilot entered in the FMC).
+    /// Empty if not set. Useful as a sanity check vs. the bid-
+    /// supplied flight number — mismatch = pilot loaded the
+    /// wrong route.
+    pub fmc_flight_number: String,
+    /// True when the pilot has completed the FMC PERF-INIT page.
+    /// Pre-flight checklist signal.
+    pub fmc_perf_input_complete: bool,
+
+    // ---- Controls — flaps, gear, autobrake (PMDG-precise) ----
+    /// Trailing-edge flap angle in degrees (live, not handle
+    /// position). For Boeing 737: 0/1/2/5/10/15/25/30/40 detents.
+    pub flap_angle_deg: f32,
+    /// Boeing flap-handle label (Premium-First). NG3 detents:
+    /// "UP"/"1"/"2"/"5"/"10"/"15"/"25"/"30"/"40". 777X detents:
+    /// "UP"/"1"/"5"/"15"/"20"/"25"/"30". Empty when not applicable.
+    /// Activity-log uses this directly instead of the Airbus-style
+    /// quantisation of `flaps_position`.
+    pub flap_handle_label: String,
+    /// Speedbrake/spoiler handle position normalised 0.0..1.0. Used
+    /// to override the standard `spoilers_handle_position` SimVar
+    /// which jitters near the ARMED detent. None when not available.
+    pub speedbrake_lever_pos: Option<f32>,
+    /// Autobrake setting label: "RTO" / "OFF" / "1" / "2" / "3"
+    /// / "MAX". The values vary by variant (777 has 4 LO/MED/...
+    /// settings) so we keep this as a label string.
+    pub autobrake_label: String,
+    /// True if the pilot has the speedbrake armed for landing.
+    pub speedbrake_armed: bool,
+    /// True if the speedbrake is currently extended in flight.
+    pub speedbrake_extended: bool,
+    /// Transponder mode label as shown on the cockpit panel:
+    /// "STBY"/"ALT-OFF"/"XPNDR"/"TA"/"TA-RA". Empty when not
+    /// applicable. PMDG-cockpit-authoritative — the standard
+    /// `TRANSPONDER STATE` SimVar only exposes the binary on/off.
+    pub xpdr_mode_label: String,
+    /// Cockpit "TAKEOFF CONFIG" warning is active. If true at
+    /// takeoff roll start, the PIREP gets a flag.
+    pub takeoff_config_warning: bool,
+
+    // ---- 777-specific extras (None for NG3) ----
+    /// FMC thrust-limit mode label as shown on the EICAS:
+    /// "TO" / "TO 1" / "TO 2" / "CLB" / "CRZ" / "CON" / "G/A"
+    /// / "D-TO" / "A-TO" etc. Empty when not applicable
+    /// (NG3 doesn't expose this).
+    pub thrust_limit_mode: String,
+    /// Electronic Checklist completion state — 10 phases.
+    /// `true` at index N = pilot has marked phase N complete in
+    /// the cockpit checklist. None for NG3 (no ECL there).
+    /// Phases:
+    ///   0=PREFLIGHT 1=BEFORE_START 2=BEFORE_TAXI
+    ///   3=BEFORE_TAKEOFF 4=AFTER_TAKEOFF 5=DESCENT
+    ///   6=APPROACH 7=LANDING 8=SHUTDOWN 9=SECURE
+    pub ecl_complete: Option<[bool; 10]>,
+    /// APU running per the SDK's authoritative bit (more accurate
+    /// than the RPM heuristic on the standard SimVar). None when
+    /// the variant doesn't expose it (NG3 derives from standard
+    /// SimVars instead).
+    pub apu_running: Option<bool>,
+    /// Wheel chocks set at the gate (777-specific). None for NG3.
+    pub wheel_chocks_set: Option<bool>,
+
+    // ---- Cockpit-state overrides for the Standard SimSnapshot ----
+    //
+    // These are the same things the standard MSFS SimVars expose
+    // (LIGHT LANDING, BATTERY MASTER, etc.) but read directly from
+    // the PMDG cockpit-state struct — guaranteed real-time vs. the
+    // standard SimVars which can lag during cold-start. The adapter
+    // overrides the matching SimSnapshot fields when these are set,
+    // so the existing activity-log change detection automatically
+    // uses the better values without any branching downstream.
+    /// Light switches mirrored from PMDG_*_Sw_ON / LTS_*Sw fields.
+    pub light_landing: Option<bool>,
+    pub light_beacon: Option<bool>,
+    pub light_strobe: Option<bool>,
+    pub light_taxi: Option<bool>,
+    pub light_nav: Option<bool>,
+    pub light_logo: Option<bool>,
+    pub light_wing: Option<bool>,
+    /// NG3-only: separate "WHEEL WELL" light switch (no Standard
+    /// SimVar exists for this — pure PMDG bonus).
+    pub light_wheel_well: Option<bool>,
+    /// Anti-ice: WING ANTI-ICE switch position.
+    pub wing_anti_ice: Option<bool>,
+    /// Anti-ice: at least one ENG ANTI-ICE switch is ON.
+    pub engine_anti_ice: Option<bool>,
+    /// Pitot/probe heat (combined).
+    pub pitot_heat: Option<bool>,
+    /// Battery master switch state.
+    pub battery_master: Option<bool>,
+    /// Parking brake set (PMDG-cockpit-authoritative).
+    pub parking_brake: Option<bool>,
+
+    // ---- v0.16.10 (#Premium): zusaetzliche SDK-Felder ----
+    // Carrier-Felder fuer Werte, die der PMDG-SDK-Struct bereits
+    // mitsendet — die sim-msfs-Mapper fuellen sie in Phase 3. Alle
+    // `Option` + `serde(default)`, damit aeltere serialisierte
+    // PmdgState-Bloecke (JSONL-Replays) weiter deserialisieren.
+    // V-Speeds + FMA-Modi existieren oben schon (`fmc_*_kt`,
+    // `fma_*_mode`) und werden NICHT dupliziert.
+    /// Any engine thrust reverser unlocked/deployed.
+    #[serde(default)]
+    pub reverser_deployed: Option<bool>,
+    /// MASTER CAUTION annunciator lit.
+    #[serde(default)]
+    pub master_caution: Option<bool>,
+    /// MASTER WARNING annunciator lit.
+    #[serde(default)]
+    pub master_warning: Option<bool>,
+    /// Below-glideslope (GPWS "BELOW G/S") annunciator.
+    #[serde(default)]
+    pub below_gs: Option<bool>,
+    /// Cabin-altitude warning active.
+    #[serde(default)]
+    pub cabin_altitude_warning: Option<bool>,
+    /// Stabilizer out-of-trim annunciator.
+    #[serde(default)]
+    pub stab_out_of_trim: Option<bool>,
+    /// Per-tank fuel in kg (PMDG tank order).
+    #[serde(default)]
+    pub fuel_per_tank_kg: Option<Vec<f64>>,
+    /// Numeric baro minimums (DA/MDA, ft) — 777 exposes this.
+    #[serde(default)]
+    pub minimums_baro_ft: Option<f64>,
+    /// GPWS ground-proximity warning active (carrier only — no
+    /// generic SimSnapshot field yet; consumers read it via `pmdg`).
+    #[serde(default)]
+    pub gnd_prox_warning: Option<bool>,
+    /// Anschnallzeichen-Wahlschalter aus dem SDK, Snapshot-Konvention
+    /// 0=OFF 1=AUTO 2=ON. 737: `COMM_FastenBeltsSelector`
+    /// (PMDG_NG3_SDK.h:216), 777: `SIGNS_SeatBeltsSelector`
+    /// (PMDG_777X_SDK.h:154), beide laut Header "0: OFF 1: AUTO 2: ON".
+    /// Audit 26.09.2026: `seatbelts_sign` blieb auf allen PMDG-Flügen
+    /// `None`, obwohl das SDK den Schalter mitsendet.
+    #[serde(default)]
+    pub seatbelts_sign: Option<u8>,
+    /// Rohbyte des Autobrake-Wahlschalters, NUR 777 — Belegung 0=RTO 1=OFF
+    /// 2=DISARM 3..6 = 1..4 7=MAX AUTO (SDK-Header, Paket-Animation und
+    /// Asobo-Template übereinstimmend, seit Runde 2 im Label). Läuft
+    /// weiter mit, damit echte Flüge die Tabelle gegenprüfen.
+    #[serde(default)]
+    pub autobrake_selector_roh: Option<u8>,
+}
+
+/// Rohwerte von Cockpit-Schaltern, deren Belegung widersprüchlich oder
+/// unbekannt ist (Audit 26.09.2026, Teil B). Sie werden NICHT gedeutet,
+/// sondern nur ins Flug-Log geschrieben, damit echte Flüge die
+/// Belegung klären. Der Adapter füllt sie je Tick; der Streamer schreibt
+/// sie nur bei Änderung ins Log (`SimSnapshot::cockpit_rohwerte_nur_bei_aenderung`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CockpitRohwerte {
+    /// Variablenname (wie bei SimConnect registriert) → Rohwert.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub werte: BTreeMap<String, f64>,
+    /// aircraft.cfg-Pfad aus dem SimConnect-Systemzustand `AircraftLoaded`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cfg_pfad: Option<String>,
+}
+
+impl SimSnapshot {
+    /// Vertical speed the TOUCHDOWN capture should use: the raw, lag-free signal
+    /// when the adapter provides one (X-Plane `local_vy`), otherwise the display
+    /// V/S (MSFS, whose `VERTICAL SPEED` SimVar is already raw + responsive).
+    /// This keeps touchdown detection responsive (no VSI lag) while
+    /// `vertical_speed_fpm` is the curvature-free value for display / phase-FSM /
+    /// approach-stability.
+    pub fn touchdown_vs_source_fpm(&self) -> f32 {
+        self.vertical_speed_raw_fpm
+            .unwrap_or(self.vertical_speed_fpm)
+    }
+
+    /// Diagnose-Rohwerte nur bei Änderung ins Flug-Log: ist
+    /// `cockpit_rohwerte` gleich dem zuletzt geschriebenen Stand, wird das
+    /// Feld auf `None` gesetzt (und damit nicht serialisiert), sonst wird
+    /// `letzte` auf den neuen Stand gezogen. So kostet der Diagnosekanal
+    /// nur bei Schalterbewegungen Platz, nicht bei jedem 3-s-Tick.
+    pub fn cockpit_rohwerte_nur_bei_aenderung(&mut self, letzte: &mut Option<CockpitRohwerte>) {
+        if self.cockpit_rohwerte.is_none() {
+            return;
+        }
+        if self.cockpit_rohwerte == *letzte {
+            self.cockpit_rohwerte = None;
+        } else {
+            letzte.clone_from(&self.cockpit_rohwerte);
+        }
+    }
+
+    /// Premium-First override for the autoflight booleans (v0.16.7).
+    ///
+    /// Data-audit finding (2026-06-11, 426 flights): the standard
+    /// `AUTOPILOT MASTER` SimVar reads permanently false on the PMDG
+    /// 737/777 (24 audited flights) — PMDG drives its autoflight purely
+    /// through the SDK, so the "Autopilot ENGAGED/OFF" and "A/THR"
+    /// activity-log lines never fired for those pilots. The real signals
+    /// are already in the SDK snapshot we receive: `ap_engaged`
+    /// (737 `MCP_annunCMD_A || MCP_annunCMD_B`, 777 `MCP_annunAP` L/R)
+    /// and `at_armed` (737 `MCP_annunATArm`, 777 `MCP_annunAT`).
+    ///
+    /// Semantics — same standard-var-OR-tiebreaker pattern as the
+    /// A346 / Fenix LVar mappings in the sim-msfs telemetry parser:
+    ///   * presence-gated: when `pmdg` is `None` (non-PMDG aircraft,
+    ///     SDK broadcast off, X-Plane, old JSONL replays) NOTHING
+    ///     changes — proven by the tests below;
+    ///   * `autopilot_master = standard || pmdg.ap_engaged` — if the
+    ///     standard SimVar is ever wired it can only agree or win;
+    ///   * `autothrottle_on = standard || pmdg.at_armed`. The NG3 SDK
+    ///     only exposes the MCP "A/T ARM" annunciator (lit while armed
+    ///     AND while engaged, off after disconnect) — there is no
+    ///     separate "engaged" bit in `PMDG_NG3_SDK.h`, so ARM is the
+    ///     closest cockpit truth and is mapped knowingly. The 777
+    ///     `MCP_annunAT` is the A/T engage-button light.
+    ///
+    /// Called by `MsfsAdapter::snapshot()` right after the PMDG state is
+    /// merged. Lives here (not in the Windows-only adapter) so the
+    /// mapping is unit-tested on every platform.
+    pub fn apply_pmdg_autoflight_override(&mut self) {
+        let Some((ap_engaged, at_on)) = self.pmdg.as_ref().map(|p| (p.ap_engaged, p.at_armed))
+        else {
+            return;
+        };
+        self.autopilot_master = Some(self.autopilot_master.unwrap_or(false) || ap_engaged);
+        self.autothrottle_on = Some(self.autothrottle_on.unwrap_or(false) || at_on);
+    }
+
+    /// v0.16.10 (#Premium): Premium-First override for the new cockpit
+    /// deep-data fields — sibling of [`Self::apply_pmdg_autoflight_override`],
+    /// called right after it in `MsfsAdapter::snapshot()` once the PMDG
+    /// ClientData block is merged. Lives here (not in the Windows-only
+    /// adapter) so the mapping is unit-tested on every platform.
+    ///
+    /// Semantics:
+    ///   * presence-gated like the autoflight override: `pmdg == None`
+    ///     (non-PMDG aircraft, SDK broadcast off, X-Plane, old JSONL
+    ///     replays) ⇒ NOTHING changes;
+    ///   * per-field PMDG-wins-when-present: a `Some` from the SDK
+    ///     replaces the generic value, a `None` (mapper not wired yet —
+    ///     Phase 3) keeps whatever is already in the snapshot;
+    ///   * FMA: the PMDG columns map onto the generic labels
+    ///     (roll → lateral, pitch → vertical, speed → thrust — Boeing's
+    ///     FMA column 1 IS the A/T thrust mode). Empty string = the
+    ///     cockpit shows nothing ⇒ stays `None`, no empty labels
+    ///     downstream;
+    ///   * V-speeds come from the existing `fmc_*_kt` fields (FMC
+    ///     entries, `Option<u8>` kt) widened to the generic f64 fields;
+    ///   * ground spoilers: PMDG only reports "speedbrake extended"
+    ///     without ground context. On the ground that's the (auto)
+    ///     ground-spoiler deployment → mapped; in the air it's a normal
+    ///     in-flight speedbrake → `ground_spoilers_active` stays
+    ///     untouched (deliberately simple, see v0.16.10 spec).
+    pub fn apply_pmdg_premium_override(&mut self) {
+        // v0.16.10 QS (Minor 10): kein PmdgState-Vollklon pro Tick mehr —
+        // der Struct traegt etliche Strings/Vecs (variant_label, FMC-
+        // Flight-Number, Label-Felder, fuel_per_tank, …). Stattdessen
+        // unter dem &-Borrow nur die benoetigten Werte herauskopieren
+        // (die 3 FMA-Strings allozieren nur wenn non-empty, der Tank-Vec
+        // nur wenn Some), dann den Borrow fallen lassen und zuweisen.
+        let non_empty = |s: &str| {
+            let s = s.trim();
+            (!s.is_empty()).then(|| s.to_string())
+        };
+        let Some(p) = self.pmdg.as_ref() else {
+            return;
+        };
+        // FMA columns → generic labels. Leerstring = Cockpit zeigt
+        // nichts an → None bleibt None.
+        let fma_lateral = non_empty(&p.fma_roll_mode);
+        let fma_vertical = non_empty(&p.fma_pitch_mode);
+        let fma_thrust = non_empty(&p.fma_speed_mode);
+        let master_caution = p.master_caution;
+        let master_warning = p.master_warning;
+        let reverser_deployed = p.reverser_deployed;
+        let below_gs = p.below_gs;
+        let cabin_altitude_warning = p.cabin_altitude_warning;
+        let stab_out_of_trim = p.stab_out_of_trim;
+        let minimums_baro_ft = p.minimums_baro_ft;
+        let fuel_per_tank_kg = p.fuel_per_tank_kg.clone();
+        let (v1, vr, v2, vref) = (p.fmc_v1_kt, p.fmc_vr_kt, p.fmc_v2_kt, p.fmc_vref_kt);
+        let speedbrake_extended = p.speedbrake_extended;
+        let seatbelts_sign = p.seatbelts_sign;
+
+        if let Some(m) = fma_lateral {
+            self.fma_lateral_mode = Some(m);
+        }
+        if let Some(m) = fma_vertical {
+            self.fma_vertical_mode = Some(m);
+        }
+        if let Some(m) = fma_thrust {
+            self.fma_thrust_mode = Some(m);
+        }
+
+        // Warn-/Status-Bits + Minimums: SDK-Wert gewinnt wenn vorhanden.
+        self.master_caution = master_caution.or(self.master_caution);
+        self.master_warning = master_warning.or(self.master_warning);
+        self.reverser_deployed = reverser_deployed.or(self.reverser_deployed);
+        self.below_gs_alert = below_gs.or(self.below_gs_alert);
+        self.cabin_altitude_warning = cabin_altitude_warning.or(self.cabin_altitude_warning);
+        self.stab_out_of_trim = stab_out_of_trim.or(self.stab_out_of_trim);
+        self.minimums_baro_ft = minimums_baro_ft.or(self.minimums_baro_ft);
+        // Anschnallzeichen aus dem SDK-Wahlschalter; ohne SDK-Wert bleibt
+        // der LVar-Rückfall des Adapters stehen.
+        self.seatbelts_sign = seatbelts_sign.or(self.seatbelts_sign);
+        if fuel_per_tank_kg.is_some() {
+            self.fuel_per_tank_kg = fuel_per_tank_kg;
+        }
+
+        // FMC V-Speeds (Option<u8> kt) → generische f64-Felder.
+        self.v1_kt = v1.map(f64::from).or(self.v1_kt);
+        self.vr_kt = vr.map(f64::from).or(self.vr_kt);
+        self.v2_kt = v2.map(f64::from).or(self.v2_kt);
+        self.vref_kt = vref.map(f64::from).or(self.vref_kt);
+
+        // Ground-Spoiler nur am Boden mappen — in der Luft ist
+        // `speedbrake_extended` eine normale Speedbrake, kein
+        // Ground-Spoiler-Signal.
+        if self.on_ground {
+            self.ground_spoilers_active = Some(speedbrake_extended);
+        }
+    }
+}
+
+impl Default for SimSnapshot {
+    fn default() -> Self {
+        Self {
+            timestamp: DateTime::<Utc>::from_timestamp(0, 0).expect("epoch is valid"),
+            lat: 0.0,
+            lon: 0.0,
+            altitude_msl_ft: 0.0,
+            altitude_agl_ft: 0.0,
+            altitude_indicated_ft: None,
+            altitude_pressure_ft: None,
+            heading_deg_true: 0.0,
+            heading_deg_magnetic: 0.0,
+            pitch_deg: 0.0,
+            bank_deg: 0.0,
+            vertical_speed_fpm: 0.0,
+            vertical_speed_raw_fpm: None,
+            velocity_body_x_fps: None,
+            velocity_body_z_fps: None,
+            groundspeed_kt: 0.0,
+            indicated_airspeed_kt: 0.0,
+            true_airspeed_kt: 0.0,
+            aircraft_wind_x_kt: None,
+            aircraft_wind_z_kt: None,
+            g_force: 1.0,
+            g_semibody: None,
+            on_ground: true,
+            crashed: false,
+            crash_source: None,
+            gear_normal_force_n: None,
+            parking_brake: true,
+            stall_warning: false,
+            overspeed_warning: false,
+            paused: false,
+            slew_mode: false,
+            simulation_rate: 1.0,
+            sim_bildrate_hz: None,
+            gear_position: 1.0,
+            flaps_position: 0.0,
+            flap_handle_index: None,
+            flap_num_positions: None,
+            engines_running: 0,
+            fuel_total_kg: 0.0,
+            fuel_used_kg: 0.0,
+            zfw_kg: None,
+            payload_kg: None,
+            total_weight_kg: None,
+            touchdown_vs_fpm: None,
+            touchdown_pitch_deg: None,
+            touchdown_bank_deg: None,
+            touchdown_heading_mag_deg: None,
+            touchdown_lat: None,
+            touchdown_lon: None,
+            wind_direction_deg: None,
+            wind_speed_kt: None,
+            qnh_hpa: None,
+            outside_air_temp_c: None,
+            total_air_temp_c: None,
+            mach: None,
+            empty_weight_kg: None,
+            aircraft_title: None,
+            aircraft_ui_name: None,
+            aircraft_icao: None,
+            aircraft_registration: None,
+            simulator: Simulator::default(),
+            sim_version: None,
+            transponder_code: None,
+            com1_mhz: None,
+            com2_mhz: None,
+            nav1_mhz: None,
+            nav2_mhz: None,
+            light_landing: None,
+            light_beacon: None,
+            light_strobe: None,
+            light_taxi: None,
+            light_nav: None,
+            light_logo: None,
+            strobe_state: None,
+            autopilot_master: None,
+            autopilot_heading: None,
+            autopilot_altitude: None,
+            autopilot_nav: None,
+            autopilot_approach: None,
+            autothrottle_on: None,
+            autothrottle_is_arm: false,
+            fuel_flow_kg_per_h: None,
+            spoilers_handle_position: None,
+            spoilers_armed: None,
+            pushback_state: None,
+            apu_switch: None,
+            apu_pct_rpm: None,
+            battery_master: None,
+            avionics_master: None,
+            pitot_heat: None,
+            engine_anti_ice: None,
+            wing_anti_ice: None,
+            light_wing: None,
+            light_wheel_well: None,
+            xpdr_mode_label: None,
+            takeoff_config_warning: None,
+            seatbelts_sign: None,
+            no_smoking_sign: None,
+            fcu_selected_altitude_ft: None,
+            fcu_selected_heading_deg: None,
+            fcu_selected_speed_kt: None,
+            fcu_selected_vs_fpm: None,
+            autobrake: None,
+            parking_name: None,
+            parking_number: None,
+            selected_runway: None,
+            sim_zeit_utc: None,
+            aircraft_profile: AircraftProfile::default(),
+            pmdg: None,
+            gear_is_skid: None,
+            gear_is_floats: None,
+            gear_is_wheels: None,
+            contact_point_on_ground: None,
+            gear_water_depth_m: None,
+            water_rudder_present: None,
+            // v0.16.10 (#Premium): Cockpit-Tiefendaten — alle None bis
+            // ein Premium-Mapper (PMDG SDK / Addon-LVars) sie fuellt.
+            fma_lateral_mode: None,
+            fma_vertical_mode: None,
+            fma_thrust_mode: None,
+            flight_phase_aircraft: None,
+            v1_kt: None,
+            vr_kt: None,
+            v2_kt: None,
+            vapp_kt: None,
+            vls_kt: None,
+            vref_kt: None,
+            design_vs0_kt: None,
+            flex_temp_c: None,
+            thrust_gate: None,
+            master_caution: None,
+            master_warning: None,
+            managed_speed: None,
+            managed_heading: None,
+            managed_altitude: None,
+            reverser_deployed: None,
+            ground_spoilers_active: None,
+            eng_n1_pct: None,
+            baro_std: None,
+            fuel_per_tank_kg: None,
+            below_gs_alert: None,
+            cabin_altitude_warning: None,
+            stab_out_of_trim: None,
+            minimums_baro_ft: None,
+            // v0.16.12 (#phase-v2): nur der Streamer stempelt die
+            // Schatten-Felder — Default/Adapter liefern None.
+            shadow_phase: None,
+            shadow_segment: None,
+            engine_signals: None,
+            cockpit_rohwerte: None,
+        }
+    }
+}
+
+/// Identifies the active aircraft add-on so the adapter can read the right
+/// LVars (and the activity log can show the pilot which mapping is in use).
+/// Detection runs on every snapshot but the answer is cached on the adapter
+/// — the title only changes when the pilot loads a different airframe.
+///
+/// Mapping status (Phase H.4 backlog):
+///   * `FbwA32nx`   — LVars wired (untested live, FBW not loaded yet).
+///     v0.16.10 (#Premium): deckt jetzt die ganze `A32NX_`-LVar-Familie
+///     ab — FBW A32NX, FBW A380X, Headwind A339 (alles Forks derselben
+///     Codebasis).
+///   * `TfdiMd11`   — detection only (v0.16.10 #Premium); Premium-Mapper
+///     folgt in einer spaeteren Phase.
+///   * `IflyMax8`   — Premium-Mapper wired (v0.16.11): AP CMD A/B,
+///     A/T ARM, Master Caution/Fire, Reverser, Ground Spoiler,
+///     Cabin-Altitude-Warnung, Autobrake-Selector (WASM-strings +
+///     HubHop, Live-Flug-Verifikation steht aus).
+///   * `FsLabsA321` — Premium-Mapper wired (v0.16.14): AP1/AP2,
+///     A/THR, APPR/LOC via FCU-LED-Helligkeit, FCU-Werte mit
+///     managed/selected (dashed → None), Autobrake LO/MED/MAX
+///     (HubHop-Output-Presets; LED-Schwellen werden beim ersten
+///     Live-Flug verifiziert).
+///   * `FenixA320`  — Lights / parking brake / flaps wired and verified
+///                    in MSFS 2024. AP indicator LVars (`I_FCU_AP*`) were
+///                    observed flickering and are intentionally disabled
+///                    until a stable source is identified.
+///   * `Pmdg737`    — detection only; LVars TBD (PMDG ships its own
+///                    SimConnect ClientData SDK, not plain LVars — needs
+///                    a separate subscribe path).
+///   * `Pmdg777`    — same as 737.
+///   * `IniA340`    — detection only; LVar list TBD.
+///   * `IniA350`    — AP1/AP2 + A/THR + APPR/LOC via FCU-LED-LVars (v0.16.8, HubHop).
+///   * `IniA346Pro` — detection only; LVar list TBD.
+///   * `AerosoftA346` — AP-state LVars wired (`L:AB_AP_*_LIGHT_ON`),
+///     confirmed via WASM strings analysis 2026-06-10. Engines/fuel-flow
+///     need no profile gate — the aircraft serves the standard
+///     `EX1`/CORRECTED-FF SimVar variants which the mapping now reads
+///     addon-agnostically.
+///
+/// Cross-cutting issue: ~50 LVar fields in one SimConnectObject macro
+/// appears to overflow the read path on Fenix (lights/flaps return 0.0
+/// despite live cockpit changes); future work is a runtime-defined LVar
+/// reader (likely via `msfs-rs` or MobiFlight WASM client data) so each
+/// profile only subscribes to the LVars it actually uses.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AircraftProfile {
+    /// Standard MSFS SimVars only — works for Asobo and most payware.
+    #[default]
+    Default,
+    /// FlyByWire A32NX (community Airbus). Reads `L:A32NX_*` LVars.
+    /// LVar reference: github.com/flybywiresim/aircraft/blob/master/
+    /// fbw-a32nx/docs/a320-simvars.md
+    /// v0.16.10 (#Premium): EIN Profil fuer die ganze FBW-Familie —
+    /// A32NX, FBW A380X und Headwind A339 nutzen dieselbe
+    /// `A32NX_`-LVar-Namensfamilie (Forks derselben Codebasis).
+    FbwA32nx,
+    /// Fenix Simulations A319 v2 (shares the `FNX_32X` SimObject with
+    /// the A320 — LVar names are variant-identical, only the airframe
+    /// dimensions differ).
+    FenixA319,
+    /// Fenix Simulations A320 v2. LVars in `FNX32X_Interior.xml` plus
+    /// the Fenix knowledge base.
+    FenixA320,
+    /// Fenix Simulations A321 v2 (same `FNX_32X` SimObject as A320).
+    FenixA321,
+    /// PMDG 737 (700/800/900). LVars are in PMDG's SDK header.
+    Pmdg737,
+    /// PMDG 777 (200/300). Same SDK family as the 737.
+    Pmdg777,
+    /// INIBuilds A340 (Standard Edition).
+    IniA340,
+    /// INIBuilds A350.
+    IniA350,
+    /// INIBuilds A340-600 Pro.
+    IniA346Pro,
+    /// Aerosoft A340-600 Professional (MSFS, ToLiss port). WASM strings
+    /// analysis of `MSFS_ToLiss_Plugin.wasm` (2026-06-10) proved the
+    /// aircraft serves NON-standard SimVar variants:
+    /// `GENERAL ENG COMBUSTION EX1:1..4` (not the plain SimVar — root
+    /// cause of the dead `engines_running` behind v0.13.17),
+    /// `TURB ENG CORRECTED FF:1..4` (not `ENG FUEL FLOW PPH` — root
+    /// cause behind the v0.13.18 FOB derivation), and AP state ONLY
+    /// via `L:AB_AP_*_LIGHT_ON` LVars. Titles start with
+    /// "Aerosoft A346", `atc_model`/`icao_type_designator` = "A346".
+    AerosoftA346,
+    /// v0.13.13: FSReborn Phenom 300E (MSFS 2024 release). Verwendet die
+    /// FSR-eigenen Engine-Knob-LVars statt `GENERAL ENG COMBUSTION:N`.
+    /// Hintergrund (Pilot-Befund Michael 2026-05-26): Standard-SimVar
+    /// liefert in Cold&Dark vor Engine-Start `engines_running > 0` obwohl
+    /// Engines aus → Auto-Start scheitert mit "Triebwerke sind an". FSR
+    /// nutzt eigene LVars fuer Switch-State (siehe HubHop-Reference
+    /// docs/dev/lvar-discovery-hubhop.md):
+    ///   L:FSR_300E_ENGINE1_KNOB_POS  Number  0=STOP 1=RUN 2=START
+    ///   L:FSR_300E_ENGINE2_KNOB_POS  Number  0=STOP 1=RUN 2=START
+    /// Rest der Telemetrie (N1/N2/Fuel/Gear/Flaps) kommt sauber via
+    /// Standard-SimVars — kein voller Profile-Override noetig.
+    FsrPhenom300e,
+    /// v0.16.10 (#Premium): TFDi Design MD-11 (Pax + Freighter — ein
+    /// Profil fuer beide). Detection-only in dieser Phase, die
+    /// Premium-Quellen (laut 7-Agent-Inventar) werden in einer
+    /// spaeteren Phase gemappt. atc_model "MD11"/"MD11F",
+    /// ICAO-Designator MD11; Titles tragen "TFDi" + "MD-11".
+    TfdiMd11,
+    /// v0.16.11: iFly 737 MAX 8 (MSFS). Title aus der aircraft.cfg:
+    /// "iFly 737-MAX8 (178Seat)" (Liveries variieren den Suffix).
+    /// `atc_model` ist ein nutzloser generischer ATCCOM-B737-Token —
+    /// Detection laeuft NUR ueber den Title-Marker. LVar-Quellen:
+    /// WASM-Strings-Dump (verifiziert) + HubHop-Output-Presets fuer
+    /// die CMD-A/B-LEDs (`L:VC_*_VAL`-Annunciator-Familie).
+    IflyMax8,
+    /// v0.16.14: FSLabs A321 (MSFS, ceo + neo — EIN Profil fuer alle
+    /// Varianten: CFM, IAE, Sharklet, NEO LEAP/PW; die ceo teilt FSLs
+    /// LVar-Schema mit der neo). FSL faehrt die Systeme in einem
+    /// EXTERNEN Prozess — die Paket-WASMs sind Stubs, die LVars
+    /// existieren nur zur Laufzeit. Die HubHop-Output-Presets
+    /// (Vendor "Flight Sim Labs", A321neo) sind deshalb die
+    /// autoritative dokumentierte Lese-Oberflaeche. Detection NUR
+    /// ueber den "FSLabs"-Title-Praefix (alle Titles + Liveries
+    /// tragen ihn).
+    FsLabsA321,
+    /// v0.17.x (#Premium, Aircraft-Scan): Contrail „Dassault Falcon 50"
+    /// (MSFS, Trijet — 3 Triebwerke). Erster über das Aircraft-Scan-Tool
+    /// (live.kant.ovh/aircraft) analysierte Flieger. Kein Stub — echtes
+    /// `contrailsystem.wasm` (6,58 MB) + offener EFIS-JS-Quellcode.
+    /// Namespace `CTL_FA50_*` (System) + `EFIS_C86C_*` (Avionik).
+    /// Premium-Quellen (verifiziert per Paket-Analyse 2026-07-05):
+    ///   * Engine-Cutoff pro TW: L:CTL_FA50_SYS_ENG1/2/3_CUTOFF
+    ///   * FMA (Number-Enum): L:EFIS_C86C_FMA_SLOT_LAT_ACTIVE/_ARMED,
+    ///     _VERT_ACTIVE/_ARMED1/_ARMED2/_VNV
+    ///   * AP-Master/YD: L:EFIS_C86C_AP_BTN_MASTER_AP/_MASTER_YD
+    ///   * Autothrottle: L:CTL_FA50_AUTOTHROTTLE_ACTIVE
+    /// Detection NUR über Title `contrail`+`falcon`. Der bekannte
+    /// Auto-File-Hänger (Stock engines_running klemmt nach Shutdown auf 3)
+    /// wird primär über den addon-agnostischen Stillstands-Fallback in der
+    /// Phase-FSM abgefangen (siehe lib.rs) — polaritätsunabhängig.
+    ContrailFa50,
+    /// Synaptic Simulations A220 (MSFS, -100/-300 — EIN Profil für beide
+    /// Varianten, gleiche `L:A22X_*`-LVar-Familie laut offizieller
+    /// Vendor-Doku docs.synapticsim.com/pilots/simvars). Anders als bei
+    /// FSLabs/Aerosoft ist hier NICHTS bekanntermaßen gefälscht — die
+    /// Standard-MSFS-SimVars (Triebwerk/Fahrwerk/Klappen/Bremse) laufen
+    /// nativ (die Inputs-Seite zeigt Standard-H-Events wie
+    /// `AXIS_THROTTLE_SET`/`FLAPS_SET`), die `A22X`-LVars sind eine reine
+    /// Zusatzschicht für Cockpit-Schalter/-Lampen. Profil erstmals aus der
+    /// Doku gebaut, BEVOR der Flieger lokal installiert war (2026-07-28).
+    /// Erster echter Flug (Thomas K., PIREP VGDmGnMEWmMbkJRP, 2026-07-28)
+    /// deckte einen Detection-Fehler auf (siehe `detect()`) und lief
+    /// deshalb komplett auf `Default` — die Premium-Mappings unten sind
+    /// also WEITERHIN unverifiziert (Detection-Fix kam erst danach).
+    /// Gemappte Premium-Quellen:
+    ///   * FG-Modi (FMA-Äquivalent): L:A22X FG LNAV/Heading/Approach
+    ///     (lateral), L:A22X FG Altitude/VNAV/Vertical Speed/Flight Path
+    ///     Angle/Flight Level (vertikal)
+    ///   * Master Caution/Warning: L:A22X Caution PBA / Warning PBA
+    ///   * Autobrake: L:A22X Autobrake (Enum RTO/OFF/LO/MED/HI laut Doku-
+    ///     Reihenfolge — NICHT explizit nummeriert, Label braucht
+    ///     Live-Verifikation)
+    ///   * Aircraft-eigene Flugphase: L:A22X Flight Stage (Enum
+    ///     Hangar/Taxi/Apron/Runway/Climb/Cruise/Approach/Final laut
+    ///     Doku-Reihenfolge — ebenfalls nicht explizit nummeriert,
+    ///     Live-Verifikation offen, Info-only wie bei allen anderen
+    ///     Profilen)
+    /// Offene Lücke: KEINE numerischen V-Speed-LVars dokumentiert (nur
+    /// ein V1-Aural-Flag) — v1/vr/v2/vapp/vls bleiben None.
+    SynapticA220,
+    /// iniBuilds A380-800 (MSFS 2024). Audit 26.09.2026 (705 MSFS-2024-
+    /// Flüge): 13 Flüge mit dem Titel "A380-800 RR Basic" (ICAO A388)
+    /// liefen alle als `Default` — der Titel trägt keinen Hersteller.
+    /// NICHT zu verwechseln mit dem FBW A380X ("FlyByWire A380X
+    /// (A380-842)"), der über seinen Titel-Marker bzw. seinen Paketpfad
+    /// (`detect_mit_pfad`) auf `FbwA32nx` landet.
+    /// Gemappt (flight-fabric-Fremdcode + HubHop übereinstimmend):
+    ///   * `L:INI_SPOILERS_ARMED` 1 = armed
+    ///   * `L:INI_APU_MASTER_SWITCH` 0/1
+    ///   * `L:INI_SEATBELTS_SWITCH` 0=ON 1=AUTO 2=OFF (umgekehrt zur
+    ///     Snapshot-Konvention, wird umgerechnet)
+    /// `L:INI_LIGHTS_STROBE` ist für die A380 nicht belegt (die A350-Belegung
+    /// 0=ON 1=AUTO 2=OFF ist nicht übertragen) und läuft nur als Rohwert ins
+    /// Flug-Log (`cockpit_rohwerte`).
+    IniA380,
+    /// iniBuilds A330-200/-300 (MSFS 2024, Paket
+    /// `StreamedPackages/fs24-microsoft-aircraft-a330`). Titel ohne
+    /// Hersteller: "A330-200 VIP (GE)", "A330-300 (RR)", "A330-200 (GE)",
+    /// "A330-300 VIP (RR)", "A330-300P2F (RR)"; ICAO meist leer. Erkannt am
+    /// Titelmuster "a330-…(…)" bzw. am aircraft.cfg-Pfad `microsoft-a330`.
+    /// NICHT der Headwind A339 ("A330-941", ICAO A339 → `FbwA32nx`).
+    /// Belegung gemessen 26.09.2026 (Schalter im Simulator bewegt, L:INI_-
+    /// Werte gleich den Input-Events):
+    ///   * `L:INI_STROBE_LIGHT_SWITCH` 0=ON 1=AUTO 2=OFF (gespiegelt)
+    ///   * `L:INI_SEATBELTS_SWITCH` 0=OFF 1=ON — zweistufig, ANDERE Richtung
+    ///     als A350/A380
+    ///   * `L:INI_TCAS_STBY_STATE` 0=STBY 1=AUTO 2=ON, `L:INI_tcas_mode_pedestal`
+    ///     0=STBY 1=TA 2=TA-RA (anders als A350); Rueckfall `TRANSPONDER STATE:1`
+    ///   * `L:INI_SPOILERS_ARMED` 0/1, `L:INI_APU_MASTER_SWITCH` 0/1
+    ///   * Beacon: Standard-SimVar; Autobrake nicht lesbar (None)
+    IniA330,
+    /// FSS E-Jets (MSFS 2024, E170/E175/E190/E195 — EIN Profil, die
+    /// Cockpit-LVars heißen alle `L:FSS_EXX_*`). Paket
+    /// `Community2024/fss-aircraft-e17x`, Verhaltensordner
+    /// `ModelBehaviorDefs/FSS/Cockpit/Instruments/`. Audit-Titel: "FSS
+    /// Embraer E190 Air France HOP F-…" (ICAO E190), "FSS Embraer E175
+    /// American LW" (ICAO E175). Gemappt (Paket, Datei:Zeile):
+    ///   * Außenlicht-Schalter Beacon/Strobe/Nav/Landing L+R+Nose/Taxi
+    ///     Nose+Side (Overhead/PanelExtLight.xml), 0 = Off
+    ///   * Anschnallzeichen `L:FSS_EXX_OVHD_PSGR_FSTN_BELT_SWITCH`
+    ///     (Overhead/PanelPsgrSigns.xml:104-111), 0 = Off
+    ///   * APU `L:FSS_EXX_OVHD_APU_MASTER` 0=Off 1=On 2=Start
+    ///     (Overhead/PanelAPUCtrl.xml:17-28)
+    ///   * Autobrake `L:FSS_EXX_AUTOBRAKE` 0=RTO 1=OFF 2=LO 3=MED 4=HI
+    ///     (Front/Front.xml:217-241)
+    ///   * Parkbremse `L:FSS_EXX_PARKBRAKE_BV_LEVER` 0 = Off
+    ///     (Pedestal/Pedestal.xml:68-76)
+    /// Spoiler ARMED hat keine LVar (None); Transponder über die Standard-
+    /// SimVar `TRANSPONDER STATE:1` (fss.wasm enthält den String).
+    /// Autopilot (Entwurf 19.10.2026, HubHop + fss.wasm, Messung steht aus):
+    /// FGP-Lampen `L:FSS_EXX_FGC_LT_AP/HDG/NAV/Alt/APP`, 0 = aus — die
+    /// Standard-`AUTOPILOT *`-SimVars bewegt der E-Jet nicht.
+    FssEjet,
+    /// BlueBird Simulations 757-200/-300 (MSFS 2020/2024, Paketordner
+    /// `bbs-757-…`). Titel: "BlueBird 757-200 RR LTU D-AMUZ", "BlueBird
+    /// 757-200 Condor D-ABNR", "BlueBird 757-200 RR Icelandair TF-FIN".
+    /// Systeme in eigenem C++/WASM; `CABIN SEATBELTS ALERT SWITCH` steht
+    /// immer auf 0 (LTU 152 / ICE 520, 26.10.2026). Belegung aus der
+    /// offiziellen Hersteller-Liste support.bluebirdsim.com/docs/simvars
+    /// („checked against source as of 21 October 2026"):
+    ///   * `L:B757_OVHD_SEATBELTS_SWITCH` / `_NO_SMOKING_SWITCH` 0=OFF
+    ///     1=AUTO 2=ON
+    ///   * Licht-Schalter `L:B757_OVHD_BEACON_LIGHT`, `_STROBE`,
+    ///     `_NAV_LIGHTS`, `_LOGO_BUTTON`, `_WING_LIGHTS`,
+    ///     `_LEFT/_RIGHT/_NOSE_LANDING_LIGHT`, `_RWY_TURN_L/R` 0/1
+    ///     (`B757_OVHD_BEACON` ist das alte NAV-Licht, nicht der Beacon)
+    ///   * `L:B757_OVHD_APU_SWITCH` 0=OFF 1=ON 2=START,
+    ///     `L:B757_FC_PARK_BRAKE` 0/1, `L:BBS_AUTOBRAKE_KNOB` 0=RTO 1=OFF
+    ///     2=DISARM 3..6=1..4 7=MAX AUTO, `L:B757_PED_TCAS_MODE_KNOB`
+    ///     0=STBY 1=ALT RPTG OFF 2=XPNDR 3=TA ONLY 4=TA/RA
+    ///   * MCP-Lampen `L:B757_MCP_CMD_1/2/3_BUTTON`, `_HOLD_1_` (HDG
+    ///     HOLD), `_HOLD_2_` (ALT HOLD), `_LNAV_`, `_LOC_`, `_APP_BUTTON`
+    /// Am Flugzeug noch nicht gemessen — Kontrollflug steht aus.
+    BlueBird757,
+}
+
+impl AircraftProfile {
+    /// Best-effort identification from the MSFS `TITLE` and `ATC MODEL`
+    /// strings. Falls back to `Default` when nothing matches — that's the
+    /// safe path: we keep using the standard SimVar set we already wire
+    /// up, so undetected aircraft still produce a working PIREP.
+    pub fn detect(title: &str, icao: &str) -> Self {
+        let t = title.to_lowercase();
+        let i = icao.to_lowercase();
+        // FlyByWire — distinguish from real Airbus by FBW's marker text.
+        // v0.16.10 (#Premium): Familie erweitert — der FBW A380X
+        // ("…A380X…" im Title, ICAO A388) und der Headwind A339
+        // (A330-900neo, FBW-Fork) teilen die `A32NX_`-LVar-Familie und
+        // landen auf demselben Profil. Keiner der Marker kommt in
+        // Fenix-/iniBuilds-Titles vor — Reihenfolge bleibt unkritisch.
+        if t.contains("flybywire")
+            || t.contains("fbw a32nx")
+            || t.contains("a32nx")
+            || t.contains("a380x")
+            || t.contains("headwind")
+        {
+            return Self::FbwA32nx;
+        }
+        // Fenix — title typically begins with "FenixA319" / "FenixA320" /
+        // "FenixA321". All three variants share the same `FNX_32X`
+        // SimObject and LVar namespace, so the mapping is identical;
+        // we differentiate purely so the activity log and PIREP show
+        // the correct sub-type. ICAO callout is the secondary signal
+        // for repaints whose title doesn't carry the variant suffix
+        // (some community liveries flatten everything to "FenixA320").
+        if t.contains("fenix") {
+            if t.contains("a319") || i.contains("a319") {
+                return Self::FenixA319;
+            }
+            if t.contains("a321") || i.contains("a321") {
+                return Self::FenixA321;
+            }
+            return Self::FenixA320;
+        }
+        // PMDG 737 — covers 736/737/738/739 NG and MAX variants.
+        if t.contains("pmdg") && (t.contains("737") || i.contains("b73")) {
+            return Self::Pmdg737;
+        }
+        // PMDG 777 — 772/773 ER/Freighter.
+        if t.contains("pmdg") && (t.contains("777") || i.contains("b77")) {
+            return Self::Pmdg777;
+        }
+        // INIBuilds A350.
+        //
+        // Audit 26.09.2026: in MSFS 2024 heissen die Titel nur noch
+        // "A350-900 (Default Cabin)", "A350-900 (No Cabin)", "A350-900
+        // ULR (No Cabin)", "A350-1000 (No Cabin)" — kein "inibuilds" mehr,
+        // alle 24 Flüge liefen als `Default`. Der Paketname der A350 ist
+        // nicht belegt, deshalb Titel-Muster statt aircraft.cfg-Pfad. Einen
+        // zweiten A350 gibt es im Simulator nicht; FBW/Headwind bauen keinen.
+        // Ein ICAO-Signal zählt nur zusammen mit "a350" im Titel — ein
+        // blanker A359/A35K-Fallback wäre dieselbe Fehlklassen-Gefahr wie
+        // der in QS M4 entfernte A20N-Fallback.
+        if (t.contains("inibuilds") && t.contains("a350"))
+            || t.contains("a350-900")
+            || t.contains("a350-1000")
+            || (t.contains("a350")
+                && matches!(
+                    clean_atc_model(icao).as_deref(),
+                    Some("A359") | Some("A35K")
+                ))
+        {
+            return Self::IniA350;
+        }
+        // iniBuilds A380-800 (MSFS 2024). Titel "A380-800 RR Basic" ohne
+        // Hersteller. Der FBW A380X ist oben schon über "a380x"/"flybywire"
+        // abgefangen; FBW-Liveries ohne diesen Marker tragen oft "FBW" im
+        // Titel (Audit: "FBW Emirates (circa 2008) A6-EDA") — die schliessen
+        // wir hier ausdrücklich aus. KEIN blanker A388-ICAO-Fallback: den
+        // meldet auch der FBW A380X.
+        if !t.contains("fbw")
+            && (t.contains("a380-800") || (t.contains("inibuilds") && t.contains("a380")))
+        {
+            return Self::IniA380;
+        }
+        // INIBuilds A340-600 Pro — pro suffix is the discriminator vs the
+        // standard A340 build.
+        //
+        // v0.19.x QS (backlog "A340 marker-less livery"): unlike IniA340
+        // just below (which has an ICAO-A343/atc_model fallback for
+        // per-livery titles that drop "inibuilds"), this branch has NONE
+        // — deliberately. A marker-less Pro livery (title drops
+        // "inibuilds" and/or "pro") falls through past this check and
+        // hits AerosoftA346's `clean_atc_model == "A346"` fallback below,
+        // because the iniBuilds A340-600 Pro reports the SAME ICAO A346
+        // as the real Aerosoft A346 (see the Aerosoft branch's own
+        // comment). There is no known signal that discriminates the two
+        // once the title marker is gone — adding one without real
+        // telemetry from such a livery would risk misclassifying genuine
+        // Aerosoft A346 aircraft instead, which is the same class of
+        // regression QS M4 explicitly avoided by REMOVING the too-broad
+        // A20N/B38M/A21N ICAO fallbacks. Accepted as a residual risk for
+        // now (same category as the documented "hypothetical marker-less
+        // Dritt-A339" case above) — worst case if it happens: this
+        // profile is "detection only, LVar list TBD" per its doc comment
+        // above, so misdetecting it as AerosoftA346 risks live-reading
+        // Aerosoft-specific LVars (`L:AB_*`) that don't exist on the
+        // iniBuilds airframe, most of which have no standard-SimVar OR
+        // fallback (unlike the Fenix/A346 autopilot mapping, which does).
+        if t.contains("inibuilds")
+            && (t.contains("a346") || t.contains("a340-600"))
+            && t.contains("pro")
+        {
+            return Self::IniA346Pro;
+        }
+        // INIBuilds A340 base.
+        // v0.16.10 (#Premium): Per-Livery-Titles der iniBuilds A340-300
+        // heissen z.B. "A340-300 EIS1" OHNE "inibuilds" — daher
+        // zusaetzlich ICAO A343 bzw. atc_model "A340-300" als Signal.
+        // Kollisionsfrei: die Aerosoft A346 meldet atc_model
+        // "A340-600"/ICAO A346, die iniBuilds A346 Pro ICAO A346 —
+        // beide bleiben auf ihren eigenen Zweigen (Pro-Match steht
+        // davor, Aerosoft matcht exakt A346).
+        if (t.contains("inibuilds") && t.contains("a340"))
+            || clean_atc_model(icao).as_deref() == Some("A343")
+            || i.contains("a340-300")
+        {
+            return Self::IniA340;
+        }
+        // Aerosoft A340-600 (ToLiss port). aircraft.cfg titles all start
+        // with "Aerosoft A346" (e.g. "Aerosoft A346-MahanAir"), the ICAO
+        // designator is "A346". The ICAO check uses the CLEANED model
+        // (some MSFS aircraft report localization tokens) and is exact —
+        // deliberately AFTER the INIBuilds branches above, so an
+        // iniBuilds A340-600 Pro (which may also report ICAO A346) keeps
+        // its own profile via its title.
+        if t.starts_with("aerosoft a346") || clean_atc_model(icao).as_deref() == Some("A346") {
+            return Self::AerosoftA346;
+        }
+        // v0.16.10 (#Premium): FBW-ICAO-Fallback fuer Repaints/Liveries
+        // ohne Marker im Title — NUR noch A339 (= Headwind A339, der
+        // einzige nennenswerte MSFS-A339; dessen Liveries tragen nicht
+        // immer den "Headwind"-Marker). Bewusst NACH Fenix/iniBuilds/
+        // Aerosoft platziert (deren Title-Matches gewinnen) und mit
+        // Stock-Guard gegen Asobo-/iniBuilds-Titles.
+        //
+        // v0.16.10 QS (M4): der fruehere A20N-Fallback ist ENTFERNT —
+        // A20N ist ein viel zu generischer Designator (LatinVFR A320neo,
+        // marker-lose Stock-Liveries, …). Diese Nicht-FBW-A20N bekamen
+        // das FBW-Profil und damit tote A32NX_-LVars → permanente
+        // Some(false)-Phantome auf AP-Sub-Modes + A/THR. FBW-Liveries
+        // matchen weiterhin ueber die Title-Marker (flybywire/a32nx/
+        // a380x/headwind). Akzeptierte Rest-Klasse: ein hypothetischer
+        // marker-loser Dritt-A339 wuerde weiter als FBW erkannt — den
+        // Fall faengt das Defense-in-Depth-OR im MSFS-Adapter ab
+        // (Standard-SimVars gewinnen, A/THR-0 → None statt Some(false)).
+        // (ICAO A388 bekommt hier bewusst keinen Zweig — den meldet auch
+        // die iniBuilds A380. FBW-A380X-Liveries ohne Marker ("FBW Emirates
+        // (circa 2008) A6-EDA") erkennt `detect_mit_pfad` am Paketordner.)
+        if !t.contains("asobo")
+            && !t.contains("inibuilds")
+            && clean_atc_model(icao).as_deref() == Some("A339")
+        {
+            return Self::FbwA32nx;
+        }
+        // iniBuilds A330 (MSFS 2024): Titel beginnt mit "A330-" und traegt
+        // eine Klammer-Variante ("A330-300 (RR)", "A330-200 VIP (GE)").
+        // Headwind/FBW sind oben schon abgefangen (Marker bzw. ICAO A339);
+        // die A330-900neo-Familie ("A330-9…", etwa "A330-941") ist
+        // ausdruecklich ausgenommen.
+        if t.starts_with("a330-") && t.contains('(') && !t.starts_with("a330-9") {
+            return Self::IniA330;
+        }
+        // v0.13.13: FSReborn Phenom 300E. Title aus dem Sim heisst typisch
+        // "FSReborn Phenom 300E Tristan Interior" (oder mit anderen
+        // Interior-Varianten). Wir matchen tolerant auf fsreborn + phenom +
+        // 300 — fängt auch Edge-Cases ab wie "FSR Phenom300" ohne Space.
+        if t.contains("fsreborn") && t.contains("phenom") && t.contains("300") {
+            return Self::FsrPhenom300e;
+        }
+        // v0.16.10 (#Premium): TFDi Design MD-11 / MD-11F. Title traegt
+        // "TFDi" + "MD-11" (z.B. "TFDi Design MD-11 …"); Repaint-
+        // Fallback ueber den ATC-MODEL/ICAO-Designator — "MD11" (Pax)
+        // und "MD11F" (Freighter) landen beide auf EINEM Profil
+        // (identische Premium-Quellen laut 7-Agent-Inventar).
+        if (t.contains("tfdi") && t.contains("md-11"))
+            || matches!(
+                clean_atc_model(icao).as_deref(),
+                Some("MD11") | Some("MD11F")
+            )
+        {
+            return Self::TfdiMd11;
+        }
+        // v0.16.11: iFly 737 MAX 8. Title aus der aircraft.cfg heisst
+        // "iFly 737-MAX8 (178Seat)" — Liveries behalten den
+        // "iFly … MAX"-Stamm. atc_model ist ein generischer
+        // ATCCOM-B737-Token (nutzlos als Signal). BEWUSST KEIN
+        // bare-B38M-ICAO-Fallback: Bredok3d verkauft ebenfalls einen
+        // B38M ("Bredok3d 737 MAX") — ein ICAO-Fallback waere dieselbe
+        // Misdetection-Klasse wie der in v0.16.10 (QS M4) entfernte
+        // A20N-Fallback (totes LVar-Profil → Some(false)-Phantome).
+        if t.contains("ifly") && t.contains("max") {
+            return Self::IflyMax8;
+        }
+        // v0.16.14: FSLabs A321 (ceo + neo). Alle aircraft.cfg-Titles
+        // tragen das "FSLabs"-Praefix ("FSLabs A321 CFM …", "FSLabs
+        // A321 IAE …", "FSLabs A321-SL …", "FSLabs A321-NEO LEAP/PW …"
+        // — Liveries behalten es). BEWUSST KEIN ICAO-Fallback: die
+        // Designatoren A321/A21N kollidieren mit Fenix-, FBW- und
+        // marker-losen Stock-Liveries — dieselbe Misdetection-Klasse
+        // wie der in v0.16.10 (QS M4) entfernte A20N-Fallback (totes
+        // LVar-Profil → Some(false)-/Phantom-Werte).
+        if t.contains("fslabs") {
+            return Self::FsLabsA321;
+        }
+        // v0.17.x (#Premium, Aircraft-Scan): Contrail Falcon 50 (Trijet).
+        // Erster über das Aircraft-Scan-Tool eingereichte Flieger. Alle
+        // aircraft.cfg-Titles beginnen mit "Contrail Falcon 50" (Liveries
+        // hängen nur einen Reg-Suffix an, z.B. "… - 9H-DFS"). Detection
+        // über die Title-Marker `contrail` + `falcon` — KEIN bare-FA50-
+        // ICAO-Fallback für die Detection (dieselbe Misdetection-Klasse-
+        // Vorsicht wie beim entfernten A20N-Fallback, QS M4). FA50 dient
+        // nur als Anzeige-`icao_fallback`, nicht zur Erkennung.
+        if t.contains("contrail") && t.contains("falcon") {
+            return Self::ContrailFa50;
+        }
+        // Synaptic A220 (-100/-300). KORRIGIERT nach dem ersten echten Flug
+        // (Thomas K., PIREP VGDmGnMEWmMbkJRP, EVRA→EDDB, 2026-07-28): die
+        // ursprüngliche Annahme "Vendor-Branding 'Synaptic' steht im Title"
+        // war FALSCH — der reale MSFS-TITLE-SimVar liefert schlicht
+        // "A220-300", kein Vendor-Marker. `ATC MODEL` kam die ganze
+        // Aufzeichnung ueber leer (None) — auch als ICAO-Signal nicht
+        // nutzbar. Match jetzt auf den bestaetigten bare-Titel; "A220-100"
+        // ist die naheliegende Analogie fuer die andere Baureihe, aber noch
+        // nicht separat live bestaetigt. Kein bekannter Kollisionskandidat
+        // (MSFS hat keinen Stock-A220, kein zweiter Addon-Hersteller
+        // aktuell bekannt) — anders als beim entfernten A20N-Fallback
+        // (QS M4), wo der Titel/ICAO tatsaechlich mehrdeutig war.
+        if t.contains("a220-300") || t.contains("a220-100") {
+            return Self::SynapticA220;
+        }
+        // FSS E-Jets. "fss" als eigenes Wort (kein Teilstring-Treffer in
+        // fremden Titeln) plus Embraer-Marker. Audit-Titel: "FSS Embraer
+        // E190 Air France HOP F-…", "FSS Embraer E175 American LW". Der
+        // E190-Paketname ist nicht belegt, deshalb trägt die Titelregel
+        // beide Baureihen. KEIN ICAO-Fallback (E170/E175/E190 fliegen auch
+        // andere Hersteller). Die FSR-Phenom (ICAO E55P) braucht
+        // "fsreborn" und kollidiert nicht.
+        let fss_wort = t
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|w| w == "fss");
+        if fss_wort && (t.contains("embraer") || t.contains("e17") || t.contains("e19")) {
+            return Self::FssEjet;
+        }
+        // BlueBird 757: alle bekannten Titel beginnen mit "BlueBird 757-".
+        // Hersteller UND Muster im Titel — kein ICAO-Fallback (B752/B753
+        // fliegen auch andere Add-ons).
+        if t.contains("bluebird") && t.contains("757") {
+            return Self::BlueBird757;
+        }
+        Self::Default
+    }
+
+    /// Erkennung mit dem aircraft.cfg-Pfad aus dem SimConnect-Systemzustand
+    /// `AircraftLoaded` als zweiter Quelle.
+    ///
+    /// Anlass (Audit 26.09.2026, 705 MSFS-2024-Flüge): MSFS 2024 liefert die
+    /// Titel ohne Hersteller — PMDG "737-800 PAX BW SC", "777F",
+    /// "777-300ER", iniBuilds "A380-800 RR Basic". Alle 81 PMDG-Flüge liefen
+    /// als `Default`. Der Paketordner im Pfad (`pmdg-aircraft-738`,
+    /// `pmdg-aircraft-77w`, …) ist dagegen stabil; der PMDG-SDK-Zweig im
+    /// Adapter wertet denselben Pfad schon seit v0.3 aus
+    /// (`PmdgVariant::detect_from_air_path`).
+    ///
+    /// Reihenfolge: der Titel gewinnt. Der Pfad zählt NUR, wenn die
+    /// Titelerkennung `Default` ergibt — so kann ein veralteter Pfad (der
+    /// Adapter fragt ihn nur bei Verbindungsaufbau und SimStart ab) nie ein
+    /// sauber erkanntes Profil überschreiben. Zusätzlich muss der Titel oder
+    /// die ICAO zum Pfad passen (737-Pfad nur mit "737"/B73x, 777-Pfad nur
+    /// mit "777"/B77x), damit ein Rest-Pfad vom vorigen Flugzeug einen
+    /// fremden Boeing-Titel nicht zu PMDG macht.
+    ///
+    /// Runde 3: dazu der FBW A380X (`flybywire-aircraft-a380…`, siehe
+    /// [`ist_fbw_a380_pfad`]) → `FbwA32nx`, und die FSS E-Jets
+    /// (`fss-aircraft-e1…`) → `FssEjet` — beide ebenfalls nur hinter einem
+    /// Titel-/ICAO-Abgleich. Dazu das iFly 737 MAX 8 nach Ordner
+    /// (`iFly 737-MAX8…`) für Fremd-Lackierungen ohne „iFly" im Titel.
+    pub fn detect_mit_pfad(title: &str, icao: &str, cfg_pfad: Option<&str>) -> Self {
+        let nach_titel = Self::detect(title, icao);
+        if nach_titel != Self::Default {
+            return nach_titel;
+        }
+        let Some(pfad) = cfg_pfad else {
+            return Self::Default;
+        };
+        let p = pfad.to_lowercase().replace('\\', "/");
+        let t = title.to_lowercase();
+        let modell = clean_atc_model(icao).unwrap_or_default();
+        // Dieselben Ordnermuster wie `PmdgVariant::detect_from_air_path`
+        // (sim-msfs) — ein Test dort hält beide deckungsgleich.
+        let pmdg_737 = [
+            "pmdg-aircraft-736",
+            "pmdg-aircraft-737",
+            "pmdg-aircraft-738",
+            "pmdg-aircraft-739",
+            "pmdg 736",
+            "pmdg 737",
+            "pmdg 738",
+            "pmdg 739",
+        ]
+        .iter()
+        .any(|m| p.contains(m));
+        let pmdg_777 = p.contains("pmdg-aircraft-77") || p.contains("pmdg 777");
+        if pmdg_737 && (t.contains("737") || modell.starts_with("B73")) {
+            return Self::Pmdg737;
+        }
+        if pmdg_777 && (t.contains("777") || modell.starts_with("B77")) {
+            return Self::Pmdg777;
+        }
+        // Wie bei den Nachbarzweigen muss Titel oder ICAO zum Pfad passen —
+        // sonst kaperte ein Rest-Pfad des A380 nach einem Flugzeugwechsel
+        // ein fremdes `Default`-Muster (QS 26.09.2026).
+        if p.contains("inibuilds")
+            && p.contains("a380")
+            && (t.contains("a380") || modell.starts_with("A38"))
+        {
+            return Self::IniA380;
+        }
+        // iniBuilds A330 (Paket `fs24-microsoft-aircraft-a330`; gemeldet
+        // wurde ausserdem `microsoft-a330` im Pfad — beide Formen zaehlen).
+        // Titel oder ICAO muss nach A330 aussehen, der Headwind A339 nie.
+        if (p.contains("microsoft-a330") || p.contains("microsoft-aircraft-a330"))
+            && modell != "A339"
+            && !t.contains("a330-9")
+            && (t.contains("a330") || modell.starts_with("A33"))
+        {
+            return Self::IniA330;
+        }
+        // FBW A380X: Livery-Titel ohne Marker ("FBW Emirates (circa 2008)
+        // A6-EDA", ICAO A388) liefen als `Default`. Titel bzw. ICAO muss
+        // zur A380 passen, damit ein Rest-Pfad keinen fremden Titel kapert.
+        if ist_fbw_a380_pfad(&p) && (modell == "A388" || t.contains("a380") || t.contains("fbw")) {
+            return Self::FbwA32nx;
+        }
+        // FSS E-Jets (Paket `fss-aircraft-e17x`; ein E190-Paket heißt
+        // vermutlich `fss-aircraft-e19x`, nicht belegt — das Muster deckt
+        // beides). Titel oder ICAO muss nach Embraer-E-Jet aussehen.
+        if p.contains("fss-aircraft-e1")
+            && (t.contains("embraer")
+                || t.contains("e17")
+                || t.contains("e19")
+                || ["E17", "E19", "E75"].iter().any(|m| modell.starts_with(m)))
+        {
+            return Self::FssEjet;
+        }
+        // iFly 737 MAX 8 (15.10.2026, Hamadoun): Fremd-Lackierungen tragen
+        // „iFly" nicht im Titel („Norwegian 737-MAX8 SE-RTR (189Seat)") und
+        // liefen als `Default` — ohne iFly-Signale und mit B738 statt B38M.
+        // Der Ordner heisst immer `iFly 737-MAX8…` (Paket
+        // `ifly-aircraft-737max8`). Beide Merkmale im selben Ordnernamen —
+        // sonst machte `iFly Addons/…/Bredok3d_737MAX8` einen fremden MAX
+        // zum iFly (Codex 15.10.2026). Titel oder ICAO muss nach 737 aussehen.
+        // Headwind A330-900neo (17.10.2026, Joel MSFS 2020): Liveries ohne
+        // „Headwind" im Titel und mit ICAO A330 statt A339 („Airbus
+        // A330-900neo Condor") liefen als `Default` — ohne die A32NX-
+        // Variablen, auch ohne Parkbremse. Der Ordner heißt
+        // `Headwind_A330neo`. Titel oder ICAO muss nach A330 aussehen.
+        let headwind_ordner = p
+            .split('/')
+            .any(|teil| teil.contains("headwind") && teil.contains("a330"));
+        if headwind_ordner && (t.contains("a330") || modell.starts_with("A33")) {
+            return Self::FbwA32nx;
+        }
+        let ifly_ordner = p.split('/').any(|teil| {
+            teil.contains("ifly") && (teil.contains("737-max8") || teil.contains("737max8"))
+        });
+        if ifly_ordner
+            && (t.contains("737")
+                || t.contains("max")
+                || modell.starts_with("B73")
+                || modell.starts_with("B38"))
+        {
+            return Self::IflyMax8;
+        }
+        // BlueBird 757 (Paketordner `bbs-757-200-pw-nw` u. a.) für
+        // Lackierungen ohne „BlueBird" im Titel. Titel oder ICAO muss nach
+        // 757 aussehen.
+        let bbs_ordner = p.split('/').any(|teil| teil.starts_with("bbs-757"));
+        if bbs_ordner && (t.contains("757") || modell.starts_with("B75")) {
+            return Self::BlueBird757;
+        }
+        Self::Default
+    }
+
+    /// `true` if this profile is any Fenix A32x variant. All three
+    /// share the same `FNX_32X` SimObject + LVar namespace, so most
+    /// adapter mapping branches treat them identically.
+    pub fn is_fenix(self) -> bool {
+        matches!(self, Self::FenixA319 | Self::FenixA320 | Self::FenixA321)
+    }
+
+    /// v0.7.17 (B-001): ICAO type designator fallback fuer Profile,
+    /// die einen kanonischen ICAO-Code haben. Wird im Adapter genutzt
+    /// wenn `aircraft_icao` aus dem Sim leer kommt (typisch bei Fenix,
+    /// das den Standard-`ATC MODEL`-SimVar nicht zuverlaessig fuellt
+    /// — Pilot saht im Activity-Log „Type ?" trotz erkanntem Profil).
+    /// Gibt nur dann ein Some zurueck wenn das Profil eine eindeutige
+    /// Variante hat (Fenix A319/A320/A321 ja, FbwA32nx je nach
+    /// Repaint mehrdeutig also weiter None).
+    pub fn icao_fallback(self) -> Option<&'static str> {
+        match self {
+            Self::FenixA319 => Some("A319"),
+            Self::FenixA320 => Some("A320"),
+            Self::FenixA321 => Some("A321"),
+            // v0.13.13: FSR Phenom 300E hat ICAO E55P (Embraer Phenom 300
+            // Standard-Designator).
+            Self::FsrPhenom300e => Some("E55P"),
+            // Aerosoft A340-600: kanonischer Designator A346 (deckt sich
+            // mit `icao_type_designator` in der aircraft.cfg).
+            Self::AerosoftA346 => Some("A346"),
+            // Contrail Falcon 50: icao_type_designator "FA50" (aus der
+            // aircraft.cfg). Nur Anzeige-Fallback — die Detection läuft
+            // über den Title, nicht über diesen Wert.
+            Self::ContrailFa50 => Some("FA50"),
+            // iniBuilds A380: ein Flug im Audit kam mit leerem ATC MODEL.
+            Self::IniA380 => Some("A388"),
+            _ => None,
+        }
+    }
+
+    /// ICAO, die VOR der ATC-Stimme (`ATC MODEL`) gilt: fuer Profile, bei denen
+    /// das Add-on die Stimme nachweislich falsch belegt. iFly 737 MAX 8: alle
+    /// vier aircraft.cfg haben `atc_model = "…AC_MODEL B738.0.text"`, aber
+    /// `icao_type_designator = "B38M"` (Scan 29.09.2026); phpVMS fuehrt die
+    /// Maschinen als B38M (TUI/RYR/ENT … -B38M). Ohne Vorrang meldete der Client
+    /// B738 — Buchung, Scan und Messung passten nicht zusammen (Thomas).
+    pub fn icao_vorrang(self) -> Option<&'static str> {
+        match self {
+            Self::IflyMax8 => Some("B38M"),
+            _ => None,
+        }
+    }
+
+    /// Short human-readable label for the activity log.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "Default (standard SimVars)",
+            Self::FbwA32nx => "FlyByWire A32NX",
+            Self::FenixA319 => "Fenix A319",
+            Self::FenixA320 => "Fenix A320",
+            Self::FenixA321 => "Fenix A321",
+            Self::Pmdg737 => "PMDG 737",
+            Self::Pmdg777 => "PMDG 777",
+            Self::IniA340 => "INIBuilds A340",
+            Self::IniA350 => "INIBuilds A350",
+            Self::IniA346Pro => "INIBuilds A340-600 Pro",
+            Self::AerosoftA346 => "Aerosoft A340-600",
+            Self::FsrPhenom300e => "FSReborn Phenom 300E",
+            Self::TfdiMd11 => "TFDi MD-11",
+            Self::IflyMax8 => "iFly 737 MAX 8",
+            Self::FsLabsA321 => "FSLabs A321",
+            Self::ContrailFa50 => "Contrail Falcon 50",
+            Self::SynapticA220 => "Synaptic A220",
+            Self::IniA380 => "INIBuilds A380",
+            Self::IniA330 => "INIBuilds A330",
+            Self::FssEjet => "FSS E-Jet",
+            Self::BlueBird757 => "BlueBird 757",
+        }
+    }
+
+    /// v0.18.x (QA-Härtung, addon-agnostischer Stillstands-Fallback): true
+    /// NUR für Flugzeug-Add-ons, bei denen wir per Aircraft-Scan-Analyse
+    /// bestätigt haben, dass die Triebwerkszähler-SimVar nach dem Shutdown
+    /// nicht auf 0 fällt (Contrail FA50: bleibt bei 3). Der Stillstands-
+    /// Fallback im FSM (siehe `arrived_standstill_condition`) darf NUR für
+    /// diese explizit bestätigten Flugzeuge laufen — NICHT als generelle
+    /// Fleet-weite Regel. Grund: ohne den harten engines-off-Test lässt sich
+    /// ein normaler, langer Rollhalt (Parkbremse gesetzt, z. B. beim Warten
+    /// auf weitere Rollfreigabe an einem großen Hub) nicht mehr von einer
+    /// echten Ankunft unterscheiden — das darf für die überwältigende
+    /// Mehrheit der Flugzeuge, deren Triebwerkszähler korrekt funktioniert,
+    /// nicht riskiert werden. Neue Add-ons kommen hier erst rein, wenn ein
+    /// Aircraft-Scan-Bericht das kaputte Verhalten konkret belegt.
+    pub fn engine_count_unreliable(self) -> bool {
+        matches!(self, Self::ContrailFa50)
+    }
+}
+
+/// Triebwerks-Rohsignale je Triebwerk (Index 0 = Triebwerk 1), siehe
+/// `SimSnapshot::engine_signals`. Die Vektoren haben dieselbe Länge: so
+/// viele Triebwerke, wie der Adapter abfragt (4). Ausnahme X-Plane (seit
+/// v1.9.12): `general_combustion`/`combustion_ex1` gibt es dort nicht, sie
+/// bleiben leer; `eng_combustion` traegt `ENGN_running`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EngineSignals {
+    /// MSFS `GENERAL ENG COMBUSTION:n` (laut SDK ein setzbarer Schalter).
+    pub general_combustion: Vec<bool>,
+    /// MSFS `GENERAL ENG COMBUSTION EX1:n`.
+    pub combustion_ex1: Vec<bool>,
+    /// MSFS `ENG COMBUSTION:n` (laut SDK nur lesbar, "True if the indexed
+    /// engine is running").
+    pub eng_combustion: Vec<bool>,
+    /// `TURB ENG N1:n` in der angeforderten Einheit Percent (0–100).
+    pub n1_pct: Vec<f64>,
+    /// `ENG FUEL FLOW PPH:n` in Pfund pro Stunde; ist deren Summe 0, dafuer
+    /// `TURB ENG CORRECTED FF:n` (dieselbe Kaskade wie `fuel_flow_kg_per_h`).
+    pub fuel_flow_pph: Vec<f64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum Simulator {
+    Msfs2020,
+    Msfs2024,
+    XPlane11,
+    XPlane12,
+    /// Catch-all when no adapter has reported a simulator yet (used as
+    /// the `Default` so `SimSnapshot::default()` works for tests).
+    #[default]
+    Other,
+}
+
+/// User-selected simulator kind, persisted across app restarts.
+/// Drives which adapter the app boots after login.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SimKind {
+    Off,
+    Msfs2020,
+    Msfs2024,
+    XPlane11,
+    XPlane12,
+}
+
+impl Default for SimKind {
+    fn default() -> Self {
+        SimKind::Msfs2024
+    }
+}
+
+impl SimKind {
+    pub fn is_msfs(self) -> bool {
+        matches!(self, SimKind::Msfs2020 | SimKind::Msfs2024)
+    }
+
+    pub fn is_xplane(self) -> bool {
+        matches!(self, SimKind::XPlane11 | SimKind::XPlane12)
+    }
+
+    /// Map to the `Simulator` enum used inside `SimSnapshot`.
+    pub fn as_simulator(self) -> Simulator {
+        match self {
+            SimKind::Off => Simulator::Other,
+            SimKind::Msfs2020 => Simulator::Msfs2020,
+            SimKind::Msfs2024 => Simulator::Msfs2024,
+            SimKind::XPlane11 => Simulator::XPlane11,
+            SimKind::XPlane12 => Simulator::XPlane12,
+        }
+    }
+}
+
+/// Flight phases as required by spec §9.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum FlightPhase {
+    #[default]
+    Preflight,
+    Boarding,
+    Pushback,
+    TaxiOut,
+    TakeoffRoll,
+    Takeoff,
+    Climb,
+    Cruise,
+    /// v0.5.11: dedicated Holding phase. Detected when the aircraft
+    /// circles at constant altitude (sustained bank > 15° + |VS| <
+    /// 200 fpm for > 90 s). Triggered from Cruise (high-altitude
+    /// hold over a fix) or Approach (low-altitude approach hold).
+    /// On exit, returns to whichever phase we came from — or to
+    /// Approach if a sustained descent has begun (= ATC clears us
+    /// out of the hold for the approach).
+    Holding,
+    Descent,
+    Approach,
+    Final,
+    Landing,
+    TaxiIn,
+    BlocksOn,
+    Arrived,
+    PirepSubmitted,
+}
+
+/// What every simulator adapter must provide.
+///
+/// Phase 1: implemented by `sim-msfs` (SimConnect). Phase 2: `sim-xplane` (UDP from XPLM plugin).
+pub trait SimAdapter: Send + 'static {
+    /// Display name of the adapter, e.g. "MSFS 2024 (SimConnect)".
+    fn name(&self) -> &str;
+
+    /// Try to connect to the simulator. Returns `Ok(())` once a snapshot stream is established.
+    fn connect(&mut self) -> Result<(), SimError>;
+
+    /// Disconnect cleanly.
+    fn disconnect(&mut self);
+
+    /// Whether the adapter is currently connected and producing snapshots.
+    fn is_connected(&self) -> bool;
+
+    /// Pull the most recent snapshot, if any. Non-blocking.
+    fn latest_snapshot(&self) -> Option<SimSnapshot>;
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SimError {
+    #[error("simulator not running")]
+    NotRunning,
+    #[error("connection refused: {0}")]
+    Refused(String),
+    #[error("transport error: {0}")]
+    Transport(String),
+    #[error("not implemented yet")]
+    NotImplemented,
+}
+
+// TODO(phase-1):
+//   * Implement the SimAdapter trait in `sim-msfs`.
+//   * Add a Phase FSM driven by SimSnapshot streams.
+//   * Add a snapshot ring buffer for downstream consumers.
+
+/// aircraft.cfg-Pfad des FlyByWire A380X. Belegt: `…/Community/
+/// flybywire-aircraft-a380-842/SimObjects/AirPlanes/FlyByWire_A380X/…` und
+/// die ältere Lackierungsform `…/FlyByWire_A380_842_LUFTHANSA-AIMK/
+/// aircraft.cfg`. iniBuilds-A380-Pfade (`…/inibuilds-a380/…`) zählen nie.
+/// Groß-/Kleinschreibung und Trennzeichen egal.
+pub fn ist_fbw_a380_pfad(pfad: &str) -> bool {
+    let p = pfad.to_lowercase().replace('\\', "/");
+    !p.contains("inibuilds")
+        && (p.contains("flybywire_a380") || p.contains("flybywire-aircraft-a380"))
+}
+
+/// MSFS often returns SimVar values as localization keys, not plain text.
+/// The ATC MODEL var is one of them — e.g. `TT:ATCCOM.AC_MODEL_A320.0.text`
+/// or `ATCCOM.AC_MODEL C208.0.text`. Pull out the readable code, or return
+/// `None` if the input is an unresolved key we can't decode.
+///
+/// v0.12.10: Hierher (sim-core) gezogen, damit der MSFS-Telemetrie-
+/// Adapter den `ATC MODEL` schon bei der Erfassung bereinigt — vorher
+/// landete der rohe Token (z.B. `ATCCOM.AC_MODEL C208.0.text` der
+/// BlackSquare Caravan) ungereinigt in `aircraft_icao`, was „Type ?"
+/// und einen kaputten PIREP zur Folge hatte.
+pub fn clean_atc_model(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // Zwei Schreibweisen im Feld, nicht eine (Korpus-Auswertung 21.08.2026):
+    //   `ATCCOM.AC_MODEL A320.0.text`     — Leerzeichen, MSFS-Standard
+    //   `ATCCOM.AC_MODEL_BE58.0.text`     — Unterstrich
+    //   `AIRCRAFT.ATC_MODEL_SF50.0.text`  — ANDERES Praefix, anderes Token
+    // Die dritte Form fiel bis hierher durch: sie enthaelt `ATC_MODEL`, nicht
+    // `AC_MODEL`, landete deshalb unten im `.TEXT`-Zweig und wurde als Muell
+    // verworfen. `ATC_MODEL` zuerst pruefen — es ist das laengere Token und
+    // die beiden ueberschneiden sich nicht.
+    let token = ["ATC_MODEL", "AC_MODEL"]
+        .into_iter()
+        .find_map(|t| s.find(t).map(|i| (i, t)));
+    if let Some((start, t)) = token {
+        let after = &s[start + t.len()..];
+        let after = after.trim_start_matches(['_', ' ']);
+        if let Some(end) = after.find('.') {
+            let model = &after[..end];
+            if !model.is_empty() {
+                return Some(model.to_uppercase());
+            }
+        }
+    }
+    let upper = s.to_uppercase();
+    if upper.starts_with("TT:") || upper.contains("ATCCOM.") || upper.ends_with(".TEXT") {
+        return None;
+    }
+    // v0.8.1: Vendor-Tag-Prefix-Strip. Einige MSFS-Addons (Flysimware
+    // Citation X, manche Carenado-Pakete) schicken den ICAO mit einem
+    // "$$:"-Prefix als ATC-MODEL — Sim liefert z.B. "$$:C750" statt
+    // "C750". Aircraft-Mismatch-Check verglich dann "C750" (Bid) gegen
+    // "$$:C750" (Sim) und schlug fehl. Live-Bug GSG/Sven M 2026-05-13.
+    // Wir strippen den Prefix wenn er aus 1-4 Zeichen + ":" besteht
+    // und kein Buchstabe enthält (= Sonderzeichen wie "$$:" / "##:"),
+    // damit echte ICAO-Codes wie "TT:..." (= text-token, oben schon
+    // gefiltert) nicht falsch behandelt werden.
+    if let Some(colon_pos) = upper.find(':') {
+        if colon_pos <= 4 {
+            let prefix = &upper[..colon_pos];
+            let is_vendor_tag =
+                !prefix.is_empty() && !prefix.chars().any(|c| c.is_ascii_alphanumeric());
+            if is_vendor_tag {
+                let stripped = upper[colon_pos + 1..].trim().to_string();
+                if !stripped.is_empty() {
+                    return Some(stripped);
+                }
+            }
+        }
+    }
+    Some(upper)
+}
+
+/// v0.17.x (#Premium, Aircraft-Scan / Health-Report): härtet die
+/// `aircraft_icao`-Ableitung. Eine Analyse über 614 VPS-Flight-Logs zeigte,
+/// dass in 42 % der Flüge `aircraft_icao` KEIN sauberer ICAO-Typcode war,
+/// sondern der MSFS-Modell-/ATC-Titel durchsickerte: der Lokalisierungs-
+/// String `ATCCOM.AC_MODEL A320.0.text` (→ A320), Marketing-Namen wie
+/// `A350-900` / `PHENOM 300E` / `HA420` und der Literal-String `None`. Die
+/// kategorie-abhängige FSM (`resolve_category` — Heli/Seaplane/Glider) UND
+/// das Premium-Profil-Matching keyen auf diesem Code; bei Garbage fallen die
+/// Flüge still auf „normales Fixed-Wing" zurück.
+///
+/// Pipeline: [`clean_atc_model`] (ATCCOM-/Vendor-Tag-/Leer-Behandlung) →
+/// Modellname→ICAO-Map (bekannte Marketing-Namen) → ICAO-Muster-Validierung.
+/// Gibt `None` zurück, wenn kein plausibler ICAO herauskommt — der Aufrufer
+/// nutzt dann `profile.icao_fallback()` bzw. lässt das Feld leer, statt einen
+/// Titel als „Typ" zu speichern.
+pub fn normalize_icao_type(raw: &str) -> Option<String> {
+    let candidate = clean_atc_model(raw)?;
+    // Explizite Junk-Werte, die zufällig dem 2-4-Zeichen-Muster ähneln.
+    if matches!(candidate.as_str(), "NONE" | "NULL" | "NA" | "N/A") {
+        return None;
+    }
+    let mapped = map_model_name_to_icao(&candidate).unwrap_or(candidate);
+    if is_plausible_icao(&mapped) {
+        Some(mapped)
+    } else {
+        None
+    }
+}
+
+/// Leitet den ICAO-Typcode aus dem **Flugzeug-Titel** ab, wenn das ATC-Modell
+/// nichts hergibt.
+///
+/// # Warum es das braucht
+///
+/// [`normalize_icao_type`] arbeitet auf `ATC MODEL`. Etliche Add-ons füllen das
+/// Feld gar nicht — dann bleibt `aircraft_icao` leer, und alles, was auf dem
+/// Typ keyed, fällt still auf einen Default zurück. **Genau das kostete MPH 9
+/// (LSZH→EHAM, 22.08.2026) 25 Punkte:** Das TFDi MD-11F meldete kein ATC-Modell,
+/// die Bahn-Achse sah kein `MD11`, die Heavy-Gutschrift von 5 Prozentpunkten
+/// entfiel, und aus 80 Punkten wurden 55. Der Titel stand die ganze Zeit im
+/// Protokoll: `TFDi Design MD-11F PW4462`.
+///
+/// Über alle 895 Flug-Protokolle des Bestands (23.08.2026) betrifft das
+/// **65 Flüge (7,3 %)**, verteilt auf 15 verschiedene Titel. Die Tabelle unten
+/// deckt sie vollständig ab — sie ist an den echten Titeln erhoben, nicht geraten.
+///
+/// # Grundsatz: im Zweifel `None`
+///
+/// Ein falscher Typ ist schlimmer als kein Typ. Ein falscher Typ wird geglaubt
+/// und keyed Bewertung und Profil-Matching; ein fehlender fällt sichtbar auf
+/// „nicht bewertbar" zurück. Deshalb wird nur zugeordnet, was eindeutig ist —
+/// keine Heuristik über Zahlenfragmente, keine Teiltreffer auf kurze Muster.
+///
+/// Die Muster sind **nach Spezifität geordnet**: `A330-300` steht vor `A330`,
+/// sonst würde die Variante von der Familie verschluckt.
+/// Das Flugzeugmuster als ICAO — aus allen drei Quellen, in fester Reihenfolge.
+///
+/// # Warum das eine Funktion sein muss
+///
+/// Am 24.08.2026 gab es im Client **vier** Stellen, die den Typ auflösten,
+/// mit **drei verschiedenen** Ketten:
+///
+/// | Stelle                     | Sim | Buchung | Titel |
+/// |----------------------------|-----|---------|-------|
+/// | Vorschau                   |  ✓  |    ✓    |   ✓   |
+/// | Bewertung (Grenzen, Vref)  |  ✓  |    ✓    |   ✗   |
+/// | MQTT-Touchdown → Server    |  ✗  |    ✓    |   ✗   |
+/// | MQTT, zweiter Pfad         |  ✗  |    ✓    |   ✗   |
+///
+/// Die dritte Stufe — der Flugzeugtitel — wurde in v1.7.0 eigens gebaut,
+/// weil etliche Add-ons `ATC MODEL` nicht füllen und ohne Buchung auch
+/// der zweite Rückgriff nicht greift (65 von 895 Flügen im Bestand,
+/// 7,3 %). Sie kam nur in die Vorschau.
+///
+/// Am ersten Live-Tag von v1.7.0 traf es EWG248, EDDL: Sim und Buchung
+/// lieferten beide nichts, der Titel wäre dagewesen. Ergebnis — keine
+/// Spurweite, keine Spannweite, Bank-Grenze und Vref aus dem Rückfall.
+/// Belegt am Datensatz: `landing_vref_source: "unknown"` entsteht nur,
+/// wenn die Grenzen-Tabelle nichts fand; BCS3 steht dort mit 128 kt.
+///
+/// # Die Reihenfolge
+///
+/// 1. **Der Simulator.** Was tatsächlich fliegt, schlägt was gebucht war —
+///    wer anders fliegt als gebucht, soll die Grenzen des geflogenen
+///    Musters bekommen. Meldet er nur die Baureihe („A330“), wird sie
+///    aus Buchung oder Titel derselben Reihe präzisiert (seit v1.9.12).
+/// 2. **Die Buchung.** Verlässlich, solange der Pilot nach Plan fliegt.
+/// 3. **Der Flugzeugtitel.** Die Notlösung: „Airbus A320neo Lufthansa"
+///    ergibt A20N. Ungenauer als die beiden anderen, aber besser als
+///    nichts — und „nichts" heisst hier: stille Rückfallwerte.
+pub fn muster_aufloesen(
+    sim_atc_model: Option<&str>,
+    buchung_icao: &str,
+    flugzeug_titel: Option<&str>,
+) -> Option<String> {
+    // v1.7.30 (UAE 52, EDDM→OMDB, 15.09.2026): Der Simulator gewinnt nur
+    // mit einem BRAUCHBAREN Code. Vorher reichte irgendein Text aus
+    // `ATC MODEL` — die iniBuilds A380 meldet „A380-800", das steht in
+    // keiner Typtabelle, und weil der Sim-Wert gesetzt war, wurde die
+    // Buchung (A388!) nie mehr gefragt. Ergebnis: keine Spurweite, keine
+    // Spannweite, kein seitlicher Randabstand, obwohl der Typ die ganze
+    // Zeit bekannt war. `normalize_icao_type` reinigt, ordnet
+    // Marketing-Namen zu und prüft die Plausibilität — genau die Stufe,
+    // die hier fehlte.
+    if let Some(m) = sim_atc_model.and_then(normalize_icao_type) {
+        // v1.9.12 (TAP, CS-TUK 17.09.2026): Meldet der Simulator nur die
+        // BAUREIHE („A330“), ist der Wert plausibel, aber unvollständig —
+        // die Familienregel der Bewertung machte daraus die A333, obwohl
+        // eine A339 flog (Spannweite 60,3 statt 64,0 m). Die genaue
+        // Variante kommt dann aus der Buchung, sofern sie zur selben
+        // Baureihe gehört, sonst aus dem Titel („A330-900“). Passt keins,
+        // bleibt die Baureihe stehen. Nur die Bewertung ist betroffen; der
+        // Buchungsabgleich läuft nicht über diese Funktion.
+        //
+        // Cloud-QS 29.09.2026 (P3a): der TITEL vor der Buchung. Er
+        // beschreibt, was tatsächlich geladen ist („A330-900neo“), die
+        // Buchung nur, was geplant war (A332 gebucht, A339 geflogen → sonst
+        // wieder die falsche Spannweite).
+        if let Some(reihe) = nur_baureihe(&m) {
+            if let Some(t) = flugzeug_titel.and_then(icao_aus_titel) {
+                if gehoert_zu_baureihe(&t, reihe) {
+                    return Some(t);
+                }
+            }
+            let gebucht = buchung_icao.trim().to_ascii_uppercase();
+            if gehoert_zu_baureihe(&gebucht, reihe) {
+                return Some(gebucht);
+            }
+        }
+        return Some(m);
+    }
+    let gebucht = buchung_icao.trim();
+    if !gebucht.is_empty() {
+        return Some(gebucht.to_ascii_uppercase());
+    }
+    flugzeug_titel.and_then(icao_aus_titel)
+}
+
+/// Baureihen-Codes ohne Variante, wie sie manche Add-ons als `ATC MODEL`
+/// melden. Gleiche Liste wie `familie_von` in der Bewertung des Clients.
+/// Rückgabe: das dreistellige Präfix, das alle Varianten der Reihe teilen
+/// (A330 → „A33“: A332, A333, A338, A339).
+fn nur_baureihe(code: &str) -> Option<&'static str> {
+    match code {
+        "A300" => Some("A30"),
+        "A330" => Some("A33"),
+        "A340" => Some("A34"),
+        "A380" => Some("A38"),
+        "B747" => Some("B74"),
+        "B777" => Some("B77"),
+        "B787" => Some("B78"),
+        _ => None,
+    }
+}
+
+/// Varianten der Baureihen, die die Bewertung kennt (Grenzwerte in der App
+/// UND Spur-/Spannweite in `landing-scoring/src/spurweite.rs`; 30.09.2026
+/// beide Tabellen um B77F/B778/B779 ergänzt, damit sie hier stehen dürfen). Cloud-QS
+/// 29.09.2026 (P3b): vorher zählte jeder vierstellige Code mit passendem
+/// Präfix — B74S oder B74R landeten so bei Rückfallwerten statt bei der
+/// Familien-Variante, die die Baureihe bisher bekam.
+pub const BAUREIHEN_VARIANTEN: &[&str] = &[
+    "A306", "A30B", "A332", "A333", "A338", "A339", "A342", "A343", "A345", "A346", "A388", "B741",
+    "B742", "B743", "B744", "B748", "B772", "B773", "B77L", "B77W", "B77F", "B778", "B779", "B788",
+    "B789", "B78X",
+];
+
+/// Eine bekannte, konkrete Variante der Reihe (Frachter-`F` angehängt
+/// erlaubt: B748F → B748).
+fn gehoert_zu_baureihe(code: &str, praefix: &str) -> bool {
+    let basis = if code.chars().count() == 5 {
+        code.strip_suffix('F').unwrap_or(code)
+    } else {
+        code
+    };
+    code.starts_with(praefix) && BAUREIHEN_VARIANTEN.contains(&basis)
+}
+
+pub fn icao_aus_titel(titel: &str) -> Option<String> {
+    let t = titel.trim().to_ascii_uppercase();
+    if t.is_empty() {
+        return None;
+    }
+    for (muster, icao) in TITEL_MUSTER {
+        if t.contains(muster) {
+            return Some((*icao).to_string());
+        }
+    }
+    None
+}
+
+/// Titel-Fragment → ICAO-Typcode, **spezifischste zuerst**.
+///
+/// Erhoben über 895 Flug-Protokolle: jedes Muster steht für mindestens einen
+/// echten Flug, bei dem der Typ sonst gefehlt hätte. Die Kommentare nennen die
+/// Häufigkeit im Bestand, damit beim Erweitern sichtbar bleibt, was Substanz hat.
+const TITEL_MUSTER: &[(&str, &str)] = &[
+    // ── Airbus ────────────────────────────────────────────────────────────
+    ("A220-300", "BCS3"), // 42 Flüge — mit Abstand der häufigste Fall
+    ("A220-100", "BCS1"),
+    ("A330-900", "A339"), // v1.9.12: 2 Flüge „Airbus A330-900neo TAP“ (Sim meldet nur A330)
+    ("A330-800", "A338"),
+    ("A330-300", "A333"), // 9 Flüge (VIP, P2F, RR)
+    ("A330-200", "A332"),
+    ("A340-300", "A343"), // 3 Flüge (Freighter EIS1)
+    ("A340-600", "A346"),
+    // v1.7.30: Titel der iniBuilds A380 ("A380-800 RR Basic") und des
+    // FBW A380X — beide tragen die Baureihe im Titel.
+    ("A380-800", "A388"),
+    ("A380X", "A388"),
+    ("A380", "A388"),
+    // ── Boeing / McDonnell Douglas ────────────────────────────────────────
+    // `MD-11` allein deckt auch `MD-11F` ab (Teilstring). Die spezifische
+    // Zeile steht trotzdem hier, weil sie den Auslöser benennt — und weil eine
+    // künftige Frachter-Unterscheidung genau hier ansetzen würde.
+    ("MD-11F", "MD11"), // 2 Flüge — der MPH-9-Fall
+    ("MD-11", "MD11"),
+    ("L1011", "L101"), // 1 Flug (TriStar -500)
+    // ── Turboprop ─────────────────────────────────────────────────────────
+    ("ATR 72-600", "AT76"), // 2 Flüge (Freighter)
+    ("ATR 72", "AT72"),
+    ("ATR 42", "AT43"),
+    // ── Geschäftsreise ────────────────────────────────────────────────────
+    ("P180", "P180"),       // 3 Flüge (FFX Avanti)
+    ("FA50", "FA50"),       // 1 Flug (Contrail)
+    ("C680", "C680"),       // 1 Flug (Cessna Latitude)
+    ("VISION JET", "SF50"), // 1 Flug (Cirrus SF50)
+];
+
+/// Ein echter ICAO-Typcode (Doc-8643) ist 2-4 alphanumerische Zeichen
+/// (Großbuchstaben + Ziffern). Filtert Modellnamen mit Leer-/Sonderzeichen
+/// und überlange Reste heraus.
+fn is_plausible_icao(s: &str) -> bool {
+    // Externe QS (Codex, 16.09.2026) P1: bis 5 Zeichen, nicht bis 4.
+    // Fuenfstellige Sim-Schreibweisen (`C182Q`, `MD11F`, `E190F`,
+    // `414AW`) sind zwar kein Doc-8643-Code, aber im Feldkorpus belegt,
+    // und die Schreibweisen-Kaskade des Clients (`muster_kandidaten`)
+    // loest sie sauber auf. Sie hier zu verwerfen hiess: der SIMULATOR
+    // verliert gegen die BUCHUNG, obwohl er recht hat. Die
+    // MSFS-Telemetrie normalisiert schon selbst (adapter/telemetry.rs),
+    // deshalb muss die Regel HIER stehen und nicht eine Ebene hoeher.
+    // Ausdrueckliche Junkwerte (NONE/NULL/NA) bleiben in
+    // `normalize_icao_type` gesperrt — die Laengenregel hebt das nicht auf.
+    let len = s.chars().count();
+    (2..=5).contains(&len)
+        && s.chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+}
+
+/// Bekannte MSFS-Modell-/Marketing-Namen → ICAO-Typcode (Doc-8643).
+/// Quelle: Health-Report-Verteilung über 614 Logs + gängige Designatoren.
+/// `None` = kein bekanntes Mapping (der Aufrufer validiert dann den
+/// Rohkandidaten gegen das ICAO-Muster). Eingabe ist bereits uppercased
+/// (aus [`clean_atc_model`]).
+fn map_model_name_to_icao(s: &str) -> Option<String> {
+    let icao = match s {
+        "PHENOM 300E" | "PHENOM 300" | "EMB-505" | "EMB505" => "E55P",
+        "A350-900" | "A350-900XWB" | "A350" => "A359",
+        // v1.7.30: A380-Langformen. Die iniBuilds A380 meldet "A380-800"
+        // als ATC-Modell — vorher fiel sie durch jede Typtabelle.
+        "A380-800" | "A380" | "A380X" | "A380-800F" => "A388",
+        "A350-1000" => "A35K",
+        "A340-300" => "A343",
+        "A340-600" => "A346",
+        "A330-900" | "A330-900NEO" | "A330NEO" => "A339",
+        "HA420" | "HONDAJET" | "HONDAJET HA-420" => "HDJT",
+        // v0.18.x (Health-Report-Nachmessung, cross-session 2026-07-06):
+        // "FALCON 50" und "A400M" fehlten komplett; beide ergaenzt.
+        "FALCON 50" | "FALCON 50EX" | "DASSAULT FALCON 50" => "FA50",
+        // v1.6.13 (Korpus-Auswertung 21.08.2026): beide traten im Feld auf und
+        // blieben ungereinigt.
+        //
+        // ⚠️ C680+ ist die Sovereign+ und traegt weiterhin C680. C68A waere die
+        // Citation Latitude — ein anderes Flugzeug. Nachgeschlagen statt
+        // geraten, weil eine falsche Kennung das Profil-Matching und damit die
+        // Gewichte verzieht.
+        "C680+" | "CITATION SOVEREIGN+" => "C680",
+        "GA-8" | "GA8 AIRVAN" | "AIRVAN" => "GA8",
+        "A400M" | "A400M ATLAS" | "AIRBUS A400M" => "A400",
+        // Nachmessung 16.08.2026 (827 VPS-Flight-Logs).
+        //
+        // Hier stehen NUR Namen, die ohne Zuordnung als unbekannt enden —
+        // was diese Funktion liefert, wird im MSFS-Adapter zu
+        // `SimSnapshot::aircraft_icao` und ist damit die Musteridentitaet
+        // des ganzen Clients (Kategorie-FSM, Auto-Start-Abgleich, PIREP).
+        // Baureihen ohne Variante ("A330", "B747") gehoeren deshalb NICHT
+        // hierher: sie sind schon vierstellig und plausibel, eine Zuordnung
+        // wuerde eine gueltige Identitaet gegen eine geratene Variante
+        // tauschen. Die Grenzen-Tabelle uebersetzt sie selbst, dort kostet
+        // ein Fehlgriff nichts, weil die Tabelle das Ergebnis bestaetigen
+        // muss (siehe `muster_kandidaten` in der App).
+        "TYPHOON" | "EUROFIGHTER" | "EUROFIGHTER TYPHOON" => "EUFI",
+        _ => {
+            // Suffix-tolerante Sonderfaelle: reale Airline-/Addon-Custom-
+            // Designatoren haengen oft Varianten-Suffixe an bekannte
+            // Marketing-Namen (z. B. "A350-900 ULR" fuer Ultra-Long-Range).
+            // Eine exakte Literal-Liste kann das nicht abdecken, ohne jede
+            // Kombination einzeln aufzuzaehlen — deshalb hier ein
+            // Praefix-Fallback fuer die bekannten variantenreichen Familien.
+            if s.starts_with("A350-900") {
+                "A359"
+            } else if s.starts_with("A400M") {
+                "A400"
+            } else {
+                return None;
+            }
+        }
+    };
+    Some(icao.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_fenix_a319_from_title() {
+        let p = AircraftProfile::detect("FenixA319 IAE", "A319");
+        assert_eq!(p, AircraftProfile::FenixA319);
+        assert!(p.is_fenix());
+        assert_eq!(p.label(), "Fenix A319");
+    }
+
+    #[test]
+    fn detect_fenix_a320_default_when_no_variant() {
+        // Plain "Fenix" matches A320 as the canonical fallback. This
+        // is the v0.7.15 stable behavior — preserve it so community
+        // liveries that flatten the title still get a Fenix profile.
+        let p = AircraftProfile::detect("Fenix Simulations Airbus", "A320");
+        assert_eq!(p, AircraftProfile::FenixA320);
+    }
+
+    #[test]
+    fn detect_fenix_a320_explicit() {
+        let p = AircraftProfile::detect("FenixA320 CFM SL", "A320");
+        assert_eq!(p, AircraftProfile::FenixA320);
+        assert!(p.is_fenix());
+    }
+
+    #[test]
+    fn detect_fenix_a321_from_title() {
+        let p = AircraftProfile::detect("FenixA321 NEO LR", "A321");
+        assert_eq!(p, AircraftProfile::FenixA321);
+        assert!(p.is_fenix());
+        assert_eq!(p.label(), "Fenix A321");
+    }
+
+    #[test]
+    fn detect_fenix_a319_via_icao_only() {
+        // Repaint scenario: title omits the variant marker, ICAO still
+        // identifies it. Match on either signal is by design.
+        let p = AircraftProfile::detect("Fenix Repaint", "A319");
+        assert_eq!(p, AircraftProfile::FenixA319);
+    }
+
+    #[test]
+    fn detect_non_fenix_stays_default() {
+        let p = AircraftProfile::detect("Asobo A320 Neo", "A20N");
+        assert_eq!(p, AircraftProfile::Default);
+        assert!(!p.is_fenix());
+    }
+
+    #[test]
+    fn is_fenix_covers_all_three_variants() {
+        assert!(AircraftProfile::FenixA319.is_fenix());
+        assert!(AircraftProfile::FenixA320.is_fenix());
+        assert!(AircraftProfile::FenixA321.is_fenix());
+        assert!(!AircraftProfile::FbwA32nx.is_fenix());
+        assert!(!AircraftProfile::Default.is_fenix());
+    }
+
+    #[test]
+    fn icao_fallback_for_fenix_variants() {
+        assert_eq!(AircraftProfile::FenixA319.icao_fallback(), Some("A319"));
+        assert_eq!(AircraftProfile::FenixA320.icao_fallback(), Some("A320"));
+        assert_eq!(AircraftProfile::FenixA321.icao_fallback(), Some("A321"));
+        assert_eq!(AircraftProfile::Default.icao_fallback(), None);
+        assert_eq!(AircraftProfile::FbwA32nx.icao_fallback(), None);
+        assert_eq!(AircraftProfile::Pmdg737.icao_fallback(), None);
+    }
+
+    // ---- v0.13.13 FsrPhenom300e Profile ----
+
+    #[test]
+    fn detect_fsr_phenom_300e_from_full_title() {
+        // Realer Title aus Michael's Telemetrie (NJE 245 LEMH->LEBL 26.05.2026):
+        let p = AircraftProfile::detect("FSReborn Phenom 300E Tristan Interior", "E55P");
+        assert_eq!(p, AircraftProfile::FsrPhenom300e);
+    }
+
+    #[test]
+    fn detect_fsr_phenom_300e_case_insensitive() {
+        let p = AircraftProfile::detect("fsreborn phenom 300e", "E55P");
+        assert_eq!(p, AircraftProfile::FsrPhenom300e);
+    }
+
+    #[test]
+    fn detect_fsr_phenom_300e_with_variant_suffix() {
+        // FSR liefert verschiedene Interior-Optionen, z.B. "Tristan", "Default".
+        let p = AircraftProfile::detect("FSReborn Phenom 300E Default Interior", "E55P");
+        assert_eq!(p, AircraftProfile::FsrPhenom300e);
+    }
+
+    #[test]
+    fn detect_phenom_without_fsreborn_marker_stays_default() {
+        // Asobo Default-Phenom oder andere Studios sollen NICHT auf das
+        // FSR-Profile fallen — die haben das Knob-LVar nicht.
+        let p = AircraftProfile::detect("Asobo Phenom 300", "E55P");
+        assert_eq!(p, AircraftProfile::Default);
+    }
+
+    #[test]
+    fn normalize_icao_type_fixes_health_report_garbage() {
+        // Reale Kaputt-Werte aus 614 VPS-Flight-Logs (Health-Report).
+        // ATCCOM-Lokalisierungs-String → sauberer Typcode.
+        assert_eq!(
+            normalize_icao_type("ATCCOM.AC_MODEL A320.0.text").as_deref(),
+            Some("A320")
+        );
+        assert_eq!(
+            normalize_icao_type("ATCCOM.AC_MODEL A321.0.text").as_deref(),
+            Some("A321")
+        );
+        // Marketing-/Modellnamen → ICAO-Designator.
+        assert_eq!(normalize_icao_type("PHENOM 300E").as_deref(), Some("E55P"));
+        assert_eq!(normalize_icao_type("A350-900").as_deref(), Some("A359"));
+        assert_eq!(normalize_icao_type("HA420").as_deref(), Some("HDJT"));
+        // Junk → None (Aufrufer nutzt profile.icao_fallback()).
+        assert_eq!(normalize_icao_type("None"), None);
+        assert_eq!(normalize_icao_type(""), None);
+        assert_eq!(normalize_icao_type("NULL"), None);
+    }
+
+    #[test]
+    fn normalize_icao_type_covers_remaining_health_report_names() {
+        // Nachmessung 06.07.2026 (cross-session Health-Report-Review):
+        // ATCCOM-Faelle sind erledigt (v0.18.x-Fix greift live), aber diese
+        // ausgeschriebenen Modellnamen fielen noch durch — kein ATCCOM-
+        // Muster, deshalb vom vorherigen Fix nicht abgedeckt.
+        assert_eq!(normalize_icao_type("FALCON 50").as_deref(), Some("FA50"));
+        assert_eq!(normalize_icao_type("A400M").as_deref(), Some("A400"));
+        // Suffix-Variante ("Ultra Long Range") — Praefix-Fallback, nicht
+        // Teil der exakten Literal-Liste.
+        assert_eq!(normalize_icao_type("A350-900 ULR").as_deref(), Some("A359"));
+    }
+
+    #[test]
+    fn normalize_icao_type_passes_clean_codes_through() {
+        // Bereits saubere ICAO-Codes bleiben unverändert.
+        for c in [
+            "A320", "B738", "E55P", "A359", "MD11", "FA50", "C172", "DH8D",
+        ] {
+            assert_eq!(
+                normalize_icao_type(c).as_deref(),
+                Some(c),
+                "{c} sollte durchgehen"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_icao_type_rejects_leftover_model_names() {
+        // Unbekannte Modellnamen (Leerzeichen/zu lang) → None statt Garbage.
+        assert_eq!(normalize_icao_type("Boeing 747-8 Intercontinental"), None);
+        assert_eq!(normalize_icao_type("Super Fancy Bizjet"), None);
+    }
+
+    #[test]
+    fn detect_contrail_fa50() {
+        // Reale Titles aus dem Aircraft-Scan-Upload (Michael K, 05.07.2026):
+        // "Contrail Falcon 50", "Contrail Falcon 50 - 17401", "… - 9H-DFS".
+        for title in [
+            "Contrail Falcon 50",
+            "Contrail Falcon 50 - 9H-DFS",
+            "contrail falcon 50 - D-BETI",
+        ] {
+            assert_eq!(
+                AircraftProfile::detect(title, "FA50"),
+                AircraftProfile::ContrailFa50,
+                "title {title:?} sollte ContrailFa50 sein",
+            );
+        }
+        // icao_fallback + label
+        assert_eq!(AircraftProfile::ContrailFa50.icao_fallback(), Some("FA50"));
+        assert_eq!(AircraftProfile::ContrailFa50.label(), "Contrail Falcon 50");
+    }
+
+    #[test]
+    fn detect_synaptic_a220_from_title() {
+        // Titel live bestätigt (Thomas K., PIREP VGDmGnMEWmMbkJRP,
+        // EVRA→EDDB, 2026-07-28): MSFS TITLE = "A220-300" — KEIN
+        // "Synaptic"-Marker (die urspüngliche Annahme dazu war falsch,
+        // siehe detect()-Kommentar). "A220-100" analog, noch nicht separat
+        // live bestätigt.
+        for title in ["A220-300", "A220-100", "a220-300"] {
+            assert_eq!(
+                AircraftProfile::detect(title, "BCS3"),
+                AircraftProfile::SynapticA220,
+                "title {title:?} sollte SynapticA220 sein",
+            );
+        }
+        assert_eq!(AircraftProfile::SynapticA220.label(), "Synaptic A220");
+        // Kein ICAO-Fallback (`ATC MODEL` kam im echten Flug ohnehin leer
+        // zurück, also kein nutzbares Signal) — ein Title ohne "a220-300"/
+        // "a220-100" bleibt Default.
+        assert_eq!(
+            AircraftProfile::detect("Some Other Aircraft", "BCS3"),
+            AircraftProfile::Default,
+        );
+    }
+
+    #[test]
+    fn engine_count_unreliable_only_for_confirmed_broken_profiles() {
+        // v0.18.x QA-Härtung: der addon-agnostische Stillstands-Fallback (FSM)
+        // darf NUR für Flugzeuge laufen, bei denen ein Aircraft-Scan-Bericht
+        // das kaputte Verhalten konkret belegt hat — aktuell ausschließlich
+        // der Contrail FA50. Jedes andere Profil muss false liefern, sonst
+        // greift der schwächere Stillstands-Test (ohne harten engines-off-
+        // Check) fleet-weit und ein normaler Rollhalt mit Parkbremse (z. B.
+        // Warten auf Rollfreigabe an einem großen Hub) könnte fälschlich als
+        // Ankunft gewertet werden.
+        assert!(AircraftProfile::ContrailFa50.engine_count_unreliable());
+        assert!(!AircraftProfile::Default.engine_count_unreliable());
+        assert!(!AircraftProfile::FbwA32nx.engine_count_unreliable());
+        assert!(!AircraftProfile::Pmdg737.engine_count_unreliable());
+        assert!(!AircraftProfile::FenixA320.engine_count_unreliable());
+        assert!(!AircraftProfile::AerosoftA346.engine_count_unreliable());
+    }
+
+    #[test]
+    fn detect_bare_fa50_icao_without_contrail_marker_stays_default() {
+        // KEIN bare-FA50-ICAO-Fallback für die Detection (M4-Lektion):
+        // ein fremder/Default-Falcon-50 ohne "contrail"-Marker darf NICHT
+        // das Contrail-Profil (mit dessen CTL_FA50_-LVars) bekommen.
+        assert_eq!(
+            AircraftProfile::detect("Just Flight Falcon 50", "FA50"),
+            AircraftProfile::Default,
+        );
+        // "falcon" allein (z.B. Falcon 900) ohne contrail bleibt Default.
+        assert_eq!(
+            AircraftProfile::detect("Some Falcon 900", "F900"),
+            AircraftProfile::Default,
+        );
+    }
+
+    #[test]
+    fn detect_fsreborn_lear_75_does_not_match_phenom() {
+        // FSReborn hat auch andere Aircraft (FSR500, Sting S4, evtl. spaeter
+        // Lear). Diese sollen nicht versehentlich als Phenom 300E erkannt
+        // werden — Detection prueft auf alle drei Marker.
+        let p = AircraftProfile::detect("FSReborn Lear 75", "LJ75");
+        assert_eq!(p, AircraftProfile::Default);
+    }
+
+    #[test]
+    fn icao_vorrang_nur_fuer_ifly_max8() {
+        assert_eq!(AircraftProfile::IflyMax8.icao_vorrang(), Some("B38M"));
+        // Gegenprobe: alle anderen Profile lassen die ATC-Stimme gelten.
+        for p in [
+            AircraftProfile::Default,
+            AircraftProfile::Pmdg737,
+            AircraftProfile::FenixA320,
+            AircraftProfile::IniA380,
+            AircraftProfile::FbwA32nx,
+        ] {
+            assert_eq!(p.icao_vorrang(), None, "{p:?}");
+        }
+    }
+
+    #[test]
+    fn icao_fallback_fsr_phenom_300e_is_e55p() {
+        assert_eq!(AircraftProfile::FsrPhenom300e.icao_fallback(), Some("E55P"));
+    }
+
+    #[test]
+    fn label_fsr_phenom_300e_is_human_readable() {
+        assert_eq!(
+            AircraftProfile::FsrPhenom300e.label(),
+            "FSReborn Phenom 300E"
+        );
+    }
+
+    #[test]
+    fn fsr_phenom_300e_is_not_fenix() {
+        // Sanity: das Profile darf NICHT als Fenix klassifiziert werden
+        // (sonst wuerde der Fenix-LVar-Mapping-Block falsch greifen).
+        assert!(!AircraftProfile::FsrPhenom300e.is_fenix());
+    }
+
+    // ---- AerosoftA346 Profile (WASM-Analyse 2026-06-10) ----
+
+    #[test]
+    fn detect_aerosoft_a346_from_title_prefix() {
+        // Reale Titles aus der aircraft.cfg beginnen alle mit
+        // "Aerosoft A346" (Livery-Suffix variiert).
+        let p = AircraftProfile::detect("Aerosoft A346-MahanAir", "A346");
+        assert_eq!(p, AircraftProfile::AerosoftA346);
+        let p = AircraftProfile::detect("Aerosoft A346 Pro", "A346");
+        assert_eq!(p, AircraftProfile::AerosoftA346);
+        assert_eq!(p.label(), "Aerosoft A340-600");
+    }
+
+    #[test]
+    fn detect_aerosoft_a346_case_insensitive_title() {
+        let p = AircraftProfile::detect("AEROSOFT A346 Lufthansa", "");
+        assert_eq!(p, AircraftProfile::AerosoftA346);
+    }
+
+    #[test]
+    fn detect_aerosoft_a346_via_icao_only() {
+        // Repaint-Szenario: Title traegt den Marker nicht, der ICAO-
+        // Designator A346 identifiziert das Aircraft trotzdem.
+        let p = AircraftProfile::detect("Custom A340-600 Repaint", "A346");
+        assert_eq!(p, AircraftProfile::AerosoftA346);
+        // Auch wenn der Sim den ICAO als Localization-Token liefert.
+        let p = AircraftProfile::detect("Custom A340-600 Repaint", "ATCCOM.AC_MODEL A346.0.text");
+        assert_eq!(p, AircraftProfile::AerosoftA346);
+    }
+
+    #[test]
+    fn detect_aerosoft_a346_no_false_positives() {
+        // Andere Aircraft duerfen NICHT auf das A346-Profil fallen.
+        assert_eq!(
+            AircraftProfile::detect("FenixA320 CFM SL", "A320"),
+            AircraftProfile::FenixA320,
+        );
+        assert_eq!(
+            AircraftProfile::detect("Asobo A320 Neo", "A20N"),
+            AircraftProfile::Default,
+        );
+        // "Aerosoft" allein (anderes Aerosoft-Aircraft) reicht nicht.
+        assert_eq!(
+            AircraftProfile::detect("Aerosoft CRJ 550", "CRJ5"),
+            AircraftProfile::Default,
+        );
+        // ICAO muss EXAKT A346 sein — A343 darf NICHT auf Aerosoft
+        // fallen. v0.16.10 (#Premium): A343 mappt jetzt auf IniA340
+        // (Per-Livery-Titles der iniBuilds A340-300 tragen kein
+        // "inibuilds") — der Guard hier bleibt: nicht AerosoftA346.
+        assert_eq!(
+            AircraftProfile::detect("Some A340-300", "A343"),
+            AircraftProfile::IniA340,
+        );
+    }
+
+    #[test]
+    fn detect_inibuilds_a346_pro_still_wins_over_aerosoft_icao_match() {
+        // Regression-Guard: die iniBuilds A340-600 Pro meldet u.U.
+        // ebenfalls ICAO A346 — ihr Title-Match muss weiter VOR dem
+        // Aerosoft-ICAO-Fallback greifen.
+        let p = AircraftProfile::detect("iniBuilds A340-600 Pro", "A346");
+        assert_eq!(p, AircraftProfile::IniA346Pro);
+    }
+
+    #[test]
+    fn aerosoft_a346_icao_fallback_and_not_fenix() {
+        assert_eq!(AircraftProfile::AerosoftA346.icao_fallback(), Some("A346"));
+        // Sanity: darf nicht als Fenix klassifiziert werden, sonst
+        // greift der Fenix-LVar-Mapping-Block faelschlich.
+        assert!(!AircraftProfile::AerosoftA346.is_fenix());
+    }
+
+    /// UAE 52 (EDDM→OMDB, 15.09.2026): Die iniBuilds A380 meldete
+    /// "A380-800" als ATC-Modell. Der Wert war gesetzt, also gewann er —
+    /// und weil er in keiner Typtabelle steht, gab es weder Spurweite noch
+    /// Spannweite noch seitlichen Randabstand, obwohl die Buchung A388
+    /// sagte. Der Sim gewinnt jetzt nur mit einem brauchbaren Code.
+    #[test]
+    fn unbrauchbarer_sim_wert_darf_die_buchung_nicht_verdraengen() {
+        assert_eq!(
+            muster_aufloesen(Some("A380-800"), "A388", Some("A380-800 RR Basic")),
+            Some("A388".to_string())
+        );
+        // Auch reiner Unsinn im ATC-Feld darf die Buchung nicht kosten.
+        assert_eq!(
+            muster_aufloesen(Some("Boeing Longname Deluxe"), "B77W", None),
+            Some("B77W".to_string())
+        );
+        // Ohne Buchung rettet der Titel.
+        assert_eq!(
+            muster_aufloesen(Some("A380-800"), "", Some("A380-800 RR Basic")),
+            Some("A388".to_string())
+        );
+    }
+
+    /// v1.9.12 (TAP, CS-TUA 08.09. / CS-TUK 17.09.2026): Das Add-on meldet
+    /// nur die Baureihe „A330“. Vorher gewann dieser Wert, die Bewertung
+    /// machte daraus A333 — Spannweite 60,3 statt 64,0 m.
+    #[test]
+    fn baureihe_vom_sim_wird_aus_buchung_oder_titel_praezisiert() {
+        let titel = Some("Airbus A330-900neo TAP");
+        // Buchung derselben Reihe gewinnt.
+        assert_eq!(
+            muster_aufloesen(Some("A330"), "A339", titel).as_deref(),
+            Some("A339")
+        );
+        // Cloud-QS P3a: der Titel beschreibt das geladene Flugzeug und
+        // schlägt die Buchung (A332 gebucht, A330-900neo geflogen).
+        assert_eq!(
+            muster_aufloesen(Some("A330"), "A332", titel).as_deref(),
+            Some("A339"),
+            "Titel schlägt Buchung"
+        );
+        // Titel ohne Variante: die Buchung entscheidet.
+        assert_eq!(
+            muster_aufloesen(Some("A330"), "A332", Some("Airbus Widebody TAP")).as_deref(),
+            Some("A332")
+        );
+        // Cloud-QS P3b: unbekannte Varianten (B74S, B74R) nicht übernehmen.
+        assert_eq!(
+            muster_aufloesen(Some("B747"), "B74S", None).as_deref(),
+            Some("B747")
+        );
+        assert_eq!(
+            muster_aufloesen(Some("A300"), "A30B", None).as_deref(),
+            Some("A30B")
+        );
+        // Ohne Buchung: der Titel.
+        assert_eq!(
+            muster_aufloesen(Some("A330"), "", titel).as_deref(),
+            Some("A339")
+        );
+        // Buchung einer ANDEREN Reihe: nicht übernehmen, Titel nehmen.
+        assert_eq!(
+            muster_aufloesen(Some("A330"), "B738", titel).as_deref(),
+            Some("A339")
+        );
+        // Nichts Passendes: Baureihe bleibt (die Bewertung wählt dann die
+        // Familien-Variante wie bisher).
+        assert_eq!(
+            muster_aufloesen(Some("A330"), "B738", Some("Airbus Widebody")).as_deref(),
+            Some("A330")
+        );
+        // Frachter-Buchung derselben Reihe.
+        assert_eq!(
+            muster_aufloesen(Some("B777"), "B77L", None).as_deref(),
+            Some("B77L")
+        );
+        assert_eq!(
+            muster_aufloesen(Some("B747"), "B748F", None).as_deref(),
+            Some("B748F")
+        );
+        // 777F und 777-9: beide Tabellen kennen sie (30.09.2026).
+        assert_eq!(
+            muster_aufloesen(Some("B777"), "B77F", None).as_deref(),
+            Some("B77F")
+        );
+        assert_eq!(
+            muster_aufloesen(Some("B777"), "B779", None).as_deref(),
+            Some("B779")
+        );
+        // A310 gehört nicht zur A300-Reihe.
+        assert_eq!(
+            muster_aufloesen(Some("A300"), "A310", None).as_deref(),
+            Some("A300")
+        );
+        // Konkreter Sim-Code bleibt unangetastet — der Sim gewinnt weiter.
+        assert_eq!(
+            muster_aufloesen(Some("A333"), "A339", titel).as_deref(),
+            Some("A333")
+        );
+    }
+
+    #[test]
+    fn titel_a330neo_varianten() {
+        assert_eq!(
+            icao_aus_titel("Airbus A330-900neo TAP").as_deref(),
+            Some("A339")
+        );
+        assert_eq!(
+            icao_aus_titel("Airbus A330-800neo").as_deref(),
+            Some("A338")
+        );
+        assert_eq!(icao_aus_titel("A330-300 VIP (RR)").as_deref(), Some("A333"));
+    }
+
+    /// Externe QS (Codex, 16.09.2026) P1: fünfstellige Sim-Schreibweisen
+    /// sind kein Doc-8643-Code, aber im Feldkorpus belegt — die Kaskade
+    /// des Clients löst sie auf. Sie dürfen die Buchung weiterhin schlagen.
+    /// Die gesperrten Junkwerte bleiben gesperrt — die erweiterte
+    /// Laengenregel darf sie nicht wieder hereinlassen (Codex P2).
+    #[test]
+    fn junkwerte_schlagen_die_buchung_nicht() {
+        for roh in ["NONE", "NULL", "NA", "N/A"] {
+            assert_eq!(
+                muster_aufloesen(Some(roh), "A388", None).as_deref(),
+                Some("A388"),
+                "{roh} darf die Buchung nicht verdraengen"
+            );
+        }
+    }
+
+    /// Die Laengenregel muss dort greifen, wo der Sim-Wert wirklich
+    /// herkommt: die MSFS-Telemetrie normalisiert selbst, bevor
+    /// `muster_aufloesen` ihn je sieht (Codex P1, zweite Runde).
+    #[test]
+    fn fuenfstellige_kennungen_ueberstehen_die_normalisierung() {
+        for roh in ["C182Q", "MD11F", "E190F", "414AW"] {
+            assert_eq!(
+                normalize_icao_type(roh).as_deref(),
+                Some(roh),
+                "{roh} muss die Normalisierung ueberstehen"
+            );
+        }
+    }
+
+    #[test]
+    fn fuenfstellige_sim_schreibweisen_bleiben_gueltig() {
+        for roh in ["C182Q", "MD11F", "E190F", "414AW"] {
+            assert_eq!(
+                muster_aufloesen(Some(roh), "A320", None).as_deref(),
+                Some(roh),
+                "{roh} muss den gebuchten Typ schlagen"
+            );
+        }
+    }
+
+    /// Was sichtbar keine Kennung ist, darf nicht als Muster weitergereicht
+    /// werden — auch nicht „nur für die Anzeige" (Codex P2: der Wert landet
+    /// in Bewertung, Health-Warnung und Landedatensatz).
+    #[test]
+    fn unbrauchbarer_sim_wert_ohne_buchung_und_titel_ergibt_nichts() {
+        // "A380-800" ist bewusst KEIN Beispiel mehr — genau das loest sich
+        // jetzt ueber die Namenstabelle auf. Hier steht, was wirklich
+        // niemand kennt.
+        assert_eq!(
+            muster_aufloesen(Some("Superjet Deluxe 9000"), "", None),
+            None
+        );
+        assert_eq!(muster_aufloesen(Some("A999-100"), "", None), None);
+    }
+
+    /// Wer anders fliegt als gebucht, bekommt weiterhin das GEFLOGENE
+    /// Muster — der Sim behält den Vorrang, solange er brauchbar ist.
+    #[test]
+    fn brauchbarer_sim_wert_schlaegt_die_buchung_weiterhin() {
+        assert_eq!(
+            muster_aufloesen(Some("B738"), "A320", None),
+            Some("B738".to_string())
+        );
+        assert_eq!(
+            muster_aufloesen(Some("A350-900"), "A320", None),
+            Some("A359".to_string())
+        );
+    }
+
+    /// Wächter gegen die Fehlerklasse: Steht ein Muster in der
+    /// Spurweiten-Tabelle, muss die Auflösung es aus den üblichen
+    /// Sim-Schreibweisen (Langform, Titel) auch herausholen.
+    #[test]
+    fn uebliche_langformen_loesen_sich_auf() {
+        for (sim_text, erwartet) in [
+            ("A380-800", "A388"),
+            ("A350-900", "A359"),
+            ("A350-1000", "A35K"),
+            ("A340-600", "A346"),
+            ("A330-900", "A339"),
+        ] {
+            assert_eq!(
+                muster_aufloesen(Some(sim_text), "", None).as_deref(),
+                Some(erwartet),
+                "{sim_text} muss sich auf {erwartet} aufloesen"
+            );
+        }
+    }
+
+    #[test]
+    fn clean_atc_model_basic_and_token_forms() {
+        // Plain ICAO codes pass through (uppercased).
+        assert_eq!(clean_atc_model("C208"), Some("C208".to_string()));
+        assert_eq!(clean_atc_model("a320"), Some("A320".to_string()));
+        // Empty / unresolved text tokens → None (caller uses fallback).
+        assert_eq!(clean_atc_model(""), None);
+        assert_eq!(clean_atc_model("TT:CESSNA"), None);
+        // Vendor-tag prefix gets stripped.
+        assert_eq!(clean_atc_model("$$:C750"), Some("C750".to_string()));
+    }
+
+    #[test]
+    fn touchdown_vs_source_prefers_raw_then_falls_back() {
+        let mut s = SimSnapshot::default();
+        s.vertical_speed_fpm = -50.0; // display value (e.g. the X-Plane VVI)
+                                      // No raw signal (MSFS) → touchdown falls back to the display V/S.
+        assert_eq!(s.vertical_speed_raw_fpm, None);
+        assert_eq!(s.touchdown_vs_source_fpm(), -50.0);
+        // Raw present (X-Plane local_vy) → touchdown uses the raw, responsive
+        // value, independent of the curvature-free (and possibly damped)
+        // display V/S — this is what keeps the landing rate lag-free.
+        s.vertical_speed_raw_fpm = Some(-320.0);
+        assert_eq!(s.touchdown_vs_source_fpm(), -320.0);
+        // The display V/S is untouched (stays the curvature-free FSM value).
+        assert_eq!(s.vertical_speed_fpm, -50.0);
+    }
+
+    #[test]
+    fn clean_atc_model_blacksquare_caravan_regression() {
+        // v0.12.10 live-bug: the BlackSquare Caravan reports its ATC MODEL
+        // as the raw token `ATCCOM.AC_MODEL C208.0.text` (note the SPACE
+        // and lowercase `.text`). Must resolve to "C208" — otherwise
+        // `aircraft_icao` carries garbage → "Type ?" → broken PIREP filing.
+        assert_eq!(
+            clean_atc_model("ATCCOM.AC_MODEL C208.0.text"),
+            Some("C208".to_string()),
+        );
+        // Underscore variant must also resolve.
+        assert_eq!(
+            clean_atc_model("ATCCOM.AC_MODEL_C750.0.TEXT"),
+            Some("C750".to_string()),
+        );
+    }
+
+    #[test]
+    fn autothrottle_on_defaults_none_and_old_jsonl_replays_deserialize() {
+        // 2026-06-10 (A346 full profile): the new `autothrottle_on`
+        // field must default to None — only profiles with a verified
+        // A/THR state source (A346 ATHR light, Fenix S_FCU_ATHR) set
+        // it, everything else stays silent in the activity log.
+        let s = SimSnapshot::default();
+        assert_eq!(s.autothrottle_on, None);
+
+        // Backward compat: a snapshot serialized BEFORE the field
+        // existed (= recorded JSONL flight logs) must still
+        // deserialize — `#[serde(default)]` covers the missing key.
+        let mut v = serde_json::to_value(&s).expect("serialize");
+        v.as_object_mut()
+            .expect("object")
+            .remove("autothrottle_on")
+            .expect("field present after serialize");
+        let restored: SimSnapshot =
+            serde_json::from_value(v).expect("old JSONL without the key must deserialize");
+        assert_eq!(restored.autothrottle_on, None);
+    }
+
+    // ---- v0.16.7 PMDG autoflight override (AP master + A/THR) ----
+    //
+    // Data-audit 2026-06-11: standard `AUTOPILOT MASTER` reads dead
+    // (never true) on PMDG 737/777 — the override maps the SDK
+    // annunciators onto the generic fields. Presence-gated: a snapshot
+    // without `pmdg` must come out bit-identical.
+
+    /// PmdgState carrier with just the two autoflight bits set.
+    fn pmdg_autoflight(ap_engaged: bool, at_armed: bool) -> PmdgState {
+        PmdgState {
+            ap_engaged,
+            at_armed,
+            ..PmdgState::default()
+        }
+    }
+
+    #[test]
+    fn pmdg_ap_engaged_overrides_dead_standard_simvar() {
+        // The audit case: standard SimVar stuck at false, CMD A (or B,
+        // or 777 AP L/R — all collapse into `ap_engaged`) is lit.
+        let mut s = SimSnapshot::default();
+        s.autopilot_master = Some(false); // dead standard var
+        s.pmdg = Some(pmdg_autoflight(true, false));
+        s.apply_pmdg_autoflight_override();
+        assert_eq!(s.autopilot_master, Some(true));
+    }
+
+    #[test]
+    fn pmdg_both_cmd_channels_off_reports_master_off() {
+        let mut s = SimSnapshot::default();
+        s.autopilot_master = Some(false);
+        s.pmdg = Some(pmdg_autoflight(false, false));
+        s.apply_pmdg_autoflight_override();
+        assert_eq!(s.autopilot_master, Some(false));
+        assert_eq!(s.autothrottle_on, Some(false));
+    }
+
+    #[test]
+    fn pmdg_standard_simvar_wins_as_or_tiebreaker() {
+        // Should PMDG ever wire the standard var, it can only agree or
+        // win — same OR semantics as the A346/Fenix LVar mappings.
+        let mut s = SimSnapshot::default();
+        s.autopilot_master = Some(true);
+        s.autothrottle_on = Some(true);
+        s.pmdg = Some(pmdg_autoflight(false, false));
+        s.apply_pmdg_autoflight_override();
+        assert_eq!(s.autopilot_master, Some(true));
+        assert_eq!(s.autothrottle_on, Some(true));
+    }
+
+    #[test]
+    fn pmdg_at_armed_maps_to_autothrottle_on() {
+        // PMDG (Default MSFS profile) leaves `autothrottle_on` at None
+        // in the telemetry parser — the override fills it from the SDK.
+        let mut s = SimSnapshot::default();
+        assert_eq!(s.autothrottle_on, None);
+        s.pmdg = Some(pmdg_autoflight(false, true));
+        s.apply_pmdg_autoflight_override();
+        assert_eq!(s.autothrottle_on, Some(true));
+    }
+
+    #[test]
+    fn absent_pmdg_leaves_snapshot_untouched() {
+        // Presence gate: no PMDG state → no field changes at all, for
+        // every starting value the standard telemetry can produce.
+        for master in [None, Some(false), Some(true)] {
+            for athr in [None, Some(false), Some(true)] {
+                let mut s = SimSnapshot::default();
+                s.autopilot_master = master;
+                s.autothrottle_on = athr;
+                assert!(s.pmdg.is_none());
+                s.apply_pmdg_autoflight_override();
+                assert_eq!(s.autopilot_master, master);
+                assert_eq!(s.autothrottle_on, athr);
+            }
+        }
+    }
+
+    // ---- v0.16.10 (#Premium): Cockpit-Tiefendaten ----
+    //
+    // Foundation-Phase: neue SimSnapshot-/PmdgState-Carrier-Felder,
+    // neue Profile (TfdiMd11, erweiterte FBW-Familie, IniA340-Livery-
+    // Fallback) und der PMDG-Premium-Override. Die Addon-Mapper folgen
+    // in spaeteren Phasen — hier sichern wir Serde-Kompatibilitaet,
+    // Detection-Regeln und die Override-Semantik ab.
+
+    /// Alle in v0.16.10 neu eingefuehrten SimSnapshot-Keys — fuer den
+    /// JSONL-Backward-Compat-Test unten.
+    const PREMIUM_SNAPSHOT_KEYS: [&str; 26] = [
+        "fma_lateral_mode",
+        "fma_vertical_mode",
+        "fma_thrust_mode",
+        "flight_phase_aircraft",
+        "v1_kt",
+        "vr_kt",
+        "v2_kt",
+        "vapp_kt",
+        "vls_kt",
+        "vref_kt",
+        "flex_temp_c",
+        "thrust_gate",
+        "master_caution",
+        "master_warning",
+        "managed_speed",
+        "managed_heading",
+        "managed_altitude",
+        "reverser_deployed",
+        "ground_spoilers_active",
+        "eng_n1_pct",
+        "baro_std",
+        "fuel_per_tank_kg",
+        "below_gs_alert",
+        "cabin_altitude_warning",
+        "stab_out_of_trim",
+        "minimums_baro_ft",
+    ];
+
+    #[test]
+    fn premium_fields_default_none_and_old_jsonl_replays_deserialize() {
+        // Default-Snapshot traegt ueberall None.
+        let s = SimSnapshot::default();
+        assert_eq!(s.fma_lateral_mode, None);
+        assert_eq!(s.v1_kt, None);
+        assert_eq!(s.eng_n1_pct, None);
+        assert_eq!(s.fuel_per_tank_kg, None);
+        assert_eq!(s.ground_spoilers_active, None);
+        assert_eq!(s.minimums_baro_ft, None);
+
+        // Backward compat: ein Snapshot, der VOR v0.16.10 serialisiert
+        // wurde (= alle aufgezeichneten JSONL-Flight-Logs), traegt
+        // KEINEN der neuen Keys — `#[serde(default)]` muss jeden
+        // einzelnen abdecken.
+        let mut v = serde_json::to_value(&s).expect("serialize");
+        let obj = v.as_object_mut().expect("object");
+        for key in PREMIUM_SNAPSHOT_KEYS {
+            obj.remove(key)
+                .expect("premium key present after serialize");
+        }
+        let restored: SimSnapshot =
+            serde_json::from_value(v).expect("old JSONL without premium keys must deserialize");
+        // Uniform pruefen: alle 26 Felder sind nach dem Restore null.
+        let v2 = serde_json::to_value(&restored).expect("re-serialize");
+        for key in PREMIUM_SNAPSHOT_KEYS {
+            assert!(
+                v2.get(key).expect("key exists").is_null(),
+                "premium field `{key}` must default to None",
+            );
+        }
+    }
+
+    #[test]
+    fn pmdg_state_old_jsonl_without_premium_fields_deserializes() {
+        // Gleiches Spiel fuer den PmdgState-Carrier: aeltere JSONL-
+        // Replays mit `pmdg: Some(...)` tragen die neuen SDK-Felder
+        // nicht — `#[serde(default)]` muss sie auf None setzen.
+        let p = PmdgState::default();
+        let mut v = serde_json::to_value(&p).expect("serialize");
+        let obj = v.as_object_mut().expect("object");
+        for key in [
+            "reverser_deployed",
+            "master_caution",
+            "master_warning",
+            "below_gs",
+            "cabin_altitude_warning",
+            "stab_out_of_trim",
+            "fuel_per_tank_kg",
+            "minimums_baro_ft",
+            "gnd_prox_warning",
+        ] {
+            obj.remove(key)
+                .expect("premium key present after serialize");
+        }
+        let restored: PmdgState =
+            serde_json::from_value(v).expect("old PmdgState JSON must deserialize");
+        assert_eq!(restored.reverser_deployed, None);
+        assert_eq!(restored.fuel_per_tank_kg, None);
+        assert_eq!(restored.gnd_prox_warning, None);
+    }
+
+    // ---- v0.16.12 (#phase-v2): Schatten-Felder-Carrier-Vertrag ----
+
+    #[test]
+    fn shadow_fields_default_none_and_skip_when_unset() {
+        // Adapter/Default liefern None — und None-Felder verschwinden
+        // per skip_serializing_if komplett aus dem JSON (Nicht-Flug-
+        // Snapshots + Frontend-Streams bleiben sauber).
+        let s = SimSnapshot::default();
+        assert_eq!(s.shadow_phase, None);
+        assert_eq!(s.shadow_segment, None);
+        let v = serde_json::to_value(&s).expect("serialize");
+        assert!(
+            v.get("shadow_phase").is_none(),
+            "None darf nicht serialisieren"
+        );
+        assert!(v.get("shadow_segment").is_none());
+
+        // Alte JSONL-Replays (ohne die Keys) deserialisieren weiter.
+        let restored: SimSnapshot =
+            serde_json::from_value(v).expect("old JSONL without shadow keys must deserialize");
+        assert_eq!(restored.shadow_phase, None);
+
+        // Vom Streamer gestempelte Werte runden sauber durch die JSONL.
+        let mut stamped = SimSnapshot::default();
+        stamped.shadow_phase = Some("climb".into());
+        stamped.shadow_segment = Some("level".into());
+        let v = serde_json::to_value(&stamped).expect("serialize stamped");
+        assert_eq!(v["shadow_phase"], "climb");
+        assert_eq!(v["shadow_segment"], "level");
+        let rt: SimSnapshot = serde_json::from_value(v).expect("round-trip");
+        assert_eq!(rt.shadow_phase.as_deref(), Some("climb"));
+        assert_eq!(rt.shadow_segment.as_deref(), Some("level"));
+    }
+
+    // ---- v0.16.10 (#Premium): Profile-Detection ----
+
+    #[test]
+    fn detect_inibuilds_a340_per_livery_title_via_icao() {
+        // Per-Livery-Titles der iniBuilds A340-300 tragen KEIN
+        // "inibuilds" — der ICAO-/atc_model-Fallback muss greifen.
+        let p = AircraftProfile::detect("A340-300 EIS1", "A343");
+        assert_eq!(p, AircraftProfile::IniA340);
+        assert_eq!(p.label(), "INIBuilds A340");
+        // atc_model-Variante "A340-300" (Substring-Match auf dem Raw-String).
+        let p = AircraftProfile::detect("A340-300 EIS2 CFM", "A340-300");
+        assert_eq!(p, AircraftProfile::IniA340);
+        // Localization-Token-Form des ICAO.
+        let p = AircraftProfile::detect("A340-300 EIS1", "ATCCOM.AC_MODEL A343.0.text");
+        assert_eq!(p, AircraftProfile::IniA340);
+    }
+
+    #[test]
+    fn detect_inibuilds_a340_title_marker_still_works() {
+        // Regression: der bestehende Title-Pfad bleibt erhalten.
+        let p = AircraftProfile::detect("iniBuilds A340-300", "");
+        assert_eq!(p, AircraftProfile::IniA340);
+        // …und die A346 Pro faellt weiter NICHT auf das Basis-Profil.
+        let p = AircraftProfile::detect("iniBuilds A340-600 Pro", "A346");
+        assert_eq!(p, AircraftProfile::IniA346Pro);
+    }
+
+    #[test]
+    fn detect_tfdi_md11_from_title_and_atc_model() {
+        let p = AircraftProfile::detect("TFDi Design MD-11", "MD11");
+        assert_eq!(p, AircraftProfile::TfdiMd11);
+        assert_eq!(p.label(), "TFDi MD-11");
+        // Freighter — gleiches Profil.
+        let p = AircraftProfile::detect("TFDi Design MD-11F", "");
+        assert_eq!(p, AircraftProfile::TfdiMd11);
+        // Repaint ohne TFDi-Marker: atc_model/ICAO-Fallback.
+        let p = AircraftProfile::detect("Custom MD-11 Repaint", "MD11F");
+        assert_eq!(p, AircraftProfile::TfdiMd11);
+        let p = AircraftProfile::detect("Some Livery", "MD11");
+        assert_eq!(p, AircraftProfile::TfdiMd11);
+    }
+
+    #[test]
+    fn detect_tfdi_md11_no_false_positives() {
+        // MD-80-Familie & Co. duerfen NICHT auf das MD-11-Profil fallen.
+        assert_eq!(
+            AircraftProfile::detect("Rotate MD-80", "MD80"),
+            AircraftProfile::Default,
+        );
+        // "TFDi" allein (anderes TFDi-Produkt) reicht nicht.
+        assert_eq!(
+            AircraftProfile::detect("TFDi Design 717", "B712"),
+            AircraftProfile::Default,
+        );
+    }
+
+    // ---- v0.16.11: iFly 737 MAX 8 ----
+
+    #[test]
+    fn detect_ifly_max8_from_title() {
+        // aircraft.cfg-Title (atc_model ist ein nutzloser generischer
+        // ATCCOM-B737-Token — darf keine Rolle spielen).
+        let p = AircraftProfile::detect("iFly 737-MAX8 (178Seat)", "ATCCOM.AC_MODEL B737.0.text");
+        assert_eq!(p, AircraftProfile::IflyMax8);
+        assert_eq!(p.label(), "iFly 737 MAX 8");
+        // Livery-Title — behaelt den "iFly … MAX"-Stamm.
+        let p = AircraftProfile::detect("iFly 737-MAX8 TUI", "");
+        assert_eq!(p, AircraftProfile::IflyMax8);
+    }
+
+    #[test]
+    fn detect_ifly_max8_no_false_positives() {
+        // Bredok3d verkauft ebenfalls einen B38M — DESHALB gibt es
+        // keinen bare-B38M-ICAO-Fallback (gleiche Misdetection-Klasse
+        // wie der entfernte A20N-Fallback): tote VC_*-LVars wuerden
+        // dort Some(false)-Phantome erzeugen.
+        assert_eq!(
+            AircraftProfile::detect("Bredok3d 737 MAX", "B38M"),
+            AircraftProfile::Default,
+        );
+        // PMDG 737-800 bleibt auf dem PMDG-Profil (Branch-Reihenfolge).
+        assert_eq!(
+            AircraftProfile::detect("PMDG 737-800 Lufthansa", "B738"),
+            AircraftProfile::Pmdg737,
+        );
+    }
+
+    // ---- v0.16.14: FSLabs A321 ----
+
+    #[test]
+    fn detect_fslabs_a321_from_title() {
+        // neo-Title aus der aircraft.cfg — der ICAO-Designator (A21N)
+        // darf keine Rolle spielen, Detection laeuft NUR ueber das
+        // "FSLabs"-Title-Praefix.
+        let p = AircraftProfile::detect("FSLabs A321-NEO LEAP DLH D-AIOA", "A21N");
+        assert_eq!(p, AircraftProfile::FsLabsA321);
+        assert_eq!(p.label(), "FSLabs A321");
+        // ceo-Title (CFM-Variante) — gleiches Profil, die ceo teilt
+        // FSLs LVar-Schema mit der neo.
+        let p = AircraftProfile::detect("FSLabs A321 CFM CFG D-ATCA", "A321");
+        assert_eq!(p, AircraftProfile::FsLabsA321);
+    }
+
+    #[test]
+    fn detect_fslabs_a321_no_false_positives() {
+        // BEWUSST kein ICAO-Fallback: A321/A21N kollidieren mit
+        // Fenix-, FBW- und Stock-Liveries (dieselbe Misdetection-
+        // Klasse wie der entfernte A20N-Fallback) — ein markerloser
+        // Stock-A321 bleibt Default, tote FSL_-LVars erzeugen dort
+        // keine Phantome.
+        assert_eq!(
+            AircraftProfile::detect("Airbus A321 Asobo", "A321"),
+            AircraftProfile::Default,
+        );
+        // Fenix A321 bleibt auf dem Fenix-Profil (Branch-Reihenfolge:
+        // der Fenix-Match steht VOR dem FSLabs-Zweig).
+        assert_eq!(
+            AircraftProfile::detect("FenixA321 Lufthansa", "A321"),
+            AircraftProfile::FenixA321,
+        );
+        // FBW-/Headwind-Familie unberuehrt.
+        assert_eq!(
+            AircraftProfile::detect("FlyByWire A32NX", "A20N"),
+            AircraftProfile::FbwA32nx,
+        );
+        assert_eq!(
+            AircraftProfile::detect("Headwind A330-900neo", "A339"),
+            AircraftProfile::FbwA32nx,
+        );
+    }
+
+    #[test]
+    fn detect_fbw_family_titles() {
+        // Klassischer A32NX — Title-Marker.
+        let p = AircraftProfile::detect("Airbus A320 Neo FlyByWire", "A20N");
+        assert_eq!(p, AircraftProfile::FbwA32nx);
+        let p = AircraftProfile::detect("FlyByWire A32NX", "A20N");
+        assert_eq!(p, AircraftProfile::FbwA32nx);
+        // FBW A380X — gleiche LVar-Familie, gleiches Profil.
+        let p = AircraftProfile::detect("FlyByWire Simulations A380X", "A388");
+        assert_eq!(p, AircraftProfile::FbwA32nx);
+        let p = AircraftProfile::detect("Airbus A380X Lufthansa", "A388");
+        assert_eq!(p, AircraftProfile::FbwA32nx);
+        // Headwind A339 (A330-900neo, FBW-Fork).
+        let p = AircraftProfile::detect("Headwind A330-900neo", "A339");
+        assert_eq!(p, AircraftProfile::FbwA32nx);
+    }
+
+    #[test]
+    fn detect_fbw_family_icao_fallback() {
+        // v0.16.10 QS (M4): nur noch A339 (Headwind ist der einzige
+        // MSFS-A339) faellt per ICAO auf das FBW-Profil zurueck.
+        let p = AircraftProfile::detect("Custom A330-900 Livery", "A339");
+        assert_eq!(p, AircraftProfile::FbwA32nx);
+    }
+
+    #[test]
+    fn detect_a20n_without_marker_stays_default() {
+        // v0.16.10 QS (M4): A20N-ICAO-Fallback entfernt — A20N ist zu
+        // generisch. Nicht-FBW-A20N (LatinVFR, marker-lose Stock-
+        // Liveries) bekamen sonst das FBW-Profil und damit tote
+        // A32NX_-LVars (Some(false)-Phantome auf AP-Sub-Modes/A/THR).
+        assert_eq!(
+            AircraftProfile::detect("Airbus A320neo Lufthansa", "A20N"),
+            AircraftProfile::Default,
+        );
+        assert_eq!(
+            AircraftProfile::detect("LatinVFR A320neo", "A20N"),
+            AircraftProfile::Default,
+        );
+        // Stock-Guard-Faelle bleiben ebenfalls Default.
+        assert_eq!(
+            AircraftProfile::detect("Asobo A320 Neo", "A20N"),
+            AircraftProfile::Default,
+        );
+        assert_eq!(
+            AircraftProfile::detect("iniBuilds A320neo V2", "A20N"),
+            AircraftProfile::Default,
+        );
+        // Title-Marker matchen weiterhin (kein Regress fuer echte FBW).
+        assert_eq!(
+            AircraftProfile::detect("FlyByWire A32NX", "A20N"),
+            AircraftProfile::FbwA32nx,
+        );
+        assert_eq!(
+            AircraftProfile::detect("Airbus A320 Neo FlyByWire", "A20N"),
+            AircraftProfile::FbwA32nx,
+        );
+    }
+
+    #[test]
+    fn detect_premium_regressions_unchanged() {
+        // v0.16.10-Guard: bestehende Profile duerfen sich durch die neuen
+        // Zweige nicht verschieben.
+        assert_eq!(
+            AircraftProfile::detect("FenixA320 CFM SL", "A320"),
+            AircraftProfile::FenixA320,
+        );
+        assert_eq!(
+            AircraftProfile::detect("iniBuilds A350-900", "A359"),
+            AircraftProfile::IniA350,
+        );
+        assert_eq!(
+            AircraftProfile::detect("Aerosoft A346-MahanAir", "A346"),
+            AircraftProfile::AerosoftA346,
+        );
+        assert_eq!(
+            AircraftProfile::detect("PMDG 737-800 GSG", "B738"),
+            AircraftProfile::Pmdg737,
+        );
+        assert_eq!(
+            AircraftProfile::detect("PMDG 777-300ER", "B77W"),
+            AircraftProfile::Pmdg777,
+        );
+    }
+
+    // ---- v0.16.10 (#Premium): PMDG-Premium-Override ----
+
+    /// PmdgState-Carrier mit gefuellten Premium-Feldern (Phase-3-Werte
+    /// simuliert) fuer die Override-Tests.
+    fn pmdg_premium_sample() -> PmdgState {
+        PmdgState {
+            fma_speed_mode: "N1".to_string(),
+            fma_roll_mode: "LNAV".to_string(),
+            fma_pitch_mode: "VNAV PTH".to_string(),
+            fmc_v1_kt: Some(142),
+            fmc_vr_kt: Some(145),
+            fmc_v2_kt: Some(151),
+            fmc_vref_kt: Some(138),
+            reverser_deployed: Some(true),
+            master_caution: Some(true),
+            master_warning: Some(false),
+            below_gs: Some(true),
+            cabin_altitude_warning: Some(false),
+            stab_out_of_trim: Some(true),
+            fuel_per_tank_kg: Some(vec![2200.0, 8400.0, 2200.0]),
+            minimums_baro_ft: Some(740.0),
+            speedbrake_extended: true,
+            ..PmdgState::default()
+        }
+    }
+
+    #[test]
+    fn pmdg_premium_override_absent_pmdg_is_noop() {
+        // Presence gate — exakt wie beim Autoflight-Override: ohne
+        // PMDG-State bleiben ALLE Premium-Felder unangetastet (None).
+        let mut s = SimSnapshot::default();
+        assert!(s.pmdg.is_none());
+        s.apply_pmdg_premium_override();
+        assert_eq!(s.fma_lateral_mode, None);
+        assert_eq!(s.fma_vertical_mode, None);
+        assert_eq!(s.fma_thrust_mode, None);
+        assert_eq!(s.master_caution, None);
+        assert_eq!(s.master_warning, None);
+        assert_eq!(s.reverser_deployed, None);
+        assert_eq!(s.below_gs_alert, None);
+        assert_eq!(s.cabin_altitude_warning, None);
+        assert_eq!(s.stab_out_of_trim, None);
+        assert_eq!(s.fuel_per_tank_kg, None);
+        assert_eq!(s.v1_kt, None);
+        assert_eq!(s.minimums_baro_ft, None);
+        // Auch am Boden (Default: on_ground=true) darf ohne PMDG kein
+        // Ground-Spoiler-Wert entstehen.
+        assert_eq!(s.ground_spoilers_active, None);
+    }
+
+    #[test]
+    fn pmdg_premium_override_copies_sdk_values() {
+        let mut s = SimSnapshot::default(); // on_ground = true
+        s.pmdg = Some(pmdg_premium_sample());
+        s.apply_pmdg_premium_override();
+        // FMA: roll → lateral, pitch → vertical, speed → thrust.
+        assert_eq!(s.fma_lateral_mode.as_deref(), Some("LNAV"));
+        assert_eq!(s.fma_vertical_mode.as_deref(), Some("VNAV PTH"));
+        assert_eq!(s.fma_thrust_mode.as_deref(), Some("N1"));
+        // Warn-/Status-Bits — Some(false) bleibt Some(false), das ist
+        // ein echter "aus"-Zustand, kein fehlender Wert.
+        assert_eq!(s.master_caution, Some(true));
+        assert_eq!(s.master_warning, Some(false));
+        assert_eq!(s.reverser_deployed, Some(true));
+        assert_eq!(s.below_gs_alert, Some(true));
+        assert_eq!(s.cabin_altitude_warning, Some(false));
+        assert_eq!(s.stab_out_of_trim, Some(true));
+        assert_eq!(s.fuel_per_tank_kg, Some(vec![2200.0, 8400.0, 2200.0]));
+        assert_eq!(s.minimums_baro_ft, Some(740.0));
+        // FMC-V-Speeds (u8 kt) → generische f64-Felder.
+        assert_eq!(s.v1_kt, Some(142.0));
+        assert_eq!(s.vr_kt, Some(145.0));
+        assert_eq!(s.v2_kt, Some(151.0));
+        assert_eq!(s.vref_kt, Some(138.0));
+        // Boeing hat keine Airbus-Felder — bleiben None.
+        assert_eq!(s.vapp_kt, None);
+        assert_eq!(s.vls_kt, None);
+        // Am Boden: speedbrake_extended → ground_spoilers_active.
+        assert_eq!(s.ground_spoilers_active, Some(true));
+    }
+
+    #[test]
+    fn pmdg_premium_override_fma_empty_strings_stay_none() {
+        // Leerer FMA-String = Cockpit zeigt nichts an → KEIN leeres
+        // Label downstream, das Feld bleibt None.
+        let mut s = SimSnapshot::default();
+        s.pmdg = Some(PmdgState::default()); // alle FMA-Strings leer
+        s.apply_pmdg_premium_override();
+        assert_eq!(s.fma_lateral_mode, None);
+        assert_eq!(s.fma_vertical_mode, None);
+        assert_eq!(s.fma_thrust_mode, None);
+    }
+
+    #[test]
+    fn pmdg_premium_override_none_fields_keep_existing_values() {
+        // Per-Field-Gating: ein None vom SDK (Mapper noch nicht
+        // verdrahtet — Phase 3) darf einen bereits gesetzten Wert
+        // nicht ueberschreiben.
+        let mut s = SimSnapshot::default();
+        s.master_caution = Some(true);
+        s.v1_kt = Some(135.0);
+        s.pmdg = Some(PmdgState::default()); // alles None/leer
+        s.apply_pmdg_premium_override();
+        assert_eq!(s.master_caution, Some(true));
+        assert_eq!(s.v1_kt, Some(135.0));
+    }
+
+    #[test]
+    fn pmdg_premium_override_ground_spoilers_only_on_ground() {
+        // In der Luft ist `speedbrake_extended` eine normale In-Flight-
+        // Speedbrake — KEIN Ground-Spoiler-Signal.
+        let mut s = SimSnapshot::default();
+        s.on_ground = false;
+        s.pmdg = Some(pmdg_premium_sample()); // speedbrake_extended = true
+        s.apply_pmdg_premium_override();
+        assert_eq!(s.ground_spoilers_active, None);
+
+        // Am Boden wird der Zustand gemappt — auch das "eingefahren"-
+        // false ist dann ein echter Wert.
+        let mut s = SimSnapshot::default(); // on_ground = true
+        let mut p = pmdg_premium_sample();
+        p.speedbrake_extended = false;
+        s.pmdg = Some(p);
+        s.apply_pmdg_premium_override();
+        assert_eq!(s.ground_spoilers_active, Some(false));
+    }
+
+    // ── icao_aus_titel: alle 15 Titel aus dem Bestand vom 23.08.2026 ──────────
+    //
+    // Jeder Fall unten ist ein ECHTER Titel aus den Flug-Protokollen, bei dem der
+    // Typ heute fehlt. Zusammen 65 Flüge (7,3 % des Bestands).
+
+    #[test]
+    fn titel_deckt_den_gesamten_bestand_ab() {
+        // (Titel, erwarteter ICAO, Häufigkeit im Bestand)
+        let faelle: &[(&str, &str, u32)] = &[
+            ("A220-300", "BCS3", 41),
+            ("A220-300 - No Cabin", "BCS3", 1),
+            ("A330-300 VIP (RR)", "A333", 7),
+            ("A330-300P2F (RR)", "A333", 1),
+            ("A330-300 (RR)", "A333", 1),
+            ("A340-300 Freighter EIS1", "A343", 3),
+            ("FFX P180 Pasengers - Wood", "P180", 2),
+            ("FFX P180 Private Charter - Wood", "P180", 1),
+            ("ATR 72-600 Freighter", "AT76", 2),
+            ("Contrail FA50 PR-WYW", "FA50", 1),
+            ("L1011-500 Standard Cabin", "L101", 1),
+            ("TFDi Design MD-11F PW4462", "MD11", 1),
+            ("TFDi Design MD-11F PW4462 (Low Poly Cabin)", "MD11", 1),
+            ("Cessna C680: OK-JRS", "C680", 1),
+            ("Microsoft Vision Jet Executive Seating", "SF50", 1),
+        ];
+        let mut abgedeckt = 0;
+        for (titel, erwartet, anzahl) in faelle {
+            assert_eq!(
+                icao_aus_titel(titel).as_deref(),
+                Some(*erwartet),
+                "Titel {titel:?} muss {erwartet} ergeben"
+            );
+            abgedeckt += anzahl;
+        }
+        assert_eq!(
+            abgedeckt, 65,
+            "die Tabelle muss alle 65 Fluege des Bestands abdecken"
+        );
+    }
+
+    #[test]
+    fn mph9_der_ausloeser() {
+        // LSZH -> EHAM, 22.08.2026: ohne diesen Fallback fehlte MD11, damit entfiel
+        // die Heavy-Gutschrift und die Bahn-Achse gab 55 statt 80 Punkten.
+        assert_eq!(
+            icao_aus_titel("TFDi Design MD-11F PW4462").as_deref(),
+            Some("MD11")
+        );
+    }
+
+    #[test]
+    fn variante_schlaegt_familie() {
+        // Die Reihenfolge in TITEL_MUSTER ist die Zusicherung: A330-300 darf nicht
+        // von einem allgemeineren A330-Muster verschluckt werden.
+        assert_eq!(icao_aus_titel("A330-300 VIP (RR)").as_deref(), Some("A333"));
+        assert_eq!(
+            icao_aus_titel("A340-300 Freighter EIS1").as_deref(),
+            Some("A343")
+        );
+        assert_eq!(
+            icao_aus_titel("ATR 72-600 Freighter").as_deref(),
+            Some("AT76")
+        );
+        // ATR 72 ohne -600 bleibt die Familie
+        assert_eq!(icao_aus_titel("ATR 72 Classic").as_deref(), Some("AT72"));
+    }
+
+    #[test]
+    fn im_zweifel_lieber_nichts() {
+        // Ein falscher Typ wird geglaubt und keyed Bewertung + Profil-Matching.
+        // Ein fehlender faellt sichtbar auf "nicht bewertbar" zurueck.
+        for titel in [
+            "",
+            "   ",
+            "Just Flight",
+            "Default Aircraft",
+            "Cessna",          // zu unspezifisch — welche?
+            "Boeing",          // dito
+            "Airbus Widebody", // kein konkretes Muster
+            "747",             // Familie ohne Variante
+        ] {
+            assert_eq!(
+                icao_aus_titel(titel),
+                None,
+                "Titel {titel:?} ist nicht eindeutig und darf keinen Typ liefern"
+            );
+        }
+    }
+
+    #[test]
+    fn gross_klein_und_leerzeichen_egal() {
+        assert_eq!(
+            icao_aus_titel("  tfdi design md-11f  ").as_deref(),
+            Some("MD11")
+        );
+        assert_eq!(icao_aus_titel("a220-300").as_deref(), Some("BCS3"));
+    }
+
+    #[test]
+    fn aendert_nichts_wenn_das_atc_modell_schon_taugt() {
+        // Der Titel-Fallback ist die DRITTE Stufe. Wo normalize_icao_type liefert,
+        // wird er nie befragt — dieser Test haelt die Rollenverteilung fest.
+        assert_eq!(normalize_icao_type("A320").as_deref(), Some("A320"));
+        assert_eq!(
+            normalize_icao_type("ATCCOM.AC_MODEL A320.0.text").as_deref(),
+            Some("A320")
+        );
+    }
+}
+
+#[cfg(test)]
+mod muster_tests {
+    use super::*;
+
+    /// Der Befund vom ersten Live-Tag: EWG248, EDDL, A220-300.
+    ///
+    /// Sim und Buchung lieferten beide nichts. Der Flugzeugtitel war da —
+    /// nur fragte ihn auf diesem Weg niemand. Ergebnis: keine Spurweite,
+    /// keine Spannweite, Bank-Grenze und Vref aus dem Rückfall.
+    #[test]
+    fn dritte_stufe_rettet_den_flug_ohne_sim_und_ohne_buchung() {
+        assert_eq!(
+            muster_aufloesen(None, "", Some("Airbus A220-300 Air Baltic")),
+            Some("BCS3".to_string()),
+            "der Flugzeugtitel ist die dritte Stufe und muss greifen"
+        );
+        // Und ohne alles bleibt es ehrlich leer.
+        assert_eq!(muster_aufloesen(None, "", None), None);
+        assert_eq!(muster_aufloesen(None, "   ", Some("")), None);
+    }
+
+    /// Die Reihenfolge ist die Aussage: Was fliegt, schlägt was gebucht war.
+    #[test]
+    fn der_simulator_schlaegt_die_buchung_schlaegt_den_titel() {
+        assert_eq!(
+            muster_aufloesen(Some("A20N"), "B738", Some("Boeing 747-8")),
+            Some("A20N".to_string()),
+            "der Simulator hat Vorrang"
+        );
+        assert_eq!(
+            muster_aufloesen(None, "B738", Some("Boeing 747-8")),
+            Some("B738".to_string()),
+            "ohne Sim gilt die Buchung"
+        );
+        assert_eq!(
+            muster_aufloesen(Some("   "), "b738", None),
+            Some("B738".to_string()),
+            "Buchung wird auf Grossbuchstaben gebracht"
+        );
+    }
+
+    /// Ein unbrauchbarer Sim-Wert darf die späteren Stufen nicht sperren.
+    #[test]
+    fn unbrauchbarer_sim_wert_faellt_durch_statt_zu_blockieren() {
+        for roh in ["", "   ", "TT:ATCCOM.AC_MODEL_A320.0.text"] {
+            let r = muster_aufloesen(Some(roh), "", Some("Airbus A220-300"));
+            assert!(
+                r.is_some(),
+                "Sim-Wert {roh:?} blockiert die dritte Stufe statt durchzufallen"
+            );
+        }
+    }
+}
+
+/// Audit 26.09.2026 (705 MSFS-2024-Flüge): Erkennung ohne Hersteller im
+/// Titel, SDK-Anschnallzeichen, Diagnose-Rohwerte. Jede Titel-/Pfad-Probe
+/// unten stammt wörtlich aus den Recorder-Logs.
+#[cfg(test)]
+mod msfs2024_cockpit_tests {
+    use super::*;
+
+    const PFAD_738: &str = r"E:\MSFS24_Community\Community\pmdg-aircraft-738\SimObjects\Airplanes\PMDG 737-800\aircraft.cfg";
+    const PFAD_737: &str = r"C:\Users\x\AppData\Local\Packages\Microsoft.Limitless\LocalCache\Packages\Community\pmdg-aircraft-737\SimObjects\Airplanes\PMDG 737-700\aircraft.cfg";
+    const PFAD_77W: &str =
+        r"D:\Community\pmdg-aircraft-77w\SimObjects\Airplanes\PMDG 777-300ER\aircraft.cfg";
+    const PFAD_77F: &str =
+        r"D:\Community\pmdg-aircraft-77f\SimObjects\Airplanes\PMDG 777F\aircraft.cfg";
+
+    #[test]
+    fn pmdg_titel_ohne_hersteller_werden_ueber_den_pfad_erkannt() {
+        for (titel, icao, pfad) in [
+            ("737-800 PAX BW SC", "B738", PFAD_738),
+            ("737-800 PAX BW HD", "B738", PFAD_738),
+            ("737-800BCF BW", "B738", PFAD_738),
+            ("737-800 PAX SSW HD", "B738", PFAD_738),
+            ("737-700 PAX BW TC", "B737", PFAD_737),
+        ] {
+            assert_eq!(
+                AircraftProfile::detect_mit_pfad(titel, icao, Some(pfad)),
+                AircraftProfile::Pmdg737,
+                "{titel}"
+            );
+        }
+        for (titel, icao, pfad) in [
+            ("777F", "B77L", PFAD_77F),
+            ("777-300ER", "B77W", PFAD_77W),
+            (
+                "777-200LR",
+                "B77L",
+                r"D:\Community\pmdg-aircraft-77l\SimObjects\Airplanes\PMDG 777-200LR\aircraft.cfg",
+            ),
+            (
+                "777-200ER PW",
+                "B772",
+                r"D:\Community\pmdg-aircraft-772\SimObjects\Airplanes\PMDG 777-200ER\aircraft.cfg",
+            ),
+        ] {
+            assert_eq!(
+                AircraftProfile::detect_mit_pfad(titel, icao, Some(pfad)),
+                AircraftProfile::Pmdg777,
+                "{titel}"
+            );
+        }
+    }
+
+    #[test]
+    fn ohne_pfad_bleiben_die_pmdg_titel_default() {
+        // Kein Titel-Rückfall für PMDG: "737-800 …" allein ist nicht
+        // eindeutig (iFly/Asobo/Zibo-Ports). Nur der Pfad entscheidet.
+        assert_eq!(
+            AircraftProfile::detect_mit_pfad("737-800 PAX BW SC", "B738", None),
+            AircraftProfile::Default
+        );
+        assert_eq!(
+            AircraftProfile::detect_mit_pfad("777F", "B77L", None),
+            AircraftProfile::Default
+        );
+    }
+
+    #[test]
+    fn der_titel_schlaegt_einen_veralteten_pfad() {
+        // Rest-Pfad vom PMDG, jetzt aber ein Fenix geladen: Titel gewinnt.
+        assert_eq!(
+            AircraftProfile::detect_mit_pfad("FenixA320 CFM SL", "A320", Some(PFAD_738)),
+            AircraftProfile::FenixA320
+        );
+        // Rest-Pfad 737, geladen ist ein fremder Boeing ohne Marker: der
+        // Titel passt nicht zum Pfad → kein PMDG.
+        assert_eq!(
+            AircraftProfile::detect_mit_pfad(
+                "Boeing 787-9 (GE) Air New Zealand",
+                "B789",
+                Some(PFAD_738)
+            ),
+            AircraftProfile::Default
+        );
+        // 777-Pfad mit 737-Titel: ebenfalls kein Treffer über Kreuz.
+        assert_eq!(
+            AircraftProfile::detect_mit_pfad("737-800 PAX BW SC", "B738", Some(PFAD_77W)),
+            AircraftProfile::Default
+        );
+    }
+
+    #[test]
+    fn inibuilds_a350_titel_aus_msfs_2024() {
+        for (titel, icao) in [
+            ("A350-900 (Default Cabin)", "A359"),
+            ("A350-900 (No Cabin)", "A359"),
+            ("A350-900 (No Cabin)", "A350-900"),
+            ("A350-900 ULR (No Cabin)", "A350-900 ULR"),
+            ("A350-1000 (No Cabin)", "A35K"),
+        ] {
+            assert_eq!(
+                AircraftProfile::detect(titel, icao),
+                AircraftProfile::IniA350,
+                "{titel} / {icao}"
+            );
+        }
+        // Keine Fremdtreffer: die iniBuilds A330 hat seit 26.09.2026 ihr
+        // eigenes Profil (nicht A350), ein blanker A359-ICAO ohne "a350" im
+        // Titel bleibt Default.
+        assert_eq!(
+            AircraftProfile::detect("A330-300 (RR)", "A333"),
+            AircraftProfile::IniA330
+        );
+        assert_eq!(
+            AircraftProfile::detect("Some Airliner", "A359"),
+            AircraftProfile::Default
+        );
+    }
+
+    /// iniBuilds A330 (MSFS 2024): echte Titel aus den Logs, ICAO meist
+    /// leer; Abgrenzung gegen Headwind A339 und FBW.
+    #[test]
+    fn ini_a380_rest_pfad_kapert_kein_fremdes_muster() {
+        let pfad = r"C:\Community\inibuilds-aircraft-a380\SimObjects\Airplanes\inibuilds-a380\aircraft.cfg";
+        // Fremdes Muster mit veraltetem A380-Pfad bleibt Default.
+        assert_eq!(
+            AircraftProfile::detect_mit_pfad("Cessna Skyhawk", "C172", Some(pfad)),
+            AircraftProfile::Default
+        );
+        // Passender Titel/ICAO erkennt weiter den A380.
+        assert_eq!(
+            AircraftProfile::detect_mit_pfad("D-AIMK", "A388", Some(pfad)),
+            AircraftProfile::IniA380
+        );
+    }
+
+    #[test]
+    fn ini_a330_msfs2024_titel_und_pfad() {
+        for titel in [
+            "A330-200 VIP (GE)",
+            "A330-300 (RR)",
+            "A330-200 (GE)",
+            "A330-300 VIP (RR)",
+            "A330-300P2F (RR)",
+        ] {
+            assert_eq!(
+                AircraftProfile::detect(titel, ""),
+                AircraftProfile::IniA330,
+                "{titel}"
+            );
+        }
+        // Headwind A339 / FBW: nie A330-Profil.
+        for (titel, icao) in [
+            ("A330-941 (TR)", ""),
+            ("A330-941", "A339"),
+            ("Headwind A330-900neo (RR)", "A339"),
+            ("A330-300 (RR)", "A339"),
+            ("FlyByWire A32NX", "A20N"),
+        ] {
+            assert_ne!(
+                AircraftProfile::detect(titel, icao),
+                AircraftProfile::IniA330,
+                "{titel} / {icao}"
+            );
+        }
+        // Pfad nur, wenn der Titel Default ergibt und nach A330 aussieht.
+        let pfad = Some(
+            "C:\\Users\\x\\AppData\\Local\\Packages\\Microsoft.Limitless\\LocalCache\\StreamedPackages\\fs24-microsoft-aircraft-a330\\SimObjects\\Airplanes\\A330-300\\aircraft.cfg",
+        );
+        assert_eq!(
+            AircraftProfile::detect_mit_pfad("Emirates A330 A6-EAA", "", pfad),
+            AircraftProfile::IniA330
+        );
+        assert_eq!(
+            AircraftProfile::detect_mit_pfad("Irgendwas", "A333", pfad),
+            AircraftProfile::IniA330
+        );
+        assert_eq!(
+            AircraftProfile::detect_mit_pfad(
+                "KLM A330 PH-AOA",
+                "",
+                Some("C:\\MSFS\\microsoft-a330\\SimObjects\\aircraft.cfg")
+            ),
+            AircraftProfile::IniA330
+        );
+        // Rest-Pfad unter fremdem Titel bzw. Headwind: kein Treffer.
+        assert_eq!(
+            AircraftProfile::detect_mit_pfad("Cessna 172", "C172", pfad),
+            AircraftProfile::Default
+        );
+        assert_eq!(
+            AircraftProfile::detect_mit_pfad("A330-941", "A339", pfad),
+            AircraftProfile::FbwA32nx
+        );
+        // Titel gewinnt vor dem Pfad.
+        assert_eq!(
+            AircraftProfile::detect_mit_pfad("FenixA320 DLH", "A320", pfad),
+            AircraftProfile::FenixA320
+        );
+        assert_eq!(AircraftProfile::IniA330.label(), "INIBuilds A330");
+    }
+
+    #[test]
+    fn inibuilds_a380_eigenes_profil_fbw_a380x_bleibt_fbw() {
+        assert_eq!(
+            AircraftProfile::detect("A380-800 RR Basic", "A388"),
+            AircraftProfile::IniA380
+        );
+        assert_eq!(
+            AircraftProfile::detect("A380-800 RR Basic", ""),
+            AircraftProfile::IniA380
+        );
+        assert_eq!(AircraftProfile::IniA380.icao_fallback(), Some("A388"));
+        // FBW A380X: Titel aus dem Audit.
+        assert_eq!(
+            AircraftProfile::detect("FlyByWire A380X (A380-842) No Cabin", "A388"),
+            AircraftProfile::FbwA32nx
+        );
+        // FBW-Livery ohne A380X-Marker darf NICHT zur iniBuilds werden.
+        assert_eq!(
+            AircraftProfile::detect("FBW Emirates A380-800 A6-EDA", "A388"),
+            AircraftProfile::Default
+        );
+        // Pfad-Weg für die A380, falls ein Livery-Titel das Muster nicht trägt.
+        assert_eq!(
+            AircraftProfile::detect_mit_pfad(
+                "Emirates A6-EUA",
+                "A388",
+                Some(
+                    r"D:\Community\inibuilds-aircraft-a380\SimObjects\Airplanes\A380\aircraft.cfg"
+                )
+            ),
+            AircraftProfile::IniA380
+        );
+    }
+
+    // ---- Runde 3 (26.09.2026): FBW A380X über den Pfad, FSS E-Jets ----
+
+    const PFAD_FBW_A380X: &str = r"C:\Users\x\AppData\Local\Packages\Microsoft.Limitless_8wekyb3d8bbwe\LocalCache\Packages\Community\flybywire-aircraft-a380-842\SimObjects\AirPlanes\FlyByWire_A380X\aircraft.cfg";
+    const PFAD_FBW_A380_ALT: &str = r"D:\Community\flybywire-aircraft-a380-842\SimObjects\AirPlanes\FlyByWire_A380_842_LUFTHANSA-AIMK\aircraft.cfg";
+    const PFAD_INI_A380: &str =
+        r"D:\Community2024\inibuilds-a380\SimObjects\Airplanes\A380\aircraft.cfg";
+    const PFAD_FSS_E17X: &str =
+        r"D:\Community2024\fss-aircraft-e17x\SimObjects\Airplanes\FSS_E175\aircraft.cfg";
+
+    #[test]
+    fn runde3_fbw_a380x_livery_ohne_marker_ueber_den_pfad() {
+        // Audit-Titel ohne A380X-/FlyByWire-Marker: nach Titel Default.
+        assert_eq!(
+            AircraftProfile::detect("FBW Emirates (circa 2008) A6-EDA", "A388"),
+            AircraftProfile::Default
+        );
+        for pfad in [PFAD_FBW_A380X, PFAD_FBW_A380_ALT] {
+            assert_eq!(
+                AircraftProfile::detect_mit_pfad(
+                    "FBW Emirates (circa 2008) A6-EDA",
+                    "A388",
+                    Some(pfad)
+                ),
+                AircraftProfile::FbwA32nx,
+                "{pfad}"
+            );
+            assert!(ist_fbw_a380_pfad(pfad), "{pfad}");
+        }
+        // iniBuilds-A380-Pfad ist kein FBW-Pfad und bleibt iniBuilds.
+        assert!(!ist_fbw_a380_pfad(PFAD_INI_A380));
+        assert_eq!(
+            AircraftProfile::detect_mit_pfad(
+                "FBW Emirates (circa 2008) A6-EDA",
+                "A388",
+                Some(PFAD_INI_A380)
+            ),
+            AircraftProfile::IniA380
+        );
+        // Rest-Pfad: ein fremder Titel wird nicht zum FBW.
+        assert_eq!(
+            AircraftProfile::detect_mit_pfad("Cessna Skyhawk", "C172", Some(PFAD_FBW_A380X)),
+            AircraftProfile::Default
+        );
+        // Der Pfad überschreibt nie ein erkanntes Profil.
+        assert_eq!(
+            AircraftProfile::detect_mit_pfad("A380-800 RR Basic", "A388", Some(PFAD_FBW_A380X)),
+            AircraftProfile::IniA380
+        );
+    }
+
+    /// Fremd-Lackierung des iFly ohne „iFly" im Titel (Hamadoun, 15.10.2026:
+    /// zwei Flüge als `Default` und B738 statt B38M).
+    /// Headwind A330-900neo ohne Marker im Titel und mit ICAO A330 (Joel,
+    /// MSFS 2020, 17.10.2026) — am Ordner erkannt; ein fremder A330 im
+    /// selben Restpfad nicht.
+    #[test]
+    fn headwind_a330neo_nach_ordner() {
+        const PFAD: &str = "SimObjects\\Airplanes\\Headwind_A330neo\\aircraft.CFG";
+        assert_eq!(
+            AircraftProfile::detect_mit_pfad("Airbus A330-900neo Condor", "A330", Some(PFAD)),
+            AircraftProfile::FbwA32nx
+        );
+        assert_eq!(
+            AircraftProfile::detect_mit_pfad("Cessna Skyhawk", "C172", Some(PFAD)),
+            AircraftProfile::Default
+        );
+        assert_eq!(
+            AircraftProfile::detect_mit_pfad("Airbus A330-900neo Condor", "A330", None),
+            AircraftProfile::Default,
+            "ohne Ordner bleibt es beim Standard"
+        );
+    }
+
+    #[test]
+    fn ifly_max8_fremdlackierung_nach_ordner() {
+        const PFAD: &str = "SimObjects\\Airplanes\\iFly 737-MAX8-189Seats\\aircraft.CFG";
+        let p = AircraftProfile::detect_mit_pfad(
+            "Norwegian 737-MAX8 SE-RTR (189Seat)",
+            "ATCCOM.AC_MODEL B738.0.text",
+            Some(PFAD),
+        );
+        assert_eq!(p, AircraftProfile::IflyMax8);
+        assert_eq!(p.icao_vorrang(), Some("B38M"));
+        // Paketname statt SimObject-Ordner.
+        assert_eq!(
+            AircraftProfile::detect_mit_pfad(
+                "TUI D-AMAX",
+                "B738",
+                Some("Community/ifly-aircraft-737max8/SimObjects/Airplanes/x/aircraft.cfg"),
+            ),
+            AircraftProfile::IflyMax8
+        );
+        // Rest-Pfad: ein fremder Titel wird nicht zum iFly.
+        assert_eq!(
+            AircraftProfile::detect_mit_pfad("Cessna Skyhawk", "C172", Some(PFAD)),
+            AircraftProfile::Default
+        );
+        // Ohne iFly-Ordner bleibt ein anderer MAX (Bredok3d) beim Standard.
+        assert_eq!(
+            AircraftProfile::detect_mit_pfad(
+                "Bredok3d 737 MAX 8 Norwegian",
+                "B38M",
+                Some("SimObjects\\Airplanes\\Bredok3d_737MAX8\\aircraft.cfg"),
+            ),
+            AircraftProfile::Default
+        );
+        // „iFly" und „737MAX8" in verschiedenen Ordnern machen kein iFly.
+        assert_eq!(
+            AircraftProfile::detect_mit_pfad(
+                "Bredok3d 737 MAX 8 Norwegian",
+                "B38M",
+                Some("Community\\iFly Addons\\SimObjects\\Airplanes\\Bredok3d_737MAX8\\aircraft.cfg"),
+            ),
+            AircraftProfile::Default
+        );
+    }
+
+    #[test]
+    fn runde3_fss_ejets_nach_titel_und_pfad() {
+        for (titel, icao) in [
+            ("FSS Embraer E190 Air France HOP F-HBLA", "E190"),
+            ("FSS Embraer E175 American LW", "E175"),
+            ("FSS E175 Republic", ""),
+        ] {
+            assert_eq!(
+                AircraftProfile::detect(titel, icao),
+                AircraftProfile::FssEjet,
+                "{titel}"
+            );
+        }
+        // Keine Fremdtreffer: FSR Phenom (E55P), ein fremder E190, "fss"
+        // als Teilstring.
+        for (titel, icao) in [
+            ("FSReborn Phenom 300E Tristan Interior", "E55P"),
+            ("Embraer E190 Generic", "E190"),
+            ("Kaffss Embraer E190", "E190"),
+        ] {
+            assert_ne!(
+                AircraftProfile::detect(titel, icao),
+                AircraftProfile::FssEjet,
+                "{titel}"
+            );
+        }
+        assert_eq!(
+            AircraftProfile::detect("FSReborn Phenom 300E Tristan Interior", "E55P"),
+            AircraftProfile::FsrPhenom300e
+        );
+        // Pfad-Weg für Liveries ohne FSS-Marker.
+        assert_eq!(
+            AircraftProfile::detect_mit_pfad(
+                "Embraer E175 American Eagle",
+                "E175",
+                Some(PFAD_FSS_E17X)
+            ),
+            AircraftProfile::FssEjet
+        );
+        assert_eq!(
+            AircraftProfile::detect_mit_pfad("Cessna Skyhawk", "C172", Some(PFAD_FSS_E17X)),
+            AircraftProfile::Default
+        );
+        assert_eq!(AircraftProfile::FssEjet.label(), "FSS E-Jet");
+        assert_eq!(AircraftProfile::FssEjet.icao_fallback(), None);
+    }
+
+    #[test]
+    fn bluebird_757_nach_titel_und_pfad() {
+        // Echte Titel aus den Flug-Logs/der Messung (26.10.2026).
+        for (titel, icao) in [
+            ("BlueBird 757-200 RR LTU D-AMUZ", "B752"),
+            ("BlueBird 757-200 Condor D-ABNR", "B752"),
+            ("BlueBird 757-200 RR Icelandair TF-FIN", ""),
+            ("BlueBird 757-300 Condor D-ABOC", "B753"),
+        ] {
+            assert_eq!(
+                AircraftProfile::detect(titel, icao),
+                AircraftProfile::BlueBird757,
+                "{titel}"
+            );
+        }
+        // FlightFactor-757 (X-Plane-Titel) und fremde 757 ohne Marker nicht.
+        for (titel, icao) in [("Boeing 757-RF", "B752"), ("757-200 Generic", "B752")] {
+            assert_eq!(AircraftProfile::detect(titel, icao), AircraftProfile::Default, "{titel}");
+        }
+        let pfad = r"C:\Community\bbs-757-200-pw-nw\SimObjects\Airplanes\bbs-757-200-pw-nw\aircraft.CFG";
+        assert_eq!(
+            AircraftProfile::detect_mit_pfad("757-200 Condor D-ABNR", "B752", Some(pfad)),
+            AircraftProfile::BlueBird757
+        );
+        assert_eq!(
+            AircraftProfile::detect_mit_pfad("Cessna Skyhawk", "C172", Some(pfad)),
+            AircraftProfile::Default
+        );
+        assert_eq!(AircraftProfile::BlueBird757.label(), "BlueBird 757");
+    }
+
+    #[test]
+    fn pmdg_sdk_anschnallzeichen_landet_im_snapshot() {
+        let mut snap = SimSnapshot {
+            pmdg: Some(PmdgState {
+                seatbelts_sign: Some(2),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        snap.apply_pmdg_premium_override();
+        assert_eq!(snap.seatbelts_sign, Some(2));
+
+        // Ohne SDK-Wert bleibt ein vorhandener (LVar-)Wert stehen.
+        let mut snap = SimSnapshot {
+            seatbelts_sign: Some(1),
+            pmdg: Some(PmdgState::default()),
+            ..Default::default()
+        };
+        snap.apply_pmdg_premium_override();
+        assert_eq!(snap.seatbelts_sign, Some(1));
+    }
+
+    #[test]
+    fn rohwerte_nur_bei_aenderung_im_log() {
+        let roh = |v: f64| CockpitRohwerte {
+            werte: [("L:INI_LIGHTS_STROBE".to_string(), v)]
+                .into_iter()
+                .collect(),
+            cfg_pfad: Some("x".into()),
+        };
+        let mut letzte = None;
+
+        let mut a = SimSnapshot {
+            cockpit_rohwerte: Some(roh(1.0)),
+            ..Default::default()
+        };
+        a.cockpit_rohwerte_nur_bei_aenderung(&mut letzte);
+        assert_eq!(
+            a.cockpit_rohwerte,
+            Some(roh(1.0)),
+            "erster Stand wird geschrieben"
+        );
+
+        let mut b = SimSnapshot {
+            cockpit_rohwerte: Some(roh(1.0)),
+            ..Default::default()
+        };
+        b.cockpit_rohwerte_nur_bei_aenderung(&mut letzte);
+        assert_eq!(b.cockpit_rohwerte, None, "unveraendert → nicht erneut");
+        let json = serde_json::to_string(&b).unwrap();
+        assert!(
+            !json.contains("cockpit_rohwerte"),
+            "None darf nicht serialisiert werden"
+        );
+
+        let mut c = SimSnapshot {
+            cockpit_rohwerte: Some(roh(2.0)),
+            ..Default::default()
+        };
+        c.cockpit_rohwerte_nur_bei_aenderung(&mut letzte);
+        assert_eq!(
+            c.cockpit_rohwerte,
+            Some(roh(2.0)),
+            "Aenderung wird geschrieben"
+        );
+    }
+}

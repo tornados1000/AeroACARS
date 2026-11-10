@@ -1,0 +1,278 @@
+/* Kabinenansagen (Beta): Ansage-Seite. Seitenform wie das Bordbuch
+   (bordbuch.css). Akzentfarbe nur fuer „spricht gerade“. */
+.kabine-seite {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4, 16px);
+  padding: 1.25rem 1.5rem 2rem;
+  max-width: 920px;
+  margin: 0 auto;
+  width: 100%;
+}
+.kabine-kopf {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: var(--sp-4, 16px);
+  flex-wrap: wrap;
+}
+.kabine-kopf h2 { margin: 0; font-size: var(--fs-600, 18px); }
+.kabine-kopf-knoepfe { display: flex; gap: 8px; flex-wrap: wrap; }
+.kabine-unter { color: var(--text-dim); font-size: var(--fs-300, 12px); margin-top: 4px; }
+
+/* Live-Bereich */
+.kabine-live {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px 20px 20px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  transition: border-color var(--dur-base, 200ms) var(--ease, ease-out), background-color var(--dur-base, 200ms) var(--ease, ease-out);
+}
+.kabine-live.ist-aktiv {
+  border-color: var(--acc);
+  background: color-mix(in srgb, var(--acc) 5%, var(--surface));
+}
+.kabine-live-kopf { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.kabine-sprecher { font-size: var(--fs-500, 15px); font-weight: var(--fw-bold, 700); color: var(--text); }
+.kabine-live.ist-aktiv .kabine-sprecher { color: var(--acc); }
+.kabine-slot { color: var(--text-dim); font-size: var(--fs-300, 12px); }
+
+.kabine-pegel { width: 100%; height: 56px; display: block; }
+.kabine-pegel rect { fill: var(--tick, #c3ccd6); transition: height 90ms linear, y 90ms linear; }
+.kabine-pegel.ist-aktiv rect { fill: var(--acc); }
+
+.kabine-sprache { font-size: var(--fs-200, 11px); color: var(--text-dim); }
+
+/* Untertitel: der Satz, der gerade gesprochen wird, groß; davor/danach blass */
+.kabine-untertitel { display: flex; flex-direction: column; gap: 6px; max-width: 68ch; }
+.kabine-untertitel-kopf { display: flex; gap: 10px; align-items: baseline; }
+.kabine-untertitel-kopf .kabine-sprache { color: var(--acc); font-weight: var(--fw-bold, 700); }
+.kabine-untertitel-zaehler { font-size: var(--fs-200, 11px); color: var(--text-dim); font-variant-numeric: tabular-nums; }
+.kabine-untertitel p { margin: 0; line-height: var(--lh-normal, 1.55); text-wrap: pretty; }
+.kabine-untertitel-jetzt { font-size: 1.25rem; color: var(--text); }
+.kabine-untertitel-davor, .kabine-untertitel-danach { font-size: 0.95rem; color: var(--text-dim); opacity: 0.7; }
+.kabine-untertitel-sprachen { font-size: var(--fs-300, 12px); color: var(--text-dim); }
+.kabine-ausloeser { margin: 0 0 8px; font-size: var(--fs-300, 12px); color: var(--text-dim); }
+.kabine-ruhe-text { margin: 0; color: var(--text-dim); font-size: var(--fs-400, 13px); }
+
+/* Warteschlange und Verlauf */
+.kabine-spalten {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: var(--sp-4, 16px);
+  align-items: start;
+}
+.kabine-h3 { margin: 0 0 8px; font-size: var(--fs-400, 13px); font-weight: var(--fw-bold, 700); }
+.kabine-leer { color: var(--text-dim); font-size: var(--fs-300, 12px); padding: 8px 0; }
+.kabine-liste { list-style: none; margin: 0; padding: 0; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+.kabine-liste li { padding: 9px 12px; font-size: var(--fs-400, 13px); background: var(--surface); }
+.kabine-liste li + li { border-top: 1px solid var(--border); }
+/* Jede Zeile klappt auf: Kopf (Ansage, Zeitpunkt, Stand) als Knopf. */
+.kabine-liste li { padding: 0; }
+.kabine-plan-kopf {
+  all: unset;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 9px 12px;
+  cursor: pointer;
+}
+.kabine-plan-kopf:hover { background: color-mix(in srgb, var(--acc) 5%, var(--surface)); }
+.kabine-plan-kopf:focus-visible { outline: 2px solid var(--acc); outline-offset: -2px; }
+.kabine-liste--verlauf .kabine-verlauf-kopf { flex: 1; }
+.kabine-verlauf-text--kurz { padding: 0 12px 9px; margin-top: -4px; }
+.kabine-plan-inhalt { display: flex; flex-direction: column; gap: 8px; padding: 0 12px 12px; }
+.kabine-plan-inhalt .kabine-verlauf-text { display: block; -webkit-line-clamp: unset; overflow: visible; color: var(--text); font-size: var(--fs-400, 13px); line-height: var(--lh-normal, 1.55); }
+.kabine-teil { display: flex; flex-direction: column; gap: 2px; }
+.kabine-plan-knoepfe { display: flex; gap: 8px; flex-wrap: wrap; }
+.kabine-knopf { padding: 4px 12px; font-size: var(--fs-300, 12px); }
+.kabine-plan-inhalt .kabine-grund-detail { margin: 0; color: var(--text-dim); font-size: var(--fs-300, 12px); }
+.kabine-plan-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.kabine-plan-wann { color: var(--text); font-size: var(--fs-400, 13px); font-variant-numeric: tabular-nums; }
+.kabine-plan-status { margin-left: auto; flex-shrink: 0; max-width: 50%; text-align: right; font-size: var(--fs-300, 12px); color: var(--text-dim); }
+.kabine-plan-status.ist-bereit { color: var(--acc); }
+.kabine-plan-status.ist-warnung { color: var(--sem-warn, #b7791f); }
+.kabine-plan-status.ist-fehler { color: var(--sem-err, #c53030); }
+.kabine-verlauf-kopf { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.kabine-zeit { font-variant-numeric: tabular-nums; color: var(--text-dim); font-size: var(--fs-300, 12px); }
+.kabine-rolle { color: var(--text-dim); font-size: var(--fs-300, 12px); margin-left: auto; }
+.kabine-verlauf-text {
+  margin: 4px 0 0;
+  color: var(--text-dim);
+  font-size: var(--fs-300, 12px);
+  line-height: var(--lh-snug, 1.35);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .kabine-live, .kabine-pegel rect { transition: none; }
+}
+
+/* Warum gerade keine Ansagen kommen */
+.kabine-grund {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px 16px;
+  border: 1px solid var(--sem-warn, #b7791f);
+  border-radius: 10px;
+  background: var(--sem-warn-bg, color-mix(in srgb, var(--sem-warn, #b7791f) 10%, var(--surface)));
+}
+.kabine-grund strong { font-size: var(--fs-500, 15px); color: var(--text); }
+.kabine-grund p { margin: 0; color: var(--text); font-size: var(--fs-400, 13px); line-height: var(--lh-normal, 1.55); max-width: 70ch; }
+.kabine-grund .kabine-grund-detail { color: var(--text-dim); font-size: var(--fs-300, 12px); }
+
+/* Ablauf oben: Freigabe → Texte → Ton → nächste Ansage */
+.kabine-ablauf {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  font-size: var(--fs-300, 12px);
+  background: var(--surface);
+}
+.kabine-ablauf th {
+  text-align: left;
+  font-weight: var(--fw-bold, 700);
+  color: var(--text-dim);
+  padding: 8px 12px 4px;
+}
+.kabine-ablauf td { padding: 0 12px 10px; color: var(--text); vertical-align: top; line-height: var(--lh-snug, 1.35); }
+.kabine-profil { margin: -6px 0 0; color: var(--text-dim); font-size: var(--fs-300, 12px); }
+@media (max-width: 640px) {
+  .kabine-ablauf thead { display: none; }
+  .kabine-ablauf tr { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 0; padding-top: 8px; }
+}
+
+/* Ton oben: Stumm + Lautstärke ohne Umweg über die Einstellungen */
+.kabine-ton {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 12px 4px 4px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+.kabine-stumm {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+.kabine-stumm:hover { background: var(--surface-2, rgba(127, 127, 127, 0.12)); }
+.kabine-ton.ist-stumm { border-color: var(--sem-warn, #b7791f); }
+.kabine-ton.ist-stumm .kabine-stumm { color: var(--sem-warn, #b7791f); font-weight: 600; }
+.kabine-ton input[type="range"] { width: 120px; accent-color: var(--acc); }
+.kabine-ton.ist-stumm input[type="range"] { opacity: 0.5; }
+.kabine-ton-wert { flex: 0 0 auto; width: 5.5ch; /* feste Breite: „5 %“ bis „100 %“ verschiebt den Regler nicht (22.10.2026) */ text-align: right; font-variant-numeric: tabular-nums; color: var(--text-dim); font-size: var(--fs-300, 12px); }
+.kabine-stumm-hinweis { color: var(--sem-warn, #b7791f); }
+.kabine-ablauf-stumm { color: var(--sem-warn, #b7791f); }
+
+/* Einstellungen: einzelne Ansagen abwählen */
+.kabine-einzeln summary { cursor: pointer; }
+.kabine-einzeln-gruppen { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-top: 8px; }
+.kabine-einzeln-gruppe { border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; margin: 0; display: flex; flex-direction: column; gap: 6px; }
+.kabine-einzeln-gruppe legend { font-size: var(--fs-300, 12px); color: var(--text-dim); padding: 0 4px; }
+
+/* Lange Listen rollen in ihrem Kasten statt die Seite zu verlängern (Thomas
+   19.10.2026: „elendig lang“, aber jede Ansage muss erreichbar bleiben, z. B.
+   zum „Erneut versuchen“). Gut fünf Zeilen sichtbar, der Rest per Rollen. */
+.kabine-liste--rollbar { max-height: 330px; overflow-y: auto; overscroll-behavior: contain; }
+
+/* Boarding-Musik (2.1.1, Design 19.10.2026): zweite Zeile der Ton-Leiste,
+   Kasten unter der Status-Zeile, Dialog „Eigene Boarding-Musik“. */
+.kabine-ton { flex-direction: column; align-items: stretch; gap: 2px; }
+.kabine-ton-zeile { display: flex; align-items: center; gap: 10px; }
+.kabine-ton-name { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; min-width: 0; color: var(--text); font-size: var(--fs-400, 13px); white-space: nowrap; }
+.kabine-ton-zeile input[type="range"] { width: 120px; accent-color: var(--acc); margin-left: auto; }
+.kabine-musik {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+.kabine-musik.ist-aus { opacity: 0.75; }
+.kabine-musik-kopf { display: flex; align-items: flex-start; gap: 12px; }
+.kabine-musik-titel { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.kabine-musik-titel strong { font-size: var(--fs-500, 15px); color: var(--text); }
+.kabine-musik-quelle { color: var(--text-dim); font-size: var(--fs-300, 12px); }
+.kabine-plakette {
+  margin-left: auto;
+  flex-shrink: 0;
+  padding: 2px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  font-size: var(--fs-300, 12px);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.kabine-plakette.ist-laeuft, .kabine-plakette.ist-probe { color: var(--acc); border-color: var(--acc); }
+.kabine-plakette.ist-bereit { color: var(--acc); }
+.kabine-plakette.ist-pausiert, .kabine-plakette.ist-wird_erzeugt { color: var(--sem-warn, #b7791f); border-color: var(--sem-warn, #b7791f); }
+.kabine-plakette.ist-kein_lied { color: var(--sem-err, #c53030); border-color: var(--sem-err, #c53030); }
+.kabine-musik-knoepfe { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.kabine-musik-schalter { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; font-size: var(--fs-400, 13px); color: var(--text); cursor: pointer; }
+.kabine-musik-erklaerung { margin: 0; color: var(--text-dim); font-size: var(--fs-300, 12px); }
+.kabine-musik-dialog { display: flex; flex-direction: column; gap: 12px; }
+.kabine-musik-unter { margin: 0; color: var(--text-dim); font-size: var(--fs-400, 13px); }
+.kabine-musik-suche, .kabine-musik-andere input { width: 100%; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); }
+.kabine-musik-gruppen { max-height: 220px; border: 1px solid var(--border); border-radius: 8px; padding: 4px; }
+.kabine-musik-gruppe-kopf {
+  display: flex;
+  width: 100%;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font-size: var(--fs-400, 13px);
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+}
+.kabine-musik-gruppe-kopf:hover { background: var(--surface-2, rgba(127, 127, 127, 0.12)); }
+.kabine-musik-zahl, .kabine-musik-laenge { color: var(--text-dim); font-weight: 400; font-size: var(--fs-300, 12px); font-variant-numeric: tabular-nums; }
+.kabine-musik-leer { padding: 2px 8px 8px 24px; color: var(--text-dim); font-size: var(--fs-300, 12px); }
+.kabine-musik-stuecke { list-style: none; margin: 0; padding: 0 0 6px 24px; display: flex; flex-direction: column; gap: 4px; }
+.kabine-musik-stuecke li { display: flex; align-items: center; gap: 8px; }
+.kabine-musik-datei { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-400, 13px); }
+.kabine-musik-neu { display: flex; flex-direction: column; gap: 10px; margin: 0; padding: 10px 12px 12px; border: 1px solid var(--border); border-radius: 8px; }
+.kabine-musik-neu legend { padding: 0 4px; color: var(--text-dim); font-size: var(--fs-300, 12px); }
+.kabine-musik-neu > .button { align-self: flex-start; }
+.kabine-musik-neu-zeile { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.kabine-musik-hinweis { margin: 0; color: var(--sem-warn, #b7791f); font-size: var(--fs-300, 12px); }
+.kabine-musik-fuer { display: flex; flex-direction: column; gap: 6px; font-size: var(--fs-400, 13px); }
+.kabine-musik-fuer-wahl { display: flex; flex-wrap: wrap; gap: 6px 16px; }
+.kabine-musik-fuer-wahl label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.kabine-musik-vorschlaege { list-style: none; margin: 4px 0 0; padding: 4px; border: 1px solid var(--border); border-radius: 6px; max-height: 180px; overflow-y: auto; }
+.kabine-musik-vorschlaege button { width: 100%; text-align: left; padding: 4px 8px; border: 0; background: transparent; color: var(--text); cursor: pointer; border-radius: 4px; }
+.kabine-musik-vorschlaege button:hover { background: var(--surface-2, rgba(127, 127, 127, 0.12)); }
+.kabine-musik-fuss { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--text-dim); font-size: var(--fs-300, 12px); }
+@media (max-width: 640px) {
+  .kabine-musik-kopf { flex-direction: column; }
+  .kabine-plakette { margin-left: 0; }
+  .kabine-musik-schalter { margin-left: 0; }
+  .kabine-musik-fuss { flex-direction: column; align-items: flex-start; }
+}

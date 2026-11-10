@@ -1,0 +1,21 @@
+[package]
+name = "api-client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "phpVMS 7 HTTP API client (auth, users, bids, flights, fleet, PIREP, ACARS positions, AeroACARS module)"
+
+[dependencies]
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_with.workspace = true
+url.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

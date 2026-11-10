@@ -1,0 +1,22 @@
+[package]
+name = "storage"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Local persistence — SQLite-backed offline queue, flight log, settings cache"
+
+[dependencies]
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# v0.7.1: SubScoreEntry-Wire-Format wird auch in landing_history.json
+# gespeichert (Spec §3.5 Legacy-Schutz: UI liest gespeicherte Sub-Scores
+# direkt aus dem Record, kein Recompute fuer alte PIREPs).
+landing-scoring = { path = "../landing-scoring" }
+
+[lints]
+workspace = true

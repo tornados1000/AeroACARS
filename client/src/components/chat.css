@@ -1,0 +1,486 @@
+/* Pilotenchat.
+ *
+ * Ausschliesslich ueber die Tokens aus App.css — keine eigenen Farben, keine
+ * eigenen Radien. Der Chat soll wie ein Teil des Programms aussehen und nicht
+ * wie ein Gast. Radien nur --r-md/--r-lg; volle Rundung bleibt dem
+ * Ungelesen-Zaehler vorbehalten, wo sie hingehoert.
+ */
+
+.chat {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.chat__kopf {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-2);
+  flex: none;
+}
+.chat__titel {
+  font-size: var(--fs-400);
+  font-weight: var(--fw-bold);
+  letter-spacing: var(--ls-tight);
+}
+.chat__wer {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-200);
+  color: var(--text-dim);
+}
+.chat__punkt {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--sem-ok);
+  flex: none;
+}
+
+/* Die Regeln im Chat selbst, nicht nur auf der Rechtsseite. Zurueckhaltend
+   gesetzt — es ist ein Hinweis, keine Warnung. */
+.chat__regeln {
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  color: var(--text-dim);
+  font: inherit;
+  font-size: var(--fs-200);
+  padding: 3px 9px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.chat__regeln:hover { border-color: var(--acc); color: var(--text); }
+.chat__regeln:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; }
+
+/* ── Wer fliegt: Name, Rufzeichen, Strecke ─────────────────────────────
+   Rufzeichen allein nutzt im Flug nichts — man weiss nicht, wer
+   dahintersteckt und wohin er unterwegs ist. */
+.chat__leiste {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-2);
+  flex: none;
+  max-height: 30vh;
+  overflow-y: auto;
+}
+.chat__pilot {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex: none;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: 7px 11px;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  color: inherit;
+  transition: border-color var(--dur-fast) var(--ease);
+}
+.chat__pilot:hover { border-color: var(--acc); }
+.chat__pilot:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; }
+.chat__pilot--ziel { border-color: var(--acc); background: var(--acc-quiet); }
+/* Wer mit einem Client ohne Chat fliegt: sichtbar, aber nicht anwaehlbar.
+   Ausblenden waere schlechter — dann fragt man sich, wo der Kollege ist,
+   den man auf der Karte sieht. */
+.chat__pilot--stumm { opacity: 0.55; cursor: default; }
+.chat__pilot--stumm:hover { border-color: var(--line); }
+.chat__pilot--stumm .chat__pilot-ruf { color: var(--text-dim); }
+.chat__pilot-name {
+  font-size: var(--fs-400);
+  font-weight: var(--fw-bold);
+  color: var(--text);
+}
+.chat__pilot-ruf {
+  font-family: var(--font-mono);
+  font-size: var(--fs-200);
+  letter-spacing: var(--ls-mono);
+  color: var(--acc);
+}
+.chat__pilot-weg {
+  font-family: var(--font-mono);
+  font-size: var(--fs-100);
+  color: var(--text-dim);
+}
+
+/* ── Verlauf ──────────────────────────────────────────────────────────── */
+.chat__log {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--sp-2) var(--sp-3);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.chat__leer {
+  color: var(--text-dim);
+  font-size: var(--fs-400);
+  padding: var(--sp-4);
+  text-align: center;
+}
+
+.chat__msg {
+  display: grid;
+  grid-template-columns: 46px minmax(0, 1fr);
+  gap: var(--sp-2);
+  padding: 6px var(--sp-2);
+  border-radius: var(--r-md);
+  font-size: var(--fs-400);
+  align-items: baseline;
+}
+.chat__msg time {
+  font-family: var(--font-mono);
+  font-size: var(--fs-200);
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.chat__who {
+  font-family: var(--font-mono);
+  font-weight: var(--fw-bold);
+  font-size: var(--fs-300);
+  letter-spacing: var(--ls-mono);
+  color: var(--acc);
+  margin-right: 7px;
+}
+.chat__name {
+  color: var(--text-dim);
+  font-size: var(--fs-300);
+  margin-right: 7px;
+}
+/* Eigene Zurufe neutral tönen — der Akzent bleibt fuer "betrifft dich". */
+.chat__msg--eigen { background: var(--surface-3); }
+.chat__msg--eigen .chat__who { color: var(--text); }
+.chat__msg--direkt { background: var(--acc-quiet); }
+.chat__marke {
+  font-family: var(--font-mono);
+  font-size: var(--fs-100);
+  letter-spacing: 0.1em;
+  padding: 1px 5px;
+  border-radius: 3px;
+  border: 1px solid var(--acc);
+  color: var(--acc);
+  margin-right: 6px;
+}
+
+/* Flugleitung: eigene Farbe, damit man sie nicht fuer einen Kollegen
+   haelt. Warnton statt Akzent — sie spricht einen an, das ist mehr als ein
+   Zuruf unter Kollegen. */
+.chat__msg--ops {
+  background: var(--sem-warn-bg);
+}
+.chat__msg--ops .chat__who { color: var(--sem-warn); }
+.chat__marke--ops {
+  border-color: var(--sem-warn);
+  color: var(--sem-warn);
+}
+
+/* ── Fusszeile: Schnellzurufe + Eingabe als EIN Bauteil ───────────────── */
+/* Feldbefund 12.08.2026: "warum wieder das grau? als leiste unten?"
+   Die Fusszeile bestand aus zwei getoenten Baendern (Schnellzurufe und
+   Eingabe, beide --surface-2), die zusammen wie ein abgeschalteter Bereich
+   wirkten. Jetzt EIN Bauteil auf der normalen Oberflaeche, abgesetzt durch
+   eine Linie — dieselbe Bauform wie in der Chat-Ansicht der Live-Karte. */
+.chat__schnell {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: var(--sp-3) var(--sp-3) 0;
+  background: var(--surface);
+  border-top: 1px solid var(--line);
+  flex: none;
+}
+.chat__schnell-marke {
+  font-family: var(--font-mono);
+  font-size: var(--fs-100);
+  letter-spacing: var(--ls-caps);
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-right: 2px;
+}
+.chat__schnell button {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  color: var(--text-dim);
+  border-radius: var(--r-md);
+  padding: 5px 10px;
+  font: inherit;
+  font-size: var(--fs-300);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
+}
+.chat__schnell button:hover:not(:disabled) { border-color: var(--acc); color: var(--text); }
+.chat__schnell button:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; }
+.chat__schnell button:disabled { opacity: 0.5; cursor: default; }
+
+.chat__eingabe {
+  display: flex;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  background: var(--surface);
+  flex: none;
+}
+/* Ohne Schnellzurufe darueber (Endanflug, Direktnachricht) braucht die
+   Eingabe ihre eigene Trennlinie, sonst schwimmt sie am Verlauf. */
+.chat__schnell + .chat__eingabe { border-top: 0; }
+.chat__log + .chat__eingabe { border-top: 1px solid var(--line); }
+.chat__eingabe input {
+  flex: 1;
+  min-width: 0;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  color: var(--text);
+  padding: 9px var(--sp-3);
+  font: inherit;
+  font-size: var(--fs-400);
+}
+.chat__eingabe input::placeholder { color: var(--text-dim); }
+.chat__eingabe input:focus-visible { outline: 2px solid var(--acc); outline-offset: 1px; }
+
+/* ── Direktnachricht: an wen geht das gerade ──────────────────────────── */
+.chat__an-wen {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--acc-quiet);
+  border-top: 1px solid var(--acc);
+  font-size: var(--fs-400);
+  color: var(--acc);
+  flex: none;
+}
+.chat__an-wen b { color: var(--text); }
+.chat__an-ruf {
+  font-family: var(--font-mono);
+  font-size: var(--fs-300);
+  letter-spacing: var(--ls-mono);
+}
+.chat__an-weg {
+  margin-left: auto;
+  background: none;
+  border: 1px solid var(--acc);
+  color: var(--acc);
+  border-radius: var(--r-md);
+  font: inherit;
+  font-size: var(--fs-300);
+  padding: 2px 9px;
+  cursor: pointer;
+}
+.chat__an-weg:hover { color: var(--text); }
+
+/* ── Zwei Warnungen, die im Cockpit zaehlen ───────────────────────────── */
+/* Der Hinweis, dass die Tastatur jetzt im Chat steht und nicht mehr im
+   Sim. Er MUSS auffallen — aber nicht als Farbfleck.
+   Feldbefund 12.08.2026: "wenn man ins Textfeld klickt, das grau da
+   drunter — braun". Der getoente Warngrund (--sem-warn-bg) sieht im
+   dunklen Aufzug schlicht schmutzig aus. Die Warnung traegt jetzt ein
+   Zeichen und die Warnfarbe im Text, der Grund bleibt die normale
+   Oberflaeche. */
+.chat__fokus {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--surface);
+  border-top: 1px solid var(--line);
+  font-size: var(--fs-300);
+  color: var(--text);
+  flex: none;
+}
+.chat__fokus::before {
+  content: "⌨";
+  color: var(--sem-warn);
+  font-size: var(--fs-400);
+  line-height: 1;
+}
+.chat__fokus kbd {
+  font-family: var(--font-mono);
+  font-size: var(--fs-200);
+  border: 1px solid var(--sem-warn);
+  border-radius: 4px;
+  padding: 1px 6px;
+  color: var(--sem-warn);
+}
+
+.chat__gesperrt {
+  padding: var(--sp-3);
+  background: var(--surface-2);
+  border-top: 1px solid var(--line);
+  font-size: var(--fs-400);
+  /* Volle Textfarbe: gedaempftes Grau auf getoentem Grund war schon am
+     Integritaets-Banner der Befund ("kaum lesbar"). */
+  color: var(--text);
+  flex: none;
+}
+
+/* Am Boden: keine Eingabe, sondern eine Ansage. Bewusst KEIN graues Band —
+   das ist eine Auskunft, kein abgeschalteter Bereich. */
+.chat__zu {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: var(--sp-4);
+  border-top: 1px solid var(--line);
+  background: var(--surface);
+  flex: none;
+}
+.chat__zu strong { font-size: var(--fs-400); color: var(--text); }
+.chat__zu span { font-size: var(--fs-300); color: var(--text-dim); max-width: 62ch; }
+.chat__zu-link {
+  align-self: flex-start;
+  margin-top: 2px;
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  font-size: var(--fs-300);
+  color: var(--acc);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.chat__zu-link:hover { color: var(--text); }
+.chat__zu-link:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; }
+
+.chat__wer--unbekannt { font-family: inherit; }
+
+/* Der Verweis auf die Rechtsseite sieht jetzt aus wie ein Verweis; die
+   Kurzfassung daneben ist reiner Text. */
+.chat__regeln-kurz {
+  font-size: var(--fs-200);
+  color: var(--text-dim);
+  margin-left: auto;
+}
+.chat__regeln {
+  margin-left: var(--sp-2);
+  color: var(--acc);
+  border-color: transparent;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat__pilot,
+  .chat__schnell button {
+    transition: none;
+  }
+}
+
+/* ── Kurze Einblendung bei einem eingehenden Zuruf ─────────────────────
+   Sitzt auf der Notice-Grundform und bleibt deshalb im Bild wie die
+   Integritaets-Meldung. Anklickbar, weil man von hier direkt in den Chat
+   will — deshalb der Zeiger und der deutliche Rand beim Ueberfahren. */
+.chat-einblendung {
+  cursor: pointer;
+  max-width: 46ch;
+}
+.chat-einblendung:hover { border-color: var(--acc); }
+.chat-einblendung .ui-notice__text {
+  /* Ein Zuruf ist kurz; laeuft er doch ueber, lieber abschneiden als das
+     halbe Cockpit verdecken. */
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.chat-einblendung__oeffnen {
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  color: var(--text-dim);
+  font: inherit;
+  font-size: var(--fs-300);
+  padding: 3px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.chat-einblendung__oeffnen:hover { border-color: var(--acc); color: var(--text); }
+.chat-einblendung__oeffnen:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; }
+
+/* ── VATSIM CDM ────────────────────────────────────────────────────────
+   Aufbau wie jede andere Ansicht: Kopfzeile, Inhalt über die volle
+   Flaeche, Fusszeile. Die fremde Seite bekommt den ganzen Platz — sie ist
+   die Hauptsache, unsere Leiste nur der Rahmen. */
+.cdm {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  overflow: hidden;
+}
+.cdm__kopf {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-2);
+  flex: none;
+}
+.cdm__titel { margin: 0; font-size: var(--fs-500); letter-spacing: var(--ls-tight); }
+.cdm__quelle { font-family: var(--font-mono); font-size: var(--fs-200); color: var(--text-dim); }
+.cdm__knoepfe { margin-left: auto; display: flex; gap: 6px; }
+
+.cdm__flaeche { flex: 1 1 auto; min-height: 0; background: var(--surface); position: relative; }
+.cdm__rahmen { width: 100%; height: 100%; border: 0; display: block; background: #fff; }
+
+.cdm__erklaerung {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-3);
+  padding: var(--sp-6);
+  text-align: center;
+}
+.cdm__erklaerung strong { font-size: var(--fs-500); }
+.cdm__erklaerung span { color: var(--text-dim); font-size: var(--fs-400); max-width: 64ch; line-height: 1.6; }
+.cdm__leise { font-size: var(--fs-300) !important; opacity: .8; }
+.cdm__fehler { color: var(--sem-warn); font-size: var(--fs-300); }
+
+.cdm__ersatz {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-3);
+  padding: var(--sp-6);
+  text-align: center;
+}
+.cdm__ersatz strong { font-size: var(--fs-500); }
+.cdm__ersatz span { color: var(--text-dim); font-size: var(--fs-400); max-width: 62ch; line-height: 1.55; }
+
+.cdm__fuss {
+  margin: 0;
+  padding: var(--sp-2) var(--sp-4);
+  border-top: 1px solid var(--line);
+  background: var(--surface);
+  font-size: var(--fs-200);
+  color: var(--text-dim);
+  flex: none;
+}

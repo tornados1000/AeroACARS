@@ -1,0 +1,1008 @@
+//! VDGS-Band — die eigene Abflugfolge (TOBT/TSAT/CTOT) im Cockpit.
+//!
+//! Quelle ist `api.viffsys.com`, das Rechenwerk hinter dem A-CDM-Werkzeug
+//! von VATSIM Spain (`vats.im/vdgs`). Der Abruf je Rufzeichen ist offen
+//! (keine Anmeldung, kein Schluessel) und liefert weltweit — nachgemessen
+//! am 20.09.2026 mit EDDF, LEBL, LIRF.
+//!
+//! **Nur lesend.** Gesetzt wird die TOBT weiterhin auf deren Seite (s.
+//! `VatsimCdmView.tsx`): der Schreibweg `POST /ifps/dpi` verlangt einen
+//! `x-api-key`, den VATSIM Spain einzeln vergibt, und die Bindung an die
+//! echte Pilotenkennung muesste der Aufrufer selbst sicherstellen. Ohne
+//! beides wird hier nichts geschrieben.
+//!
+//! Etikette gegenueber einem fremden Dienst, den wir nicht bezahlen:
+//!   * Abruf nur, wenn ueberhaupt ein Flug laeuft (kein Leerlauf-Polling),
+//!   * je Rufzeichen statt je Flughafen (LEBL: 2 kB statt 59 kB),
+//!   * serverseitiger Zwischenspeicher mit Mindestabstand, damit eine
+//!     hektische Oberflaeche den Dienst nicht haeufiger trifft als noetig.
+
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+use tauri::AppHandle;
+
+/// Mindestabstand zweier echter Abrufe. Die CDM-Rechnung drueben laeuft
+/// alle zwei Minuten (IFPS) bzw. jede Minute (ETFMS) — oefter als einmal
+/// pro Minute zu fragen brachte nie etwas Neues.
+const MIN_ABSTAND: Duration = Duration::from_secs(60);
+
+/// Wie lange ein gemerkter Stand einen Ausfall ueberbruecken darf.
+/// Waehrenddessen bleibt das Band stehen, statt bei jedem Netzhaenger zu
+/// verschwinden und wiederzukommen — ein flackerndes Geraet im Cockpit
+/// waere schlimmer als eine zwei Minuten alte TSAT. Danach ist der Wert
+/// zu alt, um ihn noch zu zeigen.
+const HOECHSTALTER_BEI_AUSFALL: Duration = Duration::from_secs(600);
+
+/// Hoechstgroesse der Antwort. Ein Flug wiegt rund 2 kB.
+const MAX_RUMPF_BYTES: usize = 512 * 1024;
+
+/// Was das Band zeigt. Zeiten als `HH:MM` oder leer — die Umrechnung aus
+/// den beiden Formaten der Gegenseite (HHMM und HHMMSS) passiert hier,
+/// damit die Oberflaeche nur noch anzeigt.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct VdgsStand {
+    pub callsign: String,
+    pub departure: String,
+    /// Aus dem VATSIM-Flugplan.
+    pub eobt: String,
+    /// Vom Piloten gesetzt bzw. bestaetigt.
+    pub tobt: String,
+    /// Vom CDM zugeteilt. Leer an Plaetzen ohne CDM-Sequenzierung.
+    pub tsat: String,
+    /// Aus der Flussregelung. Leer, wenn keine Regulierung greift.
+    pub ctot: String,
+    /// Rollzeit in Minuten.
+    pub taxi_min: Option<u32>,
+    /// `COMPLY`, `FLS-NRA`, … — kann leer sein, solange nichts entschieden ist.
+    pub cdm_sts: String,
+    /// Die schwerste greifende Regulierung, falls eine vorliegt.
+    pub regulierung: String,
+    /// Bahn und Abflugstrecke, wie die Gegenseite sie fuehrt ("24L/OLOXO3Q").
+    pub rwy_sid: String,
+    /// Tatsaechliche Off-Block-Zeit, sobald die Gegenseite den Flug in
+    /// Bewegung sieht ("Detected in movement"). Ab dann zaehlt das
+    /// Anlassfenster nicht mehr — wer rollt, hat es nicht verpasst.
+    pub aobt: String,
+    /// Tatsaechliche Startzeit laut Gegenseite. Nur zur Pruefung, ob der
+    /// Eintrag ueberhaupt zu diesem Flug gehoert (s. `passt_zum_flug`).
+    pub atot: String,
+    /// Vom Piloten auf vats.im/vdgs gewuenschte TOBT, die das CDM noch
+    /// nicht uebernommen hat. Leer, sobald sie angenommen ist oder keine
+    /// vorliegt.
+    pub tobt_wunsch: String,
+    /// Anlassbereitschaft gemeldet (Actual Start-up Request Time). Solange
+    /// sie steht, nimmt das CDM den Flug nach dem TSAT- bzw. TOBT-Fenster
+    /// nicht aus der Folge (rpuig2001/CDM, README) — das Band darf dann
+    /// nicht „verpasst" melden. Eine ASRT aus einem abgebrochenen Versuch
+    /// unter demselben Rufzeichen am selben Platz wird hingenommen wie in
+    /// `passt_zum_flug` beschrieben: Das CDM fuehrt sie dann selbst noch.
+    pub asrt: String,
+    /// Grund, den das CDM zum Flug fuehrt (etwa eine Verzoegerung).
+    pub grund: String,
+}
+
+/// Rohantwort. Nur die Felder, die das Band braucht; alles andere bleibt
+/// bewusst ungelesen, damit ein Formatwechsel drueben nicht den Abruf
+/// killt.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ApiFlug {
+    #[serde(default)]
+    callsign: String,
+    #[serde(default)]
+    departure: String,
+    #[serde(default)]
+    eobt: String,
+    #[serde(default)]
+    tobt: String,
+    #[serde(default)]
+    ctot: String,
+    #[serde(default)]
+    aobt: String,
+    #[serde(default)]
+    atot: String,
+    #[serde(default)]
+    taxi: Option<u32>,
+    #[serde(default, rename = "cdmSts")]
+    cdm_sts: String,
+    #[serde(default, rename = "reqTobt")]
+    req_tobt: String,
+    #[serde(default, rename = "cdmData")]
+    cdm_data: ApiCdm,
+    #[serde(default, rename = "atfcmData")]
+    atfcm_data: ApiAtfcm,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ApiCdm {
+    #[serde(default)]
+    tobt: String,
+    #[serde(default)]
+    tsat: String,
+    #[serde(default)]
+    ctot: String,
+    /// "24L/OLOXO3Q" — Bahn und Abflugstrecke.
+    #[serde(default, rename = "depInfo")]
+    dep_info: String,
+    #[serde(default, rename = "reqTobt")]
+    req_tobt: String,
+    #[serde(default)]
+    asrt: String,
+    #[serde(default)]
+    reason: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ApiAtfcm {
+    #[serde(default, rename = "mostPenalisingRegulation")]
+    most_penalising_regulation: String,
+}
+
+/// `1546` → `15:46`, `154600` → `15:46`, alles andere → leer.
+///
+/// Die Gegenseite fuehrt beide Formate NEBENEINANDER: die Flugplanzeiten
+/// vierstellig, die CDM-Zeiten sechsstellig mit Sekunden (nachgemessen an
+/// LEBL/VLG10WL, 20.09.2026). Wer das verwechselt, zeigt "15:46:00" als
+/// Uhrzeit an oder gar nichts.
+fn zeit(roh: &str) -> String {
+    let r = roh.trim();
+    if !(r.len() == 4 || r.len() == 6) || !r.bytes().all(|b| b.is_ascii_digit()) {
+        return String::new();
+    }
+    let (h, m) = (&r[0..2], &r[2..4]);
+    // Unsinnige Werte lieber verschweigen als falsch anzeigen.
+    if h.parse::<u32>().unwrap_or(99) > 23 || m.parse::<u32>().unwrap_or(99) > 59 {
+        return String::new();
+    }
+    format!("{h}:{m}")
+}
+
+/// Die Rohantwort auf das reduzieren, was das Band zeigt.
+///
+/// Reihenfolge bei TOBT/CTOT: der CDM-Wert gewinnt, wenn es einen gibt —
+/// er ist der juengere. Sonst der Flugplanwert.
+fn aufbereiten(f: &ApiFlug) -> VdgsStand {
+    let tobt = {
+        let cdm = zeit(&f.cdm_data.tobt);
+        if cdm.is_empty() {
+            zeit(&f.tobt)
+        } else {
+            cdm
+        }
+    };
+    let ctot = {
+        let cdm = zeit(&f.cdm_data.ctot);
+        if cdm.is_empty() {
+            zeit(&f.ctot)
+        } else {
+            cdm
+        }
+    };
+    // Der Wunsch zaehlt nur, solange er nicht schon die geltende TOBT ist.
+    let tobt_wunsch = {
+        let cdm = zeit(&f.cdm_data.req_tobt);
+        let w = if cdm.is_empty() { zeit(&f.req_tobt) } else { cdm };
+        if w == tobt {
+            String::new()
+        } else {
+            w
+        }
+    };
+    VdgsStand {
+        callsign: f.callsign.trim().to_uppercase(),
+        departure: f.departure.trim().to_uppercase(),
+        eobt: zeit(&f.eobt),
+        tobt,
+        tsat: zeit(&f.cdm_data.tsat),
+        ctot,
+        taxi_min: f.taxi.filter(|t| *t > 0),
+        cdm_sts: f.cdm_sts.trim().to_uppercase(),
+        regulierung: f.atfcm_data.most_penalising_regulation.trim().to_string(),
+        rwy_sid: f.cdm_data.dep_info.trim().to_uppercase(),
+        aobt: zeit(&f.aobt),
+        atot: zeit(&f.atot),
+        tobt_wunsch,
+        asrt: zeit(&f.cdm_data.asrt),
+        grund: f.cdm_data.reason.trim().to_string(),
+    }
+}
+
+/// Gehoert der Eintrag zu DIESEM Flug?
+///
+/// Gefragt wird je Rufzeichen, und die Gegenseite haelt einen Flug nach
+/// dem Trennen noch rund zehn Minuten vor. Nach einem Neustart, Abbruch
+/// oder schnellen Folgeflug unter demselben Rufzeichen kann die Antwort
+/// also noch der VORIGE Flug sein — mit dessen Off-Block, und das Band
+/// hielte den neuen Flug faelschlich fuer „Fenster erfuellt" (Codex-
+/// Abnahme 21.09.2026). Zwei Zeichen verraten das:
+///   * anderer Abflugplatz als der laufende Flug,
+///   * schon abgehoben (`atot`), obwohl dieser Flug noch am Boden steht —
+///     `vdgs_stand` fragt nur vor dem Abheben.
+/// Dann ist das fuer diesen Flug „kein Eintrag".
+///
+/// Bewusst NICHT abgedeckt (Codex-Nachpruefung 21.09.2026): ein Abbruch
+/// nach dem Off-Block, aber vor dem Start, und ein Neustart am selben
+/// Platz unter demselben Rufzeichen binnen der zehn Minuten. Dann fuehrt
+/// das CDM den Flug SELBST noch als off-block — das Band zeigt, was die
+/// Folge glaubt, und ein erfundenes Zeitlimit waere schlechter. Ebenso
+/// hingenommen: meldet die Gegenseite die ATOT Sekunden vor unserer
+/// eigenen Abhebe-Erkennung, steht kurz „kein Eintrag"; danach
+/// verschwindet das Band ohnehin.
+fn passt_zum_flug(stand: Option<VdgsStand>, abflug: &str) -> Option<VdgsStand> {
+    let s = stand?;
+    let abflug = abflug.trim().to_uppercase();
+    if !abflug.is_empty() && !s.departure.is_empty() && s.departure != abflug {
+        return None;
+    }
+    if !s.atot.is_empty() {
+        return None;
+    }
+    Some(s)
+}
+
+/// Zwischenspeicher: letzter Abruf je FLUG. `None` als Wert heisst
+/// „gefragt, aber dieser Flug ist dort nicht gefuehrt" — auch das wird
+/// gemerkt, sonst fragt die Oberflaeche fuer jeden Flug ausserhalb des
+/// CDM-Systems im Minutentakt vergeblich nach.
+///
+/// Der Schluessel ist die FLUGKENNUNG samt Rufzeichen, nicht das
+/// Rufzeichen allein: Zwei Fluege koennen dasselbe Rufzeichen tragen
+/// (Rueckflug, Neustart nach Abbruch, dieselbe Nummer am naechsten Tag).
+/// Mit dem Rufzeichen als einzigem Schluessel standen TOBT, TSAT und
+/// sogar der ABFLUGPLATZ des vorigen Fluges bis zu eine Minute im neuen
+/// Cockpit — bei einer Stoerung bis zu zehn (Codex-Abnahme 20.09.2026).
+type Speicher = Mutex<Option<(String, Instant, Option<VdgsStand>)>>;
+
+fn speicher() -> &'static Speicher {
+    static S: OnceLock<Speicher> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(None))
+}
+
+/// Flugkennung + Rufzeichen. Beides, weil der Pilot das Rufzeichen
+/// waehrend desselben Fluges aendern kann (Uebersteuerung).
+fn schluessel(flug_id: &str, callsign: &str) -> String {
+    format!("{flug_id}\u{1f}{callsign}")
+}
+
+fn aus_speicher(schluessel: &str, hoechstalter: Duration) -> Option<Option<VdgsStand>> {
+    let g = speicher().lock().ok()?;
+    let (gemerkt, wann, wert) = g.as_ref()?;
+    if gemerkt == schluessel && wann.elapsed() < hoechstalter {
+        Some(wert.clone())
+    } else {
+        None
+    }
+}
+
+fn in_speicher(schluessel: &str, wert: Option<VdgsStand>) {
+    if let Ok(mut g) = speicher().lock() {
+        *g = Some((schluessel.to_string(), Instant::now(), wert));
+    }
+}
+
+/// Nur das, was ein Rufzeichen sein darf — der Rest fliegt raus, damit
+/// aus einem krummen Flugplanfeld keine zusaetzlichen URL-Parameter
+/// werden koennen.
+fn sauberes_rufzeichen(roh: &str) -> String {
+    roh.trim()
+        .to_uppercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .take(16)
+        .collect()
+}
+
+/// Einen Abruf gegen die Gegenseite. `Ok(None)` = Flug dort nicht gefuehrt.
+async fn abrufen(callsign: &str) -> Result<Option<VdgsStand>, String> {
+    let url = format!("https://api.viffsys.com/ifps/callsign?callsign={callsign}&profile=false");
+    match rumpf_holen(&url, MAX_RUMPF_BYTES).await? {
+        Some(rumpf) => aus_rumpf(&rumpf),
+        None => Ok(None),
+    }
+}
+
+/// GET mit Zeit- und Groessenriegel. `Ok(None)` bei 404.
+async fn rumpf_holen(url: &str, max_bytes: usize) -> Result<Option<Vec<u8>>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .user_agent(concat!("AeroACARS/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let antwort = client.get(url).send().await.map_err(|e| e.to_string())?;
+    let status = antwort.status();
+    // 404 heisst dort schlicht „kein Eintrag" — kein Fehler, den der Pilot
+    // sehen muesste.
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        return Err(format!("HTTP {}", status.as_u16()));
+    }
+    // Die Groesse begrenzen, nicht nur die Dauer.
+    //
+    // Der Zeitriegel deckelt, wie LANGE die Gegenseite senden darf, nicht
+    // WIE VIEL. `bytes()` sammelt alles im Speicher — auch einen stark
+    // gepackten Rumpf, der entpackt um Groessenordnungen waechst. Ein
+    // Flug wiegt rund 2 kB; 512 kB sind das Vielfache dessen, was je
+    // kommen kann (Codex-Abnahme 20.09.2026).
+    let mut rumpf: Vec<u8> = Vec::new();
+    let mut antwort = antwort;
+    while let Some(stueck) = antwort.chunk().await.map_err(|e| e.to_string())? {
+        if rumpf.len() + stueck.len() > max_bytes {
+            return Err(format!("Antwort groesser als {max_bytes} Bytes"));
+        }
+        rumpf.extend_from_slice(&stueck);
+    }
+    Ok(Some(rumpf))
+}
+
+/// Wie lange die Liste der CDM-Plaetze gilt. Sie aendert sich selten.
+const CDM_LISTE_GUELTIG: Duration = Duration::from_secs(6 * 3600);
+
+/// Nach einem gescheiterten Abruf der Liste fruehestens so spaet erneut.
+const CDM_LISTE_NEUVERSUCH: Duration = Duration::from_secs(600);
+
+/// Die Liste wog am 12.10.2026 rund 130 kB (419 Plaetze, 127 mit CDM).
+const MAX_LISTE_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Deserialize)]
+struct ApiPlatz {
+    #[serde(default)]
+    icao: String,
+    #[serde(default, rename = "isCdm")]
+    is_cdm: bool,
+}
+
+/// Platz → hat CDM, aus `/etfms/getCadAirports`. Eine leere Liste ist ein
+/// Fehler: Sonst hiesse es ueberall „kein CDM", nur weil drueben gerade
+/// nichts kam.
+///
+/// Ein Platz, der FEHLT, ist unbekannt — nicht „ohne CDM": Die Liste ist
+/// nicht vollstaendig (EHAM fehlte am 12.10.2026, obwohl dort 19 Fluege
+/// gefuehrt wurden; Codex-Abnahme 447b60eb). Nur ein ausdrueckliches
+/// `isCdm: false` zaehlt als „ohne CDM".
+fn liste_lesen(rumpf: &[u8]) -> Result<std::collections::HashMap<String, bool>, String> {
+    let plaetze: Vec<ApiPlatz> = serde_json::from_slice(rumpf).map_err(|e| e.to_string())?;
+    if plaetze.is_empty() {
+        return Err("leere Platzliste".into());
+    }
+    Ok(plaetze
+        .into_iter()
+        .map(|p| (p.icao.trim().to_uppercase(), p.is_cdm))
+        .filter(|(i, _)| !i.is_empty())
+        .collect())
+}
+
+#[derive(Default)]
+struct CdmListe {
+    /// Letzte gute Liste und wann sie kam.
+    cdm: Option<(Instant, std::collections::HashMap<String, bool>)>,
+    letzter_versuch: Option<Instant>,
+}
+
+fn cdm_liste() -> &'static Mutex<CdmListe> {
+    static S: OnceLock<Mutex<CdmListe>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(CdmListe::default()))
+}
+
+/// Hat der Abflugplatz CDM? `None`, wenn das nicht bekannt ist.
+///
+/// Gebraucht nur, wenn es zum Flug keinen Eintrag gibt: Dann ist „Platz
+/// ohne CDM" etwas anderes als „CDM-Platz, Flug noch nicht erfasst".
+/// Vorher hiess beides „kein CDM-Eintrag — Rufzeichen pruefen", und an
+/// einem Platz ohne CDM suchte der Pilot einen Fehler beim Rufzeichen,
+/// den es nicht gab. Gefragt wird nur die allgemeine Platzliste — sie
+/// enthaelt nichts ueber den Flug.
+async fn ist_cdm_platz(abflug: &str) -> Option<bool> {
+    let abflug = abflug.trim().to_uppercase();
+    if abflug.is_empty() {
+        return None;
+    }
+    let (bekannt, holen) = {
+        let g = cdm_liste().lock().ok()?;
+        let frisch = g
+            .cdm
+            .as_ref()
+            .is_some_and(|(t, _)| t.elapsed() < CDM_LISTE_GUELTIG);
+        let darf = g
+            .letzter_versuch
+            .is_none_or(|t| t.elapsed() >= CDM_LISTE_NEUVERSUCH);
+        (
+            g.cdm.as_ref().and_then(|(_, l)| l.get(&abflug).copied()),
+            !frisch && darf,
+        )
+    };
+    if !holen {
+        return bekannt;
+    }
+    if let Ok(mut g) = cdm_liste().lock() {
+        g.letzter_versuch = Some(Instant::now());
+    }
+    let geholt = rumpf_holen("https://api.viffsys.com/etfms/getCadAirports", MAX_LISTE_BYTES)
+        .await
+        .and_then(|r| r.ok_or_else(|| "HTTP 404".to_string()))
+        .and_then(|r| liste_lesen(&r));
+    match geholt {
+        Ok(liste) => {
+            let ja = liste.get(&abflug).copied();
+            if let Ok(mut g) = cdm_liste().lock() {
+                g.cdm = Some((Instant::now(), liste));
+            }
+            ja
+        }
+        Err(e) => {
+            tracing::debug!(target: "vdgs", "CDM-Platzliste nicht abrufbar: {e}");
+            // Eine aeltere Liste ist besser als keine.
+            bekannt
+        }
+    }
+}
+
+/// Antwortrumpf → Stand. Eigene Funktion, weil hier der Fall sitzt, den
+/// ein unbekanntes Rufzeichen ausloest: die Gegenseite antwortet dann
+/// mit **HTTP 200 und leerem Rumpf** (nachgemessen 20.09.2026), nicht
+/// mit 404. Wer nur auf den Statuscode schaut, zeigt im Cockpit einen
+/// Fehler, wo schlicht kein Eintrag ist.
+fn aus_rumpf(rumpf: &[u8]) -> Result<Option<VdgsStand>, String> {
+    if rumpf.iter().all(|b| b.is_ascii_whitespace()) {
+        return Ok(None);
+    }
+    // Die Gegenseite antwortet auf diesen Weg mit EINEM Objekt; auf dem
+    // Flughafenweg mit einer Liste. Beides annehmen kostet nichts und
+    // faengt den Tag ab, an dem sie es angleichen.
+    let flug: Option<ApiFlug> = match serde_json::from_slice::<ApiFlug>(rumpf) {
+        Ok(f) => Some(f),
+        Err(_) => serde_json::from_slice::<Vec<ApiFlug>>(rumpf)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .next(),
+    };
+    // Ein nichtleerer Rumpf OHNE Rufzeichen ist ein Fehler, kein
+    // „kein Eintrag".
+    //
+    // „Kein Eintrag" sagt die Gegenseite durch einen LEEREN Rumpf oder
+    // 404. Kommt dagegen ein Objekt ohne `callsign` — Fehlerobjekt,
+    // geaendertes Schema —, dann haben wir die Antwort nicht verstanden.
+    // Als „kein Eintrag" gewertet ueberschriebe das einen guten Stand im
+    // Zwischenspeicher mit `None` und umginge die Ueberbrueckung bei
+    // Ausfall; das Band verschwaende, obwohl der Flug gefuehrt wird
+    // (Codex-Abnahme 20.09.2026).
+    match flug {
+        Some(f) if !f.callsign.trim().is_empty() => Ok(Some(aufbereiten(&f))),
+        Some(_) => Err("Antwort ohne Rufzeichen — Schema unbekannt".into()),
+        None => Err("leere Liste statt Eintrag".into()),
+    }
+}
+
+/// Was die Anzeige bekommt: das verwendete Rufzeichen UND der Stand.
+///
+/// Das Rufzeichen faehrt immer mit, auch wenn es keinen Eintrag gibt.
+/// Vorher verschwand die Platte in dem Fall ganz — und damit die
+/// einzige Auskunft darueber, WOMIT gefragt wurde. Genau daran ist ein
+/// Fehler lange unbemerkt geblieben: falsches Rufzeichen, leeres Band,
+/// und der Pilot sucht die Ursache beim Dienst (Thomas, 20.09.2026:
+/// „ist das nicht besser als was anzunehmen").
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct VdgsAntwort {
+    /// Das Rufzeichen, unter dem gefragt wurde.
+    pub gefragt_als: String,
+    /// Der Eintrag, wenn es einen gibt.
+    pub stand: Option<VdgsStand>,
+    /// Der Abruf ist gescheitert — Netz, Zeitueberschreitung, HTTP-Fehler
+    /// oder eine Antwort, die wir nicht verstehen.
+    ///
+    /// Ohne dieses Feld sah ein Serverfehler im Cockpit genauso aus wie
+    /// „dieser Flug ist dort nicht gefuehrt": Die Korrektur an `aus_rumpf`
+    /// wirkte nur im Parser, denn `vdgs_stand` machte aus dem Fehler
+    /// wieder ein `stand: None` (Codex-Abnahme, zweite Runde,
+    /// 20.09.2026). Der Pilot muss beides unterscheiden koennen — beim
+    /// einen stimmt vielleicht sein Rufzeichen nicht, beim anderen ist
+    /// die Gegenseite gerade nicht erreichbar.
+    pub stoerung: bool,
+    /// Nur ohne Eintrag gesetzt: Hat der Abflugplatz CDM? `None` =
+    /// unbekannt (s. `ist_cdm_platz`).
+    pub cdm_platz: Option<bool>,
+}
+
+/// Stand der eigenen Abflugfolge, oder `None`, wenn es nichts zu zeigen
+/// gibt: kein laufender Flug, kein Eintrag drueben, oder der Dienst
+/// antwortet nicht. Ein Ausfall ist bewusst kein Fehler — das Band
+/// verschwindet dann einfach, statt im Cockpit eine Fehlermeldung zu
+/// hinterlassen.
+#[tauri::command]
+pub async fn vdgs_stand(app: AppHandle) -> Option<VdgsAntwort> {
+    // Erst das Rufzeichen (kurz, synchron, keine Sperre ueber ein await),
+    // dann der Netzabruf.
+    // NUR bei laufendem Flug — und zwar hier im Backend geprueft, nicht
+    // erst in der Anzeige.
+    //
+    // `resolve_callsign` liefert auch ohne Flug ein Rufzeichen, sobald in
+    // den Einstellungen eine Uebersteuerung steht. Ueber die LAN-Bruecke
+    // ist der Befehl direkt erreichbar; ohne diese Wache haette ein
+    // Tablet den fremden Dienst also auch ohne Flug befragen koennen,
+    // entgegen der Zusage „nur bei laufendem Flug" (Codex-Abnahme
+    // 20.09.2026).
+    let flug_id = crate::vdgs_flug_kennung(&app)?;
+    let abflug = crate::vdgs_flug_abflug(&app).unwrap_or_default();
+
+    // DASSELBE Rufzeichen, unter dem der Client auch funkt.
+    //
+    // `resolve_callsign` nimmt zuerst die Uebersteuerung aus den
+    // Einstellungen und erst dann das des Fluges — und dort wieder das
+    // ATC-Rufzeichen des OFP vor Airline+Flugnummer (PaxStudio/SimBrief
+    // planen oft ein anderes, etwa DLH4TK oder EWG9KC). Wer per Hoppie
+    // unter einem Rufzeichen funkt, aber VDGS unter einem anderen
+    // abfragt, bekommt ein leeres Band und sucht den Fehler beim Dienst
+    // (Thomas, 20.09.2026: „das kann sich von der Flugnummer
+    // unterscheiden").
+    let callsign = crate::hoppie::resolve_callsign(&app)
+        .map(|c| c.trim().to_uppercase())
+        .filter(|c| !c.is_empty())?;
+
+    let callsign = sauberes_rufzeichen(&callsign);
+    if callsign.is_empty() {
+        return None;
+    }
+    let schl = schluessel(&flug_id, &callsign);
+
+    let antwort = |stand: Option<VdgsStand>, cdm_platz: Option<bool>| {
+        Some(VdgsAntwort {
+            gefragt_als: callsign.clone(),
+            stand,
+            stoerung: false,
+            cdm_platz,
+        })
+    };
+    let stoerung = |stand: Option<VdgsStand>| {
+        Some(VdgsAntwort {
+            gefragt_als: callsign.clone(),
+            stand,
+            stoerung: true,
+            cdm_platz: None,
+        })
+    };
+
+    if let Some(gemerkt) = aus_speicher(&schl, MIN_ABSTAND) {
+        let cdm_platz = match gemerkt {
+            None => ist_cdm_platz(&abflug).await,
+            Some(_) => None,
+        };
+        return antwort(gemerkt, cdm_platz);
+    }
+
+    match abrufen(&callsign).await {
+        Ok(stand) => {
+            let stand = passt_zum_flug(stand, &abflug);
+            in_speicher(&schl, stand.clone());
+            let cdm_platz = match stand {
+                None => ist_cdm_platz(&abflug).await,
+                Some(_) => None,
+            };
+            antwort(stand, cdm_platz)
+        }
+        Err(e) => {
+            tracing::debug!(target: "vdgs", "VDGS-Abruf fehlgeschlagen: {e}");
+            // Fehler NICHT merken: beim naechsten Takt darf es wieder
+            // versucht werden. Solange der letzte gute Stand nicht zu alt
+            // ist, bleibt er stehen — sonst flackert das Band bei jedem
+            // Netzhaenger weg und wieder hin.
+            // Auch im Fehlerfall das Rufzeichen mitgeben: Die Platte
+            // zeigt dann die schmale Zeile statt ganz zu verschwinden.
+            // Und als STOERUNG kennzeichnen — sonst liest der Pilot
+            // „kein CDM-Eintrag", wo die Gegenseite schlicht nicht
+            // antwortet, und prueft sein Rufzeichen statt zu warten.
+            let ueberbrueckt = aus_speicher(&schl, HOECHSTALTER_BEI_AUSFALL).flatten();
+            stoerung(ueberbrueckt)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Wer den GLOBALEN Zwischenspeicher anfasst, nimmt diese Sperre.
+    ///
+    /// `speicher()` ist ein `OnceLock` fuer den ganzen Prozess, und
+    /// Rust laesst Tests parallel laufen: Zwei Tests, die beide
+    /// hineinschreiben, machen sich gegenseitig die Erwartung kaputt.
+    /// Genau das ist am 20.09.2026 passiert — derselbe Test war einmal
+    /// rot und beim naechsten Lauf gruen. Ein sporadisch roter Test ist
+    /// schlimmer als keiner: Man gewoehnt sich an, ihn zu wiederholen.
+    fn speicher_sperre() -> std::sync::MutexGuard<'static, ()> {
+        static S: OnceLock<Mutex<()>> = OnceLock::new();
+        S.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|v| v.into_inner())
+    }
+
+    fn leer() -> VdgsStand {
+        VdgsStand {
+            callsign: String::new(),
+            departure: String::new(),
+            eobt: String::new(),
+            tobt: String::new(),
+            tsat: String::new(),
+            ctot: String::new(),
+            taxi_min: None,
+            cdm_sts: String::new(),
+            regulierung: String::new(),
+            rwy_sid: String::new(),
+            aobt: String::new(),
+            atot: String::new(),
+            tobt_wunsch: String::new(),
+            asrt: String::new(),
+            grund: String::new(),
+        }
+    }
+
+    #[test]
+    fn vierstellige_und_sechsstellige_zeiten_werden_beide_gelesen() {
+        assert_eq!(zeit("1546"), "15:46");
+        assert_eq!(zeit("154600"), "15:46");
+        assert_eq!(zeit(" 0905 "), "09:05");
+    }
+
+    /// Echte Antwort (gekuerzt) fuer AIB4TK EDDC→LEPA, 21.09.2026: kein
+    /// CDM-Platz (`isCdm:false`), TOBT nur oben, keine TSAT, Off-Block
+    /// erkannt. Genau so muss das Band sie sehen.
+    #[test]
+    fn nicht_cdm_platz_mit_off_block_wird_richtig_gelesen() {
+        let s = aus_rumpf(
+            br#"{"callsign":"AIB4TK","departure":"EDDC","eobt":"2045","tobt":"2045",
+            "taxi":10,"ctot":"","aobt":"2042","cdmSts":"COMPLY","isCdm":false,
+            "cdmData":{"tobt":"","tsat":"","ttot":"","ctot":"","depInfo":"","reqTobt":"2045"}}"#,
+        )
+        .expect("lesbar")
+        .expect("ein Flug");
+        assert_eq!(s.tobt, "20:45");
+        assert_eq!(s.tsat, "", "kein CDM-Platz, keine TSAT");
+        assert_eq!(s.aobt, "20:42");
+        assert_eq!(s.taxi_min, Some(10));
+        assert_eq!(s.cdm_sts, "COMPLY");
+    }
+
+    #[test]
+    fn eintrag_eines_frueheren_fluges_wird_verworfen() {
+        let eigen = VdgsStand {
+            callsign: "AIB4TK".into(),
+            departure: "EDDC".into(),
+            tobt: "20:45".into(),
+            ..leer()
+        };
+        assert_eq!(
+            passt_zum_flug(Some(eigen.clone()), "eddc"),
+            Some(eigen.clone())
+        );
+        // Anderer Platz: der vorige Flug unter demselben Rufzeichen.
+        assert_eq!(passt_zum_flug(Some(eigen.clone()), "LEPA"), None);
+        // Schon abgehoben, waehrend wir noch am Boden stehen.
+        let alt = VdgsStand {
+            aobt: "20:42".into(),
+            atot: "20:54".into(),
+            ..eigen.clone()
+        };
+        assert_eq!(passt_zum_flug(Some(alt), "EDDC"), None);
+        // Off-Block allein (rollt gerade) ist dagegen unser Flug.
+        let rollt = VdgsStand {
+            aobt: "20:42".into(),
+            ..eigen.clone()
+        };
+        assert_eq!(passt_zum_flug(Some(rollt.clone()), "EDDC"), Some(rollt));
+        // Unbekannter Abflugplatz auf einer Seite: nicht ausschliessen.
+        assert_eq!(passt_zum_flug(Some(eigen.clone()), ""), Some(eigen));
+        assert_eq!(passt_zum_flug(None, "EDDC"), None);
+    }
+
+    #[test]
+    fn unsinnige_zeiten_bleiben_leer() {
+        assert_eq!(zeit(""), "");
+        assert_eq!(zeit("--"), "");
+        assert_eq!(zeit("2461"), "");
+        assert_eq!(zeit("9999"), "");
+        assert_eq!(zeit("15460"), "");
+        assert_eq!(zeit("15:46"), "");
+    }
+
+    /// Gegenprobe zur Vorrangregel: gaebe es sie nicht, zeigte das Band
+    /// die aeltere Flugplan-TOBT statt der frisch gesetzten.
+    #[test]
+    fn cdm_wert_geht_vor_flugplanwert() {
+        let f = ApiFlug {
+            tobt: "1530".into(),
+            cdm_data: ApiCdm {
+                tobt: "154400".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(aufbereiten(&f).tobt, "15:44");
+
+        let ohne_cdm = ApiFlug {
+            tobt: "1530".into(),
+            ..Default::default()
+        };
+        assert_eq!(aufbereiten(&ohne_cdm).tobt, "15:30");
+    }
+
+    /// Echte Antwort (LEBL/VLG10WL, 20.09.2026), auf die gelesenen Felder
+    /// gekuerzt — faengt einen Feldumbenennung drueben.
+    #[test]
+    fn echte_antwort_wird_vollstaendig_gelesen() {
+        let roh = r#"{
+            "callsign":"VLG10WL","departure":"LEBL","eobt":"1550","tobt":"1546",
+            "ctot":"","taxi":15,"cdmSts":"COMPLY",
+            "atfcmData":{"mostPenalisingRegulation":"LECBCTA"},
+            "cdmData":{"tobt":"154400","tsat":"154600","ttot":"160100",
+                       "ctot":"","depInfo":"24L/OLOXO3Q"}
+        }"#;
+        let f: ApiFlug = serde_json::from_str(roh).expect("Antwort lesbar");
+        let s = aufbereiten(&f);
+        assert_eq!(s.callsign, "VLG10WL");
+        assert_eq!(s.departure, "LEBL");
+        assert_eq!(s.eobt, "15:50");
+        assert_eq!(s.tobt, "15:44");
+        assert_eq!(s.tsat, "15:46");
+        assert_eq!(s.ctot, "");
+        assert_eq!(s.taxi_min, Some(15));
+        assert_eq!(s.cdm_sts, "COMPLY");
+        assert_eq!(s.regulierung, "LECBCTA");
+        assert_eq!(s.rwy_sid, "24L/OLOXO3Q");
+    }
+
+    /// Ein Platz ohne CDM-Sequenzierung (EDDF, 20.09.2026): `cdmData` ist
+    /// leer, die Flugplanzeiten stehen trotzdem. Das Band muss das zeigen
+    /// koennen, statt auf eine TSAT zu warten, die dort nie kommt.
+    #[test]
+    fn platz_ohne_cdm_liefert_trotzdem_zeiten() {
+        let roh = r#"{"callsign":"DLH355","departure":"EDDF","eobt":"1844",
+            "tobt":"1753","ctot":"","taxi":9,"cdmSts":"COMPLY",
+            "cdmData":{"tobt":"","tsat":"","ctot":"","depInfo":""}}"#;
+        let f: ApiFlug = serde_json::from_str(roh).expect("Antwort lesbar");
+        let s = aufbereiten(&f);
+        assert_eq!(s.tobt, "17:53");
+        assert_eq!(s.tsat, "");
+        assert_eq!(s.taxi_min, Some(9));
+    }
+
+    /// Unbekannte oder neue Felder duerfen den Abruf nicht killen.
+    #[test]
+    fn unbekannte_felder_stoeren_nicht() {
+        let roh = r#"{"callsign":"GSG1","voellig":"neu","cdmData":{"tsat":"120000","neu":1}}"#;
+        let f: ApiFlug = serde_json::from_str(roh).expect("Antwort lesbar");
+        assert_eq!(aufbereiten(&f).tsat, "12:00");
+    }
+
+    /// Zwei Fluege mit DEMSELBEN Rufzeichen teilen sich keinen Eintrag.
+    ///
+    /// Der Fall aus der Codex-Abnahme (20.09.2026): Rueckflug, Neustart
+    /// nach Abbruch, dieselbe Nummer am naechsten Tag. Mit dem
+    /// Rufzeichen als einzigem Schluessel standen TOBT, TSAT und der
+    /// Abflugplatz des VORIGEN Fluges bis zu eine Minute im neuen
+    /// Cockpit — bei einer Stoerung bis zu zehn.
+    #[test]
+    fn ein_neuer_flug_erbt_den_stand_des_alten_nicht() {
+        let _wache = speicher_sperre();
+        let alt = VdgsStand {
+            callsign: "GSG421".into(),
+            departure: "LEBL".into(),
+            tsat: "15:46".into(),
+            ..leer()
+        };
+        let a = schluessel("PIREP-ALT", "GSG421");
+        let b = schluessel("PIREP-NEU", "GSG421");
+        assert_ne!(
+            a, b,
+            "gleiches Rufzeichen darf nicht denselben Platz teilen"
+        );
+
+        in_speicher(&a, Some(alt.clone()));
+        // Derselbe Flug findet seinen Stand.
+        assert_eq!(aus_speicher(&a, Duration::from_secs(60)), Some(Some(alt)),);
+        // Der neue Flug findet NICHTS und fragt frisch.
+        assert_eq!(
+            aus_speicher(&b, Duration::from_secs(60)),
+            None,
+            "der neue Flug erbt den Stand des alten",
+        );
+        // Auch nicht ueber die lange Ausfall-Frist.
+        assert_eq!(aus_speicher(&b, HOECHSTALTER_BEI_AUSFALL), None);
+    }
+
+    /// Der Zwischenspeicher hat zwei Fristen: die kurze fuer den
+    /// Normalbetrieb, die lange als Ueberbrueckung bei Ausfall.
+    #[test]
+    fn gemerkter_stand_verfaellt_nach_frist() {
+        let _wache = speicher_sperre();
+        let stand = VdgsStand {
+            callsign: "GSG9".into(),
+            ..leer()
+        };
+        in_speicher("GSG9", Some(stand.clone()));
+
+        assert_eq!(
+            aus_speicher("GSG9", MIN_ABSTAND),
+            Some(Some(stand.clone())),
+            "frisch gemerkt muss innerhalb der kurzen Frist kommen"
+        );
+        // Gegenprobe: mit Frist Null darf derselbe Eintrag NICHT kommen.
+        assert_eq!(aus_speicher("GSG9", Duration::ZERO), None);
+        // Und ein anderes Rufzeichen bekommt nie den fremden Stand.
+        assert_eq!(aus_speicher("GSG8", MIN_ABSTAND), None);
+    }
+
+    /// Der Abruf nimmt DASSELBE Rufzeichen wie der Funk.
+    ///
+    /// Es gibt drei Quellen, und sie koennen auseinanderlaufen: die
+    /// Uebersteuerung in den Einstellungen, das ATC-Rufzeichen aus dem
+    /// OFP (PaxStudio/SimBrief planen oft DLH4TK statt DLH400) und
+    /// Airline+Flugnummer. `hoppie::resolve_callsign` kennt die
+    /// Reihenfolge; wer hier `flight_context().callsign` nimmt, laesst
+    /// die Uebersteuerung fallen und fragt den Dienst unter einem
+    /// Rufzeichen ab, unter dem der Pilot gar nicht fliegt — das Band
+    /// bleibt leer, und die Ursache sieht man ihm nicht an.
+    ///
+    /// Ein Verhaltenstest brauchte einen laufenden Flug samt
+    /// Einstellungen; deshalb hier am Quelltext.
+    #[test]
+    fn wunsch_tobt_asrt_und_grund_werden_gelesen() {
+        // Form wie live am 12.10.2026 (JAL408/EDDF), Werte angepasst.
+        let roh = br#"{"callsign":"GSG7","departure":"EDDF","eobt":"1920","tobt":"","reqTobt":"",
+            "cdmData":{"tobt":"192000","tsat":"192000","ctot":"","reason":" Ground delay ",
+            "asrt":"1915","depInfo":"18/CINDY8S","reqAsrt":"","reqTobt":"1930"}}"#;
+        let s = aus_rumpf(roh).unwrap().unwrap();
+        assert_eq!(s.tobt_wunsch, "19:30", "gewuenschte, noch nicht uebernommene TOBT");
+        assert_eq!(s.asrt, "19:15");
+        assert_eq!(s.grund, "Ground delay");
+    }
+
+    #[test]
+    fn angenommener_wunsch_ist_kein_offener_wunsch() {
+        let roh = br#"{"callsign":"GSG7","cdmData":{"tobt":"193000","reqTobt":"1930"}}"#;
+        let s = aus_rumpf(roh).unwrap().unwrap();
+        assert_eq!(s.tobt, "19:30");
+        assert_eq!(s.tobt_wunsch, "", "schon geltende TOBT ist kein offener Wunsch mehr");
+        // Wunsch nur auf Flugebene: wird ebenso gelesen.
+        let roh = br#"{"callsign":"GSG7","reqTobt":"2045","cdmData":{}}"#;
+        assert_eq!(aus_rumpf(roh).unwrap().unwrap().tobt_wunsch, "20:45");
+    }
+
+    #[test]
+    fn platzliste_unterscheidet_ohne_cdm_von_unbekannt() {
+        let roh = br#"[{"icao":"eddf","isCdm":true,"rate":40},{"icao":"GCRR","isCdm":false},
+            {"icao":"LEBL","isCdm":true},{"isCdm":true}]"#;
+        let l = liste_lesen(roh).unwrap();
+        assert_eq!(l.get("EDDF"), Some(&true));
+        assert_eq!(l.get("LEBL"), Some(&true));
+        assert_eq!(l.get("GCRR"), Some(&false));
+        // Fehlt ein Platz, ist das unbekannt — nicht „ohne CDM".
+        assert_eq!(l.get("EHAM"), None);
+        assert_eq!(l.len(), 3);
+    }
+
+    #[test]
+    fn leere_oder_kaputte_platzliste_ist_ein_fehler() {
+        assert!(liste_lesen(b"[]").is_err(), "sonst hiesse es ueberall: kein CDM");
+        assert!(liste_lesen(b"{\"fehler\":1}").is_err());
+    }
+
+    #[test]
+    fn der_abruf_nimmt_dasselbe_rufzeichen_wie_der_funk() {
+        let quelle = include_str!("vdgs.rs");
+        let von = quelle
+            .find("pub async fn vdgs_stand")
+            .expect("vdgs_stand nicht gefunden");
+        // Bis zum Ende der Funktion, nicht 1200 Zeichen weit: Beim
+        // Einbau der Flugwache rutschte der Aufruf aus dem festen
+        // Fenster, und der Waechter schlug an, obwohl nichts falsch war.
+        let rumpf = &quelle[von..];
+        let rumpf = &rumpf[..rumpf.find("\n}\n").unwrap_or(rumpf.len())];
+        let aufloesung = rumpf
+            .find("hoppie::resolve_callsign")
+            .expect("vdgs_stand loest das Rufzeichen nicht wie der Funk auf");
+        assert!(
+            !rumpf.contains("hoppie_get_flight_context"),
+            "vdgs_stand umgeht die Uebersteuerung aus den Einstellungen",
+        );
+        // Und das aufgeloeste Rufzeichen muss auch das sein, mit dem
+        // gefragt wird — ein Aufruf ins Leere waere sonst genauso gruen.
+        let abruf = rumpf
+            .find("abrufen(&callsign)")
+            .expect("es wird nicht mit dem aufgeloesten Rufzeichen gefragt");
+        assert!(abruf > aufloesung, "gefragt wird vor dem Aufloesen");
+        // Und nur bei laufendem Flug — sonst koennte ein Tablet ueber
+        // die LAN-Bruecke auch ohne Flug fragen.
+        // Nicht nur, DASS der Name vorkommt — ein ungenutzter Aufruf
+        // genuegte sonst (Codex-Abnahme, zweite Runde). Das Ergebnis
+        // muss die Funktion abbrechen lassen, und zwar VOR dem Abruf.
+        let wache = rumpf
+            .find("vdgs_flug_kennung(&app)?")
+            .expect("vdgs_stand bricht ohne laufenden Flug nicht ab");
+        assert!(wache < abruf, "die Flugwache greift erst NACH dem Abruf",);
+        // Und die Kennung muss in den Speicherschluessel fliessen —
+        // sonst teilen sich zwei Fluege wieder einen Platz.
+        assert!(
+            rumpf.contains("schluessel(&flug_id, &callsign)"),
+            "die Flugkennung landet nicht im Speicherschluessel",
+        );
+    }
+
+    /// Unbekanntes Rufzeichen: HTTP 200, leerer Rumpf. Muss „kein
+    /// Eintrag" heissen, nicht „Fehler". Am 20.09.2026 am echten Dienst
+    /// nachgemessen (ZZZ9999 -> 200, 0 Bytes).
+    #[test]
+    fn leerer_rumpf_ist_kein_fehler() {
+        assert_eq!(aus_rumpf(b""), Ok(None));
+        assert_eq!(aus_rumpf(b"   \n"), Ok(None));
+    }
+
+    #[test]
+    fn rumpf_ohne_rufzeichen_ist_ein_fehler_kein_leerer_eintrag() {
+        // Bis zur Codex-Abnahme am 20.09.2026 stand hier `Ok(None)` —
+        // der Test schrieb damit eine Verwechslung fest: Ein Objekt ohne
+        // Rufzeichen (Fehlerobjekt, geaendertes Schema) galt als „dieser
+        // Flug ist dort nicht gefuehrt". Folge: Ein guter Stand im
+        // Zwischenspeicher wurde durch `None` ersetzt, die Ueberbrueckung
+        // bei Ausfall umgangen, das Band verschwand.
+        //
+        // „Kein Eintrag" sagt die Gegenseite durch einen LEEREN Rumpf
+        // oder 404 — beides weiter unten geprueft.
+        assert!(aus_rumpf(br#"{"callsign":""}"#).is_err());
+        assert!(aus_rumpf(br#"{"error":"rate limited"}"#).is_err());
+        assert!(aus_rumpf(b"[]").is_err(), "leere Liste ist kein Eintrag");
+        // Gegenprobe: Der echte Weg fuer „kein Eintrag" bleibt still.
+        assert_eq!(aus_rumpf(b""), Ok(None));
+        assert_eq!(aus_rumpf(b"   \n"), Ok(None));
+    }
+
+    #[test]
+    fn liste_wird_ebenso_gelesen_wie_ein_einzelnes_objekt() {
+        let s = aus_rumpf(br#"[{"callsign":"GSG1","cdmData":{"tsat":"120000"}}]"#)
+            .expect("lesbar")
+            .expect("ein Eintrag");
+        assert_eq!(s.tsat, "12:00");
+    }
+
+    #[test]
+    fn kaputter_rumpf_meldet_fehler() {
+        assert!(aus_rumpf(b"<html>nope</html>").is_err());
+    }
+
+    #[test]
+    fn rufzeichen_wird_auf_erlaubte_zeichen_gestutzt() {
+        assert_eq!(sauberes_rufzeichen(" dlh4tk "), "DLH4TK");
+        assert_eq!(sauberes_rufzeichen("GSG1&profile=true"), "GSG1PROFILETRUE");
+        assert_eq!(sauberes_rufzeichen("N-123"), "N-123");
+        assert_eq!(sauberes_rufzeichen("  "), "");
+    }
+
+    #[test]
+    fn taxi_null_zaehlt_als_unbekannt() {
+        let f = ApiFlug {
+            taxi: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(aufbereiten(&f).taxi_min, None);
+    }
+}
+
+// **Bewusst KEIN Setzen von hier aus** (Thomas, 20.09.2026).
+//
+// Ein erster Anlauf schrieb die Uebersteuerung direkt aus der Platte.
+// Die Codex-Abnahme zeigte, dass daran drei Dinge haengen, die man
+// nicht nebenbei erledigt:
+//
+//  * Hoppie merkt sich das Rufzeichen beim VERBINDEN (`from_callsign`).
+//    Ohne Neuaufbau funkt eine laufende Verbindung weiter unter dem
+//    alten, waehrend VDGS schon das neue nimmt — der Pilot arbeitet
+//    unter ZWEI Identitaeten. Das ist schlimmer als ein leeres Band.
+//  * `read_settings` + `write_settings` einzeln ist ein Wettlauf mit
+//    dem Einstellungsfenster; dabei gingen Station oder
+//    Benachrichtigungen verloren.
+//  * Aus `DLH 123` wurde stillschweigend `DLH123` — ein anderes,
+//    plausibel aussehendes Rufzeichen als Funkidentitaet.
+//
+// Geaendert wird deshalb weiter dort, wo es hingehoert: im
+// CPDLC-Fenster, das seit v1.5.6 den Neuaufbau selbst macht. Die Platte
+// ZEIGT nur, womit gefragt wurde — das war der eigentliche Gewinn.

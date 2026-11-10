@@ -1,0 +1,773 @@
+// v0.7.8 — Landing-Rate-Explainability (Pilot-Client)
+// Spec: docs/spec/v0.7.8-landing-rate-explainability.md (v1.8 APPROVED)
+//
+// Erklaert dem Piloten WARUM seine Sinkrate-Bewertung so ist wie sie ist:
+// 1. Aufklaerungs-Block — "Welche Sinkrate ist die richtige?"
+// 2. Tool-Mittel-Tiles (1.5 s / 1.0 s / 0.5 s / 0.25 s) — was Volanta/Cockpit-VSI zeigt
+// 3. Bucket-Aufschluesselung — wie sich VS in jeder Phase entwickelte
+// 4. Score-Basis-Tile — was AeroACARS scort (landing_peak_vs_fpm ?? landing_rate_fpm)
+// 5. Coaching-Tipp — ein Satz nach Prioritaet
+// 6. <details> collapsible: Position-Trace + Aufprall-G
+//
+// Design-Konsistenz (§4.5):
+// - landing-section / landing-stability / landing-stability__row CSS-Klassen
+// - lokale Sub-Komponenten im selben File (kein MetricTile/Card-Import — die
+//   existieren im Pilot-Client nicht, nur in der VPS-Webapp)
+// - CSS-Variablen statt Hex-Hardcodes
+// - Pattern wie StabilityIndicator/CoachTip/QuickFlags in LandingPanel.tsx
+
+import { useTranslation } from "react-i18next";
+import "./landungForensik.css";
+// `istBewertbar` lebt in lib/landungsFormat.ts (ohne CSS, auch in reinen
+// Node-Tests ladbar); hier weiter exportiert für bestehende Aufrufer.
+import { istBewertbar } from "../lib/landungsFormat";
+export { istBewertbar };
+import type { LandingRecord, LandingProfilePoint } from "../lib/landungsDatensatz";
+import {
+  T_VS_FIRM_FPM,
+  T_VS_HARD_FPM,
+  T_VS_SEVERE_FPM,
+} from "../lib/bewertungsGrenzen";
+// v0.19.x FIX: this file used to define its OWN hardcoded 3-band G-color
+// function (1.4/1.7, no "neutral"/"err-severe") that disagreed with
+// GForceForensik's real 5-band T_G_* ladder — the SAME peak-G value shown
+// on both panels of one report could read as a different color in each
+// (e.g. 1.25 G: green here, neutral there). Importing the single real
+// implementation instead of re-deriving it closes that drift for good.
+import { gTone } from "./GForceForensik";
+import { InfoBadge } from "./InfoBadge";
+import { useDruck } from "../lib/druck";
+
+// ───────────────────────────────────────────────────────────────────────────
+// Pure functions — gut testbar isoliert von React
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Render-Gate: rendert die Sektion wenn IRGENDEIN Forensik-Feld vorhanden.
+/// Spec §3.1, §6 A1.
+export function hasForensics(record: Pick<LandingRecord,
+  | "forensic_sample_count"
+  | "vs_smoothed_250ms_fpm"
+  | "vs_smoothed_500ms_fpm"
+  | "vs_smoothed_1000ms_fpm"
+  | "vs_smoothed_1500ms_fpm"
+  | "vs_at_edge_fpm"
+>): boolean {
+  return record.forensic_sample_count != null
+    || record.vs_smoothed_250ms_fpm != null
+    || record.vs_smoothed_500ms_fpm != null
+    || record.vs_smoothed_1000ms_fpm != null
+    || record.vs_smoothed_1500ms_fpm != null
+    || record.vs_at_edge_fpm != null;
+}
+
+/// v0.7.20 (QS-Befund GSG219): Pilot-Aufklaerung wenn der 50-Hz-Buffer-
+/// Dump fehlt. Unterscheidung zwischen
+///   - "alter Flug, Forensik gab's damals noch nicht" (forensics_version < 2)
+///   - "v2-Flug, aber Sampler-Edge-Buffer fehlt fuer diesen Touchdown"
+/// Vorher zeigten beide Faelle den irrefuehrenden Legacy-Text.
+export function pickForensicsLegacyKey(
+  record: Pick<LandingRecord, "forensics_version">,
+): "legacy_notice_text" | "no_edge_buffer_text" {
+  const isV2 = (record.forensics_version ?? 0) >= 2;
+  return isV2 ? "no_edge_buffer_text" : "legacy_notice_text";
+}
+
+export interface Bucket {
+  /// Anzeige-Label fuer die Phase, z.B. "−1.5 s … −1.0 s"
+  label: string;
+  /// Berechnete mittlere VS in fpm (negativ = sinkend) — was der Balken ZEIGT.
+  vs: number;
+  /// v1.6.3: Wert fuer die Trend-Diagnose, gesetzt wenn `vs` aus einer
+  /// anderen Messreihe stammt als die Nachbarbalken. Ohne ihn verglichen
+  /// isMonotonAccelerating und pickCoachingTip Hoehenkurve gegen Instrument
+  /// und meldeten einen Trend, den es im Flug nicht gab.
+  trendVs?: number;
+}
+
+/// Bucket-Aufschluesselung aus den 4 kumulativen Mittelwerten + Edge.
+/// Spec §3.2. disjoint-Bucket-Differenz:
+///   mean[-1500..-1000] = (1500*m1500 - 1000*m1000) / 500
+///   mean[-1000..-500]  = (1000*m1000 - 500*m500) / 500
+///   mean[-500..-250]   = (500*m500 - 250*m250) / 250
+///   mean[-250..0]      = vs_at_edge_fpm (fallback vs_smoothed_250ms_fpm)
+export function computeBuckets(
+  vs1500: number | null | undefined,
+  vs1000: number | null | undefined,
+  vs500: number | null | undefined,
+  vs250: number | null | undefined,
+  vsEdge: number | null | undefined,
+  /** v1.6.3: der Instrument-Wert am Aufsetzpunkt, falls vorhanden. Nur fuer
+   *  die Trend-Diagnose — angezeigt wird weiterhin der bewertete Wert. */
+  vsSimvarEdge?: number | null,
+): Bucket[] | null {
+  // Alle 5 Werte muessen vorhanden sein (oder edge-Fallback auf 250ms-Mittel).
+  // Spec §3.1: Bucket-Sub-Sektion ausgeblendet wenn nicht alle 5 da.
+  if (vs1500 == null || vs1000 == null || vs500 == null || vs250 == null) {
+    return null;
+  }
+  const edge = vsEdge ?? vs250;
+  // Der letzte Balken ZEIGT den bewerteten Wert (Hoehenkurve), fuer den
+  // TREND zaehlt aber der Instrument-Wert derselben Messreihe wie die drei
+  // Nachbarn. Sonst entstuende der Trend aus dem Verfahrenswechsel statt
+  // aus dem Flug — am Fixture dlh848 sind das 102 fpm, das Fuenffache der
+  // Schwelle (QS-Befund v1.6.3). Fehlt der Instrument-Wert, faellt der
+  // Trend auf das 250-ms-Mittel zurueck, das ebenfalls vom Instrument
+  // stammt.
+  const trendEnde = vsSimvarEdge ?? vs250;
+  return [
+    { label: "−1.5 s … −1.0 s", vs: (1500 * vs1500 - 1000 * vs1000) / 500 },
+    { label: "−1.0 s … −0.5 s", vs: (1000 * vs1000 - 500 * vs500) / 500 },
+    { label: "−0.5 s … −0.25 s", vs: (500 * vs500 - 250 * vs250) / 250 },
+    // v1.6.3: Der letzte Balken ist NICHT das 0,25-s-Fenster derselben
+    // Messreihe — er ist der bewertete Wert, seit v1.6.3 aus dem
+    // Höhenverlauf über 310 ms. Das alte Label „−0.25 s … TD" behauptete
+    // beides falsch: die Spanne und die Herkunft. Sichtbar wird der
+    // Unterschied als scheinbar unmöglicher Sprung gegenüber dem Nachbarn
+    // (im Fixture dlh848: −277 gegen −379 fpm).
+    { label: BEWERTET_MARKE, vs: edge, trendVs: trendEnde },
+  ];
+}
+
+/// Spec §3.2: Trend-Diagnose ueber BETRAG (sonst falsch bei negativen VS).
+///
+/// **Nur die ersten drei Balken.** Sie stammen aus derselben Messreihe
+/// (den geglaetteten Mitteln des Simulator-Instruments) und sind deshalb
+/// untereinander vergleichbar. Der vierte ist seit v1.6.3 der bewertete
+/// Wert aus dem Hoehenverlauf — ein anderes Messverfahren. Ihn
+/// mitzuvergleichen erzeugte einen Sprung aus der Umstellung statt aus dem
+/// Flug: am Fixture dlh848 sind das 102 fpm, das Fuenffache der 20-fpm-
+/// Schwelle. Der Banner "Sinkrate hat zum Touchdown hin staerker
+/// zugenommen — Flare nicht gehalten" waere damit fuer Landungen
+/// erschienen, bei denen genau das nicht passiert ist (QS-Befund v1.6.3).
+/** Platzhalter fuer das Label des bewerteten Balkens. Die Bucket-Liste
+ *  wird auch ausserhalb von React gebaut (Tests, Hilfsfunktionen), wo kein
+ *  Uebersetzer zur Hand ist — die Komponente ersetzt ihn beim Rendern.
+ *  Ein deutsches Wort direkt in der Liste waere fuer den englischen und den
+ *  italienischen Piloten woertlich sichtbar (QS-Befund v1.6.3). */
+export const BEWERTET_MARKE = "__bewertet__";
+
+export function isMonotonAccelerating(buckets: Bucket[]): boolean {
+  if (buckets.length < 4) return false;
+  const w = (b: Bucket) => Math.abs(b.trendVs ?? b.vs);
+  const deltas = [
+    w(buckets[1]!) - w(buckets[0]!),
+    w(buckets[2]!) - w(buckets[1]!),
+    w(buckets[3]!) - w(buckets[2]!),
+  ];
+  return deltas.every((d) => d > 20);
+}
+
+export type CoachingTipKey =
+  | "flare_lost"
+  | "hard_g"
+  | "no_flare"
+  | "late_drop"
+  | "clean";
+
+/// Spec §5.1: Trigger-Regeln mit Prioritaet (erster Match gewinnt).
+/// Late-Drop nutzt Math.abs (v1.3-Fix, sonst falsch bei negativen Werten).
+export function pickCoachingTip(args: {
+  buckets: Bucket[] | null;
+  peakGPost500ms: number | null | undefined;
+  flareReductionFpm: number | null | undefined;
+  vsAtEdgeFpm: number | null | undefined;
+  vsSmoothed1500ms: number | null | undefined;
+}): CoachingTipKey {
+  // 1. flare_lost — Bucket-Trend monoton |zunehmend|
+  if (args.buckets && isMonotonAccelerating(args.buckets)) {
+    return "flare_lost";
+  }
+  // 2. hard_g — peak_g_post_500ms >= 1.70
+  if (args.peakGPost500ms != null && args.peakGPost500ms >= 1.7) {
+    return "hard_g";
+  }
+  // 3. no_flare — flare_reduction_fpm < 50
+  if (args.flareReductionFpm != null && args.flareReductionFpm < 50) {
+    return "no_flare";
+  }
+  // 4. late_drop — |edge| - |1500ms-mean| > 100 (BETRAG, sonst Vorzeichen-Bug)
+  if (args.vsAtEdgeFpm != null && args.vsSmoothed1500ms != null) {
+    const drop = Math.abs(args.vsAtEdgeFpm) - Math.abs(args.vsSmoothed1500ms);
+    if (drop > 100) return "late_drop";
+  }
+  // 5. clean — kein Trigger
+  return "clean";
+}
+
+/// Tone-Bands = die exportierten T_VS_*-Konstanten aus landingScoring (SoT für
+/// den Sub-Score). Spec §4.4 — niemals divergieren lassen (Q4: ehemals
+/// hartcodierte 200/400/600/1000 hier, jetzt importiert).
+export type Tone = "good" | "neutral" | "warn" | "err" | "err-severe";
+
+/// Score-Version 19: „gut" bis zur Oberkante des Zielkorridors — die
+/// Sinkraten-Achse gibt bis 250 fpm volle Punkte (sub_landing_rate.rs,
+/// `VS_TARGET_CORRIDOR_TOP_FPM`); 200–250 fpm erschien vorher „neutral".
+const VS_KORRIDOR_OBEN_FPM = 250;
+
+export function vsTone(vs: number | null | undefined): Tone | null {
+  if (vs == null) return null;
+  const abs = Math.abs(vs);
+  if (abs < VS_KORRIDOR_OBEN_FPM) return "good";
+  if (abs < T_VS_FIRM_FPM) return "neutral";
+  if (abs < T_VS_HARD_FPM) return "warn";
+  if (abs < T_VS_SEVERE_FPM) return "err";
+  return "err-severe";
+}
+
+/// Score-Basis-Chain.
+///
+/// v0.7.17 (B-015): Bevorzuge `vs_at_edge_fpm` (50-Hz-Buffer-Edge, FAR
+/// 25.473 Engineering-Standard). Alte Felder `landing_peak_vs_fpm` /
+/// `landing_rate_fpm` kommen vom Streamer-Tick (3-30 s Cadence, je
+/// nach Phase) und liegen meist 30-50 fpm vom echten Edge entfernt.
+/// Die Webapp nutzt seit v0.7.11 den Edge-Wert konsequent (siehe
+/// `webapp/src/lib/displayVs.ts`); ohne diesen Fix zeigt der Pilot-
+/// Client einen anderen Wert als die Webapp fuer denselben Touchdown
+/// — Pilot kann sich das nicht erklaeren (User-Report 2026-05-12
+/// EIN799: Client -311 vs Web -265).
+///
+/// Negative-Check gegen Float-Noise / Pre-Touchdown-Bumps: nur Werte
+/// < 0 zaehlen als gueltiger Edge (im Sim positives V/S beim TD =
+/// Ballooning oder Sample-Glitch, nicht der echte Aufsetz-Moment).
+
+export function scoreBasisVs(record: Pick<LandingRecord,
+  "vs_at_edge_fpm" | "landing_peak_vs_fpm" | "landing_rate_fpm"
+> & { landung_nicht_bewertbar?: unknown }): number | null {
+  // ⚠ Zuerst: Wurde die Landung überhaupt gemessen?
+  //
+  // Der Client rechnet für Altdatensätze selbst (Legacy-Pfad weiter unten
+  // in LandingPanel), und diese Funktion ist dort die Quelle der Sinkrate.
+  // Ohne diese Sperre zeigte der Client eine Zahl, während Rust, PIREP und
+  // Webapp „nicht bewertbar" sagen — genau die Art Riss, die den
+  // PIA3452-Split ausgelöst hat (Log -233 gegen Karte -206).
+  if (record.landung_nicht_bewertbar != null) return null;
+  if (record.vs_at_edge_fpm != null && record.vs_at_edge_fpm < 0) {
+    return record.vs_at_edge_fpm;
+  }
+  return record.landing_peak_vs_fpm ?? record.landing_rate_fpm;
+}
+
+export interface TraceSample {
+  t_ms: number;
+  vs_fpm: number;
+  agl_ft: number;
+}
+
+/// Position-Trace aus touchdown_profile (NICHT approach_samples — die hat
+/// nur vs_fpm/bank_deg, keine t_ms/agl_ft im Base-Struct).
+/// Filter t_ms ∈ [-3500, 0], reduziert auf ~5 repraesentative Punkte.
+export function selectTraceSamples(
+  profile: LandingProfilePoint[] | null | undefined,
+): TraceSample[] {
+  if (!profile || profile.length < 3) return [];
+  const inWindow = profile.filter((p) => p.t_ms >= -3500 && p.t_ms <= 0);
+  if (inWindow.length < 3) return [];
+
+  // Nearest-Neighbor bei -3000, -2000, -1000, -500, -100 ms
+  const targets = [-3000, -2000, -1000, -500, -100];
+  const seen = new Set<number>();
+  const picked: TraceSample[] = [];
+  for (const target of targets) {
+    let best: LandingProfilePoint | null = null;
+    let bestDist = Infinity;
+    for (const p of inWindow) {
+      const d = Math.abs(p.t_ms - target);
+      if (d < bestDist) {
+        bestDist = d;
+        best = p;
+      }
+    }
+    if (best && !seen.has(best.t_ms)) {
+      seen.add(best.t_ms);
+      picked.push({ t_ms: best.t_ms, vs_fpm: best.vs_fpm, agl_ft: best.agl_ft });
+    }
+  }
+  return picked;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Haupt-Component
+// ───────────────────────────────────────────────────────────────────────────
+
+export function SinkrateForensik({ record }: { record: LandingRecord }) {
+  const { t } = useTranslation();
+  const druck = useDruck();
+
+  if (!hasForensics(record)) {
+    // v0.7.20 (QS-Befund GSG219): zwei verschiedene Texte je nach
+    // forensics_version — vorher zeigte selbst ein v2-Flug die
+    // "alter Flug"-Notice, was Piloten in die Irre fuehrte. Spec §QS-R
+    // Notice-Text-Differenzierung.
+    const noticeKey = pickForensicsLegacyKey(record);
+    return (
+      <section className="landing-section">
+        <h3>{t("landing.sinkrate_forensik.title")}{" "}<InfoBadge explanation={t("landing.erklaer.sinkrate_forensik")} /></h3>
+        <div className="sinkrate-forensik-legacy">
+          {t(`landing.sinkrate_forensik.${noticeKey}`)}
+        </div>
+      </section>
+    );
+  }
+
+  const buckets = computeBuckets(
+    record.vs_smoothed_1500ms_fpm,
+    record.vs_smoothed_1000ms_fpm,
+    record.vs_smoothed_500ms_fpm,
+    record.vs_smoothed_250ms_fpm,
+    record.vs_at_edge_fpm,
+    record.vs_simvar_edge_fpm,
+  );
+  const tipKey = pickCoachingTip({
+    buckets,
+    peakGPost500ms: record.peak_g_post_500ms,
+    // 05.10.2026: mit Höhenmessung (Abfangen ab 50 ft) zählt deren
+    // Reduktion — die alte aus den 2 s vor TD meldete bei langem Schweben
+    // fälschlich „Kein Flare" (QAF434, THY39).
+    flareReductionFpm: record.abfangen?.reduktion_fpm ?? record.flare_reduction_fpm,
+    vsAtEdgeFpm: record.vs_at_edge_fpm,
+    vsSmoothed1500ms: record.vs_smoothed_1500ms_fpm,
+  });
+  const trace = selectTraceSamples(record.touchdown_profile);
+  const scoreVs = scoreBasisVs(record);
+  // v0.16.22 FIX 3: use the CANONICAL backend `flare_reduction_fpm` directly
+  // instead of recomputing `|peak_vs_pre_flare_fpm| − |vs_at_edge_fpm|`. The
+  // old recompute mixed the AGL-derived peak with the de-lagged edge, so on
+  // MSFS it could go negative / disagree with the backend value and with
+  // `flare_detected` (and with LandingPanel.tsx, which already uses the
+  // canonical value). The backend computes the reduction from internally-
+  // consistent endpoints (AGL on the AGL path, SimVar on fallback); reading
+  // it here keeps both panels and the detection flag in lockstep. Positive =
+  // the flare reduced the sink rate; null/≤0 = no reduction.
+  // 05.10.2026: Flüge mit Abfang-Messung zeigen Sinkrate bei 50 ft und die
+  // Reduktion bis zum Aufsetzen; ältere unverändert die 2-s-Werte.
+  const abf = record.abfangen?.vs_50ft_fpm != null ? record.abfangen : null;
+  const vorFlare = abf ? abf.vs_50ft_fpm : record.peak_vs_pre_flare_fpm;
+  const flareRoh = abf ? abf.reduktion_fpm : record.flare_reduction_fpm;
+  const flareReduction = flareRoh != null ? Math.round(flareRoh) : null;
+
+  return (
+    <section className="landing-section landing-section--sinkrate-forensik">
+      <h3>{t("landing.sinkrate_forensik.title")}{" "}<InfoBadge explanation={t("landing.erklaer.sinkrate_forensik")} /></h3>
+      {/* v1.6.9 — Variante C: nur wenn es etwas zu sagen gibt. */}
+      {(() => {
+        const h = sinkrateHinweis(record);
+        if (!h) return null;
+        return (
+          <div className="sinkrate-aufschluesselung" role="note">
+            {h.art === "gelaende"
+              ? t(
+                  // QS: bei 7 von 95 Gelände-Hinweisen im Bestand ist das
+                  // Flugzeug im Messfenster sogar noch gestiegen (Skiathos,
+                  // K4S2, Ponta Delgada). „Dein Sinkflug lag bei +89 fpm"
+                  // wäre dort Unsinn — dafür ein eigener Satz.
+                  (h.eigensinken ?? 0) > 0
+                    ? "landing.sinkrate_forensik.gelaende_hinweis_steigend"
+                    : "landing.sinkrate_forensik.gelaende_hinweis",
+                  {
+                    gelaende: h.gelaende,
+                    eigensinken: Math.abs(h.eigensinken ?? 0),
+                  },
+                )
+              : t("landing.sinkrate_forensik.sim_abstand_hinweis", {
+                  referenz: h.simReferenz,
+                  abstand: h.abstand,
+                })}
+          </div>
+        );
+      })()}
+
+      {/* Block [1] — Aufklaerungs-Block (cyan Border-Left) */}
+      <div className="sinkrate-forensik-intro">
+        <div className="sinkrate-forensik-intro__header">
+          📊 {t("landing.sinkrate_forensik.intro_header")}
+        </div>
+        <div className="sinkrate-forensik-intro__body">
+          {t("landing.sinkrate_forensik.intro_body")}
+        </div>
+      </div>
+
+      {/* Block [2] — Tool-Mittelwerte (4 Tiles) */}
+      <div className="sinkrate-forensik-section">
+        <div className="sinkrate-forensik-section__title">
+          📺 {t("landing.sinkrate_forensik.tool_section_title")}
+        </div>
+        <div className="sinkrate-forensik-section__subtitle">
+          {t("landing.sinkrate_forensik.tool_section_subtitle")}
+        </div>
+        <div className="sinkrate-forensik-tiles">
+          <SmoothedVsTile
+            label={t("landing.sinkrate_forensik.tile_1500ms")}
+            value={record.vs_smoothed_1500ms_fpm ?? null}
+          />
+          <SmoothedVsTile
+            label={t("landing.sinkrate_forensik.tile_1000ms")}
+            value={record.vs_smoothed_1000ms_fpm ?? null}
+          />
+          <SmoothedVsTile
+            label={t("landing.sinkrate_forensik.tile_500ms")}
+            value={record.vs_smoothed_500ms_fpm ?? null}
+            volantaStyle
+          />
+          <SmoothedVsTile
+            label={t("landing.sinkrate_forensik.tile_250ms")}
+            value={record.vs_smoothed_250ms_fpm ?? null}
+          />
+        </div>
+      </div>
+
+      {/* Block [3] — Bucket-Aufschluesselung */}
+      {buckets && (
+        <div className="sinkrate-forensik-section">
+          <div className="sinkrate-forensik-section__title">
+            {t("landing.sinkrate_forensik.bucket_title")}
+          </div>
+          <div className="sinkrate-forensik-section__subtitle">
+            {t("landing.sinkrate_forensik.bucket_subtitle")}
+          </div>
+          <VsBucketBreakdown buckets={buckets} />
+          {isMonotonAccelerating(buckets) && (
+            <div className="sinkrate-forensik-trend-note">
+              📉 {t("landing.sinkrate_forensik.bucket_trend_drop")}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Block [4] — Score-Basis */}
+      <div className="sinkrate-forensik-section">
+        <div className="sinkrate-forensik-section__title">
+          ⭐ {t("landing.sinkrate_forensik.score_section_title")}
+        </div>
+        <div className="sinkrate-forensik-section__subtitle">
+          {t("landing.sinkrate_forensik.score_section_subtitle")}
+        </div>
+        <ScoreBasisTile
+          vs={scoreVs ?? null}
+          quelle={record.vs_at_edge_quelle ?? null}
+          landingSource={record.landing_source ?? null}
+        />
+        {vorFlare != null && (
+          <div className="sinkrate-forensik-pre-flare">
+            <span className="sinkrate-forensik-pre-flare__label">
+              {t(abf ? "landing.sinkrate_forensik.vs_50ft_label" : "landing.sinkrate_forensik.peak_pre_flare_label")}
+            </span>
+            <span className="sinkrate-forensik-pre-flare__value">
+              {Math.round(vorFlare)} fpm
+            </span>
+            {flareReduction != null && (
+              <span className="sinkrate-forensik-pre-flare__reduction">
+                · {flareReduction > 0
+                  ? t("landing.sinkrate_forensik.peak_pre_flare_reduction", { reduction: flareReduction })
+                  : t("landing.sinkrate_forensik.peak_pre_flare_reduction_none")}
+              </span>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Block [5] — Coaching-Tipp */}
+      <div className="sinkrate-forensik-coach">
+        💡 {t(`landing.sinkrate_forensik.tip.${tipKey}`)}
+      </div>
+
+      {/* Block [6] — Details (collapsible) */}
+      {(trace.length >= 3 || record.peak_g_post_500ms != null) && (
+        <details className="sinkrate-forensik-details" open={druck || undefined}>
+          <summary>{t("landing.sinkrate_forensik.details_summary")}</summary>
+          {trace.length >= 3 && (
+            <PositionTrace samples={trace} />
+          )}
+          {record.peak_g_post_500ms != null && (
+            <ImpactTiles
+              g500ms={record.peak_g_post_500ms}
+              g1000ms={record.peak_g_post_1000ms ?? null}
+            />
+          )}
+        </details>
+      )}
+    </section>
+  );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Lokale Sub-Komponenten (Pattern wie StabilityIndicator/CoachTip im
+// gleichen LandingPanel-File — NICHT von externer Library)
+// ───────────────────────────────────────────────────────────────────────────
+
+function SmoothedVsTile({
+  label,
+  value,
+  volantaStyle,
+}: {
+  label: string;
+  value: number | null;
+  volantaStyle?: boolean;
+}) {
+  const { t } = useTranslation();
+  const tone = vsTone(value);
+  const valueText = value != null ? `${Math.round(value)}` : "—";
+  const naTooltip = value == null ? t("landing.sinkrate_forensik.tile_na_tooltip") : undefined;
+  return (
+    <div
+      className={`sinkrate-tile ${tone ? `sinkrate-tile--${tone}` : "sinkrate-tile--na"}`}
+      title={naTooltip}
+      aria-label={naTooltip ? `${label}: ${naTooltip}` : undefined}
+    >
+      <div className="sinkrate-tile__label">
+        {label}
+        {volantaStyle && (
+          <span className="sinkrate-tile__hint">
+            {" · "}{t("landing.sinkrate_forensik.tile_volanta_hint")}
+          </span>
+        )}
+      </div>
+      <div className="sinkrate-tile__value">
+        {valueText}
+        {value != null && <span className="sinkrate-tile__unit"> fpm</span>}
+      </div>
+    </div>
+  );
+}
+
+function ScoreBasisTile({
+  vs,
+  quelle,
+  landingSource,
+}: {
+  /** `null`, wenn die Landung nicht gemessen werden konnte. */
+  vs: number | null;
+  /** v1.6.3: das MESSVERFAHREN (`hoehenkurve` / `simvar_fallback`). */
+  quelle: string | null;
+  /** Ältere Aufzeichnungen: nur die Buffer-Stelle, kein Verfahren. */
+  landingSource: string | null;
+}) {
+  const { t } = useTranslation();
+  // Ohne Messung bleibt die Kachel leer statt eine Zahl zu erfinden. Der
+  // Grund steht darüber im Panel, mit den gemessenen Werten.
+  if (vs == null) {
+    return (
+      <div className="sinkrate-score-tile">
+        <div className="sinkrate-score-tile__heading">
+          {t("landing.sinkrate_forensik.score_basis_label")}
+        </div>
+        <div className="sinkrate-score-tile__value sinkrate-score-tile__value--leer">
+          {t("landing.nicht_bewertbar.kein_wert", { defaultValue: "nicht gemessen" })}
+        </div>
+      </div>
+    );
+  }
+  const tone = vsTone(vs);
+  return (
+    <div className={`sinkrate-score-tile ${tone ? `sinkrate-score-tile--${tone}` : ""}`}>
+      <div className="sinkrate-score-tile__heading">
+        {t("landing.sinkrate_forensik.score_basis_label")}
+      </div>
+      <div className="sinkrate-score-tile__sublabel">
+        {t("landing.sinkrate_forensik.score_basis_sublabel")}
+      </div>
+      <div className="sinkrate-score-tile__value">
+        {Math.round(vs)}
+        <span className="sinkrate-score-tile__unit"> fpm</span>
+      </div>
+      {/* Die Quelle nur zeigen, wenn sie das VERFAHREN benennt. Für
+          Aufzeichnungen vor v1.6.3 stand hier `landing_source` — also
+          `vs_at_edge_50hz`, eine Buffer-Stelle. Unter einer aus der
+          Höhenkurve gerechneten Zahl war das schlicht das falsche Wort. */}
+      {quelle ? (
+        <div className="sinkrate-score-tile__source">
+          {t("landing.sinkrate_forensik.score_basis_source_pill")}
+          <code className="sinkrate-score-tile__source-code">
+            {t(`landing.sinkrate_forensik.quelle.${quelle}`, {
+              defaultValue: quelle,
+            })}
+          </code>
+        </div>
+      ) : (
+        landingSource != null &&
+        landingSource !== "" && (
+          <div className="sinkrate-score-tile__source">
+            {t("landing.sinkrate_forensik.score_basis_source_pill")}
+            <code className="sinkrate-score-tile__source-code">{landingSource}</code>
+          </div>
+        )
+      )}
+      <div className="sinkrate-score-tile__hint">
+        {quelle
+          ? t(`landing.sinkrate_forensik.score_basis_hint_${quelle}`, {
+              defaultValue: t("landing.sinkrate_forensik.score_basis_hint"),
+            })
+          : t("landing.sinkrate_forensik.score_basis_hint")}
+      </div>
+    </div>
+  );
+}
+
+function VsBucketBreakdown({ buckets }: { buckets: Bucket[] }) {
+  const { t } = useTranslation();
+  const maxAbs = Math.max(...buckets.map((b) => Math.abs(b.vs)), 1);
+  return (
+    <div className="sinkrate-buckets">
+      {buckets.map((b, i) => {
+        const pct = (Math.abs(b.vs) / maxAbs) * 100;
+        const tone = vsTone(b.vs);
+        return (
+          <div className="sinkrate-bucket-row" key={i}>
+            <div className="sinkrate-bucket-row__label">
+              {b.label === BEWERTET_MARKE
+                ? t("landing.sinkrate_forensik.bucket_bewertet")
+                : b.label}
+            </div>
+            <div className="sinkrate-bucket-row__bar">
+              <div
+                className={`sinkrate-bucket-row__fill ${tone ? `sinkrate-bucket-row__fill--${tone}` : ""}`}
+                style={{ width: `${pct}%` }}
+              />
+            </div>
+            <div className="sinkrate-bucket-row__value">
+              {Math.round(b.vs)} <span className="sinkrate-bucket-row__unit">fpm</span>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function PositionTrace({ samples }: { samples: TraceSample[] }) {
+  const { t } = useTranslation();
+  return (
+    <div className="sinkrate-trace">
+      <div className="sinkrate-trace__title">
+        📍 {t("landing.sinkrate_forensik.trace_title")}
+      </div>
+      <div className="sinkrate-trace__caption">
+        {t("landing.sinkrate_forensik.trace_caption")}
+      </div>
+      <table className="sinkrate-trace__table">
+        <tbody>
+          {samples.map((s, i) => (
+            <tr key={i}>
+              <td className="sinkrate-trace__t">
+                t = {(s.t_ms / 1000).toFixed(1)} s
+              </td>
+              <td className="sinkrate-trace__vs">
+                vs = {Math.round(s.vs_fpm)} fpm
+              </td>
+              <td className="sinkrate-trace__agl">
+                AGL {Number.isFinite(s.agl_ft) ? Math.round(s.agl_ft) : "—"} ft
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function ImpactTiles({ g500ms, g1000ms }: { g500ms: number; g1000ms: number | null }) {
+  const { t } = useTranslation();
+  return (
+    <div className="sinkrate-impact">
+      <div className="sinkrate-impact__title">
+        💥 {t("landing.sinkrate_forensik.impact_title")}
+      </div>
+      <div className="sinkrate-impact__tiles">
+        <div className={`sinkrate-impact__tile sinkrate-impact__tile--${gTone(g500ms) ?? "na"}`}>
+          <div className="sinkrate-impact__label">{t("landing.sinkrate_forensik.impact_g_500ms")}</div>
+          <div className="sinkrate-impact__value">{g500ms.toFixed(2)} <span>G</span></div>
+        </div>
+        {g1000ms != null && (
+          <div className={`sinkrate-impact__tile sinkrate-impact__tile--${gTone(g1000ms) ?? "na"}`}>
+            <div className="sinkrate-impact__label">{t("landing.sinkrate_forensik.impact_g_1000ms")}</div>
+            <div className="sinkrate-impact__value">{g1000ms.toFixed(2)} <span>G</span></div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── v1.6.9: woraus die gemessene Sinkrate besteht ─────────────────────
+//
+// Variante C: der Bericht bleibt ruhig und meldet sich nur, wenn es
+// etwas zu sagen gibt. Zwei Anlässe, beide aus dem Bestand hergeleitet:
+//
+//   * Gelände ab 100 fpm Beitrag — trifft 12 % der Landungen. Bei 50 fpm
+//     wären es 36 % gewesen, das ist kein Hinweis mehr, das ist Rauschen.
+//   * Abstand zur Referenz des Simulators ab 200 fpm — trifft 8 % der
+//     MSFS-Landungen. Bei 100 fpm wären es 30 %, und die halbe Streuung
+//     erklärt sich ohnehin aus Gelände und Messpunkt.
+//
+// Beides ist reine Anzeige — in keine Punktzahl fließt etwas davon ein.
+/**
+ * Ab welchem Geländebeitrag der Bericht überhaupt etwas dazu sagt.
+ *
+ * v1.6.13 (nachgemessen 21.08.2026): von 100 auf 75 fpm gesenkt. Über den
+ * Bestand liegt der Geländebeitrag im Median bei 32 fpm, p75 bei 60, p90 bei
+ * 108. Bei 100 fpm meldete sich der Bericht in 11,5 % der Landungen; die
+ * Absenkung auf 75 kostet rund 4 % mehr Hinweise.
+ *
+ * Ausgelöst hat es ein Pilot, dessen Landung 93 fpm Geländebeitrag hatte —
+ * bei einer Landerate von rund 360 fpm ein Viertel der angezeigten Zahl. Er
+ * hat genau deshalb nachgefragt, und der Bericht schwieg. Ein Hinweis, der
+ * eine überraschende Zahl erklären soll, darf bei einem Viertel nicht
+ * schweigen.
+ */
+export const GELAENDE_SCHWELLE_FPM = 75;
+export const SIM_ABSTAND_SCHWELLE_FPM = 200;
+
+export interface SinkrateHinweis {
+  art: "gelaende" | "sim_abstand";
+  /** gerundete Werte für die Textbausteine */
+  gemessen: number;
+  eigensinken?: number;
+  gelaende?: number;
+  simReferenz?: number;
+  abstand?: number;
+}
+
+/** Gibt es zur gemessenen Sinkrate etwas zu erklären? `null` = nein.
+ *
+ *  Das Gelände hat Vorrang: es erklärt die Zahl selbst, während der
+ *  Abstand zur Sim-Referenz nur sagt, dass zwei Messungen auseinander
+ *  liegen. Wer beides hat, will zuerst wissen, woran es liegt. */
+export function sinkrateHinweis(record: {
+  vs_at_edge_fpm?: number | null;
+  vs_gelaende_fpm?: number | null;
+  vs_eigensinken_fpm?: number | null;
+  vs_sim_referenz_fpm?: number | null;
+}): SinkrateHinweis | null {
+  const gemessen = record.vs_at_edge_fpm;
+  if (gemessen == null || !Number.isFinite(gemessen)) return null;
+
+  const gel = record.vs_gelaende_fpm;
+  const eigen = record.vs_eigensinken_fpm;
+  if (
+    gel != null &&
+    eigen != null &&
+    Number.isFinite(gel) &&
+    Number.isFinite(eigen) &&
+    Math.abs(gel) >= GELAENDE_SCHWELLE_FPM
+  ) {
+    return {
+      art: "gelaende",
+      gemessen: Math.round(gemessen),
+      eigensinken: Math.round(eigen),
+      gelaende: Math.round(Math.abs(gel)),
+    };
+  }
+
+  const ref = record.vs_sim_referenz_fpm;
+  if (ref != null && Number.isFinite(ref)) {
+    const abstand = Math.abs(gemessen - ref);
+    if (abstand >= SIM_ABSTAND_SCHWELLE_FPM) {
+      return {
+        art: "sim_abstand",
+        gemessen: Math.round(gemessen),
+        simReferenz: Math.round(ref),
+        abstand: Math.round(abstand),
+      };
+    }
+  }
+  return null;
+}

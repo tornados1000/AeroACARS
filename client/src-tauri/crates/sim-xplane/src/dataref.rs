@@ -1,0 +1,3908 @@
+//! DataRef catalog — the SimVar-equivalent SimSnapshot fields.
+//!
+//! Every entry maps an X-Plane DataRef name to a slot in the parsed
+//! `XPlaneState` (which then converts to `SimSnapshot`). The order
+//! determines our subscription index; we send one RREF request per
+//! row and store the (index → field) mapping.
+//!
+//! All DataRef names are confirmed to exist in BOTH X-Plane 11 and
+//! 12, sourced from the official DataRef list at
+//! <https://developer.x-plane.com/datarefs/>. When 11 and 12 diverged
+//! on a given name, we use the canonical XP12 name and accept that
+//! XP11 may report a default value (so the snapshot field stays at
+//! its default rather than crashing).
+//!
+//! ## Units
+//!
+//! X-Plane DataRefs document their units explicitly. We pull values
+//! in their native unit and convert to `SimSnapshot` units in
+//! `XPlaneState::to_snapshot`. Notable conversions:
+//!
+//!   * `local_vx/vz`     m/s → ft/s for body velocity
+//!   * `acf_m_*`         kg → kg (no-op, but the field is float)
+//!   * `latitude/longitude` deg → deg (no-op, but x-plane uses
+//!     `flightmodel/position/{latitude,longitude}` not `lat_/lon_`)
+
+use sim_core::{SimSnapshot, Simulator};
+
+/// Field on the parsed `XPlaneState` to assign each DataRef value to.
+/// Each entry corresponds to one RREF subscription.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldId {
+    Latitude,
+    Longitude,
+    AltitudeMslFt,
+    AltitudeAglFt,
+    HeadingDegTrue,
+    HeadingDegMagnetic,
+    PitchDeg,
+    BankDeg,
+    /// Display / phase-FSM / approach-stability V/S — the instrument VVI
+    /// (`vvi_fpm_pilot`, already fpm), which reads ~0 in level flight.
+    VerticalSpeedFpm,
+    /// Raw, lag-free V/S for the touchdown capture — `local_vy` (m/s, world
+    /// frame), converted to fpm. Responsive (no VSI damping) but carries an
+    /// OpenGL-frame curvature bias at speed, so it is used ONLY for the
+    /// touchdown signal, never for display/FSM/stability.
+    VerticalSpeedRawFpm,
+    GroundspeedKt,
+    IndicatedAirspeedKt,
+    TrueAirspeedKt,
+    GForce,
+    OnGround,
+    /// v0.4.4: Normal force on the gear (N). Used for sampler-side
+    /// touchdown edge detection — fires far earlier and more reliably
+    /// than `OnGround` which is a binary flight-model flag.
+    GearNormalForceN,
+    ParkingBrake,
+    GearDeploy,
+    FlapsHandle,
+    Eng1Running,
+    Eng2Running,
+    Eng3Running,
+    Eng4Running,
+    FuelTotalKg,
+    EmptyWeightKg,
+    TotalWeightKg,
+    /// WORLD-frame (OpenGL) X velocity (m/s), positive EAST — from
+    /// `sim/flightmodel/position/local_vx`. Rotated by true heading into
+    /// the body frame at snapshot time (see `body_velocity_fps`).
+    ///
+    /// v0.16.9: was `sim/flightmodel/forces/local_vx` (body frame). The
+    /// `forces/` family is written by X-Plane's OWN flight model and reads
+    /// a constant 0.0 on addons with an external FM (FlightFactor/LevelUp
+    /// 767 — live flight BCS8: 0.0 through a 256-kt takeoff roll), which
+    /// froze the Pushback→TaxiOut forward-motion gate for the whole
+    /// flight. The `position/` family is maintained by the sim core from
+    /// the kinematic state and is alive on every addon (the same family
+    /// already powers `VerticalSpeedRawFpm` and `GroundspeedKt`).
+    LocalVxMs,
+    /// WORLD-frame (OpenGL) Z velocity (m/s), positive SOUTH — from
+    /// `sim/flightmodel/position/local_vz`. See `LocalVxMs` for why the
+    /// `position/` family replaced `forces/` in v0.16.9.
+    LocalVzMs,
+    /// Wind X relative to airframe (m/s).
+    WindXMs,
+    /// Wind Z relative to airframe (m/s).
+    WindZMs,
+    /// v0.5.19: meteorological wind speed at aircraft altitude (m/s).
+    /// Source for SimSnapshot::wind_speed_kt — was hardcoded None
+    /// in X-Plane builds before, MQTT live-tracking server reported
+    /// the wind field as missing for X-Plane pilots.
+    WindNowSpeedMs,
+    /// v0.5.19: meteorological wind direction at aircraft altitude
+    /// (degrees true). Source for SimSnapshot::wind_direction_deg.
+    WindNowDirectionDegT,
+    // Phase 2 additions:
+    LightLanding,
+    LightBeacon,
+    LightStrobe,
+    LightTaxi,
+    LightNav,
+    ApMaster,
+    ApHeading,
+    ApAltitude,
+    ApNav,
+    ApApproach,
+    SpoilersHandle,
+    StallWarning,
+    BatteryMaster,
+    AvionicsMaster,
+    ApuSwitch,
+    PitotHeat,
+    QnhInHg,
+    OatC,
+    Mach,
+    // v0.3.0 additions (universal X-Plane standard DataRefs):
+    /// Autobrake selector position: 0=RTO, 1=OFF, 2=1, 3=2, 4=3, 5=MAX.
+    AutobrakeLevel,
+    /// Transponder mode: 0=OFF, 1=STBY, 2=ON, 3=TEST, 4=ALT, 5=TA, 6=TARA.
+    TransponderMode,
+    // v0.3.0 additions (Boeing 737 family — Zibo/LevelUp/Default-B738):
+    /// `laminar/B738/toggle_switch/wing_light_pos` — 1=ON, 0=OFF.
+    LightWing,
+    /// `laminar/B738/toggle_switch/wheel_well_light_pos` — 1=ON, 0=OFF.
+    LightWheelWell,
+    /// `laminar/B738/annunciator/takeoff_config` — 1=warning, 0=clear.
+    TakeoffConfigWarning,
+    /// Spec v0.7.15 F6: `sim/time/paused` — 1 wenn der User die
+    /// Pause-Taste in X-Plane gedrueckt hat, sonst 0. Plus Replay
+    /// (`sim/time/is_in_replay`) wird zur selben Pause-Logik
+    /// aggregiert: aus AeroACARS-Sicht ist Replay "Flug-Telemetrie
+    /// ist nicht echt, also als Pause behandeln".
+    SimPaused,
+    /// Spec v0.7.15 F6: `sim/time/is_in_replay` — 1 wenn der User in
+    /// X-Planes Replay-Modus ist (eigene Pause-aehnliche Quelle).
+    SimInReplay,
+    // v0.16.7 additions (ToLiss Airbus — AirbusFBW namespace):
+    /// `AirbusFBW/AP1Engage` — int 0/1, AP1 engaged. The ToLiss fleet
+    /// (A319/A320/A321/A340-600 …) drives its autoflight through the
+    /// documented `AirbusFBW/*` datarefs and leaves the standard
+    /// `servos_on` dead (data audit 2026-06-11: `autopilot_master`
+    /// never read true across ~30 ToLiss flights).
+    TolissAp1,
+    /// `AirbusFBW/AP2Engage` — int 0/1, AP2 engaged.
+    TolissAp2,
+    /// `AirbusFBW/ATHRmode` — int autothrust mode; 0 = off,
+    /// >0 = A/THR armed/active.
+    TolissAthrMode,
+    // v1.8.x (Bordbuch-Audit 26.09.2026) — Cockpit-Schalter, die der
+    // Standard-Katalog nicht oder falsch liefert. Alle anwesenheits-
+    // gesteuert ueber `addon_quelle`: der Adapter laesst einen Wert nur
+    // durch, wenn die Web-API den Dataref als lesbar bestaetigt — RREF
+    // selbst streamt auch fehlende Datarefs (als 0, gemessen 27.09.2026).
+    /// `sim/cockpit/electrical/beacon_lights_on` — der aeltere Beacon-
+    /// Dataref, den der Zibo 737 bedient (seine Checkliste `clist.txt`
+    /// prueft genau diesen), waehrend `cockpit2/switches/beacon_on` dort
+    /// im Audit in 100 von 102 X-Plane-Fluegen fest auf 0 stand.
+    LightBeaconLegacy,
+    /// `laminar/B738/knob/transponder_pos` — Drehschalter des Laminar-
+    /// und Zibo-737: 0=TEST 1=STBY 2=ALT OFF 3=XPNDR 4=TA 5=TA/RA
+    /// (Laminar `B738.systems.lua`, Zibo `clist.txt`). Der Laminar-737
+    /// schreibt in den Standard-`transponder_mode` fuer jede Flugstellung
+    /// nur 2 — der Schalter ist die einzige Quelle fuer ALT/TA/RA.
+    B738XpdrKnob,
+    /// `laminar/B738/autopilot/cmd_b_status` — CMD-B-Lampe (0/1) des
+    /// Laminar/Zibo-737 (`B738_Datarefs.txt` „AUTOPILOT LIGHTS“). CMD A
+    /// liest das Zibo-Profil als ApMaster; zusammen: Autopilot an, wenn
+    /// A ODER B leuchtet (01.10.2026, Thomas: „auch CMD B?“).
+    B738CmdB,
+    /// `laminar/B738/toggle_switch/logo_light` — Logo-Licht-Schalter (0/1; vmsACARS: an bei 1). Zibo-Audit 01.10.2026.
+    B738LogoLight,
+    /// `laminar/B738/ice/wing_heat_pos` — WING ANTI ICE (0-off, 1-on, Zibo-Doku). Zibo-Audit 01.10.2026.
+    B738WingHeat,
+    /// `laminar/B738/ice/eng1_heat_pos` — ENGINE 1 ANTI ICE (0-off, 1-on, Zibo-Doku). Zibo-Audit 01.10.2026.
+    B738Eng1Heat,
+    /// `laminar/B738/ice/eng2_heat_pos` — ENGINE 2 ANTI ICE (0-off, 1-on, Zibo-Doku). Zibo-Audit 01.10.2026.
+    B738Eng2Heat,
+    /// `laminar/B738/autopilot/autothrottle_status` — A/T-ARM-Lampe (Zibo-Doku „AUTOPILOT LIGHTS“). Zibo-Audit 01.10.2026.
+    B738AtArm,
+    /// `laminar/B738/annunciator/master_caution_light` — MASTER CAUTION (Zibo-Doku „CAUTION LIGHT“). Zibo-Audit 01.10.2026.
+    B738MasterCaution,
+    /// `laminar/B738/toggle_switch/seatbelt_sign_pos` — 0=OFF 1=AUTO 2=ON.
+    B738SeatbeltSign,
+    /// `laminar/B738/annunciator/speedbrake_armed` — >0 = SPEED BRAKE ARMED.
+    B738SpeedbrakeArmed,
+    /// `laminar/B738/autobrake/autobrake_pos` (nur Zibo) — 0=RTO 1=OFF
+    /// 2..5 = 1/2/3/MAX, dieselbe Skala wie `auto_brake_level`.
+    B738AutobrakePos,
+    /// `laminar/B738/flt_ctrls/flap_lever` (nur Zibo) — Hebel 0..1 ueber
+    /// die Rasten UP/1/2/5/10/15/25/30/40.
+    B738FlapLever,
+    /// `laminar/B738/FMS/vref` (Zibo) — VREF aus dem FMC, kt; 0 bis der
+    /// Pilot sie waehlt. Belegt in X-RAAS2 (`xraas2.c`) und StableApproach
+    /// (`B738_by_Alex .sacfg`, Bedingung `vref > 50`).
+    B738FmsVref,
+    /// `sim/aircraft/view/acf_Vso` — Ueberziehgeschwindigkeit in
+    /// Landekonfiguration laut Flugmodell, kt (siehe
+    /// `SimSnapshot::design_vs0_kt`).
+    AcfVso,
+    /// `AirbusFBW/OHPLightSwitches[0]` — ToLiss-Beacon-Schalter, 0/1.
+    /// Community-Beleg (xpcockpit, a319-copilot, buttonboss), keine
+    /// offizielle ToLiss-Liste verfuegbar.
+    TolissBeacon,
+    /// `AirbusFBW/SeatBeltSignsOn` — ToLiss-Anschnallzeichen, >0 = an.
+    TolissSeatBeltSigns,
+    /// `AirbusFBW/APUMaster` — ToLiss-APU-Master, 0/1. Gemessen 28.09.2026
+    /// („Flugzeug vermessen“, ToLiss A320neo): 0/1/0 beim Schalten; der
+    /// Standard `sim/cockpit2/electrical/APU_running` bleibt beim ToLiss 0
+    /// (vier Flüge mit durchgehend „APU aus“, auch am Gate).
+    TolissApuMaster,
+    /// `AirbusFBW/APLateralMode` / `APVerticalMode` — aktiver FMA-Modus als
+    /// Zahl; `APPRilluminated` / `LOCilluminated` — Lampen der FCU-Tasten.
+    /// Belegung wie XHSI (`FMA_A320.java`, QPAC/ToLiss): lateral 2 NAV,
+    /// 6/7 LOC*/LOC, 9 APP NAV, 101 HDG/TRK; vertikal 3/4 ALT CST*/ALT CST,
+    /// 6/7/8 G/S*/G/S/F-G/S, 10 FLARE, 11 LAND, 103/104/105 ALT*/ALT/ALT CRZ.
+    /// Namen stehen in der ToLiss-Datarefliste. Vorher standen HDG/NAV/ALT/
+    /// APPR beim ToLiss auf der LiveMap immer aus (Standard-Datarefs tot,
+    /// Flug-Log 28.09.2026).
+    TolissApLateralMode,
+    TolissApVerticalMode,
+    TolissApprIlluminated,
+    TolissLocIlluminated,
+    /// `AirbusFBW/AutoBrkLo` / `AutoBrkMed` / `AutoBrkMax` — je 0/1,
+    /// hoechstens einer gesetzt (kpcrew, xpcockpit, XHSI).
+    TolissAutoBrkLo,
+    TolissAutoBrkMed,
+    TolissAutoBrkMax,
+    /// `laminar/a333/switches/strobe_pos` (klein geschrieben) — Laminar-A330,
+    /// 0=OFF 1=AUTO 2=ON (`A333.lighting.lua`, Kommando-Handler). Der
+    /// Standard-`strobe_lights_on` zeigt dort nur den Effekt: bei AUTO
+    /// erst in der Luft (`A333.lighting.lua:1228`).
+    A333StrobePos,
+    /// `laminar/A333/switches/fasten_seatbelts` (gross geschrieben) —
+    /// Laminar-A330, 0=OFF 1=AUTO 2=ON (`A333.switches.lua`).
+    A333SeatbeltSwitch,
+    /// `AirbusFBW/OHPLightSwitches[7]` — ToLiss-Strobe-Schalter 0=OFF
+    /// 1=AUTO 2=ON. Keine offizielle ToLiss-Liste; mehrfach uebereinstimmend
+    /// in Community-Code (xpcockpit `a320_overhead.c` „(auto)" = 1,
+    /// phpvms/acars-config `toliss.json`, `toliss-a330.json`).
+    TolissStrobeSwitch,
+    /// `B742/ext_light/beacon_sw` — Felis 747-200, 0/1 (XPanel-Beispiel-
+    /// konfiguration, kpcrew B742).
+    FelisBeacon,
+    /// `FJS/Q4XP/Manips/TwoSwitch_Ctl[23]` — FlyJSim-Q400-Kollisionslicht-
+    /// Schalter (RED / OFF / WHITE): -1 = oben, 0 = Mitte (OFF), 1 = unten.
+    /// Beleg: Tabelle „Q4XP_datarefs_and_commands" (Le Coyote,
+    /// forums.x-plane.org Topic 325891, Befehle `ACOL_up`/`ACOL_dn`).
+    /// Welche Seite RED ist, steht dort nicht — deshalb nur „an/aus".
+    Q4xpKollisionslicht,
+    /// `laminar/A333/transponder/auto_on_knob_pos` — Laminar-A330, am
+    /// 27.09.2026 im Simulator gemessen: -1 = STBY, 0 = AUTO, 1 = ON. Der
+    /// Standard-`transponder_mode` zeigt dabei am Boden STBY 1 / AUTO 5
+    /// (GND) / ON 6 — TA/RA nie.
+    A333XpdrAutoOn,
+    /// `laminar/A333/transponder/ta_ra_knob_pos` — gemessen: 0 = STBY,
+    /// 1 = TA, 2 = TA/RA.
+    A333TaRaKnob,
+    /// `laminar/A333/transponder/alt_rpt_knob_pos` — 1 = Höhenübermittlung
+    /// an (Grundstellung), 0 = aus.
+    A333AltRptKnob,
+    // ---- 25.10.2026: P_-Profile (Michael Damhorst, GSG) ----
+    // Quelle: seine X-KeyPad-Konfigurationen „P_-Profile v1.0" fuer 18
+    // X-Plane-Muster; Dataref, Schwelle und Stellungsbild je Taste dort
+    // abgelesen. Live-Abgleich 25.10.: FF777 (24 Fluege) AP, Fluegellicht,
+    // Anschnall-/Rauchverbotszeichen nie belegt; ToLiss Fluegellicht und
+    // Rauchverbot nie; FF757/767 Fluegellicht, Schilder, Autobrake nie.
+    /// `AirbusFBW/OHPLightSwitches[1]` — ToLiss-Fluegellicht 0/1 (alle
+    /// fuenf ToLiss-Muster).
+    TolissFluegellicht,
+    /// `AirbusFBW/OHPLightSwitches[12]` — ToLiss-NO-SMOKING 0=OFF 1=AUTO
+    /// 2=ON (alle fuenf ToLiss-Muster).
+    TolissRauchverbot,
+    /// `1-sim/ckpt/lampsGlow/mcpCaptAP` / `mcpFoAP` — FF777, Leuchtkraft der
+    /// A/P-Tasten am MCP; > 0.01 = an (Schwelle aus den P_-Profilen). Die
+    /// FF777 setzt die Standard-AP-Datarefs nie (24 von 24 Fluegen aus).
+    Ff777ApL,
+    Ff777ApR,
+    /// Weitere MCP-Lampen der FF777, gleiche Schwelle. HDG SEL hat keine
+    /// Lampe — „Heading" ist nur HDG HOLD.
+    Ff777HdgHold,
+    Ff777AltHold,
+    Ff777Lnav,
+    Ff777Loc,
+    Ff777App,
+    Ff777At,
+    /// `1-sim/ckpt/indLightTestSwitch/anim` — FF777, 0=DIM 1=BRT 2=TEST.
+    /// In TEST leuchten alle Lampen; die MCP-Lampen zaehlen dann nicht.
+    Ff777LampenTest,
+    /// FlightFactor-Fluegellicht 0/1. Grundeintrag FF777
+    /// (`1-sim/ckpt/wingLightSwitch/anim`); die Profile FF757/767 biegen
+    /// ihn auf `anim/46/button` um.
+    FfFluegellicht,
+    /// FlightFactor-Anschnallzeichen 0=OFF 1=AUTO 2=ON, FF777
+    /// (`1-sim/ckpt/passSignsSeatbeltsSwitch/anim`).
+    FfAnschnallzeichen,
+    /// FlightFactor NO SMOKING / NO ELECTRONICS 0=OFF 1=AUTO 2=ON, FF777
+    /// (`1-sim/ckpt/passSignsNosmockingSwitch/anim`, fehlt im 777F).
+    FfRauchverbot,
+    /// FlightFactor-Autobrake-Waehler 0=RTO 1=OFF 2=DISARM 3..6=1..4 7=MAX.
+    /// Grundeintrag FF777 (`1-sim/ckpt/autobrakeSwitch/anim`); FF757/767
+    /// (`anim/rhotery/25`, RTO = -1) per Profil mit Versatz +1.
+    FfAutobrake,
+    /// `sim/cockpit/switches/fasten_seat_belts` / `no_smoking` — X-Plane-
+    /// Standard 0=OFF 1=AUTO 2=ON (die FF757/767 treiben ihn, P_-Profile).
+    /// Viele Muster lassen ihn unbelegt (0); er zaehlt deshalb erst, wenn
+    /// er im Flugzeug einmal ungleich 0 war.
+    StdAnschnallzeichen,
+    StdRauchverbot,
+    /// `sim/time/zulu_time_sec` — Sim-Uhrzeit UTC in Sekunden seit
+    /// Mitternacht (DataRefs.txt). Bordbuch: Tag/Nacht aus dem Sonnenstand.
+    ZuluTimeSec,
+    /// `sim/time/local_date_days` — Tag im Jahr (DataRefs.txt: „days since
+    /// January 1st at the user's location"). Ein Tag Versatz um Mitternacht
+    /// ist fuer den Sonnenstand belanglos (Deklination ±0,4°/Tag).
+    LocalDateDays,
+    // ---- X-Plane-Luecken (Vergleich mit vmsACARS, 29.09.2026) ----
+    /// `sim/time/sim_speed` — Zeitraffer (int, „1 = realtime, 2 = 2x,
+    /// 0 = paused"). Fuellt `simulation_rate`.
+    SimSpeed,
+    /// `sim/time/ground_speed_flt` — Multiplikator auf die zurueckgelegte
+    /// Strecke („faster travel via double-distance"), unabhaengig vom
+    /// Zeitraffer. Geht mit in `simulation_rate`.
+    GroundSpeedFactor,
+    /// `sim/time/framerate_period` — geglaettete Zeit je gezeichnetem
+    /// Bild in Sekunden („1.0 / FPS"). Fuellt `sim_bildrate_hz` (2.0.14,
+    /// nur Diagnose). Bewusst nicht `sim/operation/misc/frame_rate_period`:
+    /// das ist der Zeitschritt der Simulation und per Plugin ueberschreibbar.
+    FrameRatePeriod,
+    /// `sim/flightmodel2/misc/has_crashed` — int boolean, „True if the
+    /// aircraft is in a crashed state". Fuellt `crashed` (nur Flanke).
+    HasCrashed,
+    /// `sim/cockpit2/radios/actuators/transponder_code` — int, 0000-7777.
+    TransponderCode,
+    /// `sim/aircraft/controls/acf_flap_detents` — Rastenzahl des
+    /// Klappenhebels laut Flugzeugdatei (int).
+    FlapDetents,
+    /// `sim/aircraft/prop/acf_en_type[0]` — Triebwerksart (Enum): nur
+    /// Turbinen melden N1 (wie `TURB ENG N1` bei MSFS).
+    EngineType,
+    /// `sim/flightmodel/engine/ENGN_N1_[n]` — N1 in Prozent je Triebwerk.
+    Eng1N1,
+    Eng2N1,
+    Eng3N1,
+    Eng4N1,
+    /// `sim/flightmodel/engine/ENGN_FF_[n]` — Kraftstofffluss in kg/s je
+    /// Triebwerk.
+    Eng1FuelFlow,
+    Eng2FuelFlow,
+    Eng3FuelFlow,
+    Eng4FuelFlow,
+}
+
+/// One row in the catalog: a DataRef name + which snapshot field it
+/// fills. The index used over the wire equals the position in
+/// `CATALOG`.
+pub struct DatarefEntry {
+    pub name: &'static str,
+    pub field: FieldId,
+}
+
+/// The subscription catalog. Order is the wire index.
+pub const CATALOG: &[DatarefEntry] = &[
+    // --- Position ---
+    DatarefEntry {
+        name: "sim/flightmodel/position/latitude",
+        field: FieldId::Latitude,
+    },
+    DatarefEntry {
+        name: "sim/flightmodel/position/longitude",
+        field: FieldId::Longitude,
+    },
+    DatarefEntry {
+        // INDICATED altitude (the value the pilot reads off the
+        // altimeter / flies AP-ALT to). Already in feet, NO conversion
+        // needed at snapshot boundary.
+        //
+        // Why not `sim/flightmodel/position/elevation`?  That is TRUE
+        // MSL (geographic height above sea level), which differs from
+        // indicated altitude whenever the air mass is non-ISA (warmer
+        // than ISA → indicated reads lower than true → live bug
+        // 2026-05-05: pilot at FL390 mit OAT −46 °C sah AeroACARS
+        // 40,009 ft melden während das PFD korrekt 39,000 ft zeigte;
+        // Differenz 1.000 ft ist exakt die ISA-deviation × Faustformel
+        // 4 ft/°C × ~10 °C über ISA bei FL390).
+        //
+        // `altitude_ft_pilot` matches the cockpit altimeter exactly
+        // and converges with TRUE MSL on descent (where QNH ≈ STD ≈
+        // ambient). FieldId still says `_ft` — semantically correct
+        // now (used to lie about meters; see `value_setters`).
+        name: "sim/cockpit2/gauges/indicators/altitude_ft_pilot",
+        field: FieldId::AltitudeMslFt,
+    },
+    DatarefEntry {
+        // X-Plane reports AGL in METERS via `y_agl`. We convert at
+        // the snapshot boundary.
+        name: "sim/flightmodel/position/y_agl",
+        field: FieldId::AltitudeAglFt,
+    },
+    // --- Attitude / motion ---
+    DatarefEntry {
+        name: "sim/flightmodel/position/psi",
+        field: FieldId::HeadingDegTrue,
+    },
+    // `magpsi` ist laut DataRefs.txt „DO NOT USE THIS … REPLACED"; der
+    // Nachfolger heisst `mag_psi` („the old magpsi dataref was FUBAR").
+    DatarefEntry {
+        name: "sim/flightmodel/position/mag_psi",
+        field: FieldId::HeadingDegMagnetic,
+    },
+    DatarefEntry {
+        name: "sim/flightmodel/position/theta",
+        field: FieldId::PitchDeg,
+    },
+    DatarefEntry {
+        name: "sim/flightmodel/position/phi",
+        field: FieldId::BankDeg,
+    },
+    DatarefEntry {
+        // RAW vertical velocity (m/s, ohne VSI-Smoothing/Lag) — this is now the
+        // TOUCHDOWN source only (`vertical_speed_raw_fpm`); the display / phase
+        // FSM / approach-stability V/S comes from the VVI entry below.
+        //
+        // Wir lasen früher `vh_ind_fpm` — das ist die Vertical-Speed-
+        // Indicator-Anzeige wie im echten Cockpit, mit absichtlichem
+        // Damping (mehrere Sekunden Lag). Real-life VSIs sind gefiltert
+        // damit sie nicht zappeln.
+        //
+        // Live-Bug X-Plane Pilot-Test 2026-05-05 (EWL6822 LEPA→EDDG):
+        // pilot landed mit ca. -350 fpm aber AeroACARS scorte
+        // "smooth, peak_vs_fpm: +5.7" — der VSI-Wert hatte zum Touch-
+        // down-Moment schon auf nahe 0 gemittelt, der echte Sinkflug
+        // war im 500ms-Buffer-Window nicht mehr erkennbar.
+        //
+        // `local_vy` ist die rohe Z-Achsen-Geschwindigkeit in m/s,
+        // realtime, ohne Smoothing. Wir konvertieren m/s → fpm im
+        // value-setter (× 196.85 für ft/min). Vorzeichen ist umgekehrt
+        // zur fpm-Konvention: `local_vy > 0` = aufsteigend (X-Planes
+        // OpenGL-Y-Achse zeigt nach oben), während fpm > 0 = climb.
+        // Die haben dasselbe Vorzeichen — `local_vy` braucht keine
+        // Vorzeichen-Umkehrung.
+        name: "sim/flightmodel/position/local_vy",
+        field: FieldId::VerticalSpeedRawFpm,
+    },
+    DatarefEntry {
+        // Display / phase-FSM / approach-stability V/S — the instrument VVI.
+        //
+        // `local_vy` (above) is the OpenGL WORLD-frame vertical velocity and
+        // does NOT read zero in level flight — it carries a ground-speed-
+        // proportional bias (a level cruise at 341 kt GS reads ~ -277 fpm
+        // instead of ~0; X-Plane confirms local_vy is world-coordinate motion,
+        // not earth-referenced). That bias is fine for the responsive touchdown
+        // signal but wrong for the live V/S tile, the phase FSM (go-around /
+        // descent / holding gates) and approach-stability. The VVI reads ~0 in
+        // level flight (earth-referenced, lightly damped) — correct for those.
+        // It is ALREADY in fpm, so the value-setter does NOT apply the m/s→fpm
+        // factor (unlike local_vy).
+        name: "sim/cockpit2/gauges/indicators/vvi_fpm_pilot",
+        field: FieldId::VerticalSpeedFpm,
+    },
+    // --- Speeds ---
+    DatarefEntry {
+        // groundspeed is in m/s native; we convert to knots.
+        name: "sim/flightmodel/position/groundspeed",
+        field: FieldId::GroundspeedKt,
+    },
+    DatarefEntry {
+        name: "sim/flightmodel/position/indicated_airspeed",
+        field: FieldId::IndicatedAirspeedKt,
+    },
+    DatarefEntry {
+        name: "sim/flightmodel/position/true_airspeed",
+        field: FieldId::TrueAirspeedKt,
+    },
+    // --- Forces ---
+    DatarefEntry {
+        name: "sim/flightmodel2/misc/gforce_normal",
+        field: FieldId::GForce,
+    },
+    DatarefEntry {
+        // bool 0/1
+        name: "sim/flightmodel/failures/onground_any",
+        field: FieldId::OnGround,
+    },
+    DatarefEntry {
+        // Normal force on the gear (N). Nonzero exactly at the physical
+        // moment of wheel-runway contact. xgs (etabliertes X-Plane-
+        // Landing-Speed-Plugin, ~10 Jahre in production) nutzt das als
+        // Touchdown-Edge-Trigger statt `onground_any` weil letzteres
+        // im Flight-Model-Frame laggt und bouncen kann. Wir trigger
+        // unsere Sampler-Side-Edge-Detection auf einen rising edge
+        // hier: in der Luft = ~0 N, beim Touchdown spikt's auf
+        // mehrere kN für die Aircraft-Masse × Touchdown-G.
+        name: "sim/flightmodel/forces/fnrml_gear",
+        field: FieldId::GearNormalForceN,
+    },
+    DatarefEntry {
+        // 0..1 ratio (DataRefs.txt 12.4.3: „float [0..1] Parking Brake,
+        // 1 = max"). Live-Befund 29.09.2026: X-Plane protokolliert fuer den
+        // frueheren `sim/cockpit2/controls/parking_brake_ratio` „has been
+        // replaced" — dort steht er als REPLACED, dies ist der Nachfolger.
+        name: "sim/flightmodel/controls/parkbrake",
+        field: FieldId::ParkingBrake,
+    },
+    // --- Gear / flaps (just gear[0] = nose-gear deploy ratio 0..1).
+    //     IMPORTANT: explicit `[0]` suffix required! X-Plane's RREF
+    //     protocol returns unreliable values (often 0.0) for array
+    //     DataRefs without a bracket index — same issue we hit on
+    //     ENGN_running below. Live-bug 2026-05-04: pilot saw "Gear
+    //     UP" while parked at AMS in a LevelUp 737, even though all
+    //     three legs were on the ground. Adding `[0]` returns the
+    //     nose-gear ratio, which is a reliable on-ground proxy. ---
+    DatarefEntry {
+        name: "sim/flightmodel2/gear/deploy_ratio[0]",
+        field: FieldId::GearDeploy,
+    },
+    // Bordbuch-Audit 26.09.2026: `sim/flightmodel2/controls/
+    // flap_handle_deploy_ratio` ist in X-Plane 12 als REPLACED markiert
+    // (DataRefs.txt) und lieferte in allen 102 XP12-Fluegen 0.0 — auch
+    // beim Laminar-A330 und DA40. Die Hebelstellung steht jetzt hier.
+    DatarefEntry {
+        name: "sim/cockpit2/controls/flap_handle_request_ratio",
+        field: FieldId::FlapsHandle,
+    },
+    // --- Engines: explicit array index per engine. The unbracketed
+    //     `ENGN_running` was unreliable (returned 0 even when engine 1
+    //     was running on a 2-engine heavy — verified via live test).
+    //     Bracket-suffix syntax IS supported by RREF: X-Plane parses
+    //     `[N]` and returns just that array slot.
+    DatarefEntry {
+        name: "sim/flightmodel/engine/ENGN_running[0]",
+        field: FieldId::Eng1Running,
+    },
+    // --- Weight & fuel (kg native).
+    //     `acf_m_fuel_total` is the MAX TANK CAPACITY, not the
+    //     current onboard fuel weight (verified via live test: full
+    //     tank reported as 0 kg). Use the live `flightmodel/weight`
+    //     DataRef instead. ---
+    DatarefEntry {
+        name: "sim/flightmodel/weight/m_fuel_total",
+        field: FieldId::FuelTotalKg,
+    },
+    DatarefEntry {
+        name: "sim/aircraft/weight/acf_m_empty",
+        field: FieldId::EmptyWeightKg,
+    },
+    DatarefEntry {
+        name: "sim/flightmodel/weight/m_total",
+        field: FieldId::TotalWeightKg,
+    },
+    // --- World-frame velocity (m/s) — rotated to body frame at snapshot
+    // time (`body_velocity_fps`). `position/` (sim-core kinematics, alive
+    // on every addon), NOT `forces/` (own-FM only; constant 0.0 on
+    // external-FM addons like the FF/LevelUp 767 — v0.16.9).
+    DatarefEntry {
+        name: "sim/flightmodel/position/local_vx",
+        field: FieldId::LocalVxMs,
+    },
+    DatarefEntry {
+        name: "sim/flightmodel/position/local_vz",
+        field: FieldId::LocalVzMs,
+    },
+    // ---- Phase 2 DataRefs ----
+    // Multi-engine: array indices via `[N]` syntax (X-Plane parses
+    // the bracket and returns just that element). Engine #1 is [0].
+    DatarefEntry {
+        name: "sim/flightmodel/engine/ENGN_running[1]",
+        field: FieldId::Eng2Running,
+    },
+    DatarefEntry {
+        name: "sim/flightmodel/engine/ENGN_running[2]",
+        field: FieldId::Eng3Running,
+    },
+    DatarefEntry {
+        name: "sim/flightmodel/engine/ENGN_running[3]",
+        field: FieldId::Eng4Running,
+    },
+    // Lights — bool 0/1.
+    DatarefEntry {
+        name: "sim/cockpit2/switches/landing_lights_on",
+        field: FieldId::LightLanding,
+    },
+    DatarefEntry {
+        name: "sim/cockpit2/switches/beacon_on",
+        field: FieldId::LightBeacon,
+    },
+    DatarefEntry {
+        name: "sim/cockpit2/switches/strobe_lights_on",
+        field: FieldId::LightStrobe,
+    },
+    DatarefEntry {
+        name: "sim/cockpit2/switches/taxi_light_on",
+        field: FieldId::LightTaxi,
+    },
+    DatarefEntry {
+        name: "sim/cockpit2/switches/navigation_lights_on",
+        field: FieldId::LightNav,
+    },
+    // Logo light: X-Plane uses the same nav-light dataref by
+    // convention; some payware breaks this out separately. We
+    // alias to nav for now (Phase 3 if a payware author asks).
+    // Autopilot — XP exposes per-mode "engaged" status as int 0..2
+    // (off / armed / engaged). We treat >0 as "on".
+    DatarefEntry {
+        name: "sim/cockpit2/autopilot/servos_on",
+        field: FieldId::ApMaster,
+    },
+    DatarefEntry {
+        name: "sim/cockpit2/autopilot/heading_status",
+        field: FieldId::ApHeading,
+    },
+    DatarefEntry {
+        name: "sim/cockpit2/autopilot/altitude_hold_status",
+        field: FieldId::ApAltitude,
+    },
+    DatarefEntry {
+        name: "sim/cockpit2/autopilot/nav_status",
+        field: FieldId::ApNav,
+    },
+    DatarefEntry {
+        name: "sim/cockpit2/autopilot/approach_status",
+        field: FieldId::ApApproach,
+    },
+    // Surfaces — speedbrake handle 0..1, **-0.5 = ARMED** (DataRefs.txt).
+    // Daraus kommt auch `spoilers_armed`: das frueher dafuer abonnierte
+    // `sim/cockpit2/annunciators/speedbrake` heisst laut DataRefs.txt
+    // „Speedbrake deployed", nicht „armed".
+    DatarefEntry {
+        name: "sim/cockpit2/controls/speedbrake_ratio",
+        field: FieldId::SpoilersHandle,
+    },
+    // Windkomponenten im OpenGL-WELTSYSTEM (m/s): +X = Ost, +Z = Sued —
+    // NICHT flugzeugbezogen, trotz des `aircraft/`-Pfads. Genau dieselbe
+    // Achsenkonvention wie `local_vx`/`local_vz` weiter oben.
+    //
+    // Feldbefund 14.08.2026: sie wurden ungedreht in die als koerperfest
+    // deklarierten Snapshot-Felder gereicht. Ueber 133 Landungen gemessen
+    // korrelierte der gemeldete „Gegenwind" mit +0,89 zur Himmelsrichtung
+    // Nord und mit −0,15 zur Flugzeugachse — die Windangaben im Flugbericht
+    // waren fuer jeden X-Plane-Flug frei erfunden. Die Drehung passiert
+    // jetzt in `wind_body_kt` (dieselbe Mathematik wie `body_velocity_fps`).
+    // Same DataRefs in X-Plane 11 und 12.
+    DatarefEntry {
+        name: "sim/weather/aircraft/wind_now_x_msc",
+        field: FieldId::WindXMs,
+    },
+    DatarefEntry {
+        name: "sim/weather/aircraft/wind_now_z_msc",
+        field: FieldId::WindZMs,
+    },
+    // v0.5.19: meteorological wind (absolute, not airframe-relative).
+    // Same DataRef family in XP11 + XP12. Live-tracking server uses
+    // these for the wind column in the monitor; was hardcoded None
+    // before so X-Plane pilots showed "—" for wind.
+    DatarefEntry {
+        name: "sim/weather/aircraft/wind_now_speed_msc",
+        field: FieldId::WindNowSpeedMs,
+    },
+    DatarefEntry {
+        name: "sim/weather/aircraft/wind_now_direction_degt",
+        field: FieldId::WindNowDirectionDegT,
+    },
+    // Stall warning — annunciator (bool).
+    DatarefEntry {
+        name: "sim/cockpit2/annunciators/stall_warning",
+        field: FieldId::StallWarning,
+    },
+    // Systems — battery / avionics / APU / pitot heat.
+    DatarefEntry {
+        name: "sim/cockpit2/electrical/battery_on[0]",
+        field: FieldId::BatteryMaster,
+    },
+    // Pruefbericht 26.09.2026: `sim/cockpit2/electrical/avionics_on` gibt
+    // es nicht (DataRefs.txt XP12) — X-Plane antwortete mit 0, der Avionik-
+    // Schalter stand auf jedem X-Plane-Flug „aus". Belegt ist
+    // `sim/cockpit/electrical/avionics_on` („Is there power to the avionics").
+    DatarefEntry {
+        name: "sim/cockpit/electrical/avionics_on",
+        field: FieldId::AvionicsMaster,
+    },
+    DatarefEntry {
+        name: "sim/cockpit2/electrical/APU_running",
+        field: FieldId::ApuSwitch,
+    },
+    DatarefEntry {
+        name: "sim/cockpit2/ice/ice_pitot_heat_on_pilot",
+        field: FieldId::PitotHeat,
+    },
+    // QNH (hPa) and ambient temp — rewired several times after live
+    // bug reports:
+    //
+    // 2026-05-03: switched OAT from `temperatures_aloft_deg_c[0]`
+    // (= SURFACE temp, not aircraft altitude — pilot at FL180 sah
+    // "+22°C" während Cockpit-PFD korrekt SAT −18°C zeigte) to
+    // `cockpit2/temperature/outside_air_temp_degc` (aircraft-level
+    // ambient = SAT in modern X-Plane).
+    //
+    // 2026-05-05: switched QNH from `barometer_current_inhg` to
+    // `altimeter_setting_in_hg_pilot`. The former is the AMBIENT
+    // air pressure at aircraft altitude (~5.85 inHg / 198 hPa at
+    // FL390), NOT what the pilot dials into the Kollsman window.
+    // Live bug: pilot at FL390 saw "QNH 198 hPa" — physically
+    // impossible at sea level, but exactly the static pressure at
+    // cruise altitude. The new DataRef is the actual altimeter-
+    // setting (1013.25 hPa with STD selected, ~29.92 inHg).
+    DatarefEntry {
+        // BAROMETER, nicht altimeter — verwirrend benannt in X-Plane.
+        // Die "altimeter setting" heißt im DataRef-Namespace
+        // `barometer_setting_in_hg_*`. Quellen: FlyWithLua-Skripte,
+        // X-RAAS-Plugin, developer.x-plane.com referenzieren
+        // konsistent `barometer_setting_in_hg_alt_preselector` /
+        // `_pilot` / `_copilot`. Verifiziert 2026-05-05 vor Release —
+        // ein Tippfehler hier wäre stillschweigend tot (kein RREF
+        // mehr, QNH bleibt bei 0).
+        name: "sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pilot",
+        field: FieldId::QnhInHg,
+    },
+    DatarefEntry {
+        name: "sim/cockpit2/temperature/outside_air_temp_degc",
+        field: FieldId::OatC,
+    },
+    // Mach number.
+    DatarefEntry {
+        name: "sim/flightmodel/misc/machno",
+        field: FieldId::Mach,
+    },
+    // ---- v0.3.0 additions (universal X-Plane standard) ----
+    // Autobrake position: 0=RTO, 1=OFF, 2=1, 3=2, 4=3, 5=MAX.
+    DatarefEntry {
+        name: "sim/cockpit2/switches/auto_brake_level",
+        field: FieldId::AutobrakeLevel,
+    },
+    // Transponder mode (DataRefs.txt): off=0, stdby=1, on (mode A)=2,
+    // alt (mode C)=3, test=4, GND (mode S)=5, ta_only=6, ta/ra=7.
+    DatarefEntry {
+        name: "sim/cockpit2/radios/actuators/transponder_mode",
+        field: FieldId::TransponderMode,
+    },
+    // ---- v0.3.0 additions (Boeing 737 family — Zibo/LevelUp/B738) ----
+    // These use the laminar/B738/* namespace shared by the default
+    // Laminar 737, Zibo Mod, and LevelUp 737NG. On non-737 aircraft
+    // the DataRef simply doesn't exist and X-Plane returns 0 — no
+    // error, no spam in the activity log (the consumer code checks
+    // `is_some()` before logging anything).
+    DatarefEntry {
+        name: "laminar/B738/toggle_switch/wing_light_pos",
+        field: FieldId::LightWing,
+    },
+    DatarefEntry {
+        name: "laminar/B738/toggle_switch/wheel_well_light_pos",
+        field: FieldId::LightWheelWell,
+    },
+    // Spec v0.7.15 F6: X-Plane-Pause + Replay sind als Pause-aequivalent
+    // an AeroACARS gemeldet (siehe FieldId::SimPaused / SimInReplay).
+    // Die existierende `paused: false`-Konstante in to_snapshot() weiter
+    // unten wird damit ersetzt durch den dynamischen Wert.
+    DatarefEntry {
+        name: "sim/time/paused",
+        field: FieldId::SimPaused,
+    },
+    DatarefEntry {
+        // QS-Finding (2026-05-12): Dataref-Name war fruehe Iteration mit
+        // `sim_in_replay`-Tippfehler. X-Plane SDK + eigenes Plugin
+        // (`xplane-plugin/src/plugin.cpp:649`) nutzen `is_in_replay`.
+        name: "sim/time/is_in_replay",
+        field: FieldId::SimInReplay,
+    },
+    DatarefEntry {
+        name: "laminar/B738/annunciator/takeoff_config",
+        field: FieldId::TakeoffConfigWarning,
+    },
+    // ---- v0.16.7 additions (ToLiss Airbus — AirbusFBW namespace) ----
+    // ToLiss (A319/A320/A321/A340-600 …) routes its autoflight through
+    // the documented `AirbusFBW/*` datarefs (namespace shared with other
+    // QPAC-derived Airbus add-ons, which makes the OR in `to_snapshot`
+    // addon-agnostic) and leaves the standard
+    // `sim/cockpit2/autopilot/servos_on` dead. Data audit 2026-06-11:
+    // `autopilot_master` read false for the entire flight on every
+    // ToLiss leg (~30 flights, A20N/A21N/A320/A321), so the activity
+    // log never showed "Autopilot ENGAGED/OFF" for those pilots.
+    //
+    // Absent-dataref behaviour: ⚠ korrigiert 27.09.2026. Frueher stand
+    // hier, X-Plane streame fehlende Datarefs nie. Gemessen stimmt das
+    // nicht — RREF liefert fuer jeden Namen 0. Diese Felder sind deshalb
+    // `addon_quelle`: der Adapter uebernimmt sie nur, wenn die Web-API den
+    // Dataref als lesbar bestaetigt.
+    DatarefEntry {
+        name: "AirbusFBW/AP1Engage",
+        field: FieldId::TolissAp1,
+    },
+    DatarefEntry {
+        name: "AirbusFBW/AP2Engage",
+        field: FieldId::TolissAp2,
+    },
+    DatarefEntry {
+        name: "AirbusFBW/ATHRmode",
+        field: FieldId::TolissAthrMode,
+    },
+    // ---- Bordbuch-Audit 26.09.2026 — Cockpit-Schalter je Add-on ----
+    // Alle `addon_quelle`: gelten nur mit Bestaetigung der Web-API, sonst
+    // bleiben die `Option`-Felder `None` (RREF liefert auch Fehlendes als 0).
+    DatarefEntry {
+        name: "sim/cockpit/electrical/beacon_lights_on",
+        field: FieldId::LightBeaconLegacy,
+    },
+    DatarefEntry {
+        name: "laminar/B738/knob/transponder_pos",
+        field: FieldId::B738XpdrKnob,
+    },
+    DatarefEntry {
+        name: "laminar/B738/autopilot/cmd_b_status",
+        field: FieldId::B738CmdB,
+    },
+    DatarefEntry {
+        name: "laminar/B738/toggle_switch/logo_light",
+        field: FieldId::B738LogoLight,
+    },
+    DatarefEntry {
+        name: "laminar/B738/ice/wing_heat_pos",
+        field: FieldId::B738WingHeat,
+    },
+    DatarefEntry {
+        name: "laminar/B738/ice/eng1_heat_pos",
+        field: FieldId::B738Eng1Heat,
+    },
+    DatarefEntry {
+        name: "laminar/B738/ice/eng2_heat_pos",
+        field: FieldId::B738Eng2Heat,
+    },
+    DatarefEntry {
+        name: "laminar/B738/autopilot/autothrottle_status",
+        field: FieldId::B738AtArm,
+    },
+    DatarefEntry {
+        name: "laminar/B738/annunciator/master_caution_light",
+        field: FieldId::B738MasterCaution,
+    },
+    DatarefEntry {
+        name: "laminar/B738/toggle_switch/seatbelt_sign_pos",
+        field: FieldId::B738SeatbeltSign,
+    },
+    DatarefEntry {
+        name: "laminar/B738/annunciator/speedbrake_armed",
+        field: FieldId::B738SpeedbrakeArmed,
+    },
+    DatarefEntry {
+        name: "laminar/B738/autobrake/autobrake_pos",
+        field: FieldId::B738AutobrakePos,
+    },
+    DatarefEntry {
+        name: "laminar/B738/flt_ctrls/flap_lever",
+        field: FieldId::B738FlapLever,
+    },
+    DatarefEntry {
+        name: "laminar/B738/FMS/vref",
+        field: FieldId::B738FmsVref,
+    },
+    DatarefEntry {
+        name: "sim/aircraft/view/acf_Vso",
+        field: FieldId::AcfVso,
+    },
+    DatarefEntry {
+        name: "AirbusFBW/OHPLightSwitches[0]",
+        field: FieldId::TolissBeacon,
+    },
+    DatarefEntry {
+        name: "AirbusFBW/SeatBeltSignsOn",
+        field: FieldId::TolissSeatBeltSigns,
+    },
+    DatarefEntry {
+        name: "AirbusFBW/APUMaster",
+        field: FieldId::TolissApuMaster,
+    },
+    DatarefEntry {
+        name: "AirbusFBW/APLateralMode",
+        field: FieldId::TolissApLateralMode,
+    },
+    DatarefEntry {
+        name: "AirbusFBW/APVerticalMode",
+        field: FieldId::TolissApVerticalMode,
+    },
+    DatarefEntry {
+        name: "AirbusFBW/APPRilluminated",
+        field: FieldId::TolissApprIlluminated,
+    },
+    DatarefEntry {
+        name: "AirbusFBW/LOCilluminated",
+        field: FieldId::TolissLocIlluminated,
+    },
+    DatarefEntry {
+        name: "AirbusFBW/AutoBrkLo",
+        field: FieldId::TolissAutoBrkLo,
+    },
+    DatarefEntry {
+        name: "AirbusFBW/AutoBrkMed",
+        field: FieldId::TolissAutoBrkMed,
+    },
+    DatarefEntry {
+        name: "AirbusFBW/AutoBrkMax",
+        field: FieldId::TolissAutoBrkMax,
+    },
+    DatarefEntry {
+        name: "laminar/a333/switches/strobe_pos",
+        field: FieldId::A333StrobePos,
+    },
+    DatarefEntry {
+        name: "laminar/A333/switches/fasten_seatbelts",
+        field: FieldId::A333SeatbeltSwitch,
+    },
+    DatarefEntry {
+        name: "AirbusFBW/OHPLightSwitches[7]",
+        field: FieldId::TolissStrobeSwitch,
+    },
+    DatarefEntry {
+        name: "B742/ext_light/beacon_sw",
+        field: FieldId::FelisBeacon,
+    },
+    DatarefEntry {
+        name: "FJS/Q4XP/Manips/TwoSwitch_Ctl[23]",
+        field: FieldId::Q4xpKollisionslicht,
+    },
+    DatarefEntry {
+        name: "laminar/A333/transponder/auto_on_knob_pos",
+        field: FieldId::A333XpdrAutoOn,
+    },
+    DatarefEntry {
+        name: "laminar/A333/transponder/ta_ra_knob_pos",
+        field: FieldId::A333TaRaKnob,
+    },
+    DatarefEntry {
+        name: "laminar/A333/transponder/alt_rpt_knob_pos",
+        field: FieldId::A333AltRptKnob,
+    },
+    DatarefEntry {
+        name: "AirbusFBW/OHPLightSwitches[1]",
+        field: FieldId::TolissFluegellicht,
+    },
+    DatarefEntry {
+        name: "AirbusFBW/OHPLightSwitches[12]",
+        field: FieldId::TolissRauchverbot,
+    },
+    DatarefEntry {
+        name: "1-sim/ckpt/lampsGlow/mcpCaptAP",
+        field: FieldId::Ff777ApL,
+    },
+    DatarefEntry {
+        name: "1-sim/ckpt/lampsGlow/mcpFoAP",
+        field: FieldId::Ff777ApR,
+    },
+    DatarefEntry {
+        name: "1-sim/ckpt/lampsGlow/mcpHdgHOLD",
+        field: FieldId::Ff777HdgHold,
+    },
+    DatarefEntry {
+        name: "1-sim/ckpt/lampsGlow/mcpAltHOLD",
+        field: FieldId::Ff777AltHold,
+    },
+    DatarefEntry {
+        name: "1-sim/ckpt/lampsGlow/mcpLNAV",
+        field: FieldId::Ff777Lnav,
+    },
+    DatarefEntry {
+        name: "1-sim/ckpt/lampsGlow/mcpLOC",
+        field: FieldId::Ff777Loc,
+    },
+    DatarefEntry {
+        name: "1-sim/ckpt/lampsGlow/mcpAPP",
+        field: FieldId::Ff777App,
+    },
+    DatarefEntry {
+        name: "1-sim/ckpt/lampsGlow/mcpAT",
+        field: FieldId::Ff777At,
+    },
+    DatarefEntry {
+        name: "1-sim/ckpt/indLightTestSwitch/anim",
+        field: FieldId::Ff777LampenTest,
+    },
+    DatarefEntry {
+        name: "1-sim/ckpt/wingLightSwitch/anim",
+        field: FieldId::FfFluegellicht,
+    },
+    DatarefEntry {
+        name: "1-sim/ckpt/passSignsSeatbeltsSwitch/anim",
+        field: FieldId::FfAnschnallzeichen,
+    },
+    DatarefEntry {
+        name: "1-sim/ckpt/passSignsNosmockingSwitch/anim",
+        field: FieldId::FfRauchverbot,
+    },
+    DatarefEntry {
+        name: "1-sim/ckpt/autobrakeSwitch/anim",
+        field: FieldId::FfAutobrake,
+    },
+    DatarefEntry {
+        name: "sim/cockpit/switches/fasten_seat_belts",
+        field: FieldId::StdAnschnallzeichen,
+    },
+    DatarefEntry {
+        name: "sim/cockpit/switches/no_smoking",
+        field: FieldId::StdRauchverbot,
+    },
+    DatarefEntry {
+        name: "sim/time/zulu_time_sec",
+        field: FieldId::ZuluTimeSec,
+    },
+    DatarefEntry {
+        name: "sim/time/local_date_days",
+        field: FieldId::LocalDateDays,
+    },
+    // ---- X-Plane-Luecken (29.09.2026) — alles Kern-Datarefs, Namen, Typen
+    // und Einheiten aus DataRefs.txt (X-Plane 12.4.3), keiner REPLACED.
+    // Kern-Namen liefert jedes Flugzeug (keine `addon_quelle`).
+    DatarefEntry {
+        name: "sim/time/sim_speed",
+        field: FieldId::SimSpeed,
+    },
+    DatarefEntry {
+        name: "sim/time/ground_speed_flt",
+        field: FieldId::GroundSpeedFactor,
+    },
+    DatarefEntry {
+        name: "sim/time/framerate_period",
+        field: FieldId::FrameRatePeriod,
+    },
+    DatarefEntry {
+        name: "sim/flightmodel2/misc/has_crashed",
+        field: FieldId::HasCrashed,
+    },
+    DatarefEntry {
+        name: "sim/cockpit2/radios/actuators/transponder_code",
+        field: FieldId::TransponderCode,
+    },
+    DatarefEntry {
+        name: "sim/aircraft/controls/acf_flap_detents",
+        field: FieldId::FlapDetents,
+    },
+    DatarefEntry {
+        name: "sim/aircraft/prop/acf_en_type[0]",
+        field: FieldId::EngineType,
+    },
+    DatarefEntry {
+        name: "sim/flightmodel/engine/ENGN_N1_[0]",
+        field: FieldId::Eng1N1,
+    },
+    DatarefEntry {
+        name: "sim/flightmodel/engine/ENGN_N1_[1]",
+        field: FieldId::Eng2N1,
+    },
+    DatarefEntry {
+        name: "sim/flightmodel/engine/ENGN_N1_[2]",
+        field: FieldId::Eng3N1,
+    },
+    DatarefEntry {
+        name: "sim/flightmodel/engine/ENGN_N1_[3]",
+        field: FieldId::Eng4N1,
+    },
+    DatarefEntry {
+        name: "sim/flightmodel/engine/ENGN_FF_[0]",
+        field: FieldId::Eng1FuelFlow,
+    },
+    DatarefEntry {
+        name: "sim/flightmodel/engine/ENGN_FF_[1]",
+        field: FieldId::Eng2FuelFlow,
+    },
+    DatarefEntry {
+        name: "sim/flightmodel/engine/ENGN_FF_[2]",
+        field: FieldId::Eng3FuelFlow,
+    },
+    DatarefEntry {
+        name: "sim/flightmodel/engine/ENGN_FF_[3]",
+        field: FieldId::Eng4FuelFlow,
+    },
+];
+
+/// v0.16.9: body-frame horizontal velocity, derived from the WORLD-frame
+/// (OpenGL) velocity + true heading instead of trusting an FM-dependent
+/// body-frame DataRef.
+///
+/// Background (live flight BCS8, FF/LevelUp 767): `sim/flightmodel/forces/
+/// local_vz` is written by X-Plane's own flight model only — on addons with
+/// an external FM it reads a CONSTANT 0.0 (verified: 0.0 through a 256-kt
+/// takeoff roll). `moving_forward(Some(0.0))` then hard-blocks the
+/// Pushback→TaxiOut transition for the whole flight (only `None` activates
+/// the documented no-signal fallback), the v0.13.17 airborne-rescue forces
+/// Pushback→Climb past the Takeoff phase, and every Takeoff-latched stat
+/// (takeoff_fuel_kg → OFP fuel sub-score) is lost.
+///
+/// The `position/local_vx|vz` family used here is maintained by the SIM
+/// CORE from the kinematic state and is alive on every addon — the proof
+/// is in the same BCS8 log: `position/local_vy` (touchdown V/S) and
+/// `position/groundspeed` worked fine while `forces/` was dead.
+///
+/// Frame math (OpenGL: +X east, +Z south; psi = true heading):
+///   north = −vz, east = vx
+///   forward =  north·cos(psi) + east·sin(psi)   (positive forward)
+///   right   =  east·cos(psi)  − north·sin(psi)  (positive right)
+/// For ground movement this is exactly the body longitudinal/lateral
+/// velocity (verified semantics match the old `forces/` source on ToLiss:
+/// tug push negative, forward taxi positive, |fwd| ≈ groundspeed). In the
+/// air a crosswind crab shifts a few fps into the lateral component — all
+/// FSM consumers (`powered_taxi_move`, `moving_backward`) are ground-only,
+/// so that is irrelevant. The OpenGL curvature bias that affects the
+/// vertical axis at cruise (see `VerticalSpeedRawFpm`) is negligible for
+/// the horizontal sign test near the ground (< 1° rotation per 100 km from
+/// the local origin).
+///
+/// Plausibility guard (the sustainable part): if the sim reports genuine
+/// ground movement (> ~3 kt) but the world velocity carries none of it,
+/// the source contradicts itself — emit `None` so the FSM uses its
+/// documented no-signal fallback instead of a frozen `Some(0.0)`. Any
+/// future variant of this bug class degrades to pre-v0.15.13 behaviour
+/// (pushback phase may end early) instead of eating the Takeoff phase.
+///
+/// Returns `(forward_fps, right_fps)`.
+fn body_velocity_fps(
+    local_vx_ms: f32,
+    local_vz_ms: f32,
+    heading_true_deg: f32,
+    groundspeed_ms: f32,
+) -> (Option<f32>, Option<f32>) {
+    const M_PER_FT: f32 = 0.3048;
+    /// ~3 kt — below this no consumer needs a direction and noise dominates.
+    const GUARD_MIN_GS_MS: f32 = 1.5;
+
+    let north = -local_vz_ms;
+    let east = local_vx_ms;
+    let horizontal = (north * north + east * east).sqrt();
+    if groundspeed_ms > GUARD_MIN_GS_MS && horizontal < 0.25 * groundspeed_ms {
+        return (None, None);
+    }
+
+    let psi = heading_true_deg.to_radians();
+    let forward_ms = north * psi.cos() + east * psi.sin();
+    let right_ms = east * psi.cos() - north * psi.sin();
+    (Some(forward_ms / M_PER_FT), Some(right_ms / M_PER_FT))
+}
+
+/// Windvektor aus dem OpenGL-Weltsystem in flugzeugbezogene Komponenten.
+///
+/// Spiegelt `body_velocity_fps` — dieselbe Drehung um den rechtweisenden
+/// Steuerkurs, nur fuer den Wind. `wind_now_x_msc` ist die OST-, `_z_msc`
+/// die SUED-Komponente des Vektors, in den der Wind WEHT.
+///
+/// Rueckgabe `(gegenwind_kt, seitenwind_kt)` in der Konvention des
+/// Snapshots: Gegenwind positiv, wenn der Wind von vorn kommt; Seitenwind
+/// positiv, wenn er von rechts kommt.
+fn wind_body_kt(
+    wind_x_ms: f32,
+    wind_z_ms: f32,
+    heading_true_deg: f32,
+) -> (Option<f32>, Option<f32>) {
+    const KT_PER_MS: f32 = 1.943_844_5;
+    let north = -wind_z_ms;
+    let east = wind_x_ms;
+    let psi = heading_true_deg.to_radians();
+    // Komponenten des Vektors, in den der Wind weht.
+    let nach_vorn = north * psi.cos() + east * psi.sin();
+    let nach_rechts = east * psi.cos() - north * psi.sin();
+    // „Von vorn" ist das Gegenteil von „weht nach vorn"; dasselbe seitlich.
+    (Some(-nach_vorn * KT_PER_MS), Some(-nach_rechts * KT_PER_MS))
+}
+
+/// Mutable parsed state — populated as RREF responses arrive. Held
+/// behind a Mutex by the adapter; on every snapshot request we copy
+/// it out and convert to `SimSnapshot`.
+#[derive(Debug, Clone, Default)]
+pub struct XPlaneState {
+    pub lat: f64,
+    pub lon: f64,
+    /// Stored in METERS (X-Plane native — `sim/flightmodel/position/elevation`
+    /// reports meters MSL, not feet, despite the historic field name).
+    /// Convert to feet at snapshot time alongside AGL.
+    pub altitude_msl_m: f64,
+    /// Stored in METERS (X-Plane native). Convert at snapshot time.
+    pub altitude_agl_m: f64,
+    pub heading_true_deg: f32,
+    pub heading_magnetic_deg: f32,
+    pub pitch_deg: f32,
+    pub bank_deg: f32,
+    /// Display/FSM V/S (fpm) — from the instrument VVI (`vvi_fpm_pilot`).
+    pub vertical_speed_fpm: f32,
+    /// Raw V/S (fpm) for the touchdown signal — from `local_vy` (m/s→fpm).
+    pub vertical_speed_raw_fpm: f32,
+    /// Stored in M/S (X-Plane native). Convert at snapshot time.
+    pub groundspeed_ms: f32,
+    pub indicated_airspeed_kt: f32,
+    /// v0.19.x FIX: `sim/flightmodel/position/true_airspeed` is M/S
+    /// (X-Plane native, same as groundspeed) — NOT knots despite the
+    /// dataref's short name suggesting otherwise. Convert at snapshot
+    /// time (see `to_snapshot`'s `KT_PER_MS`). Naming this field with
+    /// the `_ms` suffix (matching `groundspeed_ms` above) is deliberate:
+    /// a field called `true_airspeed_kt` holding a raw m/s value is
+    /// exactly the bug this replaces (TAS displayed at ~51% of the
+    /// real value — below IAS, physically impossible in cruise).
+    pub true_airspeed_ms: f32,
+    pub g_force: f32,
+    pub on_ground: bool,
+    /// v0.4.4: Normal force on the gear (N). 0 in air, spikes on
+    /// touchdown. Used by Sampler-Side-Edge-Detection im Main-Crate.
+    pub gear_normal_force_n: f32,
+    pub parking_brake_ratio: f32,
+    pub gear_deploy: f32,
+    pub flaps_handle: f32,
+    pub eng1_running: bool,
+    pub fuel_total_kg: f32,
+    pub empty_weight_kg: f32,
+    pub total_weight_kg: f32,
+    pub local_vx_ms: f32,
+    pub local_vz_ms: f32,
+    pub wind_x_ms: f32,
+    pub wind_z_ms: f32,
+    /// v0.5.19: absolute wind speed (m/s) at aircraft altitude.
+    pub wind_now_speed_ms: f32,
+    /// v0.5.19: absolute wind direction (degrees true) at aircraft altitude.
+    pub wind_now_direction_degt: f32,
+    // Phase 2: multi-engine, lights, AP, surfaces, systems, environment.
+    pub eng2_running: bool,
+    pub eng3_running: bool,
+    pub eng4_running: bool,
+    pub light_landing: bool,
+    pub light_beacon: bool,
+    pub light_strobe: bool,
+    pub light_taxi: bool,
+    pub light_nav: bool,
+    pub ap_master: bool,
+    pub ap_heading: bool,
+    pub ap_altitude: bool,
+    pub ap_nav: bool,
+    pub ap_approach: bool,
+    pub spoilers_handle: f32,
+    pub stall_warning: bool,
+    pub battery_master: bool,
+    pub avionics_master: bool,
+    pub apu_switch: bool,
+    pub pitot_heat: bool,
+    pub qnh_inhg: f32,
+    pub oat_c: f32,
+    pub mach: f32,
+    // v0.3.0 additions (universal):
+    /// 0=RTO, 1=OFF, 2=1, 3=2, 4=3, 5=MAX. Stored as f32 from the
+    /// RREF feed; mapped to label string at snapshot boundary.
+    pub autobrake_level: f32,
+    /// X-Plane-12-Enum laut DataRefs.txt: 0=OFF 1=STBY 2=ON (Mode A)
+    /// 3=ALT (Mode C) 4=TEST 5=GND 6=TA ONLY 7=TA/RA. Same.
+    pub transponder_mode: f32,
+    // v0.3.0 additions (Boeing 737 family):
+    pub light_wing: bool,
+    pub light_wheel_well: bool,
+    pub takeoff_config_warning: bool,
+    /// Spec v0.7.15 F6: `sim/time/paused`-Wert. true wenn der User die
+    /// Pause-Taste in X-Plane gedrueckt hat. SimSnapshot.paused wird
+    /// daraus gespeist.
+    pub sim_paused: bool,
+    /// Spec v0.7.15 F6: `sim/time/is_in_replay`-Wert. AeroACARS
+    /// behandelt Replay als Pause-aequivalent (kein echter Flug).
+    pub sim_in_replay: bool,
+    // v0.16.7 — ToLiss Airbus (AirbusFBW namespace):
+    /// `AirbusFBW/AP1Engage` > 0.5 — AP1 engaged.
+    pub toliss_ap1: bool,
+    /// `AirbusFBW/AP2Engage` > 0.5 — AP2 engaged.
+    pub toliss_ap2: bool,
+    /// Raw `AirbusFBW/ATHRmode` value (0 = off, >0 = armed/active).
+    pub toliss_athr_mode: f32,
+    /// True once `ATHRmode` has been delivered at least once. Seit
+    /// 27.09.2026 laesst der Adapter den Wert nur durch, wenn die Web-API
+    /// den Dataref als lesbar bestaetigt (RREF streamt auch fehlende
+    /// Datarefs als 0 — siehe `addon_quelle`).
+    pub toliss_athr_seen: bool,
+    // Bordbuch-Audit 26.09.2026 — `None`, solange die Quelle nicht
+    // bestaetigt ist (`addon_quelle`).
+    pub light_beacon_legacy: Option<bool>,
+    pub b738_xpdr_knob: Option<f32>,
+    /// CMD-B-Lampe (Laminar/Zibo 737); `false`, solange nicht bestaetigt.
+    pub b738_cmd_b: bool,
+    // Zibo-Audit 01.10.2026 — `None`, solange die Quelle nicht bestaetigt ist.
+    pub b738_logo_light: Option<bool>,
+    pub b738_wing_heat: Option<bool>,
+    pub b738_eng1_heat: Option<bool>,
+    pub b738_eng2_heat: Option<bool>,
+    pub b738_at_arm: Option<bool>,
+    pub b738_master_caution: Option<bool>,
+    pub b738_seatbelt_sign: Option<f32>,
+    pub b738_speedbrake_armed: Option<bool>,
+    pub b738_autobrake_pos: Option<f32>,
+    pub b738_flap_lever: Option<f32>,
+    pub b738_fms_vref: Option<f32>,
+    pub acf_vso: Option<f32>,
+    pub toliss_beacon: Option<bool>,
+    pub toliss_seatbelt_signs: Option<bool>,
+    pub toliss_apu_master: Option<bool>,
+    pub toliss_ap_lateral_mode: Option<f32>,
+    pub toliss_ap_vertical_mode: Option<f32>,
+    pub toliss_appr_lampe: Option<bool>,
+    pub toliss_loc_lampe: Option<bool>,
+    pub toliss_autobrk_lo: Option<bool>,
+    pub toliss_autobrk_med: Option<bool>,
+    pub toliss_autobrk_max: Option<bool>,
+    pub a333_strobe_pos: Option<f32>,
+    pub a333_seatbelt_switch: Option<f32>,
+    pub toliss_strobe_switch: Option<f32>,
+    pub felis_beacon: Option<bool>,
+    pub q4xp_kollisionslicht: Option<bool>,
+    pub a333_xpdr_auto_on: Option<f32>,
+    pub a333_ta_ra_knob: Option<f32>,
+    pub a333_alt_rpt_knob: Option<f32>,
+    pub toliss_fluegellicht: Option<bool>,
+    pub toliss_rauchverbot: Option<f32>,
+    /// FF777-MCP-Lampen, roh (Leuchtkraft).
+    pub ff777_ap_l: Option<f32>,
+    pub ff777_ap_r: Option<f32>,
+    pub ff777_hdg_hold: Option<f32>,
+    pub ff777_alt_hold: Option<f32>,
+    pub ff777_lnav: Option<f32>,
+    pub ff777_loc: Option<f32>,
+    pub ff777_app: Option<f32>,
+    pub ff777_at: Option<f32>,
+    pub ff777_lampen_test: Option<f32>,
+    pub ff_fluegellicht: Option<bool>,
+    pub ff_anschnallzeichen: Option<f32>,
+    pub ff_rauchverbot: Option<f32>,
+    pub ff_autobrake: Option<f32>,
+    /// Standard-Schilder; `None`, bis das Flugzeug einmal ≠ 0 geliefert hat.
+    pub std_anschnallzeichen: Option<f32>,
+    pub std_rauchverbot: Option<f32>,
+    pub zulu_time_sec: Option<f32>,
+    pub local_date_days: Option<f32>,
+    // ---- X-Plane-Luecken (29.09.2026). `None` = noch nicht geliefert.
+    /// `sim/time/sim_speed` (1 = Echtzeit).
+    pub sim_speed: Option<f32>,
+    /// `sim/time/ground_speed_flt` (1 = normale Strecke).
+    pub ground_speed_faktor: Option<f32>,
+    /// `sim/time/framerate_period` (Sekunden je Bild).
+    pub framerate_period: Option<f32>,
+    /// Letzter Rohwert von `has_crashed`.
+    pub has_crashed_roh: Option<bool>,
+    /// `has_crashed` war seit dem letzten Verbindungsaufbau schon einmal 0.
+    /// Erst danach zaehlt eine 1 als Absturz — ein Flugzeug, das beim
+    /// Verbinden (oder nach dem Laden) schon im Absturzzustand steht, loest
+    /// keinen Unfall im laufenden Flug aus.
+    pub crash_scharf: bool,
+    /// Absturz ueber die Flanke 0 → 1 erkannt; faellt mit `has_crashed` = 0
+    /// (neuer Flug / Flugzeug neu geladen) wieder ab.
+    pub crashed: bool,
+    pub transponder_code: Option<f32>,
+    pub flap_detents: Option<f32>,
+    pub engine_type: Option<f32>,
+    /// `ENGN_N1_[0..3]` in Prozent.
+    pub eng_n1_pct: [Option<f32>; 4],
+    /// `ENGN_FF_[0..3]` in kg/s.
+    pub eng_ff_kg_s: [Option<f32>; 4],
+    /// True once we've received at least one RREF packet — drives
+    /// the connection state machine's transition into `Connected`.
+    pub got_first_packet: bool,
+}
+
+/// Map an X-Plane autobrake-level (0..5) to the cockpit-readable label.
+/// Mirrors the `sim/cockpit2/switches/auto_brake_level` semantics.
+pub fn xplane_autobrake_label(level: u8) -> &'static str {
+    match level {
+        0 => "RTO",
+        1 => "OFF",
+        2 => "1",
+        3 => "2",
+        4 => "3",
+        5 => "MAX",
+        _ => "",
+    }
+}
+
+/// Map an X-Plane-12 transponder mode to the cockpit-readable label.
+/// Enum laut `DataRefs.txt` (X-Plane 12, `sim/cockpit2/radios/actuators/
+/// transponder_mode`): off=0, stdby=1, on (mode A)=2, alt (mode C)=3,
+/// test=4, GND (mode S)=5, ta_only=6, ta/ra=7.
+///
+/// Bis zum Bordbuch-Audit (26.09.2026) stand hier 3=TEST/4=ALT — in 102
+/// XP12-Fluegen erschien dadurch nie „ALT", dafuer sprang der ToLiss
+/// nach dem Abheben verlaesslich auf „TEST" und nach dem Abstellen
+/// zurueck auf „STBY": das war ALT.
+pub fn xplane_xpdr_mode_label(mode: u8) -> &'static str {
+    match mode {
+        0 => "OFF",
+        1 => "STBY",
+        // X-Plane "ON (mode A)" = sendet OHNE Hoehe. Bewusst nicht „XPNDR":
+        // das heisst bei PMDG/Airbus/Zibo „sendet mit Hoehe" (Bordbuch,
+        // 26.09.2026 — der Punkt „Transponder mit Hoehe" muss das trennen).
+        2 => "ON",
+        3 => "ALT",
+        4 => "TEST",
+        5 => "GND",
+        6 => "TA",
+        7 => "TA-RA",
+        _ => "",
+    }
+}
+
+/// Sim-Uhrzeit (UTC) aus `zulu_time_sec` + `local_date_days`. Das Jahr
+/// kennt X-Plane nicht als Dataref — es kommt von der Rechneruhr.
+fn sim_zeit_aus(
+    zulu_s: Option<f32>,
+    tag_im_jahr: Option<f32>,
+    jetzt: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::{Datelike, Duration, TimeZone};
+    let zulu_s = zulu_s.filter(|v| v.is_finite() && (0.0..86_400.5).contains(v))?;
+    let tag = tag_im_jahr.filter(|v| v.is_finite() && (0.0..366.5).contains(v))?;
+    let neujahr = chrono::Utc
+        .with_ymd_and_hms(jetzt.year(), 1, 1, 0, 0, 0)
+        .single()?;
+    Some(
+        neujahr
+            + Duration::days(tag.round() as i64)
+            + Duration::milliseconds((zulu_s as f64 * 1000.0).round() as i64),
+    )
+}
+
+/// Dreistufiger Schalter 0=OFF 1=AUTO 2=ON; alles andere → `None`.
+fn schalter_0_1_2(roh: f32) -> Option<u8> {
+    let r = roh.round();
+    ((roh - r).abs() < 0.05 && (0.0..=2.0).contains(&r)).then_some(r as u8)
+}
+
+/// Zeitraffer in der Semantik von MSFS `SIMULATION RATE` (1.0 = Echtzeit):
+/// eingestellter Zeitraffer `sim/time/sim_speed` mal Strecken-Multiplikator
+/// `sim/time/ground_speed_flt`. X-Plane hat zwei Beschleuniger — der zweite
+/// laesst das Flugzeug bei Zeitraffer 1 doppelt so weit kommen und waere sonst
+/// unsichtbar (Cloud-QS 29.09.2026, N2).
+///
+/// Bewusst der Sollwert, nicht `sim/time/sim_speed_actual` (DataRefs.txt
+/// 3557, „takes into account fps limiting"): der schwankt mit der Bildrate
+/// und laege bei Echtzeit und wenig fps unter 1 — Rauschen, das jede
+/// Pruefung auf „≠ 1" ausloeste. MSFS meldet ebenfalls den Sollwert.
+///
+/// Fehlt ein Wert oder steht er auf 0 (`sim_speed` 0 = „paused" laut
+/// DataRefs.txt, die Pause meldet `sim/time/paused`; unter X-Plane 11 kann
+/// `ground_speed_flt` fehlen), zaehlt er als 1.
+/// Bilder pro Sekunde aus `sim/time/framerate_period` — oder nichts.
+///
+/// Ein Zeitraum von 0, ein negativer oder ein nicht endlicher Wert heisst
+/// „nicht geliefert" (RREF schickt fuer unbekannte Datarefs 0), nicht
+/// „unendlich viele Bilder".
+fn bildrate_aus_periode(periode: Option<f32>) -> Option<f32> {
+    periode
+        .filter(|p| p.is_finite() && *p > 0.0)
+        .map(|p| 1.0 / p)
+}
+
+fn sim_rate_aus(sim_speed: Option<f32>, ground_speed: Option<f32>) -> f32 {
+    let faktor = |v: Option<f32>| v.filter(|x| x.is_finite() && *x > 0.0).unwrap_or(1.0);
+    faktor(sim_speed) * faktor(ground_speed)
+}
+
+/// Squawk aus `transponder_code` (int 0000-7777) — dieselbe Form wie der
+/// MSFS-Pfad (`7000` = Squawk 7000). Nur Werte, deren vier Ziffern oktal
+/// sind; alles andere ist kein Transpondercode.
+fn squawk_aus(roh: Option<f32>) -> Option<u16> {
+    let v = roh.filter(|v| v.is_finite())?.round();
+    if !(0.0..=7777.0).contains(&v) {
+        return None;
+    }
+    let code = v as u16;
+    let oktal = [code / 1000, (code / 100) % 10, (code / 10) % 10, code % 10]
+        .iter()
+        .all(|z| *z <= 7);
+    oktal.then_some(code)
+}
+
+/// Klappenraste wie der MSFS-Pfad (`FLAPS HANDLE INDEX` /
+/// `FLAPS NUM HANDLE POSITIONS`): Index 0 = UP, Anzahl = hoechster Index.
+/// X-Plane legt die Rasten gleichmaessig ueber den Hebelweg
+/// (`flap_handle_request_ratio` 0..1), Raste i steht bei i / Rasten.
+///
+/// Gemessen 29.09.2026 (X-Plane 12.4.3, Laminar Boeing 737-800, Hebel
+/// UP → 40 → UP, Sonde ueber Plugin-Protokoll 2): `acf_flap_detents` = 8,
+/// Hebel genau 0 / 0,125 / … / 0,875 / 1,0 fuer UP/1/2/5/10/15/25/30/40,
+/// Rueckweg identisch. `flap_handle_deploy_ratio` und `flap1_deploy_ratio`
+/// laufen verzoegert hinterher (0,263 bzw. 0,133 beim Erreichen von 40) —
+/// der Hebel ist die richtige Quelle.
+/// 0 Rasten (stufenlose Klappen) oder unplausible Werte → `None`, dann
+/// greift wie bisher die Prozent-Heuristik.
+fn klappen_raste(hebel: f32, rasten: Option<f32>) -> (Option<u8>, Option<u8>) {
+    let Some(n) = rasten.filter(|v| v.is_finite()).map(|v| v.round() as i64) else {
+        return (None, None);
+    };
+    if !(1..=12).contains(&n) || !hebel.is_finite() {
+        return (None, None);
+    }
+    let idx = (hebel.clamp(0.0, 1.0) * n as f32).round() as i64;
+    if (0..=n).contains(&idx) {
+        (Some(idx as u8), Some(n as u8))
+    } else {
+        (None, None)
+    }
+}
+
+/// Turbine laut `acf_en_type` (DataRefs.txt: 5 = single spool jet,
+/// 7 = multi spool jet, 9 = free turboprop, 10 = fixed turboprop). Nur
+/// dort ist N1 eine Schubangabe — wie `TURB ENG N1` bei MSFS, das Kolben-
+/// und Elektromotoren nicht fuellen.
+fn ist_turbine(en_type: Option<f32>) -> bool {
+    en_type
+        .filter(|v| v.is_finite())
+        .is_some_and(|v| matches!(v.round() as i32, 5 | 7 | 9 | 10))
+}
+
+/// Kilogramm je Pfund (wie `KG_PER_LB` im MSFS-Adapter), fuer
+/// `EngineSignals::fuel_flow_pph`.
+const KG_JE_LB: f64 = 0.453_592_37;
+
+/// `speedbrake_ratio` unterhalb dieses Werts = SPEED BRAKE ARMED. Laut
+/// DataRefs.txt steht ARMED auf -0.5; die halbe Strecke faengt Rundung ab.
+const SPEEDBRAKE_ARMED_BELOW: f32 = -0.25;
+
+/// Transponder-Drehschalter des Laminar-/Zibo-737
+/// (`laminar/B738/knob/transponder_pos`): 0=TEST 1=STBY 2=ALT OFF
+/// 3=XPNDR 4=TA 5=TA/RA. Begriffe wie beim PMDG-SDK
+/// (`pmdg_xpdr_mode_label`), damit beide Simulatoren dieselben
+/// Woerter liefern.
+pub fn b738_xpdr_knob_label(pos: u8) -> &'static str {
+    match pos {
+        0 => "TEST",
+        1 => "STBY",
+        2 => "ALT-OFF",
+        3 => "XPNDR",
+        4 => "TA",
+        5 => "TA-RA",
+        _ => "",
+    }
+}
+
+/// ToLiss-Autobrake aus den drei Tasten `AutoBrkLo/Med/Max`. `None`,
+/// solange keiner der drei Datarefs je ankam (kein ToLiss geladen).
+fn toliss_autobrake_label(
+    lo: Option<bool>,
+    med: Option<bool>,
+    max: Option<bool>,
+) -> Option<&'static str> {
+    if lo.is_none() && med.is_none() && max.is_none() {
+        return None;
+    }
+    Some(if max == Some(true) {
+        "MAX"
+    } else if med == Some(true) {
+        "MED"
+    } else if lo == Some(true) {
+        "LO"
+    } else {
+        "OFF"
+    })
+}
+
+/// Add-on-Quelle: ein Dataref, den nur bestimmte Flugzeuge haben.
+///
+/// Befund 27.09.2026 (X-Plane-12-Demo, gemessen): RREF liefert fuer JEDEN
+/// abonnierten Namen Werte — auch fuer erfundene (`aeroacars/gibt/es/nicht`
+/// → 0). Die fruehere Annahme „fehlende Datarefs werden nie gestreamt"
+/// stimmte nicht; jedes Add-on-Feld stand dadurch bei jedem Flugzeug auf
+/// `Some(0)` (Transponder „TEST", Strobe-Schalter OFF, Klappen 0 …). Ob so
+/// eine Quelle gilt, entscheidet deshalb der Adapter ueber die Web-API
+/// (`WebApiClient::dataref_lesbar`); ohne Bestaetigung wird der Wert nicht
+/// uebernommen.
+pub fn addon_quelle(field: FieldId) -> bool {
+    matches!(
+        field,
+        FieldId::TolissAp1
+            | FieldId::TolissAp2
+            | FieldId::TolissAthrMode
+            | FieldId::LightBeaconLegacy
+            | FieldId::B738XpdrKnob
+            | FieldId::B738CmdB
+            | FieldId::B738LogoLight
+            | FieldId::B738WingHeat
+            | FieldId::B738Eng1Heat
+            | FieldId::B738Eng2Heat
+            | FieldId::B738AtArm
+            | FieldId::B738MasterCaution
+            | FieldId::B738SeatbeltSign
+            | FieldId::B738SpeedbrakeArmed
+            | FieldId::B738AutobrakePos
+            | FieldId::B738FlapLever
+            | FieldId::B738FmsVref
+            | FieldId::TolissBeacon
+            | FieldId::TolissSeatBeltSigns
+            | FieldId::TolissApuMaster
+            | FieldId::TolissApLateralMode
+            | FieldId::TolissApVerticalMode
+            | FieldId::TolissApprIlluminated
+            | FieldId::TolissLocIlluminated
+            | FieldId::TolissAutoBrkLo
+            | FieldId::TolissAutoBrkMed
+            | FieldId::TolissAutoBrkMax
+            | FieldId::A333StrobePos
+            | FieldId::A333SeatbeltSwitch
+            | FieldId::TolissStrobeSwitch
+            | FieldId::FelisBeacon
+            | FieldId::Q4xpKollisionslicht
+            | FieldId::A333XpdrAutoOn
+            | FieldId::A333TaRaKnob
+            | FieldId::A333AltRptKnob
+            | FieldId::TolissFluegellicht
+            | FieldId::TolissRauchverbot
+            | FieldId::Ff777ApL
+            | FieldId::Ff777ApR
+            | FieldId::Ff777HdgHold
+            | FieldId::Ff777AltHold
+            | FieldId::Ff777Lnav
+            | FieldId::Ff777Loc
+            | FieldId::Ff777App
+            | FieldId::Ff777At
+            | FieldId::Ff777LampenTest
+            | FieldId::FfFluegellicht
+            | FieldId::FfAnschnallzeichen
+            | FieldId::FfRauchverbot
+            | FieldId::FfAutobrake
+    )
+}
+
+/// 3-Stufen-Schalter aus einem Animations-Dataref: Schwellen wie in den
+/// P_-Profilen (`x<0.5` / `x<1.5`), damit Zwischenwerte beim Umlegen nicht
+/// als „unbekannt" durchfallen.
+fn stufe_0_1_2(roh: f32) -> Option<u8> {
+    if !roh.is_finite() {
+        return None;
+    }
+    Some(if roh < 0.5 {
+        0
+    } else if roh < 1.5 {
+        1
+    } else {
+        2
+    })
+}
+
+/// FlightFactor-Autobrake-Waehler (Skala der FF777, siehe
+/// `FieldId::FfAutobrake`) → Beschriftung. Stellungen aus den
+/// Tastenbildern der P_-Profile; „MAX AUTO" der 757/767 als „MAX".
+fn ff_autobrake_label(roh: f32) -> Option<&'static str> {
+    if !roh.is_finite() {
+        return None;
+    }
+    const STUFEN: [&str; 8] = ["RTO", "OFF", "DISARM", "1", "2", "3", "4", "MAX"];
+    let i = (roh + 0.5).floor().clamp(0.0, 7.0) as usize;
+    Some(STUFEN[i])
+}
+
+/// Laminar-A330-Transponder aus den eigenen Knoepfen (Werte am 27.09.2026
+/// im Simulator gemessen). `None`, solange der AUTO/ON-Knopf fehlt.
+fn a333_xpdr_label(
+    auto_on: Option<f32>,
+    ta_ra: Option<f32>,
+    alt_rpt: Option<f32>,
+) -> Option<&'static str> {
+    let auto_on = auto_on?.round();
+    if auto_on < -0.5 {
+        return Some("STBY");
+    }
+    if alt_rpt.is_some_and(|v| v.round() < 0.5) {
+        return Some("ON"); // sendet ohne Hoehe
+    }
+    Some(match ta_ra.map(|v| v.round() as i32) {
+        Some(2) => "TA-RA",
+        Some(1) => "TA",
+        _ => "ALT",
+    })
+}
+
+impl XPlaneState {
+    /// Leuchtet eine FF777-MCP-Lampe? > 0.01 wie in den P_-Profilen; im
+    /// Lampentest (Schalter auf TEST) zaehlt keine.
+    fn ff777_lampe(&self, glow: Option<f32>) -> bool {
+        let test = self.ff777_lampen_test.is_some_and(|t| t >= 1.5);
+        !test && glow.is_some_and(|g| g > 0.01)
+    }
+
+    /// Flugzeugwechsel: die Standard-Schilder zaehlen erst wieder ab dem
+    /// ersten Wert ≠ 0 des neuen Flugzeugs.
+    pub fn standard_schilder_vergessen(&mut self) {
+        self.std_anschnallzeichen = None;
+        self.std_rauchverbot = None;
+    }
+
+    /// Eine Add-on-Quelle vergessen (Flugzeugwechsel oder nicht bestaetigt):
+    /// das Feld faellt auf „nicht vorhanden" zurueck, der Standardwert gilt.
+    pub fn addon_leeren(&mut self, field: FieldId) {
+        match field {
+            FieldId::TolissAp1 => self.toliss_ap1 = false,
+            FieldId::TolissAp2 => self.toliss_ap2 = false,
+            FieldId::TolissAthrMode => {
+                self.toliss_athr_mode = 0.0;
+                self.toliss_athr_seen = false;
+            }
+            FieldId::LightBeaconLegacy => self.light_beacon_legacy = None,
+            FieldId::B738XpdrKnob => self.b738_xpdr_knob = None,
+            FieldId::B738CmdB => self.b738_cmd_b = false,
+            FieldId::B738LogoLight => self.b738_logo_light = None,
+            FieldId::B738WingHeat => self.b738_wing_heat = None,
+            FieldId::B738Eng1Heat => self.b738_eng1_heat = None,
+            FieldId::B738Eng2Heat => self.b738_eng2_heat = None,
+            FieldId::B738AtArm => self.b738_at_arm = None,
+            FieldId::B738MasterCaution => self.b738_master_caution = None,
+            FieldId::B738SeatbeltSign => self.b738_seatbelt_sign = None,
+            FieldId::B738SpeedbrakeArmed => self.b738_speedbrake_armed = None,
+            FieldId::B738AutobrakePos => self.b738_autobrake_pos = None,
+            FieldId::B738FlapLever => self.b738_flap_lever = None,
+            FieldId::B738FmsVref => self.b738_fms_vref = None,
+            FieldId::TolissBeacon => self.toliss_beacon = None,
+            FieldId::TolissSeatBeltSigns => self.toliss_seatbelt_signs = None,
+            FieldId::TolissApuMaster => self.toliss_apu_master = None,
+            FieldId::TolissApLateralMode => self.toliss_ap_lateral_mode = None,
+            FieldId::TolissApVerticalMode => self.toliss_ap_vertical_mode = None,
+            FieldId::TolissApprIlluminated => self.toliss_appr_lampe = None,
+            FieldId::TolissLocIlluminated => self.toliss_loc_lampe = None,
+            FieldId::TolissAutoBrkLo => self.toliss_autobrk_lo = None,
+            FieldId::TolissAutoBrkMed => self.toliss_autobrk_med = None,
+            FieldId::TolissAutoBrkMax => self.toliss_autobrk_max = None,
+            FieldId::A333StrobePos => self.a333_strobe_pos = None,
+            FieldId::A333SeatbeltSwitch => self.a333_seatbelt_switch = None,
+            FieldId::TolissStrobeSwitch => self.toliss_strobe_switch = None,
+            FieldId::FelisBeacon => self.felis_beacon = None,
+            FieldId::Q4xpKollisionslicht => self.q4xp_kollisionslicht = None,
+            FieldId::A333XpdrAutoOn => self.a333_xpdr_auto_on = None,
+            FieldId::A333TaRaKnob => self.a333_ta_ra_knob = None,
+            FieldId::A333AltRptKnob => self.a333_alt_rpt_knob = None,
+            FieldId::TolissFluegellicht => self.toliss_fluegellicht = None,
+            FieldId::TolissRauchverbot => self.toliss_rauchverbot = None,
+            FieldId::Ff777ApL => self.ff777_ap_l = None,
+            FieldId::Ff777ApR => self.ff777_ap_r = None,
+            FieldId::Ff777HdgHold => self.ff777_hdg_hold = None,
+            FieldId::Ff777AltHold => self.ff777_alt_hold = None,
+            FieldId::Ff777Lnav => self.ff777_lnav = None,
+            FieldId::Ff777Loc => self.ff777_loc = None,
+            FieldId::Ff777App => self.ff777_app = None,
+            FieldId::Ff777At => self.ff777_at = None,
+            FieldId::Ff777LampenTest => self.ff777_lampen_test = None,
+            FieldId::FfFluegellicht => self.ff_fluegellicht = None,
+            FieldId::FfAnschnallzeichen => self.ff_anschnallzeichen = None,
+            FieldId::FfRauchverbot => self.ff_rauchverbot = None,
+            FieldId::FfAutobrake => self.ff_autobrake = None,
+            _ => {}
+        }
+    }
+
+    /// Wie [`Self::apply_field`], aber mit `f64` — fuer das Plugin
+    /// (Protokoll 2), das `double`-Datarefs in voller Genauigkeit liefert.
+    /// Position und Hoehen behalten sie bis in den Schnappschuss (RREF:
+    /// `float32`, Breite/Laenge auf ≈ 0,5 m gerundet); alle anderen Felder
+    /// sind ohnehin `f32` und gehen den gewohnten Weg.
+    pub fn apply_field_f64(&mut self, field: FieldId, value: f64) {
+        match field {
+            FieldId::Latitude => {
+                self.got_first_packet = true;
+                self.lat = value;
+            }
+            FieldId::Longitude => {
+                self.got_first_packet = true;
+                self.lon = value;
+            }
+            FieldId::AltitudeMslFt => {
+                self.got_first_packet = true;
+                self.altitude_msl_m = value * 0.3048;
+            }
+            FieldId::AltitudeAglFt => {
+                self.got_first_packet = true;
+                self.altitude_agl_m = value;
+            }
+            _ => self.apply_field(field, value as f32),
+        }
+    }
+
+    /// Apply one decoded value to its `FieldId`.
+    ///
+    /// v0.12.2: the caller (the UDP listener) resolves the RREF index →
+    /// active-catalog entry → `FieldId`, and applies any profile
+    /// `ValueMapping`, before calling this. This function just writes
+    /// the already-mapped value onto the right field.
+    pub fn apply_field(&mut self, field: FieldId, value: f32) {
+        self.got_first_packet = true;
+        match field {
+            FieldId::Latitude => self.lat = value as f64,
+            FieldId::Longitude => self.lon = value as f64,
+            // MSL: DataRef now delivers FEET (`altitude_ft_pilot`).
+            // We still store internally in meters to keep the
+            // snapshot conversion uniform with AGL — convert ft→m here.
+            // 0.3048 mirrors the M_PER_FT constant in `to_snapshot()`.
+            FieldId::AltitudeMslFt => self.altitude_msl_m = (value as f64) * 0.3048,
+            FieldId::AltitudeAglFt => self.altitude_agl_m = value as f64, // y_agl: native meters
+            FieldId::HeadingDegTrue => self.heading_true_deg = value,
+            FieldId::HeadingDegMagnetic => self.heading_magnetic_deg = value,
+            FieldId::PitchDeg => self.pitch_deg = value,
+            FieldId::BankDeg => self.bank_deg = value,
+            // vvi_fpm_pilot is ALREADY in fpm — no m/s→fpm conversion.
+            FieldId::VerticalSpeedFpm => self.vertical_speed_fpm = value,
+            // local_vy ist in m/s (X-Plane native), konvertieren zu
+            // fpm: 1 m/s = 196.8504 ft/min. Vorzeichen passt direkt
+            // (positive Y = climb in beiden Konventionen).
+            FieldId::VerticalSpeedRawFpm => self.vertical_speed_raw_fpm = value * 196.8504,
+            FieldId::GroundspeedKt => self.groundspeed_ms = value, // m/s native
+            FieldId::IndicatedAirspeedKt => self.indicated_airspeed_kt = value,
+            FieldId::TrueAirspeedKt => self.true_airspeed_ms = value, // m/s native
+            FieldId::GForce => self.g_force = value,
+            FieldId::OnGround => self.on_ground = value > 0.5,
+            FieldId::GearNormalForceN => self.gear_normal_force_n = value,
+            FieldId::ParkingBrake => self.parking_brake_ratio = value,
+            FieldId::GearDeploy => self.gear_deploy = value,
+            FieldId::FlapsHandle => self.flaps_handle = value,
+            FieldId::Eng1Running => self.eng1_running = value > 0.5,
+            FieldId::Eng2Running => self.eng2_running = value > 0.5,
+            FieldId::Eng3Running => self.eng3_running = value > 0.5,
+            FieldId::Eng4Running => self.eng4_running = value > 0.5,
+            FieldId::FuelTotalKg => self.fuel_total_kg = value,
+            FieldId::EmptyWeightKg => self.empty_weight_kg = value,
+            FieldId::TotalWeightKg => self.total_weight_kg = value,
+            FieldId::LocalVxMs => self.local_vx_ms = value,
+            FieldId::LocalVzMs => self.local_vz_ms = value,
+            FieldId::WindXMs => self.wind_x_ms = value,
+            FieldId::WindZMs => self.wind_z_ms = value,
+            FieldId::WindNowSpeedMs => self.wind_now_speed_ms = value,
+            FieldId::WindNowDirectionDegT => self.wind_now_direction_degt = value,
+            FieldId::LightLanding => self.light_landing = value > 0.5,
+            FieldId::LightBeacon => self.light_beacon = value > 0.5,
+            FieldId::LightStrobe => self.light_strobe = value > 0.5,
+            FieldId::LightTaxi => self.light_taxi = value > 0.5,
+            FieldId::LightNav => self.light_nav = value > 0.5,
+            FieldId::ApMaster => self.ap_master = value > 0.5,
+            FieldId::ApHeading => self.ap_heading = value > 0.5,
+            FieldId::ApAltitude => self.ap_altitude = value > 0.5,
+            FieldId::ApNav => self.ap_nav = value > 0.5,
+            FieldId::ApApproach => self.ap_approach = value > 0.5,
+            FieldId::SpoilersHandle => self.spoilers_handle = value,
+            FieldId::StallWarning => self.stall_warning = value > 0.5,
+            FieldId::BatteryMaster => self.battery_master = value > 0.5,
+            FieldId::AvionicsMaster => self.avionics_master = value > 0.5,
+            FieldId::ApuSwitch => self.apu_switch = value > 0.5,
+            FieldId::PitotHeat => self.pitot_heat = value > 0.5,
+            FieldId::QnhInHg => self.qnh_inhg = value,
+            FieldId::OatC => self.oat_c = value,
+            FieldId::Mach => self.mach = value,
+            // v0.3.0 — universal additions
+            FieldId::AutobrakeLevel => self.autobrake_level = value,
+            FieldId::TransponderMode => self.transponder_mode = value,
+            // v0.3.0 — 737 family additions
+            FieldId::LightWing => self.light_wing = value > 0.5,
+            FieldId::LightWheelWell => self.light_wheel_well = value > 0.5,
+            FieldId::TakeoffConfigWarning => self.takeoff_config_warning = value > 0.5,
+            // Spec v0.7.15 F6
+            FieldId::SimPaused => self.sim_paused = value > 0.5,
+            FieldId::SimInReplay => self.sim_in_replay = value > 0.5,
+            // v0.16.7 — ToLiss Airbus autoflight (AirbusFBW namespace)
+            FieldId::TolissAp1 => self.toliss_ap1 = value > 0.5,
+            FieldId::TolissAp2 => self.toliss_ap2 = value > 0.5,
+            FieldId::TolissAthrMode => {
+                self.toliss_athr_mode = value;
+                // Any delivery (even 0.0) proves the dataref exists —
+                // see the `toliss_athr_seen` field doc.
+                self.toliss_athr_seen = true;
+            }
+            // Bordbuch-Audit 26.09.2026 — anwesenheitsgesteuerte Schalter
+            FieldId::LightBeaconLegacy => self.light_beacon_legacy = Some(value > 0.5),
+            FieldId::B738XpdrKnob => self.b738_xpdr_knob = Some(value),
+            FieldId::B738CmdB => self.b738_cmd_b = value > 0.5,
+            FieldId::B738LogoLight => self.b738_logo_light = Some(value > 0.5),
+            FieldId::B738WingHeat => self.b738_wing_heat = Some(value > 0.5),
+            FieldId::B738Eng1Heat => self.b738_eng1_heat = Some(value > 0.5),
+            FieldId::B738Eng2Heat => self.b738_eng2_heat = Some(value > 0.5),
+            FieldId::B738AtArm => self.b738_at_arm = Some(value > 0.5),
+            FieldId::B738MasterCaution => self.b738_master_caution = Some(value > 0.5),
+            FieldId::B738SeatbeltSign => self.b738_seatbelt_sign = Some(value),
+            FieldId::B738SpeedbrakeArmed => self.b738_speedbrake_armed = Some(value > 0.5),
+            FieldId::B738AutobrakePos => self.b738_autobrake_pos = Some(value),
+            FieldId::B738FlapLever => self.b738_flap_lever = Some(value),
+            FieldId::B738FmsVref => self.b738_fms_vref = Some(value),
+            FieldId::AcfVso => self.acf_vso = Some(value),
+            FieldId::TolissBeacon => self.toliss_beacon = Some(value > 0.5),
+            FieldId::TolissSeatBeltSigns => self.toliss_seatbelt_signs = Some(value > 0.5),
+            FieldId::TolissApuMaster => self.toliss_apu_master = Some(value > 0.5),
+            FieldId::TolissApLateralMode => self.toliss_ap_lateral_mode = Some(value),
+            FieldId::TolissApVerticalMode => self.toliss_ap_vertical_mode = Some(value),
+            FieldId::TolissApprIlluminated => self.toliss_appr_lampe = Some(value > 0.5),
+            FieldId::TolissLocIlluminated => self.toliss_loc_lampe = Some(value > 0.5),
+            FieldId::TolissAutoBrkLo => self.toliss_autobrk_lo = Some(value > 0.5),
+            FieldId::TolissAutoBrkMed => self.toliss_autobrk_med = Some(value > 0.5),
+            FieldId::TolissAutoBrkMax => self.toliss_autobrk_max = Some(value > 0.5),
+            FieldId::A333StrobePos => self.a333_strobe_pos = Some(value),
+            FieldId::A333SeatbeltSwitch => self.a333_seatbelt_switch = Some(value),
+            FieldId::TolissStrobeSwitch => self.toliss_strobe_switch = Some(value),
+            FieldId::FelisBeacon => self.felis_beacon = Some(value > 0.5),
+            FieldId::Q4xpKollisionslicht => self.q4xp_kollisionslicht = Some(value.abs() > 0.5),
+            FieldId::A333XpdrAutoOn => self.a333_xpdr_auto_on = Some(value),
+            FieldId::A333TaRaKnob => self.a333_ta_ra_knob = Some(value),
+            FieldId::A333AltRptKnob => self.a333_alt_rpt_knob = Some(value),
+            FieldId::TolissFluegellicht => self.toliss_fluegellicht = Some(value > 0.5),
+            FieldId::TolissRauchverbot => self.toliss_rauchverbot = Some(value),
+            FieldId::Ff777ApL => self.ff777_ap_l = Some(value),
+            FieldId::Ff777ApR => self.ff777_ap_r = Some(value),
+            FieldId::Ff777HdgHold => self.ff777_hdg_hold = Some(value),
+            FieldId::Ff777AltHold => self.ff777_alt_hold = Some(value),
+            FieldId::Ff777Lnav => self.ff777_lnav = Some(value),
+            FieldId::Ff777Loc => self.ff777_loc = Some(value),
+            FieldId::Ff777App => self.ff777_app = Some(value),
+            FieldId::Ff777At => self.ff777_at = Some(value),
+            FieldId::Ff777LampenTest => self.ff777_lampen_test = Some(value),
+            FieldId::FfFluegellicht => self.ff_fluegellicht = Some(value >= 0.5),
+            FieldId::FfAnschnallzeichen => self.ff_anschnallzeichen = Some(value),
+            FieldId::FfRauchverbot => self.ff_rauchverbot = Some(value),
+            FieldId::FfAutobrake => self.ff_autobrake = Some(value),
+            FieldId::StdAnschnallzeichen => {
+                if value != 0.0 || self.std_anschnallzeichen.is_some() {
+                    self.std_anschnallzeichen = Some(value);
+                }
+            }
+            FieldId::StdRauchverbot => {
+                if value != 0.0 || self.std_rauchverbot.is_some() {
+                    self.std_rauchverbot = Some(value);
+                }
+            }
+            FieldId::ZuluTimeSec => self.zulu_time_sec = Some(value),
+            FieldId::LocalDateDays => self.local_date_days = Some(value),
+            FieldId::SimSpeed => self.sim_speed = Some(value),
+            FieldId::GroundSpeedFactor => self.ground_speed_faktor = Some(value),
+            FieldId::FrameRatePeriod => self.framerate_period = Some(value),
+            FieldId::HasCrashed => {
+                let roh = value > 0.5;
+                if !roh {
+                    self.crash_scharf = true;
+                    self.crashed = false;
+                } else if self.crash_scharf {
+                    self.crashed = true;
+                }
+                self.has_crashed_roh = Some(roh);
+            }
+            FieldId::TransponderCode => self.transponder_code = Some(value),
+            FieldId::FlapDetents => self.flap_detents = Some(value),
+            FieldId::EngineType => self.engine_type = Some(value),
+            FieldId::Eng1N1 => self.eng_n1_pct[0] = Some(value),
+            FieldId::Eng2N1 => self.eng_n1_pct[1] = Some(value),
+            FieldId::Eng3N1 => self.eng_n1_pct[2] = Some(value),
+            FieldId::Eng4N1 => self.eng_n1_pct[3] = Some(value),
+            FieldId::Eng1FuelFlow => self.eng_ff_kg_s[0] = Some(value),
+            FieldId::Eng2FuelFlow => self.eng_ff_kg_s[1] = Some(value),
+            FieldId::Eng3FuelFlow => self.eng_ff_kg_s[2] = Some(value),
+            FieldId::Eng4FuelFlow => self.eng_ff_kg_s[3] = Some(value),
+        }
+    }
+
+    /// Convert the accumulated state to a fresh `SimSnapshot`. The
+    /// timestamp is stamped at conversion time (UTC now). Fields
+    /// without an X-Plane equivalent stay at SimSnapshot's `Default`
+    /// (None for Options, sensible zeros for required fields).
+    /// ToLiss-Autopilotmodi aus dem FMA: (HDG, NAV, ALT, APPR). Ohne
+    /// ToLiss-Werte alles `false` (dann gilt allein der Standard).
+    fn toliss_ap_modi(&self) -> (bool, bool, bool, bool) {
+        let modus = |v: Option<f32>| v.filter(|x| x.is_finite()).map(|x| x.round() as i32);
+        let lat = modus(self.toliss_ap_lateral_mode);
+        let vert = modus(self.toliss_ap_vertical_mode);
+        let hdg = lat == Some(101);
+        let nav = matches!(lat, Some(2 | 9));
+        let alt = matches!(vert, Some(3 | 4 | 103 | 104 | 105));
+        let appr = self.toliss_appr_lampe == Some(true)
+            || self.toliss_loc_lampe == Some(true)
+            || matches!(lat, Some(6 | 7))
+            || matches!(vert, Some(6 | 7 | 8 | 10 | 11));
+        (hdg, nav, alt, appr)
+    }
+
+    pub fn to_snapshot(&self, simulator: Simulator) -> SimSnapshot {
+        const M_PER_FT: f64 = 0.3048;
+        const KT_PER_MS: f32 = 1.9438445; // 1 m/s = 1.9438 knots
+
+        // Derive payload from ZFW-OEW like we do on the MSFS side.
+        // ZFW = total weight - fuel.
+        let zfw_kg = if self.total_weight_kg > 0.0 && self.total_weight_kg > self.fuel_total_kg {
+            Some(self.total_weight_kg - self.fuel_total_kg)
+        } else {
+            None
+        };
+        // v0.19.x FIX: mirror the MSFS-side gate (see telemetry.rs) —
+        // reject an OEW at or above the aircraft's own current gross
+        // weight, a hard physical impossibility (gross = empty + fuel
+        // + payload, all >= 0) rather than just an unusual number. A
+        // fixed floor can't safely catch implausibly-*low* bogus
+        // defaults without also rejecting real tiny GA airframes, so
+        // that gap stays open; this closes the high-end/unit-mixup
+        // case using data we already have, no aircraft-type reference
+        // needed.
+        let physically_possible =
+            self.total_weight_kg <= 0.0 || self.empty_weight_kg < self.total_weight_kg;
+        let oew = if self.empty_weight_kg > 0.0 && physically_possible {
+            Some(self.empty_weight_kg)
+        } else {
+            None
+        };
+        let payload_kg = match (zfw_kg, oew) {
+            (Some(z), Some(o)) if z > o => Some(z - o),
+            _ => None,
+        };
+
+        // Body frame, derived from the world-frame velocity + true
+        // heading — see `body_velocity_fps`.
+        let (body_forward_fps, body_right_fps) = body_velocity_fps(
+            self.local_vx_ms,
+            self.local_vz_ms,
+            self.heading_true_deg,
+            self.groundspeed_ms,
+        );
+        // Wind mit derselben Drehung wie die Geschwindigkeit (Feldbefund
+        // 14.08.2026 — vorher ungedreht und damit fuer jeden Flug falsch).
+        let (wind_gegen, wind_seitlich) =
+            wind_body_kt(self.wind_x_ms, self.wind_z_ms, self.heading_true_deg);
+
+        // Klappenraste nur mit dem Standard-Hebel: der Zibo-Hebel hat eine
+        // eigene Skala; Profile mit eigener Klappenquelle (CL650, MD-11)
+        // raeumt `XPlaneAdapter::snapshot` ab.
+        let (flap_handle_index, flap_num_positions) = if self.b738_flap_lever.is_some() {
+            (None, None)
+        } else {
+            klappen_raste(self.flaps_handle, self.flap_detents)
+        };
+
+        // Triebwerke: N1 (%) und Kraftstofffluss (kg/s → kg/h) je Triebwerk.
+        // Das Urteil `engines_running` bleibt allein bei `ENGN_running`
+        // (Lehre PC-12, 16.09.2026) — N1 und Fluss sind nur Beleg und Anzeige.
+        let wert = |v: Option<f32>| v.filter(|x| x.is_finite()).map_or(0.0, f64::from);
+        let n1: [f64; 4] = self.eng_n1_pct.map(wert);
+        let ff_kg_h: [f64; 4] = self.eng_ff_kg_s.map(|v| wert(v) * 3600.0);
+        let laeuft = [
+            self.eng1_running,
+            self.eng2_running,
+            self.eng3_running,
+            self.eng4_running,
+        ];
+        // Wie der MSFS-Pfad: Praefix 1..k bis zum hoechsten Triebwerk, das
+        // laeuft oder > 5 % N1 hat; ohne ein Triebwerk ≥ 5 % kein Wert. Nur
+        // Turbinen — Kolben-/Elektromotoren liefern wie bei MSFS kein N1.
+        let eng_n1_pct: Option<Vec<f64>> = if ist_turbine(self.engine_type) {
+            let k = (0..4)
+                .filter(|&i| laeuft[i] || n1[i] > 5.0)
+                .map(|i| i + 1)
+                .max()
+                .unwrap_or(0);
+            let lebt = n1[..k].iter().cloned().fold(0.0_f64, f64::max) >= 5.0;
+            (k > 0 && lebt).then(|| n1[..k].to_vec())
+        } else {
+            None
+        };
+        let ff_summe_kg_h: f64 = ff_kg_h.iter().sum();
+        let fuel_flow_kg_per_h = (ff_summe_kg_h > 0.0).then_some(ff_summe_kg_h as f32);
+        let engine_signals = (self.eng_n1_pct.iter().any(Option::is_some)
+            || self.eng_ff_kg_s.iter().any(Option::is_some))
+        .then(|| sim_core::EngineSignals {
+            // Die beiden Combustion-Schalter gibt es nur bei MSFS.
+            general_combustion: Vec::new(),
+            combustion_ex1: Vec::new(),
+            // X-Plane `ENGN_running` („engine on and using fuel").
+            eng_combustion: laeuft.to_vec(),
+            // N1 nur bei Turbinen (dieselbe Pruefung wie `eng_n1_pct`); bei
+            // Kolben-/Elektromotoren leer — der Monitor zeigt dann kein N1.
+            n1_pct: if ist_turbine(self.engine_type) {
+                n1.to_vec()
+            } else {
+                Vec::new()
+            },
+            fuel_flow_pph: ff_kg_h.iter().map(|kg| kg / KG_JE_LB).collect(),
+        });
+
+        SimSnapshot {
+            timestamp: chrono::Utc::now(),
+            lat: self.lat,
+            lon: self.lon,
+            altitude_msl_ft: self.altitude_msl_m / M_PER_FT,
+            altitude_agl_ft: self.altitude_agl_m / M_PER_FT,
+            // v0.7.17 (B-003): X-Plane stellt diese MSFS-spezifischen
+            // Pendants nicht direkt zur Verfuegung (X-Plane berechnet
+            // pressure altitude implizit aus baro+QNH); wir lassen sie
+            // hier None und debuggen ausschliesslich den MSFS-Pfad.
+            altitude_indicated_ft: None,
+            altitude_pressure_ft: None,
+            heading_deg_true: self.heading_true_deg,
+            heading_deg_magnetic: self.heading_magnetic_deg,
+            pitch_deg: self.pitch_deg,
+            bank_deg: self.bank_deg,
+            vertical_speed_fpm: self.vertical_speed_fpm,
+            // Raw local_vy → the responsive touchdown signal (kept separate so
+            // the curvature bias never reaches display/FSM/stability).
+            vertical_speed_raw_fpm: Some(self.vertical_speed_raw_fpm),
+            velocity_body_x_fps: body_right_fps,
+            velocity_body_z_fps: body_forward_fps,
+            groundspeed_kt: self.groundspeed_ms * KT_PER_MS,
+            // X-Plane's pitot simulation produces small negative IAS/TAS
+            // readings when the aircraft is stationary on the ground
+            // (sensor noise, residual ram pressure modelling). Clamp to
+            // zero at the source so neither the cockpit gauges nor
+            // downstream consumers (PIREP, activity log) ever surface
+            // a "−10 kt" — pilots reasonably treat that as a bug.
+            indicated_airspeed_kt: self.indicated_airspeed_kt.max(0.0),
+            true_airspeed_kt: (self.true_airspeed_ms * KT_PER_MS).max(0.0),
+            // Gedreht statt roh durchgereicht (s. Kommentar am Dataref).
+            // `aircraft_wind_z_kt` traegt laut Snapshot-Vertrag den RUECKENwind
+            // positiv, `wind_body_kt` liefert den Gegenwind — daher negiert.
+            aircraft_wind_x_kt: wind_seitlich,
+            aircraft_wind_z_kt: wind_gegen.map(|g| -g),
+            g_force: self.g_force,
+            // Zweiter G-Kanal gibt es nur unter MSFS (Lernpaket AP1a).
+            g_semibody: None,
+            on_ground: self.on_ground,
+            // `sim/flightmodel2/misc/has_crashed` (29.09.2026), nur die Flanke
+            // 0 → 1 (siehe `crash_scharf`) und nie im Replay. Die gemeinsame
+            // Heuristik greift weiter bei harten Aufschlaegen.
+            crashed: self.crashed && !self.sim_in_replay,
+            crash_source: (self.crashed && !self.sim_in_replay)
+                .then(|| "xplane_crash_dataref".to_string()),
+            gear_normal_force_n: Some(self.gear_normal_force_n),
+            parking_brake: self.parking_brake_ratio > 0.5,
+            stall_warning: self.stall_warning,
+            overspeed_warning: false, // X-Plane has no direct overspeed annunciator
+            // Spec v0.7.15 F6: aus sim/time/paused + sim/time/is_in_replay
+            // ableiten. Beide werden als Pause-aequivalent behandelt — Replay
+            // ist keine echte Flugaufzeichnung, der Streamer-Loop pausiert
+            // also fuer beide Faelle und der Pause-Akkumulator zaehlt.
+            paused: self.sim_paused || self.sim_in_replay,
+            slew_mode: false,
+            // Zeitraffer × Strecken-Multiplikator, Semantik wie MSFS.
+            simulation_rate: sim_rate_aus(self.sim_speed, self.ground_speed_faktor),
+            sim_bildrate_hz: bildrate_aus_periode(self.framerate_period),
+            gear_position: self.gear_deploy,
+            // Zibo: eigener Klappenhebel, sobald er ankommt; sonst der
+            // Standard-Hebel (`flap_handle_request_ratio`, 0..1).
+            flaps_position: self.b738_flap_lever.unwrap_or(self.flaps_handle),
+            // Raste aus Hebel + `acf_flap_detents` (siehe `klappen_raste`).
+            flap_handle_index,
+            flap_num_positions,
+            engines_running: [
+                self.eng1_running,
+                self.eng2_running,
+                self.eng3_running,
+                self.eng4_running,
+            ]
+            .iter()
+            .filter(|&&r| r)
+            .count() as u8,
+            fuel_total_kg: self.fuel_total_kg,
+            fuel_used_kg: 0.0,
+            zfw_kg,
+            payload_kg,
+            total_weight_kg: if self.total_weight_kg > 0.0 {
+                Some(self.total_weight_kg)
+            } else {
+                None
+            },
+            // No latched-touchdown DataRef in X-Plane; the buffer-
+            // based fallback in src/lib.rs takes over.
+            touchdown_vs_fpm: None,
+            touchdown_pitch_deg: None,
+            touchdown_bank_deg: None,
+            touchdown_heading_mag_deg: None,
+            touchdown_lat: None,
+            touchdown_lon: None,
+            // v0.5.19: was hardcoded None — server-side live-tracking
+            // monitor showed "—" for wind on every X-Plane pilot.
+            // Now reads `wind_now_speed_msc` (m/s → kt) and
+            // `wind_now_direction_degt` (deg true) DataRefs. We treat
+            // 0/0 as "no wind data yet" (DataRefs not populated on
+            // first tick) → None.
+            wind_direction_deg: if self.wind_now_speed_ms > 0.0 {
+                Some(self.wind_now_direction_degt)
+            } else {
+                None
+            },
+            wind_speed_kt: if self.wind_now_speed_ms > 0.0 {
+                Some(self.wind_now_speed_ms * KT_PER_MS)
+            } else {
+                None
+            },
+            qnh_hpa: if self.qnh_inhg > 0.0 {
+                // X-Plane reports altimeter setting in inHg natively;
+                // convert to hPa (1 inHg = 33.8639 hPa).
+                Some(self.qnh_inhg * 33.8639)
+            } else {
+                None
+            },
+            outside_air_temp_c: Some(self.oat_c),
+            total_air_temp_c: None,
+            mach: if self.mach > 0.0 {
+                Some(self.mach)
+            } else {
+                None
+            },
+            empty_weight_kg: oew,
+            aircraft_title: None,
+            aircraft_ui_name: None,
+            aircraft_icao: None,
+            aircraft_registration: None,
+            simulator,
+            sim_version: None,
+            // Squawk aus `sim/cockpit2/radios/actuators/transponder_code`
+            // (derselbe Dataref wie im Telemetrie-Monitor). COM/NAV bleiben
+            // offen — Add-ons sind sich bei den Konventionen uneins.
+            transponder_code: squawk_aus(self.transponder_code),
+            com1_mhz: None,
+            com2_mhz: None,
+            nav1_mhz: None,
+            nav2_mhz: None,
+            light_landing: Some(self.light_landing),
+            // Beacon aus jeder bekannten Quelle: Standard-Schalter
+            // (Laminar), der aeltere `electrical/beacon_lights_on` (Zibo)
+            // und der ToLiss-Schalter. Fehlende Quellen bleiben `None`
+            // und zaehlen nicht.
+            light_beacon: Some(
+                self.light_beacon
+                    || self.light_beacon_legacy == Some(true)
+                    || self.toliss_beacon == Some(true)
+                    || self.felis_beacon == Some(true)
+                    || self.q4xp_kollisionslicht == Some(true),
+            ),
+            light_strobe: Some(self.light_strobe),
+            light_taxi: Some(self.light_taxi),
+            light_nav: Some(self.light_nav),
+            // X-Plane's nav-light DataRef covers logo on most payware.
+            // Zibo/Laminar-737: eigener Logo-Schalter; sonst wie bisher die
+            // Nav-Lichter (X-Planes Konvention fuer die meisten Payware).
+            light_logo: Some(self.b738_logo_light.unwrap_or(self.light_nav)),
+            // 3-Stufen-Schalter, wo ein Add-on ihn liefert (Laminar-A330);
+            // sonst nur der binaere Effekt in `light_strobe`.
+            strobe_state: self
+                .a333_strobe_pos
+                .or(self.toliss_strobe_switch)
+                .and_then(schalter_0_1_2),
+            // v0.16.7: OR the ToLiss `AirbusFBW/AP1Engage`/`AP2Engage`
+            // datarefs into the standard `servos_on` — addon-agnostic
+            // (absent datarefs are never streamed → the toliss_* bools
+            // stay false → identical to Some(self.ap_master); any
+            // aircraft that serves them simply wins the OR). Same
+            // tiebreaker pattern as the A346/Fenix LVar mapping on the
+            // MSFS side.
+            autopilot_master: Some(
+                self.ap_master
+                    || self.toliss_ap1
+                    || self.toliss_ap2
+                    || self.b738_cmd_b
+                    || self.ff777_lampe(self.ff777_ap_l)
+                    || self.ff777_lampe(self.ff777_ap_r),
+            ),
+            // Standard ODER ToLiss-FMA (der ToLiss setzt die Standard-
+            // Statuswerte nie), siehe `toliss_ap_modi`; FF777 aus den
+            // MCP-Lampen.
+            autopilot_heading: Some(
+                self.ap_heading
+                    || self.toliss_ap_modi().0
+                    || self.ff777_lampe(self.ff777_hdg_hold),
+            ),
+            autopilot_altitude: Some(
+                self.ap_altitude
+                    || self.toliss_ap_modi().2
+                    || self.ff777_lampe(self.ff777_alt_hold),
+            ),
+            autopilot_nav: Some(
+                self.ap_nav
+                    || self.toliss_ap_modi().1
+                    || self.ff777_lampe(self.ff777_lnav)
+                    || self.ff777_lampe(self.ff777_loc),
+            ),
+            autopilot_approach: Some(
+                self.ap_approach || self.toliss_ap_modi().3 || self.ff777_lampe(self.ff777_app),
+            ),
+            // v0.16.7: ToLiss `AirbusFBW/ATHRmode` (0 = off, >0 =
+            // armed/active) is the first verified X-Plane A/THR state
+            // source. Presence-gated via `toliss_athr_seen`: X-Plane
+            // only streams the index when the dataref exists, so the
+            // field flips to Some(false) as soon as a ToLiss delivers
+            // its first packet (the initial state then latches silently
+            // in the activity log, exactly like the A346/Fenix MSFS
+            // path) and stays None — the pre-v0.16.7 behaviour — on
+            // every other aircraft.
+            autothrottle_on: if self.toliss_athr_seen {
+                Some(self.toliss_athr_mode > 0.5)
+            } else if self.ff777_at.is_some() {
+                Some(self.ff777_lampe(self.ff777_at))
+            } else {
+                None
+            },
+            // `autothrottle_is_arm` ist nur ein Zusatz zu `autothrottle_on`
+            // („dessen An ist ARM“) — beim Zibo gibt es fuer
+            // `autothrottle_on` keine Quelle, die ARM-Lampe haette also keine
+            // Wirkung und leuchtet auch bei aktivem A/T (QS 01.10.2026).
+            // `b738_at_arm` wird gelesen, aber noch nicht ausgegeben.
+            autothrottle_is_arm: false,
+            // Summe `ENGN_FF_` (kg/s → kg/h). 0 → None, dann leitet der
+            // Positions-Takt den Fluss wie bisher aus dem FOB-Verlauf ab.
+            fuel_flow_kg_per_h,
+            // `speedbrake_ratio` meldet ARMED als -0.5 — als Stellung
+            // ist das „eingefahren", als Zustand „scharf".
+            spoilers_handle_position: Some(self.spoilers_handle.max(0.0)),
+            spoilers_armed: Some(
+                self.b738_speedbrake_armed == Some(true)
+                    || self.spoilers_handle < SPEEDBRAKE_ARMED_BELOW,
+            ),
+            // Pushback isn't a sim-managed thing in X-Plane.
+            pushback_state: None,
+            // Standard ODER ToLiss-Master (der ToLiss setzt den Standard nie).
+            apu_switch: Some(self.apu_switch || self.toliss_apu_master == Some(true)),
+            apu_pct_rpm: None,
+            battery_master: Some(self.battery_master),
+            avionics_master: Some(self.avionics_master),
+            pitot_heat: Some(self.pitot_heat),
+            // Zibo/Laminar-737 (Doku „ANTI ICE SWITCHES“); andere Muster:
+            // unbekannt.
+            engine_anti_ice: match (self.b738_eng1_heat, self.b738_eng2_heat) {
+                (None, None) => None,
+                (a, b) => Some(a == Some(true) || b == Some(true)),
+            },
+            wing_anti_ice: self.b738_wing_heat,
+            // v0.3.0 — Boeing 737-family lights via laminar/B738/...
+            // DataRef. Some(...) when the value is non-zero in the
+            // RREF feed; None when the DataRef doesn't exist on the
+            // loaded aircraft (X-Plane returns 0, so we'd report
+            // "wing OFF" forever — to dodge that we only mark the
+            // field Some(...) when at least one tick actually saw
+            // a non-zero value, but for now we always wrap so the
+            // generic activity-log path can compare. This matches
+            // the existing light-handling in this file.
+            light_wing: Some(
+                self.light_wing
+                    || self.toliss_fluegellicht == Some(true)
+                    || self.ff_fluegellicht == Some(true),
+            ),
+            light_wheel_well: Some(self.light_wheel_well),
+            // v0.3.0 — Universal XPDR mode label.
+            xpdr_mode_label: {
+                // Laminar-/Zibo-737: der Drehschalter, weil der Standard-
+                // Dataref dort fuer jede Flugstellung nur 2 traegt.
+                // Laminar-A330: eigene Knoepfe (der Standard zeigt am
+                // Boden nie TA/RA).
+                let label = match (
+                    self.b738_xpdr_knob,
+                    a333_xpdr_label(
+                        self.a333_xpdr_auto_on,
+                        self.a333_ta_ra_knob,
+                        self.a333_alt_rpt_knob,
+                    ),
+                ) {
+                    (Some(pos), _) => b738_xpdr_knob_label(pos.round().max(0.0) as u8),
+                    (None, Some(a333)) => a333,
+                    (None, None) => xplane_xpdr_mode_label(self.transponder_mode as u8),
+                };
+                if label.is_empty() {
+                    None
+                } else {
+                    Some(label.to_string())
+                }
+            },
+            // v0.3.0 — 737 takeoff-config annunciator. Same caveat
+            // as light_wing — non-737 aircraft just stay false.
+            takeoff_config_warning: Some(self.takeoff_config_warning),
+            // 0=OFF 1=AUTO 2=ON. Nur wo ein Add-on den Schalter liefert —
+            // der Standard-Dataref ist bei den meisten Mustern nicht
+            // belegt und wuerde „OFF" vortaeuschen.
+            seatbelts_sign: match (
+                self.b738_seatbelt_sign.or(self.a333_seatbelt_switch),
+                self.toliss_seatbelt_signs,
+            ) {
+                (Some(pos), _) => schalter_0_1_2(pos),
+                (None, Some(on)) => Some(if on { 2 } else { 0 }),
+                (None, None) => self
+                    .ff_anschnallzeichen
+                    .or(self.std_anschnallzeichen)
+                    .and_then(stufe_0_1_2),
+            },
+            // Gleiche Skala; Standard erst, wenn er einmal ≠ 0 war.
+            no_smoking_sign: self
+                .toliss_rauchverbot
+                .or(self.ff_rauchverbot)
+                .or(self.std_rauchverbot)
+                .and_then(stufe_0_1_2),
+            fcu_selected_altitude_ft: None,
+            fcu_selected_heading_deg: None,
+            fcu_selected_speed_kt: None,
+            fcu_selected_vs_fpm: None,
+            // v0.3.0 — Universal autobrake label.
+            autobrake: {
+                let label = match (
+                    self.b738_autobrake_pos,
+                    toliss_autobrake_label(
+                        self.toliss_autobrk_lo,
+                        self.toliss_autobrk_med,
+                        self.toliss_autobrk_max,
+                    ),
+                ) {
+                    (Some(pos), _) => xplane_autobrake_label(pos.round().max(0.0) as u8),
+                    (None, Some(toliss)) => toliss,
+                    (None, None) => match self.ff_autobrake.and_then(ff_autobrake_label) {
+                        Some(ff) => ff,
+                        None => xplane_autobrake_label(self.autobrake_level as u8),
+                    },
+                };
+                if label.is_empty() {
+                    None
+                } else {
+                    Some(label.to_string())
+                }
+            },
+            parking_name: None,
+            parking_number: None,
+            selected_runway: None,
+            sim_zeit_utc: sim_zeit_aus(
+                self.zulu_time_sec,
+                self.local_date_days,
+                chrono::Utc::now(),
+            ),
+            aircraft_profile: sim_core::AircraftProfile::default(),
+            // PMDG SDK is MSFS-only; X-Plane never fills this.
+            pmdg: None,
+            // Category-aware landing: the static X-Plane gear-type descriptors
+            // (acf_gear_is_skid, acf_water_rud_*) are not wired through this
+            // path yet — they'd flow via the plugin/Web-API dataref set and
+            // can't be verified without a running sim. The aircraft CATEGORY
+            // is derived from the ICAO type when available (X-Plane 12 Web
+            // API); on XP11 / Web-API-off it falls back to FixedWing, i.e.
+            // unchanged behaviour (no regression). Wiring these datarefs is a
+            // tracked future enhancement (needs in-sim verification).
+            gear_is_skid: None,
+            gear_is_floats: None,
+            gear_is_wheels: None,
+            contact_point_on_ground: None,
+            gear_water_depth_m: None,
+            water_rudder_present: None,
+            // v0.16.10 (#Premium): Cockpit-Tiefendaten — auf dem
+            // X-Plane-Pfad noch nicht verdrahtet (spaetere Phase;
+            // braucht Addon-Datarefs wie AirbusFBW/ToLiss + In-Sim-
+            // Verifikation). None = "Quelle liefert es nicht"; Ausnahme
+            // seit 2.0.6: `vref_kt` aus dem Zibo-FMC (siehe B738FmsVref).
+            fma_lateral_mode: None,
+            fma_vertical_mode: None,
+            fma_thrust_mode: None,
+            flight_phase_aircraft: None,
+            v1_kt: None,
+            vr_kt: None,
+            v2_kt: None,
+            vapp_kt: None,
+            vls_kt: None,
+            vref_kt: self.b738_fms_vref.filter(|v| *v > 0.0).map(f64::from),
+            design_vs0_kt: self.acf_vso.filter(|v| *v > 0.0).map(f64::from),
+            flex_temp_c: None,
+            thrust_gate: None,
+            master_caution: self.b738_master_caution,
+            master_warning: None,
+            managed_speed: None,
+            managed_heading: None,
+            managed_altitude: None,
+            reverser_deployed: None,
+            ground_spoilers_active: None,
+            eng_n1_pct,
+            baro_std: None,
+            fuel_per_tank_kg: None,
+            below_gs_alert: None,
+            cabin_altitude_warning: None,
+            stab_out_of_trim: None,
+            minimums_baro_ft: None,
+            // v0.16.12 (#phase-v2): Schatten-Felder stempelt NUR der
+            // Streamer (post-Engine) — Adapter liefern immer None.
+            shadow_phase: None,
+            shadow_segment: None,
+            engine_signals,
+            // MSFS-Diagnosekanal (Audit 26.09.2026) — X-Plane fuellt ihn nicht.
+            cockpit_rohwerte: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod vs_dual_source_tests {
+    use super::*;
+
+    #[test]
+    fn vvi_is_fpm_direct_local_vy_is_converted() {
+        let mut s = XPlaneState::default();
+        // vvi_fpm_pilot is already fpm → stored as-is (NO m/s factor).
+        s.apply_field(FieldId::VerticalSpeedFpm, -277.0);
+        assert!((s.vertical_speed_fpm - (-277.0)).abs() < 0.001);
+        // local_vy is m/s → ×196.8504 to fpm. -11.684 m/s ≈ -2300 fpm.
+        s.apply_field(FieldId::VerticalSpeedRawFpm, -11.684);
+        assert!(
+            (s.vertical_speed_raw_fpm - (-2300.0)).abs() < 1.0,
+            "local_vy m/s→fpm: expected ~-2300, got {}",
+            s.vertical_speed_raw_fpm
+        );
+        // The two are independent: the display VVI is NOT scaled by the m/s
+        // factor and is not overwritten by the raw read.
+        assert!((s.vertical_speed_fpm - (-277.0)).abs() < 0.001);
+    }
+}
+
+// ---- v0.19.x FIX — true_airspeed m/s→kt conversion ----
+#[cfg(test)]
+mod airspeed_unit_tests {
+    use super::*;
+
+    const KT_PER_MS: f32 = 1.9438445;
+
+    /// The bug this replaces: `true_airspeed_kt` stored the raw
+    /// `sim/flightmodel/position/true_airspeed` m/s value directly, with
+    /// no conversion — so TAS displayed at ~51% of the real value.
+    /// Groundspeed (already correctly converted) is the control: both
+    /// must come out in the same unit family from the same kind of raw
+    /// X-Plane m/s input.
+    #[test]
+    fn true_airspeed_converts_ms_to_kt_like_groundspeed_does() {
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::GroundspeedKt, 100.0); // 100 m/s
+        s.apply_field(FieldId::TrueAirspeedKt, 100.0); // 100 m/s
+        let snap = s.to_snapshot(Simulator::XPlane11);
+        let expected_kt = 100.0 * KT_PER_MS;
+        assert!(
+            (snap.groundspeed_kt - expected_kt).abs() < 0.01,
+            "control (groundspeed) must convert m/s->kt"
+        );
+        assert!(
+            (snap.true_airspeed_kt - expected_kt).abs() < 0.01,
+            "true_airspeed_kt must convert m/s->kt exactly like groundspeed \
+             does — got {}, expected ~{expected_kt}",
+            snap.true_airspeed_kt
+        );
+    }
+
+    /// Physical sanity check that the old bug directly violated: true
+    /// airspeed must never read BELOW indicated airspeed at altitude (TAS
+    /// grows faster than IAS as air density drops). A real ~480 kt cruise
+    /// TAS with the old bug would have shown as ~247 kt — below a 300 kt
+    /// IAS, which is impossible.
+    #[test]
+    fn true_airspeed_is_not_below_indicated_at_a_realistic_cruise_value() {
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::IndicatedAirspeedKt, 300.0); // already kt, no conversion
+                                                            // 480 kt real TAS, expressed as the m/s raw dataref value.
+        s.apply_field(FieldId::TrueAirspeedKt, 480.0 / KT_PER_MS);
+        let snap = s.to_snapshot(Simulator::XPlane11);
+        assert!(
+            snap.true_airspeed_kt > snap.indicated_airspeed_kt,
+            "TAS ({}) must exceed IAS ({}) in cruise — got the inverse, which \
+             is physically impossible",
+            snap.true_airspeed_kt,
+            snap.indicated_airspeed_kt
+        );
+        assert!((snap.true_airspeed_kt - 480.0).abs() < 0.5);
+    }
+
+    /// The ground-noise clamp (small negative pitot readings when
+    /// stationary) must still apply AFTER the unit conversion.
+    #[test]
+    fn true_airspeed_negative_ground_noise_still_clamps_to_zero() {
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::TrueAirspeedKt, -5.0); // -5 m/s sensor noise
+        let snap = s.to_snapshot(Simulator::XPlane11);
+        assert_eq!(snap.true_airspeed_kt, 0.0);
+    }
+}
+
+// ---- v0.16.9 — body velocity derived from world frame (BCS8/FF767) ----
+#[cfg(test)]
+mod body_velocity_tests {
+    use super::*;
+
+    const FPS_PER_MS: f32 = 1.0 / 0.3048;
+
+    /// Heading north, moving north (OpenGL: −Z) → forward positive,
+    /// |forward| = groundspeed, lateral ≈ 0.
+    #[test]
+    fn forward_taxi_north() {
+        let (fwd, right) = body_velocity_fps(0.0, -5.0, 0.0, 5.0);
+        assert!((fwd.unwrap() - 5.0 * FPS_PER_MS).abs() < 0.01);
+        assert!(right.unwrap().abs() < 0.01);
+    }
+
+    /// Heading north, tug pushing SOUTH (+Z) → forward negative — the
+    /// pushback signal `moving_backward` keys on.
+    #[test]
+    fn tug_push_reads_backward() {
+        let (fwd, _) = body_velocity_fps(0.0, 2.0, 0.0, 2.0);
+        assert!(
+            fwd.unwrap() < -1.0,
+            "tug push must read backward, got {fwd:?}"
+        );
+    }
+
+    /// The sign test must hold at EVERY heading (the world→body rotation is
+    /// the whole point — a raw world component flips sign with heading).
+    #[test]
+    fn forward_taxi_any_heading() {
+        for hdg in [0.0_f32, 47.3, 90.0, 135.0, 226.7, 270.0, 333.0] {
+            let psi = hdg.to_radians();
+            // World velocity for "moving straight ahead at 10 m/s".
+            let east = 10.0 * psi.sin();
+            let north = 10.0 * psi.cos();
+            let (fwd, right) = body_velocity_fps(east, -north, hdg, 10.0);
+            assert!(
+                (fwd.unwrap() - 10.0 * FPS_PER_MS).abs() < 0.05,
+                "heading {hdg}: forward expected ~{}, got {fwd:?}",
+                10.0 * FPS_PER_MS
+            );
+            assert!(right.unwrap().abs() < 0.05, "heading {hdg}: lateral ≈ 0");
+        }
+    }
+
+    /// Heading east, drifting south → positive lateral (south is to the
+    /// right of east), forward ≈ 0.
+    #[test]
+    fn lateral_sign() {
+        let (fwd, right) = body_velocity_fps(0.0, 4.0, 90.0, 4.0);
+        assert!(fwd.unwrap().abs() < 0.01);
+        assert!((right.unwrap() - 4.0 * FPS_PER_MS).abs() < 0.01);
+    }
+
+    /// THE BCS8 regression: sim reports 30 kt of ground movement but the
+    /// velocity source is dead (constant 0). Must emit None (→ FSM
+    /// no-signal fallback), NEVER a frozen Some(0.0) that hard-blocks
+    /// Pushback→TaxiOut.
+    #[test]
+    fn dead_source_with_real_movement_is_none() {
+        let (fwd, right) = body_velocity_fps(0.0, 0.0, 48.0, 15.4);
+        assert_eq!(fwd, None);
+        assert_eq!(right, None);
+    }
+
+    /// Parked: groundspeed ~0 and world velocity ~0 is CONSISTENT —
+    /// emit Some(0.0) (standstill is real, not a dead source).
+    #[test]
+    fn parked_is_some_zero() {
+        let (fwd, right) = body_velocity_fps(0.0, 0.0, 243.0, 0.0001);
+        assert!(fwd.unwrap().abs() < 0.01);
+        assert!(right.unwrap().abs() < 0.01);
+    }
+
+    /// End-to-end through the snapshot: a dead world-velocity source at
+    /// taxi speed yields None on the snapshot fields.
+    #[test]
+    fn snapshot_emits_none_for_dead_source() {
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::HeadingDegTrue, 48.0);
+        s.apply_field(FieldId::GroundspeedKt, 15.4); // m/s native
+        s.apply_field(FieldId::LocalVxMs, 0.0);
+        s.apply_field(FieldId::LocalVzMs, 0.0);
+        let snap = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(snap.velocity_body_z_fps, None);
+        assert_eq!(snap.velocity_body_x_fps, None);
+    }
+}
+
+// ---- v0.16.7 — ToLiss Airbus autoflight (AirbusFBW namespace) ----
+//
+// Data-audit 2026-06-11: the standard `servos_on` dataref reads dead
+// (never true) on ToLiss aircraft. The tests pin the OR semantics AND
+// the no-behaviour-change guarantee for aircraft that don't serve the
+// AirbusFBW datarefs (X-Plane never streams absent datarefs, so their
+// `apply_field` calls simply never happen — modelled here by not
+// calling it).
+#[cfg(test)]
+mod toliss_autoflight_tests {
+    use super::*;
+
+    #[test]
+    fn absent_toliss_datarefs_change_nothing() {
+        // Non-ToLiss aircraft: no AirbusFBW index is ever streamed.
+        // Master must mirror the standard servos_on exactly and A/THR
+        // must stay None — bit-identical to the pre-v0.16.7 snapshot.
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::ApMaster, 0.0);
+        let snap = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(snap.autopilot_master, Some(false));
+        assert_eq!(snap.autothrottle_on, None);
+
+        // Standard servos_on alone still drives the master (Zibo etc.).
+        s.apply_field(FieldId::ApMaster, 1.0);
+        let snap = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(snap.autopilot_master, Some(true));
+        assert_eq!(snap.autothrottle_on, None);
+    }
+
+    #[test]
+    fn toliss_ap1_engages_master_despite_dead_standard_dataref() {
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::ApMaster, 0.0); // dead on ToLiss
+        s.apply_field(FieldId::TolissAp1, 1.0);
+        let snap = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(snap.autopilot_master, Some(true));
+    }
+
+    #[test]
+    fn toliss_ap2_engages_master_despite_dead_standard_dataref() {
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::ApMaster, 0.0);
+        s.apply_field(FieldId::TolissAp2, 1.0);
+        let snap = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(snap.autopilot_master, Some(true));
+    }
+
+    /// Zibo-Audit 01.10.2026: Logo, Anti-Eis, A/T-ARM und Master Caution
+    /// aus den Zibo-Quellen; ohne Zibo bleiben sie unbekannt (None) bzw.
+    /// fallen auf das Bisherige zurueck (Logo = Nav).
+    #[test]
+    fn zibo_quellen_im_snapshot() {
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::LightNav, 1.0);
+        let leer = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(leer.light_logo, Some(true), "ohne Zibo: Logo = Nav");
+        assert_eq!(leer.engine_anti_ice, None);
+        assert_eq!(leer.wing_anti_ice, None);
+        assert_eq!(leer.master_caution, None);
+        assert!(!leer.autothrottle_is_arm);
+
+        s.apply_field(FieldId::B738LogoLight, 0.0);
+        s.apply_field(FieldId::B738Eng1Heat, 0.0);
+        s.apply_field(FieldId::B738Eng2Heat, 1.0);
+        s.apply_field(FieldId::B738WingHeat, 0.0);
+        s.apply_field(FieldId::B738AtArm, 1.0);
+        s.apply_field(FieldId::B738MasterCaution, 1.0);
+        let z = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(
+            z.light_logo,
+            Some(false),
+            "Zibo-Logo-Schalter aus, obwohl Nav an"
+        );
+        assert_eq!(z.engine_anti_ice, Some(true), "Triebwerk 2 an");
+        assert_eq!(z.wing_anti_ice, Some(false));
+        // A/T-ARM wird gelesen, aber nicht ausgegeben (ohne Quelle fuer
+        // `autothrottle_on` haette es keine Wirkung, QS 01.10.2026).
+        assert_eq!(s.b738_at_arm, Some(true));
+        assert!(!z.autothrottle_is_arm);
+        assert_eq!(z.master_caution, Some(true));
+
+        // Flugzeugwechsel: Quellen vergessen → wieder unbekannt.
+        for f in [
+            FieldId::B738LogoLight,
+            FieldId::B738Eng1Heat,
+            FieldId::B738Eng2Heat,
+            FieldId::B738WingHeat,
+            FieldId::B738AtArm,
+            FieldId::B738MasterCaution,
+        ] {
+            assert!(addon_quelle(f), "{f:?} muss Add-on-Quelle sein");
+            s.addon_leeren(f);
+        }
+        let weg = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(weg.light_logo, Some(true));
+        assert_eq!(weg.engine_anti_ice, None);
+        assert_eq!(weg.master_caution, None);
+        assert!(!weg.autothrottle_is_arm);
+    }
+
+    /// Zibo/Laminar 737 (01.10.2026): CMD B allein (Copilot fliegt) zaehlt
+    /// als Autopilot an; ApMaster ist im Zibo-Profil die CMD-A-Lampe.
+    #[test]
+    fn b738_cmd_b_allein_heisst_autopilot_an() {
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::ApMaster, 0.0); // CMD A aus
+        s.apply_field(FieldId::B738CmdB, 1.0);
+        assert_eq!(
+            s.to_snapshot(Simulator::XPlane12).autopilot_master,
+            Some(true)
+        );
+        s.apply_field(FieldId::B738CmdB, 0.0);
+        assert_eq!(
+            s.to_snapshot(Simulator::XPlane12).autopilot_master,
+            Some(false)
+        );
+        // Quelle vergessen (Flugzeugwechsel) → kein Rest-„an“.
+        s.apply_field(FieldId::B738CmdB, 1.0);
+        s.addon_leeren(FieldId::B738CmdB);
+        assert_eq!(
+            s.to_snapshot(Simulator::XPlane12).autopilot_master,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn toliss_both_aps_off_reports_master_off() {
+        // ToLiss loaded (datarefs streaming) but hand-flown: int 0s
+        // arrive for AP1/AP2 → master is a real Some(false).
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::ApMaster, 0.0);
+        s.apply_field(FieldId::TolissAp1, 0.0);
+        s.apply_field(FieldId::TolissAp2, 0.0);
+        let snap = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(snap.autopilot_master, Some(false));
+    }
+
+    #[test]
+    fn toliss_athr_mode_presence_gates_then_maps() {
+        let mut s = XPlaneState::default();
+        // First delivery is the int 0 of an A/THR that is simply off —
+        // it must flip the field to a real Some(false) (so the first
+        // ENGAGED transition gets logged after the silent initial
+        // latch), not leave it None.
+        s.apply_field(FieldId::TolissAthrMode, 0.0);
+        let snap = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(snap.autothrottle_on, Some(false));
+
+        // ATHRmode 1 (armed) and 2 (active) both count as ON (>0).
+        s.apply_field(FieldId::TolissAthrMode, 1.0);
+        assert_eq!(
+            s.to_snapshot(Simulator::XPlane12).autothrottle_on,
+            Some(true)
+        );
+        s.apply_field(FieldId::TolissAthrMode, 2.0);
+        assert_eq!(
+            s.to_snapshot(Simulator::XPlane12).autothrottle_on,
+            Some(true)
+        );
+
+        // Disconnect → back to a real Some(false), not None.
+        s.apply_field(FieldId::TolissAthrMode, 0.0);
+        assert_eq!(
+            s.to_snapshot(Simulator::XPlane12).autothrottle_on,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn catalog_subscribes_the_documented_toliss_datarefs() {
+        // Guard the dataref-name ↔ FieldId pairing (a typo here would
+        // be silently dead: X-Plane just never answers).
+        let find = |field: FieldId| CATALOG.iter().find(|e| e.field == field).map(|e| e.name);
+        assert_eq!(find(FieldId::TolissAp1), Some("AirbusFBW/AP1Engage"));
+        assert_eq!(find(FieldId::TolissAp2), Some("AirbusFBW/AP2Engage"));
+        assert_eq!(find(FieldId::TolissAthrMode), Some("AirbusFBW/ATHRmode"));
+    }
+}
+
+// v0.19.x FIX — empty_weight_kg plausibility (mirrors telemetry.rs on
+// the MSFS side). The only prior gate was `> 0.0`, so a corrupted-but-
+// positive OEW reading (e.g. a unit-mixup bug) sailed straight through
+// into payload_kg. Reject an OEW at or above the aircraft's own
+// current gross weight — a hard physical impossibility for any
+// aircraft type, so no fixed-floor heuristic (which would also reject
+// real tiny GA airframes) is needed.
+#[cfg(test)]
+mod empty_weight_plausibility_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_a_reading_at_or_above_current_gross_weight() {
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::TotalWeightKg, 64_000.0);
+        s.apply_field(FieldId::EmptyWeightKg, 250_000.0); // impossible
+        let snap = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(snap.empty_weight_kg, None);
+        assert_eq!(
+            snap.payload_kg, None,
+            "an impossible OEW must not leak into payload math"
+        );
+    }
+
+    #[test]
+    fn accepts_a_plausible_reading_below_gross_weight() {
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::TotalWeightKg, 64_000.0);
+        s.apply_field(FieldId::EmptyWeightKg, 42_000.0);
+        let snap = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(snap.empty_weight_kg, Some(42_000.0));
+    }
+
+    #[test]
+    fn still_passes_through_when_gross_weight_is_unavailable() {
+        // total_weight_kg still at its 0.0 default (= unknown this
+        // tick) — can't check the physical-impossibility gate, so fall
+        // back to the pre-existing positive-only gate.
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::EmptyWeightKg, 42_000.0);
+        let snap = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(snap.empty_weight_kg, Some(42_000.0));
+    }
+}
+
+#[cfg(test)]
+mod wind_body_tests {
+    use super::*;
+
+    /// Der Wind muss durch die GANZE Kette korrekt ankommen — nicht nur in
+    /// der Hilfsfunktion. Genau daran ist die MSFS-Entlagung gescheitert:
+    /// 20 Tests grün, im Feld nie gelaufen. Deshalb hier über
+    /// `apply_field` + `to_snapshot`, also den Weg, den echte Daten nehmen.
+    fn snapshot_mit_wind(x_ms: f32, z_ms: f32, heading: f32) -> SimSnapshot {
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::WindXMs, x_ms);
+        s.apply_field(FieldId::WindZMs, z_ms);
+        s.apply_field(FieldId::HeadingDegTrue, heading);
+        s.to_snapshot(Simulator::XPlane12)
+    }
+
+    #[test]
+    fn wind_kommt_koerperfest_im_snapshot_an() {
+        // Wind weht nach Norden (z = -10 m/s ≙ Nordkomponente +10),
+        // Flugzeug fliegt nach Norden → reiner RÜCKENwind.
+        let s = snapshot_mit_wind(0.0, -10.0, 0.0);
+        let rueck = s.aircraft_wind_z_kt.expect("Wind da");
+        assert!(rueck > 15.0, "Rueckenwind muss positiv sein, war {rueck}");
+        assert!(
+            s.aircraft_wind_x_kt.unwrap().abs() < 1.0,
+            "reiner Rueckenwind darf keine Seitenkomponente haben"
+        );
+    }
+
+    #[test]
+    fn dasselbe_wetter_dreht_sich_mit_dem_steuerkurs() {
+        // DER Feldbefund: vorher haengte das Ergebnis NICHT am Steuerkurs,
+        // weil die Weltkoordinaten ungedreht durchgereicht wurden.
+        let nach_norden = snapshot_mit_wind(0.0, -10.0, 0.0);
+        let nach_osten = snapshot_mit_wind(0.0, -10.0, 90.0);
+        // Nach Osten fliegend wird aus dem Rueckenwind ein Seitenwind.
+        assert!(nach_norden.aircraft_wind_z_kt.unwrap() > 15.0);
+        assert!(
+            nach_osten.aircraft_wind_z_kt.unwrap().abs() < 1.0,
+            "quer zum Wind darf kein Rueckenwind mehr uebrig sein"
+        );
+        assert!(
+            nach_osten.aircraft_wind_x_kt.unwrap().abs() > 15.0,
+            "quer zum Wind muss die Seitenkomponente voll da sein"
+        );
+    }
+
+    #[test]
+    fn seitenwind_von_rechts_ist_positiv() {
+        // Flugzeug nach Norden, Wind weht nach Westen (x = -10 ≙ Ost -10)
+        // → der Wind kommt aus Osten, also von RECHTS.
+        let s = snapshot_mit_wind(-10.0, 0.0, 0.0);
+        let seit = s.aircraft_wind_x_kt.expect("Wind da");
+        assert!(seit > 15.0, "Wind von rechts muss positiv sein, war {seit}");
+    }
+}
+
+// ---- Bordbuch-Audit 26.09.2026 — Cockpit-Schalter ----
+// Audit ueber 102 X-Plane-12-Fluege: Klappen immer 0.0, Beacon beim Zibo
+// fest aus, Transponder nie „ALT", Spoiler nie „scharf". Die Tests halten
+// jeden dieser Befunde fest; mit dem alten Katalog/Mapping waeren sie rot.
+#[cfg(test)]
+mod cockpit_schalter_tests {
+    use super::*;
+
+    fn katalog_name(field: FieldId) -> Option<&'static str> {
+        CATALOG.iter().find(|e| e.field == field).map(|e| e.name)
+    }
+
+    #[test]
+    fn klappen_kommen_aus_dem_xp12_hebel_dataref() {
+        // `sim/flightmodel2/controls/flap_handle_deploy_ratio` ist in XP12
+        // REPLACED und lieferte in 102/102 Fluegen 0.0.
+        assert_eq!(
+            katalog_name(FieldId::FlapsHandle),
+            Some("sim/cockpit2/controls/flap_handle_request_ratio")
+        );
+        assert!(
+            CATALOG
+                .iter()
+                .all(|e| !e.name.starts_with("sim/flightmodel2/controls/flap")),
+            "der ersetzte flightmodel2-Klappen-Dataref darf nicht mehr abonniert werden"
+        );
+    }
+
+    /// Bordbuch: Sim-Uhrzeit aus zulu_time_sec + local_date_days (0 = 1. Jan).
+    #[test]
+    fn sim_zeit_aus_zulu_und_tag() {
+        use chrono::TimeZone;
+        let jetzt = chrono::Utc.with_ymd_and_hms(2026, 9, 26, 8, 0, 0).unwrap();
+        let z = super::sim_zeit_aus(Some(3600.0), Some(268.0), jetzt).expect("zeit");
+        assert_eq!(z.to_rfc3339(), "2026-09-26T01:00:00+00:00");
+        assert_eq!(super::sim_zeit_aus(None, Some(1.0), jetzt), None);
+        assert_eq!(super::sim_zeit_aus(Some(f32::NAN), Some(1.0), jetzt), None);
+        let mut s = XPlaneState::default();
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).sim_zeit_utc, None);
+        s.apply_field(FieldId::ZuluTimeSec, 7200.0);
+        s.apply_field(FieldId::LocalDateDays, 0.0);
+        let z = s
+            .to_snapshot(Simulator::XPlane12)
+            .sim_zeit_utc
+            .expect("zeit");
+        assert_eq!(z.format("%m-%d %H:%M").to_string(), "01-01 02:00");
+    }
+
+    #[test]
+    fn transponder_folgt_dem_xp12_enum() {
+        let mut s = XPlaneState::default();
+        for (roh, erwartet) in [
+            (0.0, "OFF"),
+            (1.0, "STBY"),
+            (2.0, "ON"),
+            (3.0, "ALT"),
+            (4.0, "TEST"),
+            (5.0, "GND"),
+            (6.0, "TA"),
+            (7.0, "TA-RA"),
+        ] {
+            s.apply_field(FieldId::TransponderMode, roh);
+            let snap = s.to_snapshot(Simulator::XPlane12);
+            assert_eq!(
+                snap.xpdr_mode_label.as_deref(),
+                Some(erwartet),
+                "Rohwert {roh}"
+            );
+        }
+    }
+
+    #[test]
+    fn b738_drehschalter_schlaegt_den_standard_transponder() {
+        // Der Laminar-737 schreibt fuer jede Flugstellung 2 in den
+        // Standard-Dataref — TA/RA steht nur am Drehschalter.
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::TransponderMode, 2.0);
+        s.apply_field(FieldId::B738XpdrKnob, 5.0);
+        let snap = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(snap.xpdr_mode_label.as_deref(), Some("TA-RA"));
+
+        for (pos, erwartet) in [
+            (0.0, "TEST"),
+            (1.0, "STBY"),
+            (2.0, "ALT-OFF"),
+            (3.0, "XPNDR"),
+            (4.0, "TA"),
+        ] {
+            s.apply_field(FieldId::B738XpdrKnob, pos);
+            let snap = s.to_snapshot(Simulator::XPlane12);
+            assert_eq!(
+                snap.xpdr_mode_label.as_deref(),
+                Some(erwartet),
+                "Stellung {pos}"
+            );
+        }
+    }
+
+    #[test]
+    fn spoiler_scharf_kommt_aus_speedbrake_ratio_minus_halb() {
+        // DataRefs.txt: speedbrake_ratio -0.5 = ARMED. Das frueher genutzte
+        // `annunciators/speedbrake` heisst „deployed" und bleibt draussen.
+        assert!(CATALOG
+            .iter()
+            .all(|e| e.name != "sim/cockpit2/annunciators/speedbrake"));
+
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::SpoilersHandle, -0.5);
+        let snap = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(snap.spoilers_armed, Some(true));
+        assert_eq!(
+            snap.spoilers_handle_position,
+            Some(0.0),
+            "scharf ist nicht ausgefahren"
+        );
+
+        s.apply_field(FieldId::SpoilersHandle, 0.4);
+        let snap = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(snap.spoilers_armed, Some(false));
+        assert_eq!(snap.spoilers_handle_position, Some(0.4));
+
+        s.apply_field(FieldId::SpoilersHandle, 0.0);
+        let snap = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(snap.spoilers_armed, Some(false));
+    }
+
+    #[test]
+    fn b738_speedbrake_armed_leuchte_zaehlt() {
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::SpoilersHandle, 0.0);
+        s.apply_field(FieldId::B738SpeedbrakeArmed, 1.0);
+        assert_eq!(
+            s.to_snapshot(Simulator::XPlane12).spoilers_armed,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn beacon_aus_jeder_quelle() {
+        // Nur Standard (Laminar): wie bisher.
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::LightBeacon, 0.0);
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).light_beacon, Some(false));
+        s.apply_field(FieldId::LightBeacon, 1.0);
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).light_beacon, Some(true));
+
+        // Zibo: Standard tot, aelterer electrical-Dataref an.
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::LightBeacon, 0.0);
+        s.apply_field(FieldId::LightBeaconLegacy, 1.0);
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).light_beacon, Some(true));
+
+        // ToLiss: Standard tot, OHPLightSwitches[0] an.
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::LightBeacon, 0.0);
+        s.apply_field(FieldId::TolissBeacon, 1.0);
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).light_beacon, Some(true));
+        s.apply_field(FieldId::TolissBeacon, 0.0);
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).light_beacon, Some(false));
+    }
+
+    #[test]
+    fn anschnallzeichen_nur_wo_ein_addon_es_liefert() {
+        let s = XPlaneState::default();
+        assert_eq!(
+            s.to_snapshot(Simulator::XPlane12).seatbelts_sign,
+            None,
+            "ohne Add-on-Quelle kein vorgetaeuschtes OFF"
+        );
+
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::B738SeatbeltSign, 1.0);
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).seatbelts_sign, Some(1));
+
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::TolissSeatBeltSigns, 1.0);
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).seatbelts_sign, Some(2));
+        s.apply_field(FieldId::TolissSeatBeltSigns, 0.0);
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).seatbelts_sign, Some(0));
+    }
+
+    #[test]
+    fn toliss_ap_modi_aus_dem_fma() {
+        let snap = |lat: f32, vert: f32, appr: f32| {
+            let mut s = XPlaneState::default();
+            s.apply_field(FieldId::TolissApLateralMode, lat);
+            s.apply_field(FieldId::TolissApVerticalMode, vert);
+            s.apply_field(FieldId::TolissApprIlluminated, appr);
+            s.apply_field(FieldId::TolissLocIlluminated, 0.0);
+            let x = s.to_snapshot(Simulator::XPlane12);
+            (
+                x.autopilot_heading,
+                x.autopilot_nav,
+                x.autopilot_altitude,
+                x.autopilot_approach,
+            )
+        };
+        let (t, f) = (Some(true), Some(false));
+        // Reiseflug NAV + ALT CRZ.
+        assert_eq!(snap(2.0, 105.0, 0.0), (f, t, t, f));
+        // HDG + V/S.
+        assert_eq!(snap(101.0, 107.0, 0.0), (t, f, f, f));
+        // APPR gedrückt (armed): Lampe, noch NAV/ALT.
+        assert_eq!(snap(2.0, 104.0, 1.0), (f, t, t, t));
+        // LOC + G/S eingefangen, Lampe aus.
+        assert_eq!(snap(7.0, 7.0, 0.0), (f, f, f, t));
+        // Kein Modus (-1): nichts.
+        assert_eq!(snap(-1.0, -1.0, 0.0), (f, f, f, f));
+        // Ohne ToLiss-Werte bleibt der Standard maßgeblich.
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::ApHeading, 1.0);
+        let x = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!((x.autopilot_heading, x.autopilot_nav), (t, f));
+    }
+
+    #[test]
+    fn toliss_apu_master_zaehlt_obwohl_der_standard_tot_ist() {
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::ApuSwitch, 0.0); // beim ToLiss immer 0
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).apu_switch, Some(false));
+        s.apply_field(FieldId::TolissApuMaster, 1.0);
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).apu_switch, Some(true));
+        s.apply_field(FieldId::TolissApuMaster, 0.0);
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).apu_switch, Some(false));
+        // Ohne ToLiss bleibt der Standard allein maßgeblich.
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::ApuSwitch, 1.0);
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).apu_switch, Some(true));
+    }
+
+    #[test]
+    fn autobrake_bevorzugt_die_addon_quelle() {
+        // Ohne Add-on: Standard-Enum wie bisher.
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::AutobrakeLevel, 3.0);
+        assert_eq!(
+            s.to_snapshot(Simulator::XPlane12).autobrake.as_deref(),
+            Some("2")
+        );
+
+        // Zibo: eigener Wahlschalter, Standard steht fest auf OFF.
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::AutobrakeLevel, 1.0);
+        s.apply_field(FieldId::B738AutobrakePos, 4.0);
+        assert_eq!(
+            s.to_snapshot(Simulator::XPlane12).autobrake.as_deref(),
+            Some("3")
+        );
+
+        // ToLiss: drei Tasten.
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::AutobrakeLevel, 1.0);
+        s.apply_field(FieldId::TolissAutoBrkLo, 0.0);
+        s.apply_field(FieldId::TolissAutoBrkMed, 1.0);
+        s.apply_field(FieldId::TolissAutoBrkMax, 0.0);
+        assert_eq!(
+            s.to_snapshot(Simulator::XPlane12).autobrake.as_deref(),
+            Some("MED")
+        );
+        s.apply_field(FieldId::TolissAutoBrkMed, 0.0);
+        assert_eq!(
+            s.to_snapshot(Simulator::XPlane12).autobrake.as_deref(),
+            Some("OFF")
+        );
+    }
+
+    #[test]
+    fn zibo_klappenhebel_ersetzt_den_standard() {
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::FlapsHandle, 0.0);
+        s.apply_field(FieldId::B738FlapLever, 0.875); // Flaps 30
+        assert!((s.to_snapshot(Simulator::XPlane12).flaps_position - 0.875).abs() < 1e-6);
+
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::FlapsHandle, 0.5);
+        assert!((s.to_snapshot(Simulator::XPlane12).flaps_position - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn katalog_hat_keine_doppelten_datarefs() {
+        let mut namen: Vec<&str> = CATALOG.iter().map(|e| e.name).collect();
+        namen.sort_unstable();
+        let vorher = namen.len();
+        namen.dedup();
+        assert_eq!(vorher, namen.len(), "jeder Dataref genau einmal im Katalog");
+    }
+
+    #[test]
+    fn laminar_a330_strobe_schalter_statt_effekt() {
+        // Bei AUTO am Boden blitzt nichts — der Standard-Dataref sagt 0,
+        // der Schalter steht regulaer.
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::LightStrobe, 0.0);
+        s.apply_field(FieldId::A333StrobePos, 1.0);
+        let snap = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(snap.strobe_state, Some(1));
+        assert_eq!(snap.light_strobe, Some(false));
+
+        let s = XPlaneState::default();
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).strobe_state, None);
+    }
+
+    #[test]
+    fn laminar_a330_anschnallzeichen() {
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::A333SeatbeltSwitch, 1.0);
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).seatbelts_sign, Some(1));
+        s.apply_field(FieldId::A333SeatbeltSwitch, 1.5);
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).seatbelts_sign, None);
+    }
+
+    #[test]
+    fn toliss_strobe_auto_und_felis_beacon() {
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::TolissStrobeSwitch, 1.0);
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).strobe_state, Some(1));
+
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::LightBeacon, 0.0);
+        s.apply_field(FieldId::FelisBeacon, 1.0);
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).light_beacon, Some(true));
+    }
+
+    #[test]
+    fn q4xp_kollisionslicht_jede_stellung_ausser_mitte() {
+        for (roh, an) in [(-1.0, true), (0.0, false), (1.0, true)] {
+            let mut s = XPlaneState::default();
+            s.apply_field(FieldId::LightBeacon, 0.0);
+            s.apply_field(FieldId::Q4xpKollisionslicht, roh);
+            assert_eq!(
+                s.to_snapshot(Simulator::XPlane12).light_beacon,
+                Some(an),
+                "Stellung {roh}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod a333_und_quellen_tests {
+    use super::*;
+
+    /// Werte am 27.09.2026 im Laminar-A330 gemessen.
+    #[test]
+    fn a333_transponder_aus_den_knoepfen() {
+        assert_eq!(
+            a333_xpdr_label(Some(-1.0), Some(2.0), Some(1.0)),
+            Some("STBY")
+        );
+        assert_eq!(
+            a333_xpdr_label(Some(0.0), Some(2.0), Some(1.0)),
+            Some("TA-RA")
+        );
+        assert_eq!(a333_xpdr_label(Some(1.0), Some(1.0), Some(1.0)), Some("TA"));
+        assert_eq!(
+            a333_xpdr_label(Some(0.0), Some(0.0), Some(1.0)),
+            Some("ALT")
+        );
+        assert_eq!(a333_xpdr_label(Some(0.0), Some(2.0), Some(0.0)), Some("ON"));
+        assert_eq!(a333_xpdr_label(None, Some(2.0), Some(1.0)), None);
+    }
+
+    /// Im Snapshot: A330 in AUTO mit TA/RA meldet „TA-RA", obwohl der
+    /// Standard am Boden 5 (GND) zeigt.
+    #[test]
+    fn a333_snapshot_meldet_ta_ra() {
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::TransponderMode, 5.0);
+        s.apply_field(FieldId::A333XpdrAutoOn, 0.0);
+        s.apply_field(FieldId::A333TaRaKnob, 2.0);
+        s.apply_field(FieldId::A333AltRptKnob, 1.0);
+        assert_eq!(
+            s.to_snapshot(Simulator::XPlane12)
+                .xpdr_mode_label
+                .as_deref(),
+            Some("TA-RA")
+        );
+        // Quelle weggefallen (Flugzeugwechsel) → Standardwert.
+        s.addon_leeren(FieldId::A333XpdrAutoOn);
+        assert_eq!(
+            s.to_snapshot(Simulator::XPlane12)
+                .xpdr_mode_label
+                .as_deref(),
+            Some("GND")
+        );
+    }
+
+    /// Jede Add-on-Quelle laesst sich leeren: nach `addon_leeren` muss der
+    /// Snapshot aussehen, als sei der Wert nie gekommen. Sonst bliebe nach
+    /// einem Flugzeugwechsel ein Wert des alten Flugzeugs stehen.
+    #[test]
+    fn jede_addon_quelle_laesst_sich_leeren() {
+        let leer = XPlaneState::default().to_snapshot(Simulator::XPlane12);
+        for e in CATALOG.iter().filter(|e| addon_quelle(e.field)) {
+            let mut s = XPlaneState::default();
+            s.apply_field(e.field, 1.0);
+            s.addon_leeren(e.field);
+            s.got_first_packet = false;
+            let snap = s.to_snapshot(Simulator::XPlane12);
+            assert_eq!(snap.xpdr_mode_label, leer.xpdr_mode_label, "{}", e.name);
+            assert_eq!(snap.strobe_state, leer.strobe_state, "{}", e.name);
+            assert_eq!(snap.seatbelts_sign, leer.seatbelts_sign, "{}", e.name);
+            assert_eq!(snap.autobrake, leer.autobrake, "{}", e.name);
+            assert_eq!(snap.flaps_position, leer.flaps_position, "{}", e.name);
+            assert_eq!(snap.light_beacon, leer.light_beacon, "{}", e.name);
+            assert_eq!(snap.autothrottle_on, leer.autothrottle_on, "{}", e.name);
+            assert_eq!(snap.autopilot_master, leer.autopilot_master, "{}", e.name);
+            assert_eq!(snap.spoilers_armed, leer.spoilers_armed, "{}", e.name);
+            assert_eq!(snap.autopilot_heading, leer.autopilot_heading, "{}", e.name);
+            assert_eq!(snap.autopilot_altitude, leer.autopilot_altitude, "{}", e.name);
+            assert_eq!(snap.autopilot_nav, leer.autopilot_nav, "{}", e.name);
+            assert_eq!(snap.autopilot_approach, leer.autopilot_approach, "{}", e.name);
+            assert_eq!(snap.light_wing, leer.light_wing, "{}", e.name);
+            assert_eq!(snap.no_smoking_sign, leer.no_smoking_sign, "{}", e.name);
+        }
+    }
+
+    // ---- P_-Profile (25.10.2026): Rohwerte wie in Michels Konfigurationen ----
+
+    #[test]
+    fn ff777_ap_aus_den_mcp_lampen() {
+        let mut s = XPlaneState::default();
+        let snap = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(snap.autopilot_master, Some(false));
+        // Gedimmte Lampe (Schalter DIM) zaehlt — Schwelle 0.01.
+        s.apply_field(FieldId::Ff777ApR, 0.3);
+        s.apply_field(FieldId::Ff777Lnav, 0.3);
+        s.apply_field(FieldId::Ff777AltHold, 1.0);
+        s.apply_field(FieldId::Ff777At, 1.0);
+        let snap = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(snap.autopilot_master, Some(true));
+        assert_eq!(snap.autopilot_nav, Some(true));
+        assert_eq!(snap.autopilot_altitude, Some(true));
+        assert_eq!(snap.autopilot_heading, Some(false));
+        assert_eq!(snap.autopilot_approach, Some(false));
+        assert_eq!(snap.autothrottle_on, Some(true));
+        // Lampe aus → aus; Quelle vorhanden heisst A/T `Some(false)`.
+        s.apply_field(FieldId::Ff777At, 0.0);
+        s.apply_field(FieldId::Ff777ApR, 0.0);
+        let snap = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(snap.autothrottle_on, Some(false));
+        assert_eq!(snap.autopilot_master, Some(false));
+    }
+
+    #[test]
+    fn ff777_lampentest_schaltet_keinen_ap_ein() {
+        let mut s = XPlaneState::default();
+        for f in [
+            FieldId::Ff777ApL,
+            FieldId::Ff777ApR,
+            FieldId::Ff777HdgHold,
+            FieldId::Ff777App,
+            FieldId::Ff777At,
+        ] {
+            s.apply_field(f, 1.0);
+        }
+        s.apply_field(FieldId::Ff777LampenTest, 2.0); // TEST
+        let snap = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(snap.autopilot_master, Some(false));
+        assert_eq!(snap.autopilot_heading, Some(false));
+        assert_eq!(snap.autopilot_approach, Some(false));
+        assert_eq!(snap.autothrottle_on, Some(false));
+        s.apply_field(FieldId::Ff777LampenTest, 1.0); // BRT
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).autopilot_master, Some(true));
+        // Lampentest-Quelle vergessen (Flugzeugwechsel): sperrt nicht weiter.
+        s.apply_field(FieldId::Ff777LampenTest, 2.0);
+        s.addon_leeren(FieldId::Ff777LampenTest);
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).autopilot_master, Some(true));
+    }
+
+    #[test]
+    fn ff_schilder_dreistufig_auch_beim_umlegen() {
+        let mut s = XPlaneState::default();
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).seatbelts_sign, None);
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).no_smoking_sign, None);
+        for (roh, erwartet) in [(0.0, 0), (0.37, 0), (1.0, 1), (1.62, 2), (2.0, 2)] {
+            s.apply_field(FieldId::FfAnschnallzeichen, roh);
+            s.apply_field(FieldId::FfRauchverbot, roh);
+            let snap = s.to_snapshot(Simulator::XPlane12);
+            assert_eq!(snap.seatbelts_sign, Some(erwartet), "{roh}");
+            assert_eq!(snap.no_smoking_sign, Some(erwartet), "{roh}");
+        }
+    }
+
+    #[test]
+    fn ff_autobrake_stellungen() {
+        let mut s = XPlaneState::default();
+        // Skala der FF777 (0 = RTO … 7 = MAX); Zwischenwert rundet.
+        for (roh, erwartet) in [
+            (0.0, "RTO"),
+            (1.0, "OFF"),
+            (2.0, "DISARM"),
+            (3.0, "1"),
+            (6.0, "4"),
+            (6.6, "MAX"),
+            (7.0, "MAX"),
+        ] {
+            s.apply_field(FieldId::FfAutobrake, roh);
+            assert_eq!(
+                s.to_snapshot(Simulator::XPlane12).autobrake.as_deref(),
+                Some(erwartet),
+                "{roh}"
+            );
+        }
+    }
+
+    #[test]
+    fn toliss_fluegellicht_und_rauchverbot() {
+        let mut s = XPlaneState::default();
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).light_wing, Some(false));
+        s.apply_field(FieldId::TolissFluegellicht, 1.0);
+        s.apply_field(FieldId::TolissRauchverbot, 1.0);
+        let snap = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(snap.light_wing, Some(true));
+        assert_eq!(snap.no_smoking_sign, Some(1)); // AUTO
+    }
+
+    /// Standard-Schilder: ein Flugzeug, das sie nicht treibt, liefert 0 —
+    /// das darf kein „OFF" werden. Erst ab dem ersten Wert ≠ 0 gilt er,
+    /// danach auch 0 (der Pilot hat ausgeschaltet).
+    #[test]
+    fn standard_schilder_zaehlen_erst_ab_erstem_wert() {
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::StdAnschnallzeichen, 0.0);
+        s.apply_field(FieldId::StdRauchverbot, 0.0);
+        let snap = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(snap.seatbelts_sign, None);
+        assert_eq!(snap.no_smoking_sign, None);
+        s.apply_field(FieldId::StdAnschnallzeichen, 2.0);
+        s.apply_field(FieldId::StdRauchverbot, 1.0);
+        let snap = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(snap.seatbelts_sign, Some(2));
+        assert_eq!(snap.no_smoking_sign, Some(1));
+        s.apply_field(FieldId::StdAnschnallzeichen, 0.0);
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).seatbelts_sign, Some(0));
+    }
+
+    /// Add-on-Schalter haben Vorrang vor dem Standard.
+    #[test]
+    fn addon_schilder_vor_standard() {
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::StdAnschnallzeichen, 1.0);
+        s.apply_field(FieldId::FfAnschnallzeichen, 2.0);
+        s.apply_field(FieldId::StdRauchverbot, 1.0);
+        s.apply_field(FieldId::TolissRauchverbot, 0.0);
+        let snap = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(snap.seatbelts_sign, Some(2));
+        assert_eq!(snap.no_smoking_sign, Some(0));
+    }
+}
+
+#[cfg(test)]
+mod pruefbericht_2026_09_26 {
+    use super::*;
+
+    fn name_fuer(feld: FieldId) -> &'static str {
+        CATALOG
+            .iter()
+            .find(|e| e.field == feld)
+            .map(|e| e.name)
+            .expect("Feld im Katalog")
+    }
+
+    #[test]
+    fn avionik_liest_den_belegten_dataref() {
+        // DataRefs.txt (XP12) Zeile 615: `sim/cockpit/electrical/avionics_on`
+        // „Is there power to the avionics". Die cockpit2-Variante gibt es
+        // nicht — X-Plane lieferte 0, der Schalter stand immer auf „aus".
+        assert_eq!(
+            name_fuer(FieldId::AvionicsMaster),
+            "sim/cockpit/electrical/avionics_on"
+        );
+    }
+
+    #[test]
+    fn missweisender_kurs_ohne_veralteten_dataref() {
+        // DataRefs.txt: `magpsi` „DO NOT USE THIS … REPLACED",
+        // `mag_psi` „the old magpsi dataref was FUBAR".
+        assert_eq!(
+            name_fuer(FieldId::HeadingDegMagnetic),
+            "sim/flightmodel/position/mag_psi"
+        );
+        assert!(!CATALOG.iter().any(|e| e.name.ends_with("/magpsi")));
+    }
+}
+
+#[cfg(test)]
+mod doppelt_genau_tests {
+    use super::*;
+
+    /// Protokoll 2 liefert `double`: Breite/Laenge bleiben bis in den
+    /// Schnappschuss genau (RREF-`float32` rundet auf ≈ 0,5 m).
+    #[test]
+    fn position_behaelt_volle_genauigkeit() {
+        let mut s = XPlaneState::default();
+        s.apply_field_f64(FieldId::Latitude, 51.234_567_891_2);
+        s.apply_field_f64(FieldId::Longitude, -8.765_432_109_8);
+        s.apply_field_f64(FieldId::AltitudeAglFt, 12.345_678_9);
+        assert!(s.got_first_packet);
+        let snap = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(snap.lat, 51.234_567_891_2);
+        assert_eq!(snap.lon, -8.765_432_109_8);
+        // float32 haette hier schon in der 6. Nachkommastelle abgewichen.
+        assert_ne!((51.234_567_891_2_f64 as f32) as f64, snap.lat);
+        // Uebrige Felder gehen den f32-Weg.
+        s.apply_field_f64(FieldId::OnGround, 1.0);
+        assert!(s.on_ground);
+    }
+}
+
+// ---- X-Plane-Luecken (Vergleich mit vmsACARS, 29.09.2026) ----
+#[cfg(test)]
+mod xplane_luecken_tests {
+    use super::*;
+
+    fn name_fuer(feld: FieldId) -> &'static str {
+        CATALOG
+            .iter()
+            .find(|e| e.field == feld)
+            .map(|e| e.name)
+            .expect("Feld im Katalog")
+    }
+
+    /// Zeilen aus DataRefs.txt (X-Plane 12.4.3), von Hand kopiert: Name,
+    /// Typ, Einheit. Keine davon ist dort als REPLACED markiert. Der Katalog
+    /// muss genau diese Namen treffen (ohne `[n]`), Arrays nur mit Index
+    /// innerhalb der Laenge, Skalare ohne Index.
+    const AUS_DATAREFS_TXT: &[(&str, &str, &str)] = &[
+        ("sim/flightmodel/controls/parkbrake", "float", "[0..1]"), // 1053
+        ("sim/time/sim_speed", "int", "ratio"),                    // 3556
+        ("sim/time/ground_speed_flt", "float", "ratio"),           // 3560
+        ("sim/time/framerate_period", "float", "seconds"),         // 3563
+        ("sim/flightmodel2/misc/has_crashed", "int", "boolean"),   // 5560
+        (
+            "sim/cockpit2/radios/actuators/transponder_code",
+            "int",
+            "transponder_code",
+        ), // 4647
+        ("sim/aircraft/controls/acf_flap_detents", "int", ""),     // 331
+        ("sim/aircraft/prop/acf_en_type", "int[16]", "enum"),      // 218
+        ("sim/flightmodel/engine/ENGN_N1_", "float[16]", "percent"), // 1490
+        ("sim/flightmodel/engine/ENGN_FF_", "float[16]", "kg/s"),  // 1485
+    ];
+
+    #[test]
+    fn namen_aus_datarefs_txt() {
+        let neu = [
+            FieldId::ParkingBrake,
+            FieldId::SimSpeed,
+            FieldId::GroundSpeedFactor,
+            FieldId::FrameRatePeriod,
+            FieldId::HasCrashed,
+            FieldId::TransponderCode,
+            FieldId::FlapDetents,
+            FieldId::EngineType,
+            FieldId::Eng1N1,
+            FieldId::Eng2N1,
+            FieldId::Eng3N1,
+            FieldId::Eng4N1,
+            FieldId::Eng1FuelFlow,
+            FieldId::Eng2FuelFlow,
+            FieldId::Eng3FuelFlow,
+            FieldId::Eng4FuelFlow,
+        ];
+        for f in neu {
+            let name = name_fuer(f);
+            let (grund, index) = match name.split_once('[') {
+                Some((g, rest)) => (
+                    g,
+                    rest.strip_suffix(']').map(|i| i.parse::<usize>().unwrap()),
+                ),
+                None => (name, None),
+            };
+            let (_, typ, _) = AUS_DATAREFS_TXT
+                .iter()
+                .find(|(n, _, _)| *n == grund)
+                .unwrap_or_else(|| panic!("{name} steht nicht in DataRefs.txt"));
+            match (typ.split_once('['), index) {
+                (Some((_, laenge)), Some(i)) => {
+                    let laenge: usize = laenge.trim_end_matches(']').parse().unwrap();
+                    assert!(i < laenge, "{name}: Index jenseits {laenge}");
+                }
+                (None, None) => {}
+                _ => panic!("{name}: Index passt nicht zum Typ {typ}"),
+            }
+            // Kern-Datarefs: keine Add-on-Quelle, gelten ohne Web-API-Beleg.
+            assert!(!addon_quelle(f), "{f:?}");
+        }
+        // Der REPLACED-Name (4099) ist raus.
+        assert!(!CATALOG
+            .iter()
+            .any(|e| e.name == "sim/cockpit2/controls/parking_brake_ratio"));
+    }
+
+    /// 2.0.14: Die Bildrate kommt vom Simulator, als Kehrwert der
+    /// Zeichenzeit je Bild. 0 (RREF fuer unbekannte Namen, XP11 ohne den
+    /// Wert) und Unsinn heissen „nicht geliefert".
+    #[test]
+    fn bildrate_aus_der_zeichenzeit() {
+        let mut s = XPlaneState::default();
+        assert_eq!(
+            s.to_snapshot(Simulator::XPlane12).sim_bildrate_hz,
+            None,
+            "ohne Wert keine Bildrate"
+        );
+        s.apply_field(FieldId::FrameRatePeriod, 0.025);
+        let hz = s
+            .to_snapshot(Simulator::XPlane12)
+            .sim_bildrate_hz
+            .expect("Bildrate");
+        assert!(
+            (hz - 40.0).abs() < 0.01,
+            "0,025 s je Bild sind 40/s, nicht {hz}"
+        );
+        for unsinn in [0.0, -0.02, f32::NAN, f32::INFINITY] {
+            s.apply_field(FieldId::FrameRatePeriod, unsinn);
+            assert_eq!(
+                s.to_snapshot(Simulator::XPlane12).sim_bildrate_hz,
+                None,
+                "{unsinn} ist keine Bildrate"
+            );
+        }
+    }
+
+    #[test]
+    fn feststellbremse_schwelle_bleibt() {
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::ParkingBrake, 0.4);
+        assert!(!s.to_snapshot(Simulator::XPlane12).parking_brake);
+        s.apply_field(FieldId::ParkingBrake, 1.0);
+        assert!(s.to_snapshot(Simulator::XPlane12).parking_brake);
+    }
+
+    #[test]
+    fn zeitraffer_wie_msfs() {
+        let mut s = XPlaneState::default();
+        assert_eq!(
+            s.to_snapshot(Simulator::XPlane12).simulation_rate,
+            1.0,
+            "ohne Wert Echtzeit"
+        );
+        s.apply_field(FieldId::SimSpeed, 4.0);
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).simulation_rate, 4.0);
+        // 0 = „paused" laut DataRefs.txt — die Pause meldet `sim/time/paused`.
+        s.apply_field(FieldId::SimSpeed, 0.0);
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).simulation_rate, 1.0);
+        s.apply_field(FieldId::SimSpeed, f32::NAN);
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).simulation_rate, 1.0);
+        // Strecken-Multiplikator: bei Zeitraffer 1 doppelt so weit.
+        s.apply_field(FieldId::SimSpeed, 1.0);
+        s.apply_field(FieldId::GroundSpeedFactor, 2.0);
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).simulation_rate, 2.0);
+        s.apply_field(FieldId::SimSpeed, 4.0);
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).simulation_rate, 8.0);
+        // XP11/RREF ohne den Dataref: 0 → zaehlt als 1.
+        s.apply_field(FieldId::GroundSpeedFactor, 0.0);
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).simulation_rate, 4.0);
+    }
+
+    /// Nur die Flanke 0 → 1 ist ein Absturz. Ein Flugzeug, das beim
+    /// Verbinden schon im Absturzzustand steht (oder so geladen wird), loest
+    /// nichts aus; nach dem Neuladen (0) faellt der Zustand ab.
+    #[test]
+    fn absturz_nur_ueber_die_flanke() {
+        let mut s = XPlaneState::default();
+        let snap = |s: &XPlaneState| s.to_snapshot(Simulator::XPlane12);
+        assert!(!snap(&s).crashed);
+        s.apply_field(FieldId::HasCrashed, 1.0);
+        assert!(!snap(&s).crashed, "schon beim Verbinden abgestuerzt");
+        assert_eq!(snap(&s).crash_source, None);
+        s.apply_field(FieldId::HasCrashed, 0.0);
+        assert!(!snap(&s).crashed);
+        s.apply_field(FieldId::HasCrashed, 1.0);
+        let a = snap(&s);
+        assert!(a.crashed);
+        assert_eq!(a.crash_source.as_deref(), Some("xplane_crash_dataref"));
+        // Im Replay kein Absturz des laufenden Flugs.
+        s.apply_field(FieldId::SimInReplay, 1.0);
+        assert!(!snap(&s).crashed);
+        s.apply_field(FieldId::SimInReplay, 0.0);
+        assert!(snap(&s).crashed);
+        // Neu geladen.
+        s.apply_field(FieldId::HasCrashed, 0.0);
+        assert!(!snap(&s).crashed);
+        assert_eq!(snap(&s).crash_source, None);
+    }
+
+    #[test]
+    fn squawk_wie_msfs() {
+        let mut s = XPlaneState::default();
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).transponder_code, None);
+        s.apply_field(FieldId::TransponderCode, 7000.0);
+        assert_eq!(
+            s.to_snapshot(Simulator::XPlane12).transponder_code,
+            Some(7000)
+        );
+        s.apply_field(FieldId::TransponderCode, 2573.0);
+        assert_eq!(
+            s.to_snapshot(Simulator::XPlane12).transponder_code,
+            Some(2573)
+        );
+        // Keine oktalen Ziffern bzw. ausserhalb 0000-7777: kein Squawk.
+        for roh in [2583.0, 8000.0, -1.0, 12000.0, f32::NAN] {
+            s.apply_field(FieldId::TransponderCode, roh);
+            assert_eq!(
+                s.to_snapshot(Simulator::XPlane12).transponder_code,
+                None,
+                "{roh}"
+            );
+        }
+    }
+
+    /// Messung 29.09.2026, X-Plane 12.4.3, Laminar Boeing 737-800 (Thomas,
+    /// Hebel UP → 40 → UP): `acf_flap_detents` = 8, Hebelwerte genau wie hier.
+    /// Ergibt Index 0..8 bei 8 Rasten — im Aktivitaetslog die Boeing-Namen
+    /// UP/1/2/5/10/15/25/30/40 (`raster_flap_label`, Test in der App).
+    #[test]
+    fn klappenraste_laminar_737_gemessen() {
+        const HEBEL: [f32; 9] = [0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0];
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::FlapDetents, 8.0);
+        let hin: Vec<(Option<u8>, Option<u8>)> = HEBEL
+            .iter()
+            .map(|&h| {
+                s.apply_field(FieldId::FlapsHandle, h);
+                let a = s.to_snapshot(Simulator::XPlane12);
+                (a.flap_handle_index, a.flap_num_positions)
+            })
+            .collect();
+        let soll: Vec<(Option<u8>, Option<u8>)> = (0..=8u8).map(|i| (Some(i), Some(8))).collect();
+        assert_eq!(hin, soll);
+        // Rueckweg identisch.
+        for (i, &h) in HEBEL.iter().enumerate().rev() {
+            s.apply_field(FieldId::FlapsHandle, h);
+            assert_eq!(
+                s.to_snapshot(Simulator::XPlane12).flap_handle_index,
+                Some(i as u8)
+            );
+        }
+    }
+
+    /// Messung 29.09.2026, X-Plane 12.4.3, Laminar Airbus A330-300 (A333,
+    /// Thomas, Hebel 3× 0 → FULL → 0, alle Durchgaenge gleich):
+    /// `acf_flap_detents` = 4, Hebel genau 0 / 0,25 / 0,5 / 0,75 / 1,0 fuer
+    /// 0/1/2/3/FULL. Keine eigene Raste fuer 1+F (die stellt der A330
+    /// selbst) — Index 0..4 bei 4 Rasten, im Log die 4-Rasten-Airbus-Namen.
+    #[test]
+    fn klappenraste_laminar_a330_gemessen() {
+        const HEBEL: [f32; 5] = [0.0, 0.25, 0.5, 0.75, 1.0];
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::FlapDetents, 4.0);
+        for _ in 0..3 {
+            for (i, &h) in HEBEL
+                .iter()
+                .enumerate()
+                .chain(HEBEL.iter().enumerate().rev())
+            {
+                s.apply_field(FieldId::FlapsHandle, h);
+                let a = s.to_snapshot(Simulator::XPlane12);
+                assert_eq!(
+                    (a.flap_handle_index, a.flap_num_positions),
+                    (Some(i as u8), Some(4)),
+                    "Hebel {h}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn klappenraste_aus_hebel_und_rastenzahl() {
+        let mut s = XPlaneState::default();
+        // Ohne Rastenzahl: alter Weg (Prozent-Heuristik).
+        s.apply_field(FieldId::FlapsHandle, 0.25);
+        let a = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!((a.flap_handle_index, a.flap_num_positions), (None, None));
+        // Airbus-Raster: 4 Rasten, Hebel 1/4 = Raste 1.
+        s.apply_field(FieldId::FlapDetents, 4.0);
+        let a = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(
+            (a.flap_handle_index, a.flap_num_positions),
+            (Some(1), Some(4))
+        );
+        s.apply_field(FieldId::FlapsHandle, 1.0);
+        assert_eq!(
+            s.to_snapshot(Simulator::XPlane12).flap_handle_index,
+            Some(4)
+        );
+        // 737: 8 Rasten, Hebel auf 5/8 = Raste 5 (Flaps 15).
+        s.apply_field(FieldId::FlapDetents, 8.0);
+        s.apply_field(FieldId::FlapsHandle, 0.625);
+        let a = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(
+            (a.flap_handle_index, a.flap_num_positions),
+            (Some(5), Some(8))
+        );
+        assert_eq!(a.flaps_position, 0.625, "Stellung unveraendert");
+        // 0 Rasten (stufenlos) → keine Raste, keine Division durch 0.
+        s.apply_field(FieldId::FlapDetents, 0.0);
+        let a = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!((a.flap_handle_index, a.flap_num_positions), (None, None));
+        // Zibo-Hebel mit eigener Skala: keine Raste aus der Flugzeugdatei.
+        s.apply_field(FieldId::FlapDetents, 8.0);
+        s.apply_field(FieldId::B738FlapLever, 0.5);
+        let a = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!((a.flap_handle_index, a.flap_num_positions), (None, None));
+        assert_eq!(a.flaps_position, 0.5);
+    }
+
+    fn zweistrahler(s: &mut XPlaneState, n1: [f32; 2], ff_kg_s: [f32; 2]) {
+        s.apply_field(FieldId::Eng1N1, n1[0]);
+        s.apply_field(FieldId::Eng2N1, n1[1]);
+        s.apply_field(FieldId::Eng3N1, 0.0);
+        s.apply_field(FieldId::Eng4N1, 0.0);
+        s.apply_field(FieldId::Eng1FuelFlow, ff_kg_s[0]);
+        s.apply_field(FieldId::Eng2FuelFlow, ff_kg_s[1]);
+        s.apply_field(FieldId::Eng3FuelFlow, 0.0);
+        s.apply_field(FieldId::Eng4FuelFlow, 0.0);
+    }
+
+    #[test]
+    fn n1_und_kraftstofffluss_je_triebwerk() {
+        let mut s = XPlaneState::default();
+        let a = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(a.eng_n1_pct, None);
+        assert_eq!(a.fuel_flow_kg_per_h, None);
+        assert!(a.engine_signals.is_none(), "ohne Werte kein Beleg");
+
+        s.apply_field(FieldId::EngineType, 7.0); // multi spool jet
+        s.apply_field(FieldId::Eng1Running, 1.0);
+        s.apply_field(FieldId::Eng2Running, 1.0);
+        zweistrahler(&mut s, [22.5, 21.0], [0.1, 0.12]);
+        let a = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(a.eng_n1_pct, Some(vec![22.5, 21.0]));
+        let summe = a.fuel_flow_kg_per_h.expect("Fluss in kg/h");
+        assert!((summe - 792.0).abs() < 0.01, "{summe}");
+        let sig = a.engine_signals.expect("Beleg je Triebwerk");
+        assert_eq!(sig.n1_pct, vec![22.5, 21.0, 0.0, 0.0]);
+        assert_eq!(sig.eng_combustion, vec![true, true, false, false]);
+        assert!(sig.general_combustion.is_empty() && sig.combustion_ex1.is_empty());
+        // 0,1 kg/s = 360 kg/h = 793,66 lb/h.
+        assert!((sig.fuel_flow_pph[0] - 793.664).abs() < 0.01);
+        assert_eq!(sig.fuel_flow_pph.len(), 4);
+
+        // Kolbenmotor: kein N1 (wie MSFS), auch nicht im Beleg; Fluss bleibt.
+        s.apply_field(FieldId::EngineType, 1.0);
+        let a = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(a.eng_n1_pct, None);
+        assert!(a.fuel_flow_kg_per_h.is_some());
+        let sig = a.engine_signals.expect("Beleg");
+        assert!(sig.n1_pct.is_empty());
+        assert_eq!(sig.fuel_flow_pph.len(), 4);
+    }
+
+    /// PFLICHT (Lehre PC-12, 16.09.2026): Das Urteil „Triebwerk laeuft"
+    /// kommt bei X-Plane allein aus `ENGN_running`. Windmuehlen-N1 am Stand
+    /// und selbst hohes N1 ohne `ENGN_running` aendern es nicht.
+    #[test]
+    fn triebwerk_laeuft_bleibt_bei_engn_running() {
+        let mut s = XPlaneState::default();
+        s.apply_field(FieldId::EngineType, 9.0); // free turboprop (PC-12)
+        zweistrahler(&mut s, [0.3, 0.0], [0.0, 0.0]);
+        let a = s.to_snapshot(Simulator::XPlane12);
+        assert_eq!(a.engines_running, 0);
+        assert_eq!(a.eng_n1_pct, None, "Windmuehle ist kein Schub");
+        assert_eq!(a.fuel_flow_kg_per_h, None);
+        zweistrahler(&mut s, [45.0, 44.0], [0.0, 0.0]);
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).engines_running, 0);
+        s.apply_field(FieldId::Eng1Running, 1.0);
+        assert_eq!(s.to_snapshot(Simulator::XPlane12).engines_running, 1);
+        // Stehendes Triebwerk 2 mit ~0 bleibt positionserhaltend im Praefix.
+        zweistrahler(&mut s, [60.0, 0.25], [0.2, 0.0]);
+        s.apply_field(FieldId::Eng2Running, 0.0);
+        assert_eq!(
+            s.to_snapshot(Simulator::XPlane12).eng_n1_pct,
+            Some(vec![60.0])
+        );
+        s.apply_field(FieldId::Eng2Running, 1.0);
+        assert_eq!(
+            s.to_snapshot(Simulator::XPlane12).eng_n1_pct,
+            Some(vec![60.0, 0.25])
+        );
+    }
+}

@@ -1,0 +1,4065 @@
+//! phpVMS 7 HTTP API client.
+//!
+//! Talks to:
+//!   * phpVMS Core API (users, bids, flights, fleet, PIREP file, ACARS positions)
+//!   * AeroACARS phpVMS module (config, version, heartbeat, landing extras) — Phase 4
+//!
+//! Authentication: phpVMS API key sent via the `X-API-Key` header (phpVMS standard).
+//! All requests advertise `User-Agent: AeroACARS/<version>` so the server can identify us.
+
+#![allow(dead_code)] // Some endpoints land in later phases; their wrappers are stubbed.
+
+use std::fmt;
+use std::time::Duration;
+
+use reqwest::{header, Client as HttpClient, Response, StatusCode};
+use serde::de::{self, DeserializeOwned, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
+use thiserror::Error;
+use url::Url;
+
+/// phpVMS sometimes encodes string-ish fields (e.g. `flight_number`) as JSON
+/// numbers when the value happens to be all digits. Accept either form.
+fn de_str_or_int<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    struct V;
+    impl<'de> Visitor<'de> for V {
+        type Value = String;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("string or integer")
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<String, E> {
+            Ok(v.to_owned())
+        }
+        fn visit_string<E: de::Error>(self, v: String) -> Result<String, E> {
+            Ok(v)
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+    }
+    d.deserialize_any(V)
+}
+
+/// `Option<String>` variant of `de_str_or_int`. Reuses the same string-or-int
+/// visitor but accepts JSON `null` / missing as `None`. Needed because
+/// phpVMS encodes optional id fields (route_code, callsign, alt_airport_id,
+/// flight_type, route) as integers when the underlying value is numeric,
+/// strings when alphanumeric, and null when missing. Without this we'd
+/// fail the entire bids list parse on a single legacy flight whose
+/// route_code was stored as an integer in the database.
+fn de_opt_str_or_int<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    struct V;
+    impl<'de> Visitor<'de> for V {
+        type Value = Option<String>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("string, integer, or null")
+        }
+        fn visit_unit<E: de::Error>(self) -> Result<Option<String>, E> {
+            Ok(None)
+        }
+        fn visit_none<E: de::Error>(self) -> Result<Option<String>, E> {
+            Ok(None)
+        }
+        fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Option<String>, D::Error> {
+            de_str_or_int(d).map(Some)
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Option<String>, E> {
+            Ok(Some(v.to_owned()))
+        }
+        fn visit_string<E: de::Error>(self, v: String) -> Result<Option<String>, E> {
+            Ok(Some(v))
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Option<String>, E> {
+            Ok(Some(v.to_string()))
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Option<String>, E> {
+            Ok(Some(v.to_string()))
+        }
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<Option<String>, E> {
+            Ok(Some(v.to_string()))
+        }
+    }
+    d.deserialize_any(V)
+}
+
+/// Mirror of `de_str_or_int` for fields we want as `i64`. phpVMS encodes
+/// numeric ids inconsistently — sometimes as JSON numbers, sometimes as
+/// strings (notably on the Eurowings test instance). Tolerating both
+/// stops the entire bids list from failing to parse on a single bad row.
+fn de_int_or_str<'de, D: Deserializer<'de>>(d: D) -> Result<i64, D::Error> {
+    struct V;
+    impl<'de> Visitor<'de> for V {
+        type Value = i64;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("integer or numeric string")
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<i64, E> {
+            Ok(v)
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<i64, E> {
+            Ok(v as i64)
+        }
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<i64, E> {
+            Ok(v as i64)
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<i64, E> {
+            v.trim()
+                .parse::<i64>()
+                .map_err(|_| E::custom(format!("not an integer: {v:?}")))
+        }
+        fn visit_string<E: de::Error>(self, v: String) -> Result<i64, E> {
+            self.visit_str(&v)
+        }
+    }
+    d.deserialize_any(V)
+}
+
+// v0.5.49 — HTTP-Client-Hardening gegen "Fehler 1236" (NAT-Eviction +
+// dead-Socket-Hangs). Vorher: nur DEFAULT_TIMEOUT=20s am total request,
+// kein connect_timeout, kein tcp_keepalive. Eine vom Router/ISP gekillte
+// TCP-Verbindung führte zu 20s blockiertem await — der Streamer-Tick
+// hing 20s je Request, kein UI-Update, kein JSONL-Append, Pilot dachte
+// die App ist tot.
+//
+// Fix-Komponenten:
+// - tcp_keepalive(30s): OS schickt regelmaessig TCP-Keep-Alive-Pakete,
+//   verhindert NAT-Eviction in Consumer-Routern (FritzBox, Speedport)
+//   und haelt phpVMS-Server-side keep-alive warm
+// - connect_timeout(5s): wenn der TCP-Handshake hängt, schnell aufgeben
+//   statt 20s zu warten
+// - pool_idle_timeout(60s): idle Verbindungen aus dem Pool werfen bevor
+//   der Server (typisch nginx keepalive_timeout 60-75s) die Tür zumacht
+// - pool_max_idle_per_host(8): mehr als 8 idle Sockets pro Host sind eh
+//   Verschwendung
+// - DEFAULT_TIMEOUT auf 10s reduziert: 20s war im Pilot-Use-Case immer
+//   zu lang — wenn ein Call so lange braucht ist die Verbindung eh tot
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Kabinenansagen: das Modul ruft Sonnet bis zu zweimal mit je 60 s auf.
+const KABINEN_DREHBUCH_TIMEOUT: Duration = Duration::from_secs(150);
+const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// v1.6.14 — Timeout speziell fuer den Positions-Batch-POST. Siehe
+/// [`Client::post_positions`] fuer die Messwerte, auf denen der Wert steht.
+const POSITION_POST_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// v0.16.17: server-side IN_PROGRESS filter (phpVMS PirepState 0). Const so
+/// the URL test below pins the exact path + query the client sends — see
+/// `get_user_pireps_in_progress` for why this must NOT be a page-1
+/// fetch-then-filter.
+const USER_PIREPS_IN_PROGRESS_PATH: &str = "/api/user/pireps?state=0";
+
+#[derive(Debug, Error)]
+pub enum ApiError {
+    #[error("invalid base URL: {0}")]
+    InvalidUrl(String),
+    #[error("network error: {0}")]
+    Network(String),
+    #[error("authentication failed (HTTP 401) — check API key")]
+    Unauthenticated,
+    #[error("forbidden (HTTP 403) — account may lack permissions")]
+    Forbidden,
+    #[error("not found (HTTP 404) — endpoint missing on this phpVMS site")]
+    NotFound,
+    #[error("rate limited (HTTP 429), retry after {retry_after_seconds}s")]
+    RateLimited { retry_after_seconds: u64 },
+    #[error("server error (HTTP {status}): {body}")]
+    Server { status: u16, body: String },
+    #[error("unexpected response shape: {0}")]
+    BadResponse(String),
+}
+
+/// v0.7.8: Spezifische Fehler-Varianten fuer den SimBrief-direct
+/// Fetch-Pfad. Werden auf Frontend-Notice-Codes gemapped (Spec §8).
+/// Nicht aus ApiError abgeleitet weil:
+///   - Pfad ist getrennt (keine phpVMS-API-Schicht dazwischen)
+///   - Notice-Wording haengt von Variante ab — Pilot soll wissen ob
+///     User falsch konfiguriert ist (UserNotFound) vs Internet weg
+///     (Network) vs SimBrief offline (Unavailable) vs XML kaputt
+///     (ParseFailed). Pure code-Granularitaet, Wording landet
+///     i18n-side.
+/// Spec docs/spec/ofp-refresh-simbrief-direct-v0.7.8.md §3 + §5.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum SimBriefDirectError {
+    /// Settings haben weder username noch user_id gesetzt.
+    /// Pure code-Variante — Pfad-Auswahl im Caller faengt das ab,
+    /// dieser Variant tritt nicht in der Praxis auf.
+    #[error("no SimBrief identifier configured")]
+    NoIdentifier,
+    /// HTTP 400 (Navigraph-Doku-Pfad) ODER `<fetch><status>Error</status>`
+    /// (Live-Probe-Pfad). Pilot muss Settings pruefen.
+    #[error("SimBrief user not found")]
+    UserNotFound,
+    /// HTTP 5xx — SimBrief offline / maintenance.
+    #[error("SimBrief service unavailable")]
+    Unavailable,
+    /// Network-Layer-Fehler (DNS, TLS, Connection-Refused, etc.).
+    /// Auch fuer unerwartete non-2xx-Codes die nicht 400/5xx sind.
+    #[error("SimBrief network error")]
+    Network,
+    /// HTTP 200 + Status Success aber XML konnte nicht geparsed werden.
+    /// Sollte praktisch nie passieren — SimBrief liefert stabile XML.
+    #[error("SimBrief XML parse failed")]
+    ParseFailed,
+}
+
+impl ApiError {
+    /// Stable identifier surfaced to the UI for i18n key lookup.
+    pub fn code(&self) -> &'static str {
+        match self {
+            ApiError::InvalidUrl(_) => "invalid_url",
+            ApiError::Network(_) => "network",
+            ApiError::Unauthenticated => "unauthenticated",
+            ApiError::Forbidden => "forbidden",
+            ApiError::NotFound => "not_found",
+            ApiError::RateLimited { .. } => "rate_limited",
+            ApiError::Server { .. } => "server",
+            ApiError::BadResponse(_) => "bad_response",
+        }
+    }
+}
+
+impl From<reqwest::Error> for ApiError {
+    fn from(err: reqwest::Error) -> Self {
+        ApiError::Network(err.to_string())
+    }
+}
+
+/// Was phpVMS in einer Erfolgsantwort über die gespeicherten Zeilen sagt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gespeichert {
+    /// Gültiges `count`.
+    Zahl(u64),
+    /// Gültige Antwort ohne `count` (älteres phpVMS).
+    KeineAngabe,
+    /// Kein JSON-Objekt oder `count` vom falschen Typ — nicht belegt, was
+    /// gespeichert wurde.
+    Ungueltig,
+}
+
+/// Ergebnis von [`Client::post_acars_logs_zustellung`].
+#[derive(Debug)]
+pub enum Zustellung {
+    /// phpVMS hat die Anfrage angenommen. `gespeichert`: die Zahl, die
+    /// phpVMS als angelegt meldet (`count`) — kann kleiner sein als gesendet,
+    /// weil phpVMS Datenbankfehler je Zeile abfängt.
+    Angekommen { gespeichert: Gespeichert },
+    /// Sicher nicht verarbeitet (keine Verbindung, 429, 502–504) — Neuversuch
+    /// erzeugt keine Doppelten.
+    NichtAngekommen(ApiError),
+    /// Vielleicht gespeichert (Zeitüberschreitung, sonstiger 5xx) — ein
+    /// Neuversuch könnte Doppelte erzeugen.
+    Unklar(ApiError),
+    /// Abgelehnt (401, 403, 404, sonstige 4xx, ungültige Adresse).
+    Abgelehnt(ApiError),
+}
+
+/// Connection details for a phpVMS site.
+#[derive(Clone, Debug)]
+pub struct Connection {
+    base_url: Url,
+    api_key: String,
+}
+
+impl Connection {
+    pub fn new(base_url: &str, api_key: impl Into<String>) -> Result<Self, ApiError> {
+        let trimmed = base_url.trim().trim_end_matches('/');
+        let url = Url::parse(trimmed).map_err(|_| ApiError::InvalidUrl(trimmed.into()))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(ApiError::InvalidUrl(format!(
+                "URL must be http(s), got '{}'",
+                url.scheme()
+            )));
+        }
+        // SECURITY: plaintext `http://` is only allowed to loopback. The API key
+        // travels in the X-API-Key / bearer headers, so over http to a routable
+        // host it would be sent in cleartext. Production hard-locks the phpVMS URL
+        // to https anyway; this stops the dev/localhost path from being aimed at a
+        // remote http host (LAN or public).
+        if url.scheme() == "http" {
+            let host = url.host_str().unwrap_or("");
+            // host_str() keeps brackets for IPv6 (e.g. "[::1]") — strip them.
+            let host_ip = host.trim_start_matches('[').trim_end_matches(']');
+            let is_loopback = host.eq_ignore_ascii_case("localhost")
+                || host_ip
+                    .parse::<std::net::IpAddr>()
+                    .map(|ip| ip.is_loopback())
+                    .unwrap_or(false);
+            if !is_loopback {
+                return Err(ApiError::InvalidUrl(format!(
+                    "plaintext http:// is only allowed for localhost, got '{host}'"
+                )));
+            }
+        }
+        Ok(Self {
+            base_url: url,
+            api_key: api_key.into(),
+        })
+    }
+
+    pub fn base_url(&self) -> &str {
+        self.base_url.as_str()
+    }
+}
+
+// ---- Resource types ----
+
+/// Subset of `GET /api/user` we need.
+///
+/// phpVMS exposes `home_airport` / `curr_airport` (the ICAO strings) NOT a
+/// `_id` suffix, despite the underlying DB columns being named that way. Took
+/// us one debug round to spot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Profile {
+    pub id: i64,
+    pub pilot_id: i64,
+    /// Formatted pilot identifier, e.g. `GSG0001`.
+    #[serde(default)]
+    pub ident: Option<String>,
+    pub name: String,
+    pub email: Option<String>,
+    pub airline_id: Option<i64>,
+    /// ICAO of the airport the pilot is currently at.
+    #[serde(default, alias = "curr_airport_id")]
+    pub curr_airport: Option<String>,
+    /// ICAO of the pilot's home airport.
+    #[serde(default, alias = "home_airport_id")]
+    pub home_airport: Option<String>,
+    #[serde(default)]
+    pub airline: Option<Airline>,
+    #[serde(default)]
+    pub rank: Option<Rank>,
+    /// v0.7.8 (v1.5): Pilot-personalisierter Callsign-Suffix
+    /// (z.B. "4TK"). Kombiniert mit `airline.icao` ergibt das
+    /// typische ATC-Callsign-Muster "CFG4TK" das viele VAs operativ
+    /// nutzen — abweichend von der Bid-`flight_number`-Form "CFG1504".
+    /// Spec docs/spec/ofp-refresh-simbrief-direct-v0.7.8.md §6.1.
+    /// Falls Pilot-Profile das Feld nicht hat: None, kein Schaden.
+    #[serde(default)]
+    pub callsign: Option<String>,
+    /// v0.12.1 (Stream B): phpVMS 7 `UserState` — pilot account status.
+    /// 0 = PENDING, 1 = ACTIVE, 2 = REJECTED, 3 = ON_LEAVE, 4 = SUSPENDED.
+    /// `/api/user` returns it; only ACTIVE pilots may use AeroACARS
+    /// (see `pilot_state_block_reason`). `None` on legacy installs that
+    /// don't expose the field.
+    #[serde(default)]
+    pub state: Option<i32>,
+    /// v0.16.23: SimBrief profile username as stored on the pilot's
+    /// phpVMS account. A companion phpVMS change exposes this through
+    /// `/api/user` so we can auto-source the SimBrief identifier (used by
+    /// `flight_refresh_route_only`) without the pilot re-typing it in
+    /// Settings. `#[serde(default)]` is mandatory: older phpVMS installs
+    /// (and any instance without the companion change) simply omit the
+    /// field — `None` then, no error. We NEVER overwrite an explicit
+    /// user-set identifier with this (see `cache_pilot`).
+    #[serde(default)]
+    pub simbrief_username: Option<String>,
+}
+
+/// Profil-Abfrage ohne `rank.subfleets` (siehe `Client::get_profile`).
+/// Der Wert von `with` darf "subfleets" nicht enthalten.
+pub const PROFIL_PFAD: &str = "/api/user?with=airline,rank";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Rank {
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Airline {
+    /// phpVMS occasionally encodes integer ids as JSON strings on certain
+    /// resources (Eurowings test instance observed 2026-05-02). Use the
+    /// permissive int-or-string helper and convert to i64 here so the rest
+    /// of the codebase keeps an integer.
+    #[serde(deserialize_with = "de_int_or_str")]
+    pub id: i64,
+    /// May be missing on legacy installs that haven't run the airline
+    /// migration — default to empty so the bid still loads.
+    #[serde(default)]
+    pub icao: String,
+    #[serde(default)]
+    pub iata: Option<String>,
+    /// Same defensive default as `icao`.
+    #[serde(default)]
+    pub name: String,
+    /// Optional URL to the airline's logo, exposed by phpVMS Airline resources.
+    /// May be absent or empty depending on VA configuration.
+    #[serde(default)]
+    pub logo: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Airport {
+    /// phpVMS encodes airport ids inconsistently across instances —
+    /// usually ICAO strings, sometimes integers (legacy databases).
+    /// Permissive here so a single misencoded airport doesn't fail the
+    /// whole bids/flight list parse.
+    #[serde(deserialize_with = "de_str_or_int")]
+    pub id: String,
+    #[serde(default, deserialize_with = "de_opt_str_or_int")]
+    pub icao: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_str_or_int")]
+    pub iata: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_str_or_int")]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub lat: Option<f64>,
+    #[serde(default)]
+    pub lon: Option<f64>,
+    #[serde(default)]
+    pub elevation: Option<f64>,
+}
+
+impl Distance {
+    /// Streckenlaenge in NM — egal, welche Einheit phpVMS mitgeschickt
+    /// hat. Externe QS (Codex, 16.09.2026): Wer nur `nmi` liest, bekommt
+    /// bei einem Serializer, der nur `km`/`m`/`mi` liefert, still `None`
+    /// — und damit faellt die Mehrweg-Gutschrift der OFP-Achse weg.
+    pub fn nm(&self) -> Option<f64> {
+        self.nmi
+            .or_else(|| self.km.map(|v| v / 1.852))
+            .or_else(|| self.m.map(|v| v / 1852.0))
+            .or_else(|| self.mi.map(|v| v * 0.868_976))
+            .filter(|v| v.is_finite() && *v > 0.0)
+    }
+}
+
+/// phpVMS exposes distance as a multi-unit object:
+/// `{ "m": 483372, "km": 483.37, "mi": 300.35, "nmi": 261 }`.
+/// Any of these may be missing depending on the serializer.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Distance {
+    #[serde(default)]
+    pub m: Option<f64>,
+    #[serde(default)]
+    pub mi: Option<f64>,
+    #[serde(default)]
+    pub km: Option<f64>,
+    #[serde(default)]
+    pub nmi: Option<f64>,
+}
+
+/// Subset of phpVMS's Flight resource we use in Phase 1. Permissive on optional fields.
+///
+/// Every `String` / `Option<String>` id-ish field uses a permissive
+/// deserializer because phpVMS is inconsistent across instances: a
+/// numeric flight_id stored in the DB comes back as a JSON integer on
+/// some sites (legacy auto-increment IDs) and as a string on others
+/// (UUID setups). Live bug from a GSG pilot 2026-05-03: `/api/user/bids`
+/// returned `"flight_number": 6431` (integer, no quotes), failing the
+/// entire bids parse with "invalid type: integer '6431', expected a
+/// string". Lesson: assume nothing about wire types, only types we
+/// fully control end-to-end deserve a strict shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Flight {
+    #[serde(deserialize_with = "de_str_or_int")]
+    pub id: String,
+    /// phpVMS encodes this as a JSON number when the value is purely numeric
+    /// (e.g. `284` or `6431`) and as a string otherwise (e.g. `"VL12A"`).
+    #[serde(deserialize_with = "de_str_or_int")]
+    pub flight_number: String,
+    #[serde(default, deserialize_with = "de_opt_str_or_int")]
+    pub route_code: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_str_or_int")]
+    pub route_leg: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_str_or_int")]
+    pub callsign: Option<String>,
+    #[serde(deserialize_with = "de_str_or_int")]
+    pub dpt_airport_id: String,
+    #[serde(deserialize_with = "de_str_or_int")]
+    pub arr_airport_id: String,
+    #[serde(default, deserialize_with = "de_opt_str_or_int")]
+    pub alt_airport_id: Option<String>,
+    /// Scheduled flight time in minutes.
+    #[serde(default)]
+    pub flight_time: Option<i32>,
+    /// Scheduled departure time of day, "HH:MM", Zulu — raw phpVMS schedule
+    /// field, passed through unmodified (`phpvmsflights.dpt_time`).
+    #[serde(default, deserialize_with = "de_opt_str_or_int")]
+    pub dpt_time: Option<String>,
+    /// Scheduled arrival time of day, "HH:MM", Zulu (`phpvmsflights.arr_time`).
+    #[serde(default, deserialize_with = "de_opt_str_or_int")]
+    pub arr_time: Option<String>,
+    /// Cruise level (e.g. 360 == FL360).
+    #[serde(default)]
+    pub level: Option<i32>,
+    #[serde(default, deserialize_with = "de_opt_str_or_int")]
+    pub route: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_str_or_int")]
+    pub flight_type: Option<String>,
+    #[serde(default)]
+    pub distance: Option<Distance>,
+    #[serde(default)]
+    pub airline: Option<Airline>,
+    #[serde(default)]
+    pub dpt_airport: Option<Airport>,
+    #[serde(default)]
+    pub arr_airport: Option<Airport>,
+    /// SimBrief OFP relation when the pilot has prepared this flight in SimBrief.
+    #[serde(default)]
+    pub simbrief: Option<SimBrief>,
+}
+
+/// SimBrief OFP record returned with a bid/flight when the pilot has prepared one.
+/// `id` looks like `"1777622821_5F3E3B3842"` (a SimBrief-side identifier).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimBrief {
+    pub id: String,
+    /// JSON briefing endpoint exposed by phpVMS Core.
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub aircraft_id: Option<i64>,
+    /// SimBrief-derived subfleet info, including the fares (passenger / cargo
+    /// counts) the OFP was generated against. We carry these forward into the
+    /// final filed PIREP so the VA gets accurate load numbers.
+    #[serde(default)]
+    pub subfleet: Option<SimBriefSubfleet>,
+}
+
+/// Parsed SimBrief OFP weights + fuel plan, fetched from the
+/// public XML endpoint. All weights / fuel quantities normalised
+/// to KG regardless of the OFP's `units.wt_unit` setting.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct SimBriefOfp {
+    /// Block fuel (= ramp fuel, what the pilot loads at the gate).
+    /// `<fuel><plan_ramp>` in the OFP.
+    pub planned_block_fuel_kg: f32,
+    /// Estimated trip burn — the dispatcher's planned fuel consumed
+    /// from takeoff to touchdown. `<fuel><est_burn>`.
+    pub planned_burn_kg: f32,
+    /// Reserve fuel set aside for the alternate + holding pattern.
+    /// `<fuel><reserve>`.
+    pub planned_reserve_kg: f32,
+    /// Zero-fuel weight as planned by the dispatcher. Used to detect
+    /// over-loading at takeoff.
+    pub planned_zfw_kg: f32,
+    /// Takeoff weight (block fuel + ZFW − taxi fuel) per OFP.
+    pub planned_tow_kg: f32,
+    /// Landing weight (TOW − burn) per OFP.
+    pub planned_ldw_kg: f32,
+    /// ICAO-coded route string from the flight plan, e.g.
+    /// `"DENUT5L DENUT M624 SUSAN ..."`. None when the OFP didn't
+    /// include a route (rare).
+    pub route: Option<String>,
+    /// Alternate airport ICAO, if planned.
+    pub alternate: Option<String>,
+    /// v0.21.x (#phase-v2 Fix A): planned initial cruise altitude in FEET,
+    /// from `<general><initial_altitude>`. Feeds the Phase-v2 engine's
+    /// cruise reference so ref-less flights (GSG `flights.level` is almost
+    /// always empty) show "Cruise" immediately at level-off instead of
+    /// waiting the ~240 s duration fallback. `None` when the tag is absent
+    /// or non-numeric. This is the FIRST cruise level; later step climbs
+    /// are covered by the higher-priority live PMDG-FMC source.
+    #[serde(default)]
+    pub planned_cruise_alt_ft: Option<f64>,
+    /// Ordered waypoints from the OFP `<navlog>`. Posted to phpVMS via
+    /// `POST /pireps/{id}/route` after prefile so the live map can show
+    /// the planned track alongside the actually flown one.
+    #[serde(default)]
+    pub waypoints: Vec<RouteFix>,
+    // ---- MAX-Werte aus dem OFP für Overweight-Detection (v0.3.0) ----
+    /// Maximum Zero-Fuel Weight laut Aircraft-Performance. Pilot darf
+    /// `IST-ZFW <= MAX-ZFW` haben — sonst Strukturschaden möglich.
+    /// 0.0 wenn das OFP-XML kein `<max_zfw>`-Tag hatte.
+    pub max_zfw_kg: f32,
+    /// Maximum Takeoff Weight. Drives die Overweight-Warnung im
+    /// Live-Loadsheet und zieht Punkte vom Loadsheet-Score ab wenn
+    /// IST-TOW > MAX-TOW beim Takeoff.
+    pub max_tow_kg: f32,
+    /// Maximum Landing Weight. Bei Overshoot droht Fuel-Dumping
+    /// oder Overweight-Landing-Inspektion.
+    pub max_ldw_kg: f32,
+    /// Briefing-2a Weights-Transparenz (Pilot-Feedback 2026-08-03, analog
+    /// zur Fuel-Aufschluesselung): Operating Empty Weight aus `<oew>` —
+    /// mit `planned_payload_kg` ergibt die Summe exakt `planned_zfw_kg`.
+    #[serde(default)]
+    pub planned_oew_kg: f32,
+    /// Payload (Pax + Fracht zusammen) aus `<payload>`.
+    #[serde(default)]
+    pub planned_payload_kg: f32,
+    /// Briefing-2a LOAD-Rubrik-Transparenz: Pax-Gesamtgewicht
+    /// (`pax_weight * pax_count`) und Gepaeck-Gesamtgewicht
+    /// (`bag_weight * bag_count`) getrennt von der reinen Fracht
+    /// (`freight_kg`) — zusammen ergeben sie `planned_payload_kg`.
+    #[serde(default)]
+    pub planned_pax_weight_kg: f32,
+    #[serde(default)]
+    pub planned_baggage_kg: f32,
+    // ---- OFP-Identitätsfelder (v0.3.0) ----
+    // Damit der Pilot bei Mismatch sieht WORAUF der SimBrief-OFP
+    // tatsächlich basiert (Flight-Number, Origin, Destination, wann
+    // erstellt). Hilft die "Plan ist von gestern"-Verwirrung
+    // aufzulösen — SimBrief liefert immer den letzten OFP des
+    // Pilot-Accounts, ohne dass das mit der aktuellen Buchung
+    // verknüpft ist.
+    /// Flight-Number aus dem OFP (z.B. "DLH123" oder "RYR100").
+    /// Empty wenn das XML keine atc.callsign / general.flight_number
+    /// hatte.
+    pub ofp_flight_number: String,
+    /// Origin-ICAO aus dem OFP (z.B. "LOWS"). Empty wenn nicht im XML.
+    pub ofp_origin_icao: String,
+    /// Destination-ICAO aus dem OFP (z.B. "EDDB"). Empty wenn nicht.
+    pub ofp_destination_icao: String,
+    /// Wann der OFP erstellt wurde (Unix-Timestamp als String aus
+    /// dem XML, oder ISO-Datum). Empty wenn nicht im XML.
+    pub ofp_generated_at: String,
+    /// v0.7.8: `<params><request_id>` aus dem SimBrief-XML. Aendert sich
+    /// bei JEDER Re-Generation auf simbrief.com — canonical changed-flag-
+    /// Quelle fuer SimBrief-direct Refresh. Leer wenn Tag fehlt (sollte
+    /// praktisch nie passieren laut Live-API-Probe).
+    /// Spec docs/spec/ofp-refresh-simbrief-direct-v0.7.8.md §3.
+    #[serde(default)]
+    pub request_id: String,
+    /// v0.7.12: `<weights><pax_count>` aus dem SimBrief-XML — Anzahl Pax
+    /// im OFP-Plan. Bei Pre-Flight-SimBrief-direct (v0.7.10) zeigt das
+    /// Frontend diesen Wert in der Bid-Card; ohne diesen Wert sah der
+    /// Pilot keine Pax-Info bevor er den OFP ueber phpVMS gebunden hat.
+    /// 0 wenn der Tag fehlt oder cargo-only.
+    #[serde(default)]
+    pub pax_count: i32,
+    /// v0.7.12: Cargo-Last in kg. SimBrief liefert das in `<weights><cargo>`
+    /// (default lbs, mit `units_set=kgs`-Toggle: kg). 0.0 wenn Tag fehlt.
+    ///
+    /// WICHTIG: Das ist Gepaeck + Fracht ZUSAMMEN, nicht die Fracht allein.
+    /// Fuer die Anzeige als "Cargo" `freight_kg` nehmen.
+    #[serde(default)]
+    pub cargo_kg: f32,
+    /// Reine Fracht in kg (ohne Pax-Gepaeck) aus `<weights><freight_added>`,
+    /// mit Fallback `cargo - bag_weight`. Das ist der Wert, den ein Pilot
+    /// meint, wenn er "wieviel Cargo habe ich" fragt.
+    #[serde(default)]
+    pub freight_kg: f32,
+    /// Briefing-2a: Aircraft-ICAO-Typ aus `<aircraft><icaocode>` — Fallback
+    /// fuer die Route-Mitte/LOAD-Rubrik wenn der Bid (noch) keinen phpVMS-
+    /// Bid-Pointer-Subfleet hat (SimBrief-direct-Pfad, der Normalfall vor
+    /// dem ersten phpVMS-OFP-Binding).
+    #[serde(default)]
+    pub aircraft_icao: Option<String>,
+    /// Sitzplatz-Total der geplanten Config aus `<aircraft><max_passengers>` —
+    /// Grundlage fuer "PAX von N" in der LOAD-Rubrik. Verifiziert per Live-
+    /// XML-Dump 2026-08-02 (vorherige Annahme "kommt nicht aus der SimBrief-
+    /// Preview" war falsch, siehe BidsList.tsx-Historie).
+    #[serde(default)]
+    pub max_passengers: Option<i32>,
+    /// Geplante Blockzeit ab (Unix-Epoch-Sekunden, UTC) aus `<times><sched_out>`.
+    /// Fallback-Quelle fuer STD, wenn phpVMS' `flight.dpt_time` fehlt.
+    #[serde(default)]
+    pub sched_out_epoch: Option<i64>,
+    /// Geplante Blockzeit an (Unix-Epoch-Sekunden, UTC) aus `<times><sched_in>`.
+    #[serde(default)]
+    pub sched_in_epoch: Option<i64>,
+    /// Geplantes Abheben / Aufsetzen (Unix-Epoch-Sekunden, UTC) aus
+    /// `<times><sched_off>` / `<sched_on>` — fuer „Zeiten gegen Flugplan".
+    #[serde(default)]
+    pub sched_off_epoch: Option<i64>,
+    #[serde(default)]
+    pub sched_on_epoch: Option<i64>,
+    /// Kabinenansagen (Beta): Zeitzone von Abflug und Ziel als Abstand zu UTC
+    /// in Minuten, aus `<times><orig_timezone>` / `<dest_timezone>` (SimBrief
+    /// liefert Stunden, z. B. `-5` oder `5.5`). Fuer Ortszeit und Tageszeit.
+    #[serde(default)]
+    pub orig_utc_offset_min: Option<i32>,
+    #[serde(default)]
+    pub dest_utc_offset_min: Option<i32>,
+    /// Briefing-2a Fuel-Transparenz (Pilot-Feedback 2026-08-02: Trip+Reserve
+    /// allein ergaben keine plausible Summe zu Block — verifiziert per Live-
+    /// XML-Dump: `<fuel>` hat taxi/contingency/alternate_burn/reserve/extra,
+    /// die zusammen mit Trip exakt `plan_ramp` (Block) ergeben).
+    #[serde(default)]
+    pub planned_taxi_kg: f32,
+    #[serde(default)]
+    pub planned_contingency_kg: f32,
+    #[serde(default)]
+    pub planned_alternate_burn_kg: f32,
+    #[serde(default)]
+    pub planned_extra_kg: f32,
+}
+
+/// Single navlog fix from a SimBrief OFP. `kind` carries the SimBrief
+/// fix type ("apt", "wpt", "vor", "ndb"); we map it to phpVMS's
+/// numeric `nav_type` at the boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RouteFix {
+    pub ident: String,
+    pub lat: f64,
+    pub lon: f64,
+    pub kind: String,
+    /// v1.7.35: Plan-Sprit bis zu diesem Fix (kg, kumuliert; SimBrief
+    /// `<fuel_totalused>`, in die OFP-Einheit umgerechnet). Grundlage der
+    /// Sprit-Auswertung „bis Sinkflug / Anflug". `None` bei Altbestand.
+    #[serde(default)]
+    pub sprit_bis_hier_kg: Option<f32>,
+    /// v1.7.35: Segmentlaenge zu diesem Fix (NM, `<distance>`).
+    #[serde(default)]
+    pub segment_nm: Option<f32>,
+    /// v1.7.35: geplante Hoehe am Fix (ft, `<altitude_feet>`).
+    #[serde(default)]
+    pub hoehe_ft: Option<f32>,
+    /// v1.7.35: geplante Zeit bis zu diesem Fix (s, `<time_total>`).
+    #[serde(default)]
+    pub zeit_bis_hier_s: Option<f32>,
+    /// v1.7.40: Sprit an Bord laut Plan an diesem Fix (kg,
+    /// `<fuel_plan_onboard>`). Grundlage der Tabelle „Sprit · Wegpunkt für
+    /// Wegpunkt". `None` bei Altbestand.
+    #[serde(default)]
+    pub sprit_an_bord_kg: Option<f32>,
+    /// v1.7.40: Mindest-Sprit an Bord laut OFP an diesem Fix (kg,
+    /// `<fuel_min_onboard>`) — darunter wird die Zeile rot.
+    #[serde(default)]
+    pub sprit_min_an_bord_kg: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SimBriefSubfleet {
+    // BUG-FIX (Briefing-2a, Pilot-Report 2026-08-02 "Subfleet-Bezeichnung
+    // passt nicht"): ohne dieses `alias` blieb das Feld IMMER `None`, weil
+    // phpVMS den JSON-Key `"type"` liefert (nicht `"type_"`) — Rust erlaubt
+    // `type` nicht als Bezeichner, daher der Trailing-Underscore. Live
+    // verifiziert: `flight.simbrief.subfleet.type` = "VLG-A320-IAE-SL"
+    // (Airline-Typ-Triebwerk-Winglet) ist in der API IMMER schon da, wurde
+    // aber nie ankommend gelesen.
+    // WICHTIG: `alias` statt `rename` — `rename` haette zusaetzlich das
+    // Serialize-Verhalten geaendert (Rust->Frontend-IPC-JSON schriebe dann
+    // `"type"` statt `"type_"`), was den bestehenden Frontend-Zugriff
+    // `subfleet?.type_` bricht (genau dieser Fehler ist beim ersten Versuch
+    // mit `rename` live aufgetreten — Subfleet blieb weiterhin leer, obwohl
+    // das Rust-Objekt intern schon korrekt befuellt war). `alias` wirkt nur
+    // beim Deserialisieren, Serialize bleibt beim Rust-Feldnamen `type_`.
+    #[serde(default, alias = "type")]
+    pub type_: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub fares: Vec<Fare>,
+}
+
+/// Single fare-class entry. Fields are permissive — phpVMS varies which keys
+/// it returns based on context (subfleet vs. PIREP file).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Fare {
+    pub id: i64,
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub capacity: Option<i32>,
+    /// Number of passengers (or cargo units) the OFP was generated for.
+    #[serde(default)]
+    pub count: Option<i32>,
+    #[serde(default)]
+    pub price: Option<f64>,
+    /// 0 = passenger fare, 1 = cargo (phpVMS convention).
+    #[serde(default, rename = "type")]
+    pub fare_type: Option<i32>,
+}
+
+/// One fare row returned by the PaxStudio ACARS API (`/api/paxstudio/ofp/{id}/…`).
+/// Only `id` + `count` are needed to file; the endpoint also sends `code`/`type`
+/// which serde ignores here.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PaxFare {
+    pub id: i64,
+    pub count: i32,
+}
+
+/// Kabinenansagen (Beta): Antwort von `/api/kabinenansagen/status`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct KabinenStatus {
+    #[serde(default)]
+    pub beta: bool,
+    #[serde(default)]
+    pub bereit: bool,
+    /// Der Pilot hat die Ansagen für diesen Flug im Loadsheet abgeschaltet
+    /// (nur mit `pirep_id`). Der Server sendet dann `beta: false` dazu; der
+    /// Client wertet `flug_aus` zuerst aus. Fehlt bei älteren Modulen.
+    #[serde(default)]
+    pub flug_aus: bool,
+}
+
+/// Pfad der Statusabfrage; mit PIREP-Nummer meldet der Server auch, ob der
+/// Pilot die Ansagen für diesen Flug abgeschaltet hat (`flug_aus`).
+fn kabinen_status_pfad(pirep_id: Option<&str>) -> String {
+    match pirep_id.filter(|id| !id.is_empty()) {
+        Some(id) => format!("/api/kabinenansagen/status?pirep_id={}", urlencoding_escape(id)),
+        None => "/api/kabinenansagen/status".to_string(),
+    }
+}
+
+/// Kabinenansagen (Beta): ein Text des Drehbuchs. `slot` ist der serde-Name
+/// aus `cabin_announcements::Slot` (der api-client kennt den Baustein nicht).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KabinenEintrag {
+    pub slot: String,
+    pub sprache: String,
+    pub text: String,
+    /// Wer spricht, wenn der Server es festlegt: `kapitaen` an der
+    /// Sicherheitsansage von Mustern ohne Kabinencrew (Kurzfassung, GSG-Modul
+    /// ab Paket 2). Fehlt bei allen anderen Einträgen und bei älteren Modulen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rolle: Option<String>,
+    /// Nur `reiseflug80`: zweiter_service | ende_bordverkauf.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub art: Option<String>,
+    /// Fremde Namen im Text samt ihrer Sprache (2.1.0): Der Ton-Server
+    /// spricht sie in ihrer Sprache. Fehlt bei älteren Modulen.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fremd: Vec<KabinenFremd>,
+}
+
+/// Ein fremder Name in einem Ansagetext, z. B. „Times Square“ (en).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct KabinenFremd {
+    pub wort: String,
+    pub sprache: String,
+}
+
+/// Kabinenansagen: Crew des Fluges laut GSG-Server (in jeder Antwort).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KabinenCrew {
+    #[serde(default)]
+    pub kapitaen: Option<String>,
+    /// "m" | "w"
+    #[serde(default)]
+    pub kapitaen_geschlecht: Option<String>,
+    /// "m" | "w" (Purser/Purserin)
+    #[serde(default)]
+    pub kabine_geschlecht: Option<String>,
+}
+
+/// Kabinenansagen (Beta): Antwort von `/api/kabinenansagen/drehbuch`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct KabinenDrehbuch {
+    #[serde(default)]
+    pub sprachen: Vec<String>,
+    #[serde(default)]
+    pub eintraege: Vec<KabinenEintrag>,
+    #[serde(default)]
+    pub crew: Option<KabinenCrew>,
+    /// Boarding-Lied (2.1.1 G1): nur, wenn der Client es mit
+    /// `boarding_lied: true` angefragt hat und das Modul es schreiben konnte.
+    #[serde(default)]
+    pub boarding_lied: Option<KabinenLied>,
+    /// Das Modul hatte bis zum Zeitlimit keine Zeit mehr für das Lied: kurz
+    /// danach noch einmal fragen (Drehbuch kommt dann aus dem Zwischenspeicher).
+    #[serde(default)]
+    pub boarding_lied_spaeter: bool,
+    /// Was auf diesem Flug sicher entfällt (Modul ab Rundumschlag 22.10.2026):
+    /// `sicherheit/sv-SE` → `keine_vorlage`, `sprache/zh-CN` → `keine_stimme`.
+    /// Ältere Module schicken nichts; eine leere PHP-Liste (`[]`) zählt als leer.
+    #[serde(default, deserialize_with = "entfaellt_lesen")]
+    pub entfaellt: std::collections::BTreeMap<String, String>,
+    /// Antwort auf `auffrischen: true` (Modul ab 23.10.2026): Restzeit und
+    /// Landezeit neu in die geprüfte Rohfassung eingesetzt. Ein älteres
+    /// Modul kennt den Schalter nicht und schickt das Feld nicht.
+    #[serde(default)]
+    pub aufgefrischt: bool,
+}
+
+fn entfaellt_lesen<'de, D: serde::Deserializer<'de>>(d: D) -> Result<std::collections::BTreeMap<String, String>, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(v.as_object()
+        .map(|o| o.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect())
+        .unwrap_or_default())
+}
+
+/// Text und Stil des Boarding-Lieds für den Ton-Server (acemusic.ai).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct KabinenLied {
+    /// Englischer Liedtext mit Marken `[Verse]`, `[Chorus]` …
+    pub text: String,
+    /// Musikstil (Steckbrief der Airline, sonst von der KI gewählt).
+    pub stil: String,
+    /// Für die Anzeige: Titel und Strecke („Frankfurt → Hamburg“).
+    #[serde(default)]
+    pub titel: Option<String>,
+    #[serde(default)]
+    pub strecke: Option<String>,
+}
+
+/// Response payload of the PaxStudio fares/claim endpoints (inside the `{data:…}`
+/// envelope). `value_source` is `"booked"` when the pilot's exact per-class split
+/// was returned, `"none"` when the OFP has no PaxStudio booking (empty `fares`).
+/// `linked` is only set by the claim endpoint (true once the OFP is bound to the PIREP).
+#[derive(Debug, Clone, Deserialize)]
+pub struct PaxStudioFares {
+    #[serde(default)]
+    pub value_source: String,
+    #[serde(default)]
+    pub fares: Vec<PaxFare>,
+    #[serde(default)]
+    pub linked: bool,
+}
+
+/// `GET /api/user/bids` returns a list of these.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Bid {
+    #[serde(deserialize_with = "de_int_or_str")]
+    pub id: i64,
+    /// phpVMS sometimes returns the user id as a string (Eurowings test
+    /// instance, 2026-05-02). Be permissive on the wire.
+    #[serde(deserialize_with = "de_int_or_str")]
+    pub user_id: i64,
+    /// Always a string in canonical phpVMS, but tolerant to int just in case.
+    #[serde(deserialize_with = "de_str_or_int")]
+    pub flight_id: String,
+    pub flight: Flight,
+}
+
+// ---- PIREP lifecycle types ----
+
+/// Body for `POST /api/pireps/prefile`.
+/// phpVMS validates these; only the listed fields are required, the rest are
+/// dropped if `None` (skipped via `skip_serializing_if`).
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct PrefileBody {
+    pub airline_id: i64,
+    pub aircraft_id: String,
+    /// v0.16.18: phpVMS-Flight-ID aus dem aktiven Bid. phpVMS validiert
+    /// sie im PrefileRequest ('sometimes|nullable|exists:flights,id') und
+    /// haengt den PIREP damit an den geplanten Flug — wichtig fuers
+    /// Event-/Tour-Matching (SkyAdventures: Etappen mit festem Flug).
+    /// Vorher fehlte sie systematisch -> pireps.flight_id blieb leer.
+    /// Bei Diversion nullt phpVMS sie bewusst selbst (PirepService:778).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flight_id: Option<String>,
+    pub flight_number: String,
+    pub dpt_airport_id: String,
+    pub arr_airport_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alt_airport_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flight_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_leg: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planned_distance: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planned_flight_time: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    pub source_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+/// Single position entry posted to `POST /api/pireps/{id}/acars/position`.
+/// We map our internal `SimSnapshot` to this on the way out.
+///
+/// Field set tracks the phpVMS-Core `acars` model (lat/lon/heading/altitude/
+/// altitude_agl/altitude_msl/gs/ias/vs/fuel/fuel_flow/transponder/autopilot/
+/// distance/log/sim_time/source). Anything outside that schema (lights,
+/// COM/NAV freqs, autopilot mode detail) goes into `log` as a compact JSON
+/// blob so the live map / PIREP detail page can surface it without a custom
+/// field per item.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PositionEntry {
+    /// v1.6.14 — Idempotenz-Schluessel, EINMAL beim Erzeugen des Punktes
+    /// vergeben (siehe `snapshot_to_position`) und danach unveraendert
+    /// durch Outbox, `position_queue.json` und jeden Requeue getragen.
+    ///
+    /// Hintergrund (Feldbefund 21.08.2026): schlaegt ein Batch-POST fehl,
+    /// legt der Worker den KOMPLETTEN Batch zurueck in die Outbox und
+    /// schickt ihn erneut. Der Server hatte ihn aber meist laengst
+    /// verarbeitet (er merkt einen Client-Abbruch nicht, `ignore_user_abort`
+    /// wirkt erst bei Output) — ohne Schluessel legt phpVMS dabei NEUE
+    /// Zeilen an. Messung ueber 6 Fluege: 19-122 Dubletten je Flug.
+    ///
+    /// phpVMS' `AcarsController::acars_store` kennt beide Zweige: mit
+    /// gesetzter `id` aktualisiert es die vorhandene Zeile, ohne legt es
+    /// eine neue an. Leer = altes Verhalten, deshalb `skip_serializing_if`
+    /// (aeltere `position_queue.json`-Eintraege haben kein Feld).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    pub lat: f64,
+    pub lon: f64,
+    pub altitude: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub altitude_agl: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub altitude_msl: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heading: Option<f32>,
+    /// Groundspeed in knots.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gs: Option<f32>,
+    /// Vertical speed in fpm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vs: Option<f32>,
+    /// Indicated airspeed in knots.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ias: Option<f32>,
+    /// Total fuel on board, kilograms (phpVMS-Core column).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fuel: Option<f32>,
+    /// Total fuel flow, kg/h (phpVMS-Core column).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fuel_flow: Option<f32>,
+    /// 4-digit transponder / squawk code (phpVMS-Core column).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transponder: Option<u16>,
+    /// Autopilot master on/off (phpVMS-Core column, stored as int 0/1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub autopilot: Option<bool>,
+    /// Distance to the destination in nautical miles (phpVMS-Core column).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distance: Option<f64>,
+    /// Free-form log line shown on the live map. We pack telemetry that
+    /// phpVMS doesn't have first-class columns for (lights, com/nav,
+    /// autopilot modes) here as compact JSON.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log: Option<String>,
+    /// ISO-8601 UTC timestamp.
+    pub sim_time: String,
+}
+
+/// Body for `POST /api/pireps/{id}/file` — final flight stats at submission.
+//
+// v0.5.49: Deserialize hinzugefügt damit der PIREP-Queue-Worker das
+// JSON aus der persistenten Queue zurücklesen kann.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FileBody {
+    /// Total flight time in minutes (takeoff → landing).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flight_time: Option<i32>,
+    /// Fuel used (units configured site-side; phpVMS default is pounds).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fuel_used: Option<f64>,
+    /// Total fuel on board at block-off, same unit as `fuel_used`.
+    /// Without this phpVMS shows "Verbleibender Treibstoff = -fuel_used"
+    /// because it derives remaining = block_fuel - fuel_used and the
+    /// missing field defaults to 0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_fuel: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distance: Option<f64>,
+    /// Cruise level in feet (e.g. 36000). Native phpVMS column on the
+    /// PIREP details page (`Flt.Level`); we report the highest steady
+    /// altitude the aircraft held during the flight.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<i32>,
+    /// Touchdown vertical speed in fpm (negative on a real landing).
+    /// phpVMS displays this as "Landing Rate" on the PIREP overview.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub landing_rate: Option<f64>,
+    /// Numeric landing score 0..100 (phpVMS convention; we map our
+    /// LandingScore enum into roughly equivalent ranges).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    /// Final passenger / cargo loads per fare class.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fares: Option<Vec<FareEntry>>,
+    /// Custom PIREP fields keyed by name. The VA admin configures the fields
+    /// in their phpVMS / ACARS module; we send everything we can compute.
+    /// Spec §24.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fields: Option<std::collections::HashMap<String, String>>,
+    /// Override the planned arrival airport when filing — used for
+    /// diverts. phpVMS' FileRequest.rules() validates this field, and
+    /// the controller writes it through to the Pirep model on file.
+    /// When set, the PIREP shows up in the VA's PIREP list with the
+    /// ACTUAL landing airport instead of the bid's planned one.
+    /// Pair with a `notes` block that explains the divert (we do that
+    /// in `flight_end_with_divert`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arr_airport_id: Option<String>,
+    /// ISO-8601 / RFC-3339 off-block time (first movement out of the gate).
+    ///
+    /// phpVMS will NOT derive this on its own. `PirepService::create()` tries
+    /// (`block_off_time = block_on_time - flight_time`), but the guard
+    /// `if (!$pirep->block_off_time)` never fires: `block_off_time` is cast
+    /// with `App\Casts\CarbonCast`, whose `get()` turns a NULL column into
+    /// `new Carbon(null)` — i.e. the CURRENT time, which is always truthy.
+    /// So a PIREP we don't send this for keeps `block_off_time = NULL` in the
+    /// DB forever, while the model reports "now" to every reader.
+    ///
+    /// Consequence before this was sent: every AeroACARS PIREP on GSG had a
+    /// NULL off-block time (vmsACARS/smartCARS PIREPs all have one), which
+    /// broke SkyAdventures' event-window matching for long-haul flights.
+    /// `block_off_time` is in the Pirep `$fillable` list and `/file` mass-
+    /// assigns the raw request input, so sending it is enough.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_off_time: Option<String>,
+    /// ISO-8601 / RFC-3339 on-block time (parked at the gate).
+    ///
+    /// phpVMS otherwise falls back to the submission timestamp, which is when
+    /// the pilot clicked "file" — on a long flight that can be far from the
+    /// actual arrival. Same mass-assignment path as `block_off_time`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_on_time: Option<String>,
+}
+
+/// Minimal fare entry for filing — phpVMS uses `id` to look up the fare class
+/// and `count` for the loaded amount.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FareEntry {
+    pub id: i64,
+    pub count: i32,
+}
+
+/// Body for `POST /api/pireps/{id}/update`. Used both for explicit phase /
+/// state transitions AND as the periodic "heartbeat" that keeps the PIREP
+/// alive against phpVMS's `RemoveExpiredLiveFlights` cron — that cron looks
+/// at `pireps.updated_at`, NOT at the latest position row, so without a
+/// regular call here a long cruise leg gets soft-deleted after the
+/// `acars.live_time` window (default 2h on most installs).
+///
+/// vmsACARS sends this every `acars_update_timer` seconds (default 30) with
+/// monotonically growing `flight_time` / `distance` fields, which
+/// guarantees Eloquent sees the model as dirty and bumps `updated_at`.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct UpdateBody {
+    /// phpVMS PirepState. 0 = IN_PROGRESS, 1 = PENDING, 2 = ACCEPTED, etc.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<i32>,
+    /// phpVMS PirepSource. 0 = ACARS, 1 = MANUAL. Smuggled through the
+    /// update endpoint (rules() doesn't validate it but parsePirep
+    /// passes everything to mass-assignment, and `source` is in the
+    /// Pirep $fillable). Used by `flight_end_manual` to flip the source
+    /// to MANUAL before /file so PirepService::submit() routes the
+    /// PIREP through the manual auto-approve path on the pilot's rank.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<i32>,
+    /// phpVMS PirepStatus code (e.g. "BST" boarding, "OFB" pushback,
+    /// "TKO" takeoff, "ENR" enroute, "APP" approach).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Seconds since block-off. Monotonically growing → guarantees dirty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flight_time: Option<i32>,
+    /// Distance flown so far (nmi). Also used by the live-map sidebar.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distance: Option<f64>,
+    /// Fuel burned so far (units configured site-side; phpVMS default lbs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fuel_used: Option<f64>,
+    /// Total fuel on board at block-off (units configured site-side).
+    /// v0.3.0: NEW in the live heartbeat. phpVMS' live tracking page
+    /// derives "Verbleibender Treibstoff = block_fuel − fuel_used";
+    /// without this field the missing column defaults to 0 and the
+    /// remaining-fuel display reads as "−<fuel_used>" for the entire
+    /// flight. We send the value once it's known (= once block-off
+    /// has been timestamped) and on every subsequent heartbeat.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_fuel: Option<f64>,
+    /// Current cruise level / altitude in feet (e.g. 34000).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<i32>,
+    /// Free-form ACARS source identifier shown in the PIREP detail.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    /// ISO-8601 / RFC-3339 timestamp. Smuggled through `parsePirep`
+    /// (which Carbon-converts the field) → mass-assigned onto the
+    /// Pirep model where `updated_at` is in the $fillable list.
+    /// Used by the heartbeat as the guaranteed-dirty marker so
+    /// Eloquent always emits an UPDATE: without this, a heartbeat
+    /// sent while the aircraft is still parked would pass distance=0
+    /// and flight_time=0 — those aren't dirty after the first call,
+    /// no UPDATE fires, and `pireps.updated_at` doesn't bump → cron
+    /// kills the PIREP after `acars.live_time` hours.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    /// Override the arrival airport. Used by the divert-finalize path
+    /// in `flight_end` to mass-assign the actual landing airport when
+    /// the pilot diverted. `arr_airport_id` is in the Pirep `$fillable`
+    /// list, so this is mass-assigned through `parsePirep` like every
+    /// other field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arr_airport_id: Option<String>,
+    /// Touchdown vertical speed in fpm (negative on a real landing).
+    /// Smuggled the same way as `source` — `landing_rate` is in
+    /// `$fillable`, the Acars\\UpdateRequest doesn't validate it but
+    /// parsePirep passes the raw input through to mass-assignment.
+    /// Used by the divert-finalize path so the PIREP detail shows the
+    /// landing rate even though we never call `/file`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub landing_rate: Option<f64>,
+    /// Numeric landing score 0..100. Same smuggle path as
+    /// `landing_rate` — `score` is in the Pirep $fillable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<i32>,
+    /// ISO-8601 / RFC-3339 timestamp marking when the PIREP was
+    /// submitted. Normally set by `Acars\\PirepController::file()`;
+    /// since the divert-finalize path skips `/file`, we set it here
+    /// so admin queue ordering works.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submitted_at: Option<String>,
+    /// ISO-8601 / RFC-3339 block-on time. Same reason as
+    /// `submitted_at` — `/file` would normally set this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_on_time: Option<String>,
+}
+
+/// phpVMS PirepSource enum values, mirrored here so call sites don't
+/// have to remember the magic numbers. Values match the upstream
+/// `App\Models\Enums\PirepSource` constants.
+pub mod pirep_source {
+    // phpVMS `App\Enums\PirepSource`: MANUAL = 0, ACARS = 1. These two were
+    // swapped until v1.7.0, so every "flip this PIREP to MANUAL" wrote ACARS —
+    // the manual-file path silently kept asking for the ACARS auto-approve rule
+    // it was trying to avoid. Verified against phpvms@dev and the live GSG
+    // database on 23.08.2026.
+    pub const MANUAL: i32 = 0;
+    pub const ACARS: i32 = 1;
+}
+
+/// Single text log line posted to `POST /api/pireps/{id}/acars/logs`. Used
+/// for sub-events that don't map to a phpVMS PirepStatus code (TOC, TOD,
+/// V1 / VR / V2, touchdown vertical speed, engine start/stop, etc.) — vmsACARS
+/// uses this same endpoint to write the chronological "story" pilots see
+/// in the PIREP detail page.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LogEntry {
+    /// Feste Kennung der Zeile (UUID). phpVMS legt Zeilen mit `id` per
+    /// `updateOrInsert` an — dieselbe Zeile zweimal zu senden erzeugt also
+    /// keine Doppelte. Damit darf der ACARS-Postausgang bei jedem Fehler
+    /// erneut senden (AeroACARS 2.0.10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub log: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lat: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lon: Option<f64>,
+    /// ISO-8601 UTC timestamp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+}
+
+/// Single waypoint posted to `POST /api/pireps/{id}/route`. Order is
+/// 0-based; nav_type follows the phpVMS Navdata enum (1 = waypoint,
+/// 2 = NDB, 3 = VOR, 4 = airport). When unsure, omit nav_type — phpVMS
+/// renders it generically.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct RouteWaypoint {
+    pub name: String,
+    pub order: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nav_type: Option<i32>,
+    pub lat: f64,
+    pub lon: f64,
+}
+
+/// Full PIREP record returned by `GET /api/pireps/{id}`. We use this for
+/// recovery / diagnose when the live POST endpoints suddenly start
+/// returning 404 — we can distinguish "soft-deleted by cron" from
+/// "pirep was filed elsewhere" from "auth lost".
+#[derive(Debug, Clone, Deserialize)]
+pub struct PirepFull {
+    pub id: String,
+    #[serde(default)]
+    pub state: Option<i32>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub flight_number: Option<String>,
+    #[serde(default)]
+    pub dpt_airport_id: Option<String>,
+    #[serde(default)]
+    pub arr_airport_id: Option<String>,
+    #[serde(default)]
+    pub flight_time: Option<i32>,
+    // `distance` intentionally omitted — phpVMS sometimes returns it as
+    // a `{value, unit}` object (e.g. on `/api/pireps/{id}`) and sometimes
+    // as a bare `f64` (other endpoints), and we don't need it for any
+    // current call site. Serde ignores unknown fields by default, so
+    // dropping it makes the GET resilient to both shapes.
+}
+
+/// A single ACARS position row from `GET /api/pireps/{id}/acars/position`.
+///
+/// CRITICAL: decode ONLY `lat`/`lon`. The phpVMS `Acars` API resource returns
+/// `distance` and `fuel` as **unit-objects** (e.g. `{"nmi": 12.3}`), not bare
+/// scalars, so a struct that named those fields with a scalar type would fail
+/// to decode the whole envelope. Serde drops unknown fields by default, so we
+/// keep only the two coordinates — same resilience pattern as `PirepFull`,
+/// which drops `distance` for the same reason (see above).
+#[derive(Debug, Clone, Deserialize)]
+pub struct AcarsPosition {
+    // Option: lat/lon are nullable in the phpVMS acars schema. A single null
+    // row must NOT poison the whole-batch decode (it would silently skip the
+    // track reseed) — null rows are filtered out at the consumer.
+    pub lat: Option<f64>,
+    pub lon: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PirepCreated {
+    pub id: String,
+}
+
+/// Lightweight PIREP record returned by `GET /api/user/pireps`. Used to find
+/// an existing in-progress flight so we can resume it instead of doing a
+/// fresh prefile (which would fail with aircraft-not-available because the
+/// existing PIREP holds the aircraft "in use").
+// Default: nur damit Tests eine Vorlage bauen können, ohne zwei Dutzend
+// Optionsfelder aufzuzählen. Alle Felder sind Option/serde(default), der
+// abgeleitete Default ist also derselbe leere Zustand, den serde erzeugt.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PirepSummary {
+    pub id: String,
+    #[serde(default)]
+    pub airline_id: Option<i64>,
+    #[serde(default)]
+    pub flight_number: Option<String>,
+    #[serde(default)]
+    pub aircraft_id: Option<i64>,
+    /// phpVMS PirepState: 0=IN_PROGRESS, 1=PENDING, 2=ACCEPTED, 3=CANCELLED, …
+    #[serde(default)]
+    pub state: Option<i32>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub dpt_airport_id: Option<String>,
+    #[serde(default)]
+    pub arr_airport_id: Option<String>,
+    // v0.7.18 (B-011): Felder fuer den Orphan-Cleanup-Pfad. phpVMS liefert
+    // diese je nach Version + VA-Plugin-Config nicht garantiert mit, daher
+    // alle Option + serde(default). Spec docs/spec/v0.7.18-orphan-flight-
+    // cleanup.md §B-011 Datenpfad-Hinweis (Option 1: Schema erweitern und
+    // schauen was kommt; bei Bedarf via Fleet-Lookup nachreichen).
+    //
+    // v0.7.18 (R1-3): `flight_id` über `de_opt_str_or_int` deserialisieren —
+    // phpVMS liefert je nach Installation als String ("flightid_1") ODER
+    // als Zahl (numeric flight_id). Ohne den Deserializer würde
+    // get_user_pireps() bei einem einzigen numeric-flight_id-PIREP komplett
+    // failen.
+    #[serde(default, deserialize_with = "de_opt_str_or_int")]
+    pub flight_id: Option<String>,
+    #[serde(default)]
+    pub aircraft_icao: Option<String>,
+    #[serde(default)]
+    pub aircraft_registration: Option<String>,
+    /// `created_at` aus phpVMS PirepResource — ISO-8601 String. Wird
+    /// vom Frontend zu „vor X h Y min" konvertiert.
+    #[serde(default)]
+    pub created_at: Option<String>,
+    /// `updated_at` aus phpVMS PirepResource — die letzte Meldung eines
+    /// Clients. Frisch heisst: Der Flug laeuft gerade auf einem Geraet.
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+/// v0.5.33: Subfleet mit nested Aircraft-Liste, wie phpVMS-V7
+/// SubfleetResource sie liefert (`/api/fleet`, `/api/user/fleet`).
+///
+/// **Korrektur ggü. v0.5.32**: Wir hatten faelschlich angenommen es
+/// gaebe einen `/api/fleet/{id}/aircraft`-Endpoint — den gibt es nicht.
+/// SubfleetResource enthaelt das Aircraft-Array bereits inline:
+///
+/// ```php
+/// // SubfleetResource::toArray
+/// $res['aircraft'] = AircraftResource::collection($this->aircraft);
+/// ```
+///
+/// Also: einmal `/api/user/fleet` abrufen, ueber alle Subfleets iterieren,
+/// `aircraft` flatten — fertig. Kein N+1.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubfleetWithAircraft {
+    pub id: i64,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub icao: Option<String>,
+    #[serde(default, rename = "type")]
+    pub subfleet_type: Option<String>,
+    /// Nested Aircraft-Liste — bereits in der Subfleet-Response
+    /// enthalten. Default = leer falls phpVMS-Version das Feld
+    /// nicht liefert.
+    #[serde(default)]
+    pub aircraft: Vec<AircraftDetails>,
+}
+
+/// Subset of `GET /api/fleet/aircraft/{id}` we use for diagnostic purposes,
+/// e.g. when phpVMS rejects a prefile with `aircraft-not-available`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AircraftDetails {
+    pub id: i64,
+    #[serde(default)]
+    pub registration: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub icao: Option<String>,
+    /// ICAO of the airport where the aircraft is currently parked.
+    #[serde(default)]
+    pub airport_id: Option<String>,
+    /// 0 = parked, 1 = in use, 2 = in flight (phpVMS AircraftState).
+    #[serde(default)]
+    pub state: Option<i32>,
+    /// "A" active, "S" stored, etc.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Max takeoff weight, per-tail (`phpvmsaircraft.mtow`). phpVMS's
+    /// `App\Http\Resources\Aircraft` always wraps mass fields as
+    /// `{kg, lbs}` (`App\Contracts\Unit::getResponseUnits()`), never a
+    /// bare number — hence the nested struct instead of `Option<f64>`.
+    #[serde(default)]
+    pub mtow: Option<MassUnits>,
+}
+
+/// `{kg, lbs}` shape phpVMS's `Mass`/`Fuel` unit wrappers always emit
+/// (`App\Contracts\Unit::getResponseUnits()` — both units are hardcoded
+/// in `responseUnits`, so both keys are always present).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MassUnits {
+    #[serde(default)]
+    pub kg: Option<f64>,
+    #[serde(default)]
+    pub lbs: Option<f64>,
+}
+
+// v0.12.12-dev: VA-News-Post aus `GET /api/news`. phpVMS liefert je
+// nach Version + Plugin-Config unterschiedliche Felder — wir bleiben
+// permissiv (alle optionalen Felder via `serde(default)`), damit ein
+// fehlendes `updated_at`/`author` nicht die ganze Liste killt.
+// `body` ist HTML — Frontend sanitiziert vor dem Render.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewsItem {
+    #[serde(deserialize_with = "de_int_or_str")]
+    pub id: i64,
+    #[serde(default)]
+    pub subject: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    /// Optional flat author field (manche Installs liefern das so).
+    #[serde(default)]
+    pub author: Option<String>,
+    /// Optional nested user-Objekt — phpVMS-Standard liefert das
+    /// via Resource-Include. Wir nehmen `name` daraus wenn der flat
+    /// `author`-Pfad nicht greift (mapping macht das Frontend).
+    #[serde(default)]
+    pub user: Option<NewsUser>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewsUser {
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+// phpVMS resource responses are wrapped: `{ "data": {...} }`.
+#[derive(Deserialize)]
+struct DataEnvelope<T> {
+    data: T,
+}
+
+// ---- Client ----
+
+/// v0.19.x FIX: outcome of [`same_host_redirect_decision`] — kept separate
+/// from `reqwest::redirect::Action` so the decision logic is testable
+/// without constructing a real `reqwest::redirect::Attempt` (which has no
+/// public constructor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedirectDecision {
+    Follow,
+    Stop,
+    TooMany,
+}
+
+/// Origin fingerprint used for same-host redirect comparison: scheme +
+/// host + the *effective* port (falls back to the scheme's default port
+/// when the URL has none explicit, so `https://host` and `https://host:443`
+/// compare equal).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RedirectOrigin {
+    scheme: String,
+    host: String,
+    port: Option<u16>,
+}
+
+impl RedirectOrigin {
+    fn from_url(url: &Url) -> Option<Self> {
+        Some(Self {
+            scheme: url.scheme().to_string(),
+            host: url.host_str()?.to_string(),
+            port: url.port_or_known_default(),
+        })
+    }
+}
+
+/// Pure redirect-policy decision: only ever follow a redirect that stays
+/// on the phpVMS host+scheme+port this client was configured for.
+/// `X-API-Key` is not in reqwest's cross-host header-strip allowlist (only
+/// Authorization/Cookie/... are), so an unrestricted redirect could hand
+/// the API key — which also mints MQTT credentials — to any host a
+/// compromised or misconfigured phpVMS install redirects to.
+///
+/// v0.20.x FIX: the original version compared `host_str()` only. That
+/// missed two leaks on the SAME host: (a) an https -> http redirect would
+/// still be "same host" and get followed, sending X-API-Key in cleartext
+/// (a classic scheme-downgrade attack); (b) a redirect to a different port
+/// on the same host — a completely different service — would also be
+/// followed. Both are now rejected. The one same-host cross-scheme case we
+/// deliberately keep allowing is an http -> https *upgrade* (some phpVMS/
+/// load-balancer setups issue exactly this) — but ONLY to the standard
+/// https port (443), not an arbitrary one.
+///
+/// v0.20.x QS fix (follow-up): the first cut of this upgrade exception
+/// skipped the port check ENTIRELY whenever schemes differed, so an
+/// upgrade redirect to `https://<host>:<any-port>` was followed — not just
+/// the standard port. Since the only case reaching this branch is a
+/// plaintext `http://` connection (and `Connection::new` only ever allows
+/// that for loopback/localhost), this narrowed the exposure to an
+/// unexpected local service on an unexpected port, rather than a routable
+/// host — but it was still broader than the "some phpVMS/load-balancer
+/// setups issue a same-host https upgrade" case this exception exists for.
+fn same_host_redirect_decision(
+    target: Option<&RedirectOrigin>,
+    allowed: &RedirectOrigin,
+    hops_so_far: usize,
+) -> RedirectDecision {
+    if hops_so_far > 5 {
+        return RedirectDecision::TooMany;
+    }
+    let Some(target) = target else {
+        return RedirectDecision::Stop;
+    };
+    if target.host != allowed.host {
+        return RedirectDecision::Stop;
+    }
+    if target.scheme == allowed.scheme {
+        if target.port != allowed.port {
+            return RedirectDecision::Stop;
+        }
+    } else if allowed.scheme == "http" && target.scheme == "https" {
+        // The upgrade exception — standard https port only.
+        if target.port != Some(443) {
+            return RedirectDecision::Stop;
+        }
+    } else {
+        // Any other scheme mismatch (an https -> http downgrade, or
+        // anything else) is rejected.
+        return RedirectDecision::Stop;
+    }
+    RedirectDecision::Follow
+}
+
+/// A reusable client. `Clone` is cheap because the inner reqwest client is
+/// `Arc`-backed and `Connection` only holds a URL + API key string.
+#[derive(Clone)]
+pub struct Client {
+    http: HttpClient,
+    conn: Connection,
+}
+
+impl Client {
+    pub fn new(conn: Connection) -> Result<Self, ApiError> {
+        let user_agent = format!("AeroACARS/{}", env!("CARGO_PKG_VERSION"));
+        // SECURITY (v0.19.x FIX): reqwest's default redirect policy strips
+        // Authorization/Cookie/... on a cross-host hop but does NOT strip
+        // custom headers — `X-API-Key` (the phpVMS credential, which also
+        // mints MQTT credentials) would survive a redirect to a completely
+        // different host. A compromised or misconfigured VA phpVMS install
+        // could hand it straight to an attacker. There is no legitimate
+        // reason for this client to ever need a cross-host redirect — every
+        // request is built against the one configured `base_url` — so only
+        // same-host redirects are followed at all; anything else is
+        // rejected outright, same effect as `Policy::none()` for the case
+        // that actually matters, without breaking a same-host https upgrade
+        // some phpVMS/load-balancer setups issue.
+        let allowed_origin = RedirectOrigin::from_url(&conn.base_url);
+        let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
+            let target_origin = RedirectOrigin::from_url(attempt.url());
+            let decision = match &allowed_origin {
+                Some(allowed) => same_host_redirect_decision(
+                    target_origin.as_ref(),
+                    allowed,
+                    attempt.previous().len(),
+                ),
+                None => RedirectDecision::Stop,
+            };
+            match decision {
+                RedirectDecision::Follow => attempt.follow(),
+                RedirectDecision::Stop => attempt.stop(),
+                RedirectDecision::TooMany => attempt.error("too many redirects"),
+            }
+        });
+        let http = HttpClient::builder()
+            .user_agent(user_agent)
+            .timeout(DEFAULT_TIMEOUT)
+            // v0.5.49 — siehe Konstanten-Block oben für Begründung jedes
+            // einzelnen Settings. tl;dr: gegen NAT-Eviction + tote
+            // TCP-Verbindungen die den Streamer-Tick blockieren.
+            .connect_timeout(CONNECT_TIMEOUT)
+            .tcp_keepalive(TCP_KEEPALIVE)
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+            .pool_max_idle_per_host(8)
+            .redirect(redirect_policy)
+            .build()
+            .map_err(ApiError::from)?;
+        Ok(Self { http, conn })
+    }
+
+    pub fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
+    fn endpoint(&self, path: &str) -> Result<Url, ApiError> {
+        let path = path.trim_start_matches('/');
+        let joined = format!(
+            "{}/{}",
+            self.conn.base_url.as_str().trim_end_matches('/'),
+            path
+        );
+        Url::parse(&joined).map_err(|_| ApiError::InvalidUrl(joined))
+    }
+
+    /// GET a `{ "data": T }` resource and decode it.
+    async fn get_data<T: DeserializeOwned>(&self, path: &str) -> Result<T, ApiError> {
+        let url = self.endpoint(path)?;
+        let response = self
+            .http
+            .get(url)
+            .header("X-API-Key", &self.conn.api_key)
+            .header(header::ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(ApiError::from)?;
+
+        let response = check_status(response, path).await?;
+        // Read the body as text so we can log a snippet on decode failure —
+        // the default error from `response.json()` doesn't include the offending
+        // JSON, which makes API-shape mismatches very hard to diagnose.
+        let body = response
+            .text()
+            .await
+            .map_err(|e| ApiError::BadResponse(format!("read body for {path}: {e}")))?;
+        // Logged at DEBUG so it's silent by default but available for diagnosing
+        // schema mismatches on a new VA via `RUST_LOG=api_client=debug`.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let head: String = body.chars().take(2000).collect();
+            tracing::debug!(path = %path, body_len = body.len(), head = %head, "response body");
+        }
+        match serde_json::from_str::<DataEnvelope<T>>(&body) {
+            Ok(envelope) => Ok(envelope.data),
+            Err(e) => {
+                let snippet: String = body.chars().take(800).collect();
+                tracing::warn!(
+                    path = %path,
+                    error = %e,
+                    body_len = body.len(),
+                    body_snippet = %snippet,
+                    "JSON decode failed"
+                );
+                Err(ApiError::BadResponse(format!(
+                    "JSON decode failed for {path}: {e}"
+                )))
+            }
+        }
+    }
+
+    /// `GET /api/user` — ohne die Flottenliste des Rangs.
+    ///
+    /// phpVMS haengt an das Profil standardmaessig `rank.subfleets` an, also
+    /// jede Subfleet samt Flugzeugen, die der Rang fliegen darf. Bei der GSG
+    /// sind das 1,44 MB und rund 8 s — und das beim Start, beim Login und bei
+    /// jedem Auffrischen, bevor Simulator und Live-Verbindung starten
+    /// (gemessen 30.09.2026). Der Client liest vom Rang nur den Namen.
+    /// Enthaelt `with` das Wort "subfleets" nicht, laesst phpVMS die Liste weg
+    /// (`Api\UserController::index`): 645 Bytes, 1,3 s, alle uebrigen Felder
+    /// gleich.
+    pub async fn get_profile(&self) -> Result<Profile, ApiError> {
+        self.get_data(PROFIL_PFAD).await
+    }
+
+    /// `GET /api/user/bids`
+    pub async fn get_bids(&self) -> Result<Vec<Bid>, ApiError> {
+        self.get_data("/api/user/bids").await
+    }
+
+    /// `GET /api/user/pireps` — pilot's PIREPs (any state).
+    ///
+    /// **Pagination warning**: phpVMS returns `paginate()` here — 20 per
+    /// page, newest first — and this method only ever reads page 1. So the
+    /// result is "the 20 most recent PIREPs of any state", NOT the complete
+    /// list. Use this only for callers that genuinely want *recent* PIREPs.
+    /// Anything that hunts for IN_PROGRESS entries must use
+    /// [`get_user_pireps_in_progress`](Self::get_user_pireps_in_progress)
+    /// instead — see the 2026-06-13 incident note there.
+    pub async fn get_user_pireps(&self) -> Result<Vec<PirepSummary>, ApiError> {
+        self.get_data("/api/user/pireps").await
+    }
+
+    /// `GET /api/user/pireps?state=0` — ONLY the pilot's IN_PROGRESS PIREPs,
+    /// filtered **server-side**.
+    ///
+    /// Why a dedicated method: `/api/user/pireps` is paginated (20 per page,
+    /// newest first) and `get_user_pireps()` only reads page 1. Any stuck /
+    /// orphaned IN_PROGRESS PIREP older than the pilot's last ~20 flights was
+    /// therefore INVISIBLE to every fetch-then-filter consumer (orphan-cleanup
+    /// panel, resume discovery, prefile collision check) — pilots could not
+    /// self-clean and an admin had to delete by hand (24 such corpses were
+    /// cleaned manually in production on 2026-06-13). The server-side filter
+    /// beats pagination: phpVMS `UserController::pireps` applies
+    /// `$where['state']` when the query param is present, and a pilot has at
+    /// most a handful of IN_PROGRESS PIREPs at once, so page 1 is always the
+    /// complete set.
+    pub async fn get_user_pireps_in_progress(&self) -> Result<Vec<PirepSummary>, ApiError> {
+        self.get_data(USER_PIREPS_IN_PROGRESS_PATH).await
+    }
+
+    /// `POST /api/paxstudio/ofp/{simbrief_id}/claim {pirep_id}` — claim a SimBrief OFP
+    /// for a PIREP and return the pilot's booked per-class PAX/Cargo split.
+    ///
+    /// Two effects in one call: (1) the server binds the OFP to the PIREP id-only
+    /// (authoritative link, NO route rewrite — PaxStudio does not call core
+    /// attachSimbriefToPirep), and (2) it returns the exact booked fares so we can file
+    /// them at the source instead of phpVMS-core's generic subfleet distribution. When
+    /// the OFP has no PaxStudio booking the response is `value_source:"none"` + empty
+    /// `fares` and the caller keeps its core-derived fares. Requires the PaxStudio module
+    /// (≥2.10.0); a 404/older install simply errors and the caller falls back.
+    pub async fn claim_paxstudio_ofp(
+        &self,
+        simbrief_id: &str,
+        pirep_id: &str,
+    ) -> Result<PaxStudioFares, ApiError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            pirep_id: &'a str,
+        }
+        self.post_data(
+            &format!("/api/paxstudio/ofp/{simbrief_id}/claim"),
+            &Body { pirep_id },
+        )
+        .await
+    }
+
+    /// Kabinenansagen (Beta): Darf dieser Pilot die Ansagen nutzen?
+    /// `GET /api/kabinenansagen/status` am GSG-Modul. Nur `beta && bereit`
+    /// schaltet frei; jeder Fehler heisst „aus“ (Aufrufer entscheidet).
+    /// Mit `pirep_id` (laufender Flug) kommt zusätzlich `flug_aus`.
+    pub async fn kabinen_status(&self, pirep_id: Option<&str>) -> Result<KabinenStatus, ApiError> {
+        self.get_data(&kabinen_status_pfad(pirep_id)).await
+    }
+
+    /// Kabinenansagen (Beta): die Texte eines Flugteils.
+    /// `POST /api/kabinenansagen/drehbuch` am GSG-Modul.
+    pub async fn kabinen_drehbuch(
+        &self,
+        anfrage: &serde_json::Value,
+    ) -> Result<KabinenDrehbuch, ApiError> {
+        // Sonnet schreibt die Texte erst bei dieser Anfrage: gemessen 11 s
+        // fuer eine Begruessung, das Modul wartet bis 2 x 60 s. Mit dem
+        // Default (10 s) gab der Client auf, bevor die Texte fertig waren.
+        self.post_data_with_timeout("/api/kabinenansagen/drehbuch", anfrage, Some(KABINEN_DREHBUCH_TIMEOUT))
+            .await
+    }
+
+    /// `GET /api/airlines?page=N` — aktive Airlines der VA, nach Namen
+    /// (phpVMS `paginate()`); für die Airline-Wahl der Boarding-Musik.
+    pub async fn get_airlines(&self, page: u32) -> Result<Vec<Airline>, ApiError> {
+        self.get_data(&format!("/api/airlines?page={page}")).await
+    }
+
+    /// `GET /api/airports/{icao}` — single airport lookup with coordinates.
+    pub async fn get_airport(&self, icao: &str) -> Result<Airport, ApiError> {
+        let path = format!("/api/airports/{}", icao.trim().to_uppercase());
+        self.get_data(&path).await
+    }
+
+    /// v0.13.x (In-App-Live-Map, VA-Übersicht): öffentlicher Live-ACARS-Feed
+    /// (alle aktiven Flüge der VA mit Position) als rohe JSON. Nutzt den
+    /// konfigurierten HTTP-Client (gleicher TLS-Pfad wie alle anderen Calls) —
+    /// vermeidet den rustls-CryptoProvider-Stolperstein eines frisch gebauten
+    /// reqwest::Client. `/api/acars` ist public (kein API-Key nötig).
+    pub async fn get_acars_live(&self) -> Result<serde_json::Value, ApiError> {
+        let url = self.endpoint("/api/acars")?;
+        let response = self
+            .http
+            .get(url)
+            .header(header::ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(ApiError::from)?;
+        let response = check_status(response, "/api/acars").await?;
+        response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| ApiError::BadResponse(format!("read /api/acars: {e}")))
+    }
+
+    /// GsgLogbook-Modul (GSG phpVMS): liest das Pilot-Logbuch LIVE über die
+    /// API — nichts gespeichert.
+    ///
+    /// Loest StratosLogbook ab. Grund: dessen Track lieferte pro Punkt genau
+    /// ein Hoehenfeld (`altitude_msl ?? altitude_agl ?? 0`), also nie AGL
+    /// separat — die AGL-Kurve der Logbuch-Ansicht fiel damit auf 0 zurueck
+    /// und das Gelaendeprofil (alt - agl) lag exakt auf MSL. Beide Werte
+    /// stehen in `phpvmsacars` und werden von der GSG-API mit ausgeliefert,
+    /// zusammen mit IAS, Steig-/Sinkrate und Treibstoff.
+    ///
+    /// Auth: phpVMS-`api_key`. Die GSG-Routen haengen an phpVMS' eigener
+    /// `api.auth`-Middleware (X-API-Key); der Bearer bleibt drin, damit ein
+    /// Rueckschalten auf Stratos ohne Codeaenderung moeglich ist.
+    async fn get_logbook_json(&self, path: &str) -> Result<serde_json::Value, ApiError> {
+        let url = self.endpoint(path)?;
+        let response = self
+            .http
+            .get(url)
+            .bearer_auth(&self.conn.api_key)
+            .header("X-API-Key", &self.conn.api_key)
+            .header(header::ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(ApiError::from)?;
+        let response = check_status(response, path).await?;
+        response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| ApiError::BadResponse(format!("read {path}: {e}")))
+    }
+
+    /// Logbuch-Flugliste (paginiert): `{ items, total, limit, offset }`.
+    pub async fn get_logbook_pireps(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> Result<serde_json::Value, ApiError> {
+        self.get_logbook_json(&format!(
+            "/api/gsg/logbook/pireps?limit={limit}&offset={offset}"
+        ))
+        .await
+    }
+
+    /// Logbuch-Summen (Flüge, Stunden, Distanz, Ø-Landung, Rang).
+    pub async fn get_logbook_stats(&self) -> Result<serde_json::Value, ApiError> {
+        self.get_logbook_json("/api/gsg/logbook/stats").await
+    }
+
+    /// Logbuch-Detail eines PIREP inkl. `route` (Track) + `log` (Fluglogbuch).
+    pub async fn get_logbook_pirep(&self, id: &str) -> Result<serde_json::Value, ApiError> {
+        self.get_logbook_json(&format!("/api/gsg/logbook/pireps/{id}"))
+            .await
+    }
+
+    /// POST a JSON body and decode the response envelope `{ data: T }`.
+    async fn post_data<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T, ApiError> {
+        self.post_data_with_timeout(path, body, None).await
+    }
+
+    /// Wie [`post_data`], aber mit optionalem Per-Request-Timeout, der den
+    /// Client-Default (`DEFAULT_TIMEOUT`) ueberschreibt.
+    async fn post_data_with_timeout<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+        timeout: Option<Duration>,
+    ) -> Result<T, ApiError> {
+        let url = self.endpoint(path)?;
+        let mut req = self
+            .http
+            .post(url)
+            .header("X-API-Key", &self.conn.api_key)
+            .header(header::ACCEPT, "application/json")
+            .json(body);
+        if let Some(t) = timeout {
+            req = req.timeout(t);
+        }
+        let response = req.send().await.map_err(ApiError::from)?;
+        let response = check_status(response, path).await?;
+        let text = response
+            .text()
+            .await
+            .map_err(|e| ApiError::BadResponse(format!("read body for {path}: {e}")))?;
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let head: String = text.chars().take(2000).collect();
+            tracing::debug!(path = %path, body_len = text.len(), head = %head, "post response");
+        }
+        match serde_json::from_str::<DataEnvelope<T>>(&text) {
+            Ok(envelope) => Ok(envelope.data),
+            Err(e) => {
+                tracing::warn!(path = %path, error = %e, "JSON decode failed for POST response");
+                Err(ApiError::BadResponse(format!(
+                    "JSON decode failed for {path}: {e}"
+                )))
+            }
+        }
+    }
+
+    /// POST and ignore the response body (status-check only).
+    async fn post_void<B: Serialize>(&self, path: &str, body: &B) -> Result<(), ApiError> {
+        self.post_void_with_timeout(path, body, None).await
+    }
+
+    /// Wie [`post_void`], aber mit optionalem Per-Request-Timeout, der den
+    /// Client-Default (`DEFAULT_TIMEOUT`) ueberschreibt. Gedacht fuer
+    /// Aufrufe im Hintergrund-Worker, wo Robustheit vor Reaktionszeit geht.
+    async fn post_void_with_timeout<B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+        timeout: Option<Duration>,
+    ) -> Result<(), ApiError> {
+        let url = self.endpoint(path)?;
+        let mut req = self
+            .http
+            .post(url)
+            .header("X-API-Key", &self.conn.api_key)
+            .header(header::ACCEPT, "application/json")
+            .json(body);
+        if let Some(t) = timeout {
+            req = req.timeout(t);
+        }
+        let response = req.send().await.map_err(ApiError::from)?;
+        let _ = check_status(response, path).await?;
+        Ok(())
+    }
+
+    /// DELETE and ignore the response body (status-check only).
+    async fn delete_void(&self, path: &str) -> Result<(), ApiError> {
+        let url = self.endpoint(path)?;
+        let response = self
+            .http
+            .delete(url)
+            .header("X-API-Key", &self.conn.api_key)
+            .header(header::ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(ApiError::from)?;
+        let _ = check_status(response, path).await?;
+        Ok(())
+    }
+
+    /// `DELETE /api/user/bids` — drop a bid after its PIREP was filed
+    /// (or to give it back).
+    ///
+    /// **Korrektur 18.08.2026 (am Live-Server nachgesehen):** hier stand
+    /// jahrelang „phpVMS does NOT auto-consume bids when the PIREP is filed".
+    /// Das stimmt nicht. phpVMS-Core hängt `BidEventHandler` an das
+    /// `PirepFiled`-Ereignis und ruft dort `removeBidForPirep()` — die Buchung
+    /// ist also schon weg, bevor dieser Aufruf überhaupt rausgeht.
+    ///
+    /// Sichtbare Folge im Zugriffsprotokoll, bei JEDEM Piloten und JEDEM Flug
+    /// (19 × 404, dann 17 × 200 im untersuchten Zeitraum): der `bid_id`-Versuch
+    /// läuft in `Bid::findOrFail()` und bekommt 404, der `flight_id`-Rückfall
+    /// ruft `removeBid()` auf eine bereits entfernte Buchung und bekommt 200,
+    /// ohne etwas zu tun. Zwei Anfragen ohne Wirkung, je abgeschicktem Flug.
+    ///
+    /// **Warum das trotzdem so bleibt:** ein 404 auf DELETE ließe sich als
+    /// „schon weg, Ziel erreicht" werten und der zweite Versuch sparen — aber
+    /// 404 heißt auf demselben Pfad auch „diesen Endpunkt gibt es hier nicht".
+    /// Beide sind von außen nicht sicher zu unterscheiden, und die zweite
+    /// Bedeutung stillschweigend als Erfolg zu verbuchen würde einen kaputten
+    /// Endpunkt verdecken. Zwei wirkungslose Anfragen sind der billigere
+    /// Fehler. Der Aufruf selbst wird ohnehin gebraucht — beim Zurückgeben
+    /// einer Buchung OHNE Flugbericht feuert `PirepFiled` nicht.
+    ///
+    /// phpVMS routes ALL bid CRUD through `/api/user/bids` (kein `{id}` im
+    /// Pfad). Die ID reist im JSON-Body als `{ "bid_id": ... }` ODER
+    /// `{ "flight_id": ... }`. v0.7.18 (B-011) erlaubt beide Eingaben.
+    ///
+    /// **Body-Auswahl-Reihenfolge** (siehe Spec §B-011 Backend-API):
+    ///   - `bid_id` Some → erster Versuch `{ bid_id }`.
+    ///     Bei 422/400 UND `flight_id` Some → zweiter Versuch
+    ///     `{ flight_id }`.
+    ///   - `bid_id` None, `flight_id` Some → direkt `{ flight_id }`.
+    ///   - beide None → `ApiError::InvalidUrl` (Caller-Bug).
+    ///
+    /// Aus Spec-§B-011 Decision: **kein 405-Fallback hier** (anders als bei
+    /// `cancel_pirep`). Wenn ein VA-Install POST mit `_method=DELETE`
+    /// braucht, machen wir das als separate Aufgabe nach v0.7.18.
+    pub async fn delete_bid(
+        &self,
+        bid_id: Option<i64>,
+        flight_id: Option<&str>,
+    ) -> Result<(), ApiError> {
+        // phpVMS routes ALL bid CRUD through `/api/user/bids` — there
+        // is NO `/api/user/bids/{id}` or `/api/bids/{id}` route, despite
+        // what previous reverse-engineering of vmsACARS' binary
+        // suggested (the strings we saw there are likely alternative
+        // routes added by VA installs, or just unused).
+        //
+        // Verified against the canonical phpVMS source at
+        // github.com/nabeelio/phpvms (`Api/UserController::bids`):
+        //
+        //     if ($request->isMethod('DELETE')) {
+        //         if ($request->filled('bid_id')) {
+        //             $bid = Bid::findOrFail($request->input('bid_id'));
+        //             ...
+        //             $this->bidSvc->removeBid($flight, $user);
+        //         } elseif ($request->filled('flight_id')) {
+        //             ...
+        //         }
+        //     }
+        //
+        // → entweder `bid_id` ODER `flight_id` reisen im Body. JSON ist
+        // fine weil Laravel's `$request->input(...)` JSON-Body / Form-
+        // Body / Query-String transparent liest.
+        //
+        // v0.7.18 (B-011): Signatur akzeptiert beide IDs als Option.
+        // Aufruf-Logik:
+        //   - bid_id Some → erster Versuch `{ bid_id }`. Bei 400/404/422
+        //     UND flight_id Some → zweiter Versuch `{ flight_id }`.
+        //   - bid_id None, flight_id Some → direkt `{ flight_id }`.
+        //   - beide None → InvalidUrl-Error (Caller-Bug).
+        //
+        // v0.7.18 (R2-2): 404 in den Fallback aufgenommen. Wenn die VA
+        // den bid_id-Wert serverseitig schon nicht mehr kennt (verwaister
+        // PIREP, Bid wurde manuell gedroppt etc.), liefert phpVMS 404 statt
+        // 422. Der flight_id-Pfad ist dann der einzige Weg den Bid zu
+        // droppen — genau der Orphan-Cleanup-Fall den B-011 fixt.
+        //
+        // Manche VAs liefern in `PirepSummary` kein `bid_id`, dann ist
+        // der flight_id-Pfad der einzige Weg den Bid serverseitig zu
+        // droppen.
+        let path = "/api/user/bids";
+
+        #[derive(serde::Serialize)]
+        struct BidIdBody {
+            bid_id: i64,
+        }
+        #[derive(serde::Serialize)]
+        struct FlightIdBody<'a> {
+            flight_id: &'a str,
+        }
+
+        // Versuch 1: bid_id wenn vorhanden.
+        if let Some(bid_id) = bid_id {
+            let url = self.endpoint(path)?;
+            let response = self
+                .http
+                .delete(url)
+                .header("X-API-Key", &self.conn.api_key)
+                .header(header::ACCEPT, "application/json")
+                .json(&BidIdBody { bid_id })
+                .send()
+                .await
+                .map_err(ApiError::from)?;
+            let status = response.status();
+            // Bei 400/404/422 (Validation-Fehler oder „bid nicht gefunden"
+            // vom phpVMS-Plugin) und wenn ein flight_id-Fallback verfuegbar
+            // ist: Versuch 2. Bei allen anderen Status-Codes (inkl. 2xx)
+            // durch check_status laufen lassen.
+            if matches!(status.as_u16(), 400 | 404 | 422) && flight_id.is_some() {
+                tracing::info!(
+                    bid_id,
+                    status = status.as_u16(),
+                    "delete_bid: bid_id-Body abgelehnt, versuche flight_id-Fallback"
+                );
+                // Body verbrauchen damit kein Connection-Reuse-Glitch
+                let _ = response.text().await;
+            } else {
+                let _ = check_status(response, path).await?;
+                return Ok(());
+            }
+        }
+
+        // Versuch 2 (oder direkt wenn bid_id=None): flight_id-Body.
+        if let Some(flight_id) = flight_id {
+            let url = self.endpoint(path)?;
+            let response = self
+                .http
+                .delete(url)
+                .header("X-API-Key", &self.conn.api_key)
+                .header(header::ACCEPT, "application/json")
+                .json(&FlightIdBody { flight_id })
+                .send()
+                .await
+                .map_err(ApiError::from)?;
+            let _ = check_status(response, path).await?;
+            return Ok(());
+        }
+
+        // Beide None → Caller-Bug.
+        Err(ApiError::InvalidUrl(
+            "delete_bid called with both bid_id and flight_id = None".into(),
+        ))
+    }
+
+    /// `POST /api/pireps/prefile` — create an in-flight PIREP.
+    pub async fn prefile_pirep(&self, body: &PrefileBody) -> Result<PirepCreated, ApiError> {
+        self.post_data("/api/pireps/prefile", body).await
+    }
+
+    /// Fetch the public SimBrief OFP XML for a given OFP id and
+    /// extract the weights + fuel plan we care about. The endpoint
+    /// is `https://www.simbrief.com/ofp/flightplans/xml/{id}.xml` —
+    /// no auth needed; SimBrief OFPs are public-by-id.
+    ///
+    /// Weights / fuel are normalised to KG regardless of the OFP's
+    /// `<units><wt_unit>` setting (kgs vs lbs).
+    ///
+    /// Returns `Ok(None)` when the OFP is missing or malformed —
+    /// flight_start should treat that as "no plan, no comparison"
+    /// rather than refusing to start.
+    pub async fn fetch_simbrief_ofp(&self, ofp_id: &str) -> Result<Option<SimBriefOfp>, ApiError> {
+        let url = format!(
+            "https://www.simbrief.com/ofp/flightplans/xml/{}.xml",
+            urlencoding_escape(ofp_id)
+        );
+        let response = match self.http.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, ofp_id, "SimBrief OFP fetch failed (network)");
+                return Ok(None);
+            }
+        };
+        if !response.status().is_success() {
+            tracing::warn!(
+                status = %response.status(),
+                ofp_id,
+                "SimBrief OFP fetch returned non-2xx",
+            );
+            return Ok(None);
+        }
+        let xml = match response.text().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "SimBrief OFP body read failed");
+                return Ok(None);
+            }
+        };
+        Ok(parse_simbrief_ofp(&xml))
+    }
+
+    /// v0.7.8: SimBrief-direct OFP-Fetch via `xml.fetcher.php?username=X`
+    /// oder `?userid=X` (= "Fetching a User's Latest OFP Data" laut
+    /// Navigraph-Doku). Bypasst den phpVMS-Bid-Pointer → funktioniert
+    /// auch wenn der Bid nach Prefile entfernt wurde (W5).
+    ///
+    /// Pfad-Auswahl:
+    /// - `user_id` (numerisch) → `?userid={user_id}` (Navigraph-Empfehlung,
+    ///   robuster weil unveraenderlich)
+    /// - sonst `username` → `?username={username}` (offiziell ebenfalls
+    ///   unterstuetzt, einfacher zu finden im Profile-URL)
+    ///
+    /// Error-Detection (Spec §3.3 v1.3 — beide Pfade abdecken):
+    /// - HTTP 400 ODER `<fetch><status>Error</status>` → `UserNotFound`
+    /// - HTTP 5xx → `Unavailable`
+    /// - andere non-2xx → `Network`
+    /// - Parse-Fehler nach Status-OK → `ParseFailed`
+    /// - Network/IO-Error vor Response → `Network`
+    ///
+    /// Spec docs/spec/ofp-refresh-simbrief-direct-v0.7.8.md §3.
+    ///
+    /// Briefing-2a-Haertung (Pilot-Feedback 2026-08-03): der allererste
+    /// Preview-Fetch direkt nach App-Start/Seiten-Reload schlug wiederholt
+    /// transient fehl (Cold-Start-Netzwerkstack/DNS, kurzer SimBrief-Haenger),
+    /// waehrend ein manueller "Aktualisieren"-Klick sofort danach klappte —
+    /// klassisches Retry-Symptom. `Network`/`Unavailable` (beide moeglicherweise
+    /// transient) bekommen bis zu 2 weitere Versuche mit kurzem Backoff;
+    /// `NoIdentifier`/`UserNotFound`/`ParseFailed` sind dauerhafte Fehler
+    /// (falscher Key, kein OFP, kaputtes XML) und werden NICHT wiederholt —
+    /// erneutes Versuchen wuerde nur Zeit kosten ohne die Ursache zu beheben.
+    pub async fn fetch_simbrief_direct(
+        &self,
+        user_id: Option<&str>,
+        username: Option<&str>,
+    ) -> Result<SimBriefOfp, SimBriefDirectError> {
+        const MAX_ATTEMPTS: u32 = 3;
+        const BACKOFF: [std::time::Duration; 2] = [
+            std::time::Duration::from_millis(400),
+            std::time::Duration::from_millis(900),
+        ];
+        let mut last_err = SimBriefDirectError::Network;
+        for attempt in 0..MAX_ATTEMPTS {
+            match self.fetch_simbrief_direct_attempt(user_id, username).await {
+                Ok(ofp) => return Ok(ofp),
+                Err(e @ (SimBriefDirectError::Network | SimBriefDirectError::Unavailable)) => {
+                    last_err = e;
+                    if attempt + 1 < MAX_ATTEMPTS {
+                        tracing::warn!(
+                            attempt = attempt + 1,
+                            "SimBrief-direct: transienter Fehler, retry"
+                        );
+                        tokio::time::sleep(BACKOFF[attempt as usize]).await;
+                        continue;
+                    }
+                }
+                // Dauerhafte Fehler sofort durchreichen, kein Retry.
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err)
+    }
+
+    async fn fetch_simbrief_direct_attempt(
+        &self,
+        user_id: Option<&str>,
+        username: Option<&str>,
+    ) -> Result<SimBriefOfp, SimBriefDirectError> {
+        // user_id > username Prioritaet (Spec §4.1 — robuster, unveraenderlich)
+        let url = if let Some(uid) = user_id.filter(|s| !s.is_empty()) {
+            format!(
+                "https://www.simbrief.com/api/xml.fetcher.php?userid={}",
+                urlencoding_escape(uid),
+            )
+        } else if let Some(un) = username.filter(|s| !s.is_empty()) {
+            format!(
+                "https://www.simbrief.com/api/xml.fetcher.php?username={}",
+                urlencoding_escape(un),
+            )
+        } else {
+            return Err(SimBriefDirectError::NoIdentifier);
+        };
+
+        let response = self.http.get(&url).send().await.map_err(|e| {
+            tracing::warn!(error = %e, "SimBrief-direct network error");
+            SimBriefDirectError::Network
+        })?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::BAD_REQUEST {
+            // Navigraph-Doku-Pfad: invalid user → HTTP 400 + small XML error
+            tracing::warn!(%status, "SimBrief-direct: HTTP 400, treating as UserNotFound");
+            return Err(SimBriefDirectError::UserNotFound);
+        }
+        if status.is_server_error() {
+            tracing::warn!(%status, "SimBrief-direct: server error, Unavailable");
+            return Err(SimBriefDirectError::Unavailable);
+        }
+        if !status.is_success() {
+            tracing::warn!(%status, "SimBrief-direct: unexpected non-2xx status");
+            return Err(SimBriefDirectError::Network);
+        }
+
+        let xml = response.text().await.map_err(|e| {
+            tracing::warn!(error = %e, "SimBrief-direct body read failed");
+            SimBriefDirectError::Network
+        })?;
+
+        // Live-Probe-Pfad: HTTP 200 + <fetch><status>Error</status>
+        // moeglich. Status MUSS gepruefped werden, nicht nur HTTP-Code.
+        let fetch_status = extract_tag(&xml, "fetch")
+            .and_then(|inner| extract_tag(inner, "status"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        if fetch_status != "Success" {
+            tracing::warn!(
+                fetch_status = %fetch_status,
+                "SimBrief-direct: <fetch><status> not Success, treating as UserNotFound",
+            );
+            return Err(SimBriefDirectError::UserNotFound);
+        }
+
+        parse_simbrief_ofp(&xml).ok_or_else(|| {
+            tracing::warn!("SimBrief-direct: XML parse failed");
+            SimBriefDirectError::ParseFailed
+        })
+    }
+
+    /// `POST /api/pireps/{pirep_id}/acars/position` — push a batch of positions.
+    ///
+    /// v1.6.14: eigener, groesserer Timeout statt `DEFAULT_TIMEOUT` (10 s).
+    /// Gemessen am GSG-Live-Server (21.08.2026, 377 POSTs eines Fluges):
+    /// Median 1 s, p90 2 s, **Maximum 11 s** — dazu 1,3 s reine
+    /// phpVMS-Bootstrap-Zeit pro Request und eine wiederkehrende
+    /// Lastspitze durch den Minuten-Cron (80 % der gescheiterten POSTs
+    /// fielen in das Fenster :40-:09, waehrend alle Zeilen ueber die
+    /// Minute gleichverteilt sind). Die 10 s trafen also regelmaessig
+    /// Requests, die der Server gleich darauf erfolgreich abschloss.
+    ///
+    /// Der Positions-POST laeuft im entkoppelten Worker und blockiert
+    /// weder Streamer-Tick noch UI — laenger warten kostet hier nichts,
+    /// aufgeben dagegen erzeugt Dubletten.
+    pub async fn post_positions(
+        &self,
+        pirep_id: &str,
+        positions: &[PositionEntry],
+    ) -> Result<(), ApiError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            positions: &'a [PositionEntry],
+        }
+        let path = format!("/api/pireps/{pirep_id}/acars/position");
+        self.post_void_with_timeout(&path, &Body { positions }, Some(POSITION_POST_TIMEOUT))
+            .await
+    }
+
+    /// `POST /api/pireps/{pirep_id}/file` — submit the PIREP.
+    pub async fn file_pirep(&self, pirep_id: &str, body: &FileBody) -> Result<(), ApiError> {
+        let path = format!("/api/pireps/{pirep_id}/file");
+        self.post_void(&path, body).await
+    }
+
+    /// `DELETE /api/pireps/{pirep_id}/cancel` — cancel an in-flight PIREP,
+    /// with `PUT` as fallback for VAs that have stricter method routing.
+    ///
+    /// v0.7.18 (R1-1, B-011): vorher `POST`. Standard-phpVMS-Core erwartet
+    /// DELETE; manche VA-Installs (oder hinter Restrictive-Reverse-Proxies)
+    /// liefern dafür 405 und akzeptieren PUT. POST war im Pilot-Client-Code
+    /// ein Pre-v0.7.18-Drift gegen die Server-Spec.
+    pub async fn cancel_pirep(&self, pirep_id: &str) -> Result<(), ApiError> {
+        let path = format!("/api/pireps/{pirep_id}/cancel");
+        let url = self.endpoint(&path)?;
+
+        // 1. Versuch: DELETE — phpVMS-Core-Standard.
+        let response = self
+            .http
+            .delete(url.clone())
+            .header("X-API-Key", &self.conn.api_key)
+            .header(header::ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(ApiError::from)?;
+
+        let status = response.status();
+        if status.is_success() {
+            let _ = response.text().await; // Body verbrauchen
+            return Ok(());
+        }
+        // 405 Method Not Allowed → PUT-Fallback
+        // (manche VA-Installs blockieren DELETE auf API-Routes)
+        if status == StatusCode::METHOD_NOT_ALLOWED {
+            tracing::info!(
+                pirep_id,
+                "cancel_pirep: DELETE returned 405 — versuche PUT-Fallback"
+            );
+            let _ = response.text().await;
+            let response_put = self
+                .http
+                .put(url)
+                .header("X-API-Key", &self.conn.api_key)
+                .header(header::ACCEPT, "application/json")
+                .send()
+                .await
+                .map_err(ApiError::from)?;
+            let _ = check_status(response_put, &path).await?;
+            return Ok(());
+        }
+        // Andere Fehler durch check_status → typisierte ApiError
+        let _ = check_status(response, &path).await?;
+        Ok(())
+    }
+
+    /// `POST /api/pireps/{pirep_id}/update` — change PIREP status/state during flight.
+    /// Also serves as the periodic heartbeat (see `UpdateBody` doc).
+    pub async fn update_pirep(&self, pirep_id: &str, body: &UpdateBody) -> Result<(), ApiError> {
+        let path = format!("/api/pireps/{pirep_id}/update");
+        self.post_void(&path, body).await
+    }
+
+    /// `POST /api/pireps/{pirep_id}/acars/logs` — push a batch of free-form
+    /// text log lines that show up in the PIREP detail. Used for sub-events
+    /// without a PirepStatus equivalent (TOC, TOD, V1/VR/V2, touchdown VS,
+    /// engine start/stop, etc.).
+    /// Wie [`Self::post_acars_logs`], unterscheidet aber, ob die Zeilen
+    /// sicher NICHT bei phpVMS angekommen sind. Nur dann ist ein Neuversuch
+    /// ohne Doppelte möglich — phpVMS hat keine Abfrage vorhandener
+    /// Logzeilen und keine Doppelten-Erkennung (AeroACARS 2.0.10).
+    pub async fn post_acars_logs_zustellung(
+        &self,
+        pirep_id: &str,
+        logs: &[LogEntry],
+    ) -> Zustellung {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            logs: &'a [LogEntry],
+        }
+        let path = format!("/api/pireps/{pirep_id}/acars/logs");
+        let url = match self.endpoint(&path) {
+            Ok(u) => u,
+            Err(e) => return Zustellung::Abgelehnt(e),
+        };
+        let gesendet = self
+            .http
+            .post(url)
+            .header("X-API-Key", &self.conn.api_key)
+            .header(header::ACCEPT, "application/json")
+            .json(&Body { logs })
+            .send()
+            .await;
+        let response = match gesendet {
+            Ok(r) => r,
+            // Keine Verbindung zustande gekommen: sicher nicht angekommen.
+            Err(e) if e.is_connect() => return Zustellung::NichtAngekommen(ApiError::from(e)),
+            // Zeitüberschreitung o. ä.: phpVMS kann die Zeilen gespeichert haben.
+            Err(e) => return Zustellung::Unklar(ApiError::from(e)),
+        };
+        match check_status(response, &path).await {
+            Ok(r) => {
+                let gespeichert = match r.json::<serde_json::Value>().await {
+                    Ok(serde_json::Value::Object(o)) => match o.get("count") {
+                        None => Gespeichert::KeineAngabe,
+                        Some(c) => c.as_u64().map_or(Gespeichert::Ungueltig, Gespeichert::Zahl),
+                    },
+                    _ => Gespeichert::Ungueltig,
+                };
+                Zustellung::Angekommen { gespeichert }
+            }
+            Err(e) => match &e {
+                // 429 und Gateway-Fehler: Die Anfrage hat phpVMS nicht verarbeitet.
+                ApiError::RateLimited { .. } => Zustellung::NichtAngekommen(e),
+                ApiError::Server { status, .. } if matches!(*status, 502..=504) => {
+                    Zustellung::NichtAngekommen(e)
+                }
+                ApiError::Server { status, .. } if *status >= 500 => Zustellung::Unklar(e),
+                ApiError::Network(_) => Zustellung::Unklar(e),
+                _ => Zustellung::Abgelehnt(e),
+            },
+        }
+    }
+
+    pub async fn post_acars_logs(&self, pirep_id: &str, logs: &[LogEntry]) -> Result<(), ApiError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            logs: &'a [LogEntry],
+        }
+        let path = format!("/api/pireps/{pirep_id}/acars/logs");
+        self.post_void(&path, &Body { logs }).await
+    }
+
+    /// `POST /api/pireps/{pirep_id}/route` — upload the planned flight-plan
+    /// waypoints (e.g. from the SimBrief OFP). phpVMS draws these as a
+    /// dotted line on the PIREP map alongside the actually flown track.
+    /// Send once shortly after prefile.
+    pub async fn post_route(
+        &self,
+        pirep_id: &str,
+        route: &[RouteWaypoint],
+    ) -> Result<(), ApiError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            route: &'a [RouteWaypoint],
+        }
+        let path = format!("/api/pireps/{pirep_id}/route");
+        self.post_void(&path, &Body { route }).await
+    }
+
+    /// `POST /api/pireps/{pirep_id}/fields` — upsert custom PIREP fields the
+    /// VA admin defined in the phpVMS admin panel (e.g. "Block fuel",
+    /// "Pilot remarks", "Diversion?"). Map keys are the field NAMES (as
+    /// shown in the admin), values are stringified.
+    pub async fn post_pirep_fields(
+        &self,
+        pirep_id: &str,
+        fields: &std::collections::HashMap<String, String>,
+    ) -> Result<(), ApiError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            fields: &'a std::collections::HashMap<String, String>,
+        }
+        let path = format!("/api/pireps/{pirep_id}/fields");
+        self.post_void(&path, &Body { fields }).await
+    }
+
+    /// `GET /api/pireps/{pirep_id}` — fetch the current server-side state of
+    /// a single PIREP. Used for resume-after-restart and to disambiguate
+    /// 404s on the live POST endpoints (soft-deleted by cron vs. cancelled
+    /// elsewhere vs. auth lost).
+    pub async fn get_pirep(&self, pirep_id: &str) -> Result<PirepFull, ApiError> {
+        let path = format!("/api/pireps/{pirep_id}");
+        self.get_data(&path).await
+    }
+
+    /// `GET /api/pireps/{pirep_id}/acars/position` — the complete server-side
+    /// ACARS position track for a PIREP, ordered by sim_time ASC (oldest →
+    /// newest) and unpaginated. This endpoint is under `api.auth` (same
+    /// `X-API-Key` we already send) and returns the standard `{ data: [...] }`
+    /// envelope.
+    ///
+    /// Used on flight-resume to reseed the in-app live-map track from the
+    /// authoritative superset, so a mid-flight update/restart can't leave the
+    /// local track empty or frozen behind a stale localStorage seed-gate.
+    pub async fn get_acars_positions(
+        &self,
+        pirep_id: &str,
+    ) -> Result<Vec<AcarsPosition>, ApiError> {
+        self.get_data(&format!("/api/pireps/{pirep_id}/acars/position"))
+            .await
+    }
+
+    /// `GET /api/fleet/aircraft/{id}` — single aircraft, used for diagnostics.
+    /// We also try `/api/aircraft/{id}` as a fallback because phpVMS deployments
+    /// vary on this exact path.
+    pub async fn get_aircraft(&self, id: i64) -> Result<AircraftDetails, ApiError> {
+        match self
+            .get_data::<AircraftDetails>(&format!("/api/fleet/aircraft/{id}"))
+            .await
+        {
+            Ok(a) => Ok(a),
+            Err(ApiError::NotFound) => self.get_data(&format!("/api/aircraft/{id}")).await,
+            Err(e) => Err(e),
+        }
+    }
+
+    /// v0.5.27: `GET /api/airports/{icao}/aircraft` — Aircraft die aktuell
+    /// am Departure-Airport stehen. Fuer den VFR/Manual-Mode-Aircraft-
+    /// Picker. Filter `?status=active` damit Maintenance-Aircraft nicht
+    /// in der Liste landen.
+    ///
+    /// phpVMS gibt nur Aircraft zurueck die der Pilot per Subfleet-Rank
+    /// fliegen darf — Server-side enforcement, kein Client-Filter noetig.
+    pub async fn get_aircraft_at_airport(
+        &self,
+        icao: &str,
+    ) -> Result<Vec<AircraftDetails>, ApiError> {
+        let path = format!("/api/airports/{}/aircraft", icao.to_uppercase());
+        self.get_data(&path).await
+    }
+
+    /// v0.5.33: `GET /api/fleet` — **alle** Subfleets ohne Rank-Filter.
+    ///
+    /// Wir verwenden bewusst NICHT `/api/user/fleet` — das wuerde via
+    /// `UserService::getAllowableSubfleets` nur Subfleets liefern die
+    /// der aktuelle Pilot-Rank fliegen darf. Stattdessen vertrauen wir
+    /// dem Pilot bei der Auswahl, und phpVMS lehnt beim Prefile ab
+    /// wenn er eine Aircraft ausserhalb seines Ranks waehlt.
+    ///
+    /// Jeder Subfleet enthaelt bereits eine nested `aircraft`-Liste
+    /// (siehe SubfleetResource::toArray). Paginiert — wir folgen
+    /// den Pages bis wir eine non-volle Page bekommen.
+    ///
+    /// **Korrektur ggü. v0.5.32**: Der vorherige Fix versuchte
+    /// `/api/fleet/{id}/aircraft` — diesen Endpoint gibt es in phpVMS-V7
+    /// **nicht** (nur `/api/fleet/aircraft/{id}` fuer ein einzelnes
+    /// Aircraft). Resultat war eine leere Picker-Liste.
+    pub async fn get_fleet(&self) -> Result<Vec<SubfleetWithAircraft>, ApiError> {
+        self.get_paginated_subfleets("/api/fleet").await
+    }
+
+    /// Hilfsfunktion: paginierten Subfleet-Endpoint komplett durchziehen.
+    ///
+    /// Phpvms `paginate_limit` clamped `?limit=` auf
+    /// `phpvms.pagination.max` (default 100). Wir fragen mit limit=100
+    /// per Page und folgen den Pages so lange wir volle Pages bekommen.
+    /// Sicherheits-Cap bei 50 Pages = 5000 Subfleets.
+    async fn get_paginated_subfleets(
+        &self,
+        base_path: &str,
+    ) -> Result<Vec<SubfleetWithAircraft>, ApiError> {
+        const PAGE_LIMIT: usize = 100;
+        const MAX_PAGES: u32 = 50;
+        let mut all = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let path = format!("{base_path}?limit={PAGE_LIMIT}&page={page}");
+            let chunk: Vec<SubfleetWithAircraft> = self.get_data(&path).await?;
+            let n = chunk.len();
+            tracing::debug!(
+                page,
+                page_size = n,
+                cumulative = all.len() + n,
+                "fetched subfleet page"
+            );
+            all.extend(chunk);
+            if n < PAGE_LIMIT {
+                break; // letzte Page erreicht
+            }
+        }
+        Ok(all)
+    }
+
+    /// v0.5.32 (gefixt v0.5.33): alle einzelnen Aircraft die der Pilot
+    /// fliegen darf — flach. Liest `aircraft` aus jedem Subfleet
+    /// (bereits nested in der phpVMS-Response, kein N+1).
+    pub async fn get_all_aircraft(&self) -> Result<Vec<AircraftDetails>, ApiError> {
+        let subfleets = self.get_fleet().await?;
+        let total_subfleets = subfleets.len();
+        let mut all = Vec::new();
+        for sf in subfleets {
+            all.extend(sf.aircraft);
+        }
+        tracing::info!(
+            subfleets = total_subfleets,
+            aircraft = all.len(),
+            "get_all_aircraft completed"
+        );
+        Ok(all)
+    }
+
+    /// v0.12.12-dev: `GET /api/news` — VA-News-Posts. phpVMS liefert
+    /// das paginiert mit `{ data: [...], meta: {...} }`. Wir nehmen
+    /// nur `data` und verzichten auf Meta — der Client-Tab zeigt
+    /// Seite 1 mit `per_page` Items (Default 20) und braucht keine
+    /// Pagination.
+    pub async fn get_news(&self, per_page: u32) -> Result<Vec<NewsItem>, ApiError> {
+        let path = format!("/api/news?per_page={}", per_page.max(1).min(100));
+        self.get_data(&path).await
+    }
+}
+
+async fn check_status(response: Response, path: &str) -> Result<Response, ApiError> {
+    let status = response.status();
+    // v0.7.18 (R1-2): alle 2xx akzeptieren, nicht nur 200 OK.
+    // DELETE-Endpoints (cancel_pirep, delete_bid) liefern oft 204
+    // No Content. PUT/POST koennen 201 Created liefern.
+    // Vorher wurde 204 als ApiError::Server { status: 204 } behandelt
+    // → B-011 Cancel-Flow scheiterte still gegen Standard-phpVMS.
+    if status.is_success() {
+        return Ok(response);
+    }
+    match status {
+        StatusCode::UNAUTHORIZED => Err(ApiError::Unauthenticated),
+        StatusCode::FORBIDDEN => Err(ApiError::Forbidden),
+        StatusCode::NOT_FOUND => Err(ApiError::NotFound),
+        StatusCode::TOO_MANY_REQUESTS => {
+            let retry_after_seconds = response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(60);
+            Err(ApiError::RateLimited {
+                retry_after_seconds,
+            })
+        }
+        s => {
+            let body = response.text().await.unwrap_or_default();
+            tracing::warn!(%s, %path, body_len = body.len(), "phpVMS returned non-OK");
+            Err(ApiError::Server {
+                status: s.as_u16(),
+                body,
+            })
+        }
+    }
+}
+
+// ---- SimBrief OFP XML parser ----
+
+/// Lazy URL-encode helper for the OFP id. SimBrief ids are
+/// `[A-Za-z0-9_-]` so we technically don't need to encode anything,
+/// but we'll be defensive in case they ever change format.
+fn urlencoding_escape(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{:02X}", b),
+        })
+        .collect()
+}
+
+/// Pull the inner text of the FIRST `<tag>...</tag>` occurrence.
+/// Naive but adequate for SimBrief's well-formed OFP XML — every
+/// field we want is a leaf scalar, no nested duplicates.
+fn extract_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let rest = &xml[start..];
+    let end = rest.find(&close)?;
+    Some(&rest[..end])
+}
+
+/// Parse the SimBrief OFP XML into our `SimBriefOfp` struct. All
+/// weights returned in KG; if the OFP was generated in lbs we
+/// convert. Returns None when the document is too malformed to be
+/// useful (no weights block at all).
+/// Rechnet das OFP in Pfund?
+///
+/// v1.7.35: SimBrief schreibt die Einheit als `<params><units>kgs|lbs</units>`.
+/// Frueher wurde hier `<wt_unit>` gesucht — ein Tag, das in KEINEM echten OFP
+/// vorkommt (Korpus-Pruefung ueber 40 OFPs der Produktionsdatenbank). Die
+/// Pfund-Erkennung war damit toter Code: Fuer einen Piloten mit lbs-Konto
+/// waeren alle Planwerte 2,2-fach zu gross gewesen — Reserve auf jedem Flug
+/// „unterschritten", die Sprit-Leiter Unsinn. `wt_unit` bleibt als Rueckfall.
+fn ofp_unit_is_lb(xml: &str) -> bool {
+    let ist_lbs = |v: Option<&str>| {
+        v.map(str::trim)
+            .is_some_and(|v| v.eq_ignore_ascii_case("lbs"))
+    };
+    ist_lbs(extract_tag(xml, "params").and_then(|p| extract_tag(p, "units")))
+        || ist_lbs(extract_tag(xml, "wt_unit"))
+}
+
+fn parse_simbrief_ofp(xml: &str) -> Option<SimBriefOfp> {
+    // Conversion factor: SimBrief reports either kgs or lbs.
+    // v1.7.35 (Korpus-Pruefung an 40 echten OFPs): SimBrief schreibt die
+    // Einheit als `<params><units>kgs|lbs</units></params>`. Das frueher
+    // gesuchte `<wt_unit>` kommt in KEINEM echten OFP vor — die
+    // Pfund-Erkennung war toter Code. Fuer einen Piloten mit lbs-Konto waeren
+    // damit ALLE Planwerte 2,2-fach zu gross gewesen: Reserve auf jedem Flug
+    // „unterschritten", die Sprit-Leiter Unsinn. `wt_unit` bleibt als
+    // Rueckfall stehen, falls SimBrief es irgendwo doch liefert.
+    let unit_is_lb = ofp_unit_is_lb(xml);
+    let to_kg = |v: f32| -> f32 {
+        if unit_is_lb {
+            v * 0.453_592_37
+        } else {
+            v
+        }
+    };
+
+    let parse_f = |tag: &str| -> Option<f32> {
+        extract_tag(xml, tag).and_then(|s| s.trim().parse::<f32>().ok())
+    };
+
+    // Required: at least one weight field has to be present, else
+    // the OFP is too broken to use.
+    let zfw = parse_f("est_zfw").map(to_kg).unwrap_or(0.0);
+    let tow = parse_f("est_tow").map(to_kg).unwrap_or(0.0);
+    let ldw = parse_f("est_ldw").map(to_kg).unwrap_or(0.0);
+    if zfw == 0.0 && tow == 0.0 && ldw == 0.0 {
+        return None;
+    }
+    let plan_ramp = parse_f("plan_ramp").map(to_kg).unwrap_or(0.0);
+    // Trip-Burn: SimBrief liefert das als `<enroute_burn>` unter
+    // `<fuel>` — der reine Verbrauch von Takeoff bis Touchdown.
+    // Fallback auf `<est_burn>` falls ein älteres SimBrief-Schema
+    // den Tag anders genannt hat (sicherheitshalber).
+    let est_burn = parse_f("enroute_burn")
+        .or_else(|| parse_f("est_burn"))
+        .map(to_kg)
+        .unwrap_or(0.0);
+    let reserve = parse_f("reserve").map(to_kg).unwrap_or(0.0);
+    // Briefing-2a: die restlichen Fuel-Kategorien aus <fuel> — zusammen mit
+    // trip (enroute_burn/est_burn) + reserve ergeben sie exakt plan_ramp
+    // (Block). Ohne diese fehlt die Nachvollziehbarkeit der Block-Summe.
+    let taxi_fuel = parse_f("taxi").map(to_kg).unwrap_or(0.0);
+    let contingency_fuel = parse_f("contingency").map(to_kg).unwrap_or(0.0);
+    let alternate_burn_fuel = parse_f("alternate_burn").map(to_kg).unwrap_or(0.0);
+    let extra_fuel = parse_f("extra").map(to_kg).unwrap_or(0.0);
+    // v0.3.0: MAX-Werte aus dem Aircraft-Performance-Block des OFP.
+    // SimBrief liefert die in `<max_zfw>` / `<max_tow>` / `<max_ldw>`
+    // unter `<weights>`. Bei Custom-Subfleets können die fehlen — dann
+    // bleibt's bei 0.0 und Frontend skipped die Overweight-Anzeige.
+    let max_zfw = parse_f("max_zfw").map(to_kg).unwrap_or(0.0);
+    let max_tow = parse_f("max_tow").map(to_kg).unwrap_or(0.0);
+    let max_ldw = parse_f("max_ldw").map(to_kg).unwrap_or(0.0);
+    // Briefing-2a: OEW + Payload aus <weights> — zusammen ergeben sie ZFW,
+    // macht die Zahl nachvollziehbar (analog zur Fuel-Aufschluesselung).
+    let oew = parse_f("oew").map(to_kg).unwrap_or(0.0);
+    let payload = parse_f("payload").map(to_kg).unwrap_or(0.0);
+    // v0.3.0: OFP-Identitätsfelder. SimBrief liefert always den
+    // letzten OFP des Pilot-Accounts — wenn der nicht zur aktuellen
+    // Buchung passt, wollen wir das im Frontend deutlich anzeigen.
+    // Flight-Number meist als `<atc><callsign>`, Origin/Destination
+    // direkt als nested `<origin><icao_code>` und `<destination>...`.
+    let extract_str = |tag: &str| -> String {
+        extract_tag(xml, tag)
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    };
+    let ofp_flight_number = extract_tag(xml, "atc")
+        .and_then(|inner| extract_tag(inner, "callsign"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| extract_str("flight_number"));
+    let ofp_origin_icao = extract_tag(xml, "origin")
+        .and_then(|inner| extract_tag(inner, "icao_code"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let ofp_destination_icao = extract_tag(xml, "destination")
+        .and_then(|inner| extract_tag(inner, "icao_code"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let ofp_generated_at = extract_tag(xml, "params")
+        .and_then(|inner| extract_tag(inner, "time_generated"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| extract_str("time_generated"));
+    // v0.7.8: <params><request_id> als canonical changed-flag-Quelle
+    // fuer SimBrief-direct Refresh-Pfad. Aendert sich bei JEDER
+    // Re-Generation. Spec §3.
+    let request_id = extract_tag(xml, "params")
+        .and_then(|inner| extract_tag(inner, "request_id"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let route = extract_tag(xml, "route")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    // SimBrief's <alternate>...</alternate> element is a NESTED XML
+    // block (children: icao_code / iata_code / faa_code / icao_region
+    // / elevation / pos_lat / pos_long / ...) — earlier we returned
+    // the raw inner XML which made the PIREP-detail show
+    // "<icao_code>LFBO</icao_code> <iata_code>TLS</iata_code> ..."
+    // as the alternate string. Drill in to grab just the ICAO.
+    // QS 2026-08-04: hier stand ein `.or_else(|| extract_tag(xml, "icao_code"))`
+    // als "defensiver" Rueckfall, falls SimBrief den Alternate mal flach als
+    // Geschwister-Element liefert. Der Rueckfall war aber NICHT auf einen
+    // Bereich eingegrenzt, und `extract_tag` nimmt das ERSTE Vorkommen im
+    // ganzen Dokument. In einem echten OFP steht <origin> vor <alternate>
+    // und enthaelt selbst ein <icao_code> — plante der Pilot also gar kein
+    // Ausweichziel (auf Kurzstrecke die Regel, SimBrief laesst den Block
+    // dann weg oder leer), griff der Rueckfall daneben und lieferte den
+    // ABFLUGHAFEN. Ein EDDL->EDDM-Flug briefte damit "Alternate: EDDL" —
+    // und zwar nicht nur in der Anzeige: der Wert lief ueber
+    // `stats.planned_alternate` auch in die Live-Karte und ins PIREP-Feld
+    // "Plan Alternate". Kein Ausweichziel geplant heisst jetzt schlicht
+    // "keins" statt eines falschen. Der alte Test hat das nie bemerkt, weil
+    // sein Fixture kein <origin> enthielt — die eine Form, in der der
+    // Rueckfall nicht danebengreifen kann.
+    let alternate = extract_tag(xml, "alternate")
+        .and_then(|inner| extract_tag(inner, "icao_code"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let waypoints = extract_navlog_fixes(xml, unit_is_lb);
+
+    // v0.21.x (#phase-v2 Fix A): geplante Reiseflughöhe aus
+    // `<general><initial_altitude>` — SimBrief liefert das immer in FUSS
+    // (z.B. 36000), unabhängig von der Gewichtseinheit. KEINE FL-×100-
+    // Heuristik wie beim Bid-Level: initial_altitude ist dokumentiert in
+    // Fuß, ein echter Tiefflug-Wert (z.B. 9000) darf nicht fälschlich
+    // hochskaliert werden. Auf <general> begrenzt, damit kein anderes
+    // gleichnamiges Tag getroffen wird. None wenn Tag fehlt/nicht numerisch.
+    //
+    // v1.0.0-Härtung (Code-Review): >= 1000 ft als Plausibilitäts-FLOOR.
+    // Sollte SimBrief je einen FL-artigen Wert liefern ("360" statt "36000"),
+    // wäre near_or_above_ref(alt) = alt >= 360 - 1000 IMMER wahr → das erste
+    // Level-Off im Steig würde fälschlich sofort Cruise (genau die Premature-
+    // Cruise-Falle, die Fix A verhindern soll). Ein echter Reiseflug in Fuß
+    // liegt immer >= 1000; bare Flight-Level (<= ~600) fallen sauber darunter
+    // raus → Fallback auf obsref/240 s.
+    let planned_cruise_alt_ft = extract_tag(xml, "general")
+        .and_then(|inner| extract_tag(inner, "initial_altitude"))
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|&ft| ft >= 1000.0);
+
+    // v0.7.12: Pax + Cargo aus <weights>. SimBrief liefert pax_count als
+    // Integer + cargo als float (in kg wenn die XML mit units_set=kgs
+    // angefordert wurde — was wir tun). Bei Cargo-Only-Flights ist
+    // pax_count = 0, bei Pax-Only-Flights cargo = 0. Bei Mixed-Loads
+    // beide > 0.
+    let pax_count: i32 = extract_tag(xml, "weights")
+        .and_then(|inner| extract_tag(inner, "pax_count"))
+        .and_then(|s| s.trim().parse().ok())
+        .or_else(|| {
+            extract_tag(xml, "weights")
+                .and_then(|inner| extract_tag(inner, "pax_count_actual"))
+                .and_then(|s| s.trim().parse().ok())
+        })
+        .unwrap_or(0);
+    let cargo_kg: f32 = extract_tag(xml, "weights")
+        .and_then(|inner| extract_tag(inner, "cargo"))
+        .and_then(|s| s.trim().parse().ok())
+        .map(to_kg)
+        .unwrap_or(0.0);
+    // ACHTUNG: <weights><cargo> ist bei SimBrief Gepaeck + Fracht ZUSAMMEN,
+    // nicht die Fracht allein. Die reine Fracht steht in <freight_added>,
+    // das Gepaeck in <bag_weight>. Wir ziehen die Fracht separat, weil der
+    // Bid-Card-Chip sie als "Cargo" ausweist — mit dem Summenwert las sich
+    // ein 3-t-Frachtflug mit 150 Pax als 6 t Fracht.
+    let freight_kg: f32 = extract_tag(xml, "weights")
+        .and_then(|inner| extract_tag(inner, "freight_added"))
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .map(to_kg)
+        .filter(|&v| v > 0.0)
+        .or_else(|| {
+            // Fallback: Summe minus Gepaeck, wenn SimBrief kein freight_added
+            // liefert (aeltere OFP-Formate / manueller Payload).
+            // ACHTUNG: <bag_weight> ist das Gewicht PRO Gepaeckstueck (z.B. 20),
+            // nicht das Gesamtgepaeck — erst mit <bag_count> multiplizieren.
+            let per_bag_kg: f32 = extract_tag(xml, "weights")
+                .and_then(|inner| extract_tag(inner, "bag_weight"))
+                .and_then(|s| s.trim().parse::<f32>().ok())
+                .map(to_kg)
+                .unwrap_or(0.0);
+            let bag_count: f32 = extract_tag(xml, "weights")
+                .and_then(|inner| extract_tag(inner, "bag_count"))
+                .and_then(|s| s.trim().parse::<f32>().ok())
+                .or_else(|| {
+                    extract_tag(xml, "weights")
+                        .and_then(|inner| extract_tag(inner, "bag_count_actual"))
+                        .and_then(|s| s.trim().parse::<f32>().ok())
+                })
+                .unwrap_or(0.0);
+            let bag_total_kg = per_bag_kg * bag_count;
+            (bag_total_kg > 0.0 && cargo_kg > bag_total_kg).then(|| cargo_kg - bag_total_kg)
+        })
+        // Letzter Fallback: Summe. Dann ist sie entweder schon reine Fracht
+        // (Cargo-Only-Flight ohne Gepaeck) oder wir haben nichts Besseres.
+        .unwrap_or(cargo_kg);
+
+    // Briefing-2a: LOAD-Rubrik-Transparenz (Pilot-Feedback 2026-08-03,
+    // analog zu Fuel/Weights) — Pax-Gesamtgewicht + Gepaeck-Gesamtgewicht
+    // getrennt von der reinen Fracht, damit sich Payload nachvollziehen
+    // laesst (Pax-Gewicht + Gepaeck + Fracht = Payload).
+    let pax_weight_total_kg: f32 = {
+        let per_pax_kg: f32 = extract_tag(xml, "weights")
+            .and_then(|inner| extract_tag(inner, "pax_weight"))
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .map(to_kg)
+            .unwrap_or(0.0);
+        per_pax_kg * pax_count as f32
+    };
+    let baggage_total_kg: f32 = {
+        let per_bag_kg: f32 = extract_tag(xml, "weights")
+            .and_then(|inner| extract_tag(inner, "bag_weight"))
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .map(to_kg)
+            .unwrap_or(0.0);
+        let bag_count: f32 = extract_tag(xml, "weights")
+            .and_then(|inner| extract_tag(inner, "bag_count"))
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .or_else(|| {
+                extract_tag(xml, "weights")
+                    .and_then(|inner| extract_tag(inner, "bag_count_actual"))
+                    .and_then(|s| s.trim().parse::<f32>().ok())
+            })
+            .unwrap_or(0.0);
+        per_bag_kg * bag_count
+    };
+
+    // Briefing-2a: Aircraft-Typ + Sitzplatz-Total aus <aircraft>, geplante
+    // Block-Zeiten aus <times> — Fallback-Quellen wenn phpVMS' eigene Felder
+    // (Bid-Pointer-Subfleet bzw. flights.dpt_time/arr_time) fehlen.
+    let aircraft_icao = extract_tag(xml, "aircraft")
+        .and_then(|inner| {
+            extract_tag(inner, "icaocode").or_else(|| extract_tag(inner, "base_type"))
+        })
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let max_passengers = extract_tag(xml, "aircraft")
+        .and_then(|inner| extract_tag(inner, "max_passengers"))
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .filter(|&n| n > 0);
+    let sched_out_epoch = extract_tag(xml, "times")
+        .and_then(|inner| extract_tag(inner, "sched_out"))
+        .and_then(|s| s.trim().parse::<i64>().ok());
+    let sched_in_epoch = extract_tag(xml, "times")
+        .and_then(|inner| extract_tag(inner, "sched_in"))
+        .and_then(|s| s.trim().parse::<i64>().ok());
+    let sched_off_epoch = extract_tag(xml, "times")
+        .and_then(|inner| extract_tag(inner, "sched_off"))
+        .and_then(|s| s.trim().parse::<i64>().ok());
+    let sched_on_epoch = extract_tag(xml, "times")
+        .and_then(|inner| extract_tag(inner, "sched_on"))
+        .and_then(|s| s.trim().parse::<i64>().ok());
+    // Stunden gegen UTC; ausserhalb von −12…+14 ist es kein Zeitzonenwert.
+    let utc_offset_min = |tag: &str| {
+        extract_tag(xml, "times")
+            .and_then(|inner| extract_tag(inner, tag))
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|h| h.is_finite() && (-12.0..=14.0).contains(h))
+            .map(|h| (h * 60.0).round() as i32)
+    };
+    let orig_utc_offset_min = utc_offset_min("orig_timezone");
+    let dest_utc_offset_min = utc_offset_min("dest_timezone");
+
+    Some(SimBriefOfp {
+        planned_block_fuel_kg: plan_ramp,
+        planned_burn_kg: est_burn,
+        planned_reserve_kg: reserve,
+        planned_zfw_kg: zfw,
+        planned_tow_kg: tow,
+        planned_ldw_kg: ldw,
+        route,
+        alternate,
+        planned_cruise_alt_ft,
+        waypoints,
+        max_zfw_kg: max_zfw,
+        max_tow_kg: max_tow,
+        max_ldw_kg: max_ldw,
+        planned_oew_kg: oew,
+        planned_payload_kg: payload,
+        planned_pax_weight_kg: pax_weight_total_kg,
+        planned_baggage_kg: baggage_total_kg,
+        ofp_flight_number,
+        ofp_origin_icao,
+        ofp_destination_icao,
+        ofp_generated_at,
+        request_id,
+        pax_count,
+        cargo_kg,
+        freight_kg,
+        aircraft_icao,
+        max_passengers,
+        sched_out_epoch,
+        sched_in_epoch,
+        sched_off_epoch,
+        sched_on_epoch,
+        orig_utc_offset_min,
+        dest_utc_offset_min,
+        planned_taxi_kg: taxi_fuel,
+        planned_contingency_kg: contingency_fuel,
+        planned_alternate_burn_kg: alternate_burn_fuel,
+        planned_extra_kg: extra_fuel,
+    })
+}
+
+/// Walk `<navlog>...<fix>...</fix>...</navlog>` and pull every fix.
+/// Resilient to missing `<navlog>` (older SimBrief OFP variants put fixes
+/// at the document root) — falls back to scanning the whole document.
+fn extract_navlog_fixes(xml: &str, unit_is_lb: bool) -> Vec<RouteFix> {
+    let to_kg = |v: f32| if unit_is_lb { v * 0.453_592_37 } else { v };
+    let num = |block: &str, tag: &str| -> Option<f32> {
+        extract_tag(block, tag)
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite())
+    };
+    let scope = extract_tag(xml, "navlog").unwrap_or(xml);
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    while let Some(start) = scope[cursor..].find("<fix>") {
+        let abs_start = cursor + start + "<fix>".len();
+        let Some(rel_end) = scope[abs_start..].find("</fix>") else {
+            break;
+        };
+        let block = &scope[abs_start..abs_start + rel_end];
+        cursor = abs_start + rel_end + "</fix>".len();
+        let ident = extract_tag(block, "ident").unwrap_or("").trim().to_string();
+        let lat: Option<f64> = extract_tag(block, "pos_lat").and_then(|s| s.trim().parse().ok());
+        let lon: Option<f64> = extract_tag(block, "pos_long").and_then(|s| s.trim().parse().ok());
+        let kind = extract_tag(block, "type").unwrap_or("").trim().to_string();
+        if let (true, Some(la), Some(lo)) = (!ident.is_empty(), lat, lon) {
+            out.push(RouteFix {
+                ident,
+                lat: la,
+                lon: lo,
+                kind,
+                sprit_bis_hier_kg: num(block, "fuel_totalused").map(to_kg),
+                segment_nm: num(block, "distance"),
+                hoehe_ft: num(block, "altitude_feet"),
+                zeit_bis_hier_s: num(block, "time_total"),
+                sprit_an_bord_kg: num(block, "fuel_plan_onboard").map(to_kg),
+                sprit_min_an_bord_kg: num(block, "fuel_min_onboard").map(to_kg),
+            });
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod positions_wire_tests {
+    use super::*;
+
+    /// v1.6.14 — der Idempotenz-Schluessel muss im Body landen, sonst geht
+    /// phpVMS in den `Acars::create()`-Zweig und jeder Requeue erzeugt
+    /// eine neue Zeile (Feldbefund 21.08.2026).
+    #[test]
+    fn gesetzte_id_geht_mit_auf_die_leitung() {
+        let p = PositionEntry {
+            id: "0f1d5a2c-4b6e-4c8a-9d3f-77c1e2b40a55".into(),
+            lat: 50.0,
+            lon: 8.5,
+            altitude: 3000.0,
+            sim_time: "2026-08-21T20:01:32+00:00".into(),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(
+            v.get("id").and_then(|x| x.as_str()),
+            Some("0f1d5a2c-4b6e-4c8a-9d3f-77c1e2b40a55")
+        );
+    }
+
+    /// Eine leere id darf NICHT gesendet werden: phpVMS pruefte mit
+    /// `!empty($position['id'])`, ein leerer String waere also folgenlos —
+    /// aber der Query-Builder-Zweig setzt keine Timestamps, und ein
+    /// versehentlich leerer Schluessel wuerde dort `created_at` auf NULL
+    /// ziehen. Weglassen ist die sichere Variante.
+    #[test]
+    fn leere_id_bleibt_aus_dem_body() {
+        let p = PositionEntry {
+            lat: 50.0,
+            lon: 8.5,
+            sim_time: "2026-08-21T20:01:32+00:00".into(),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert!(
+            v.get("id").is_none(),
+            "leere id darf nicht mitgeschickt werden"
+        );
+    }
+
+    /// Rueckwaertskompatibilitaet: `position_queue.json` eines aelteren
+    /// Standes hat kein `id`-Feld. Ohne `serde(default)` wuerde das
+    /// Einlesen scheitern und ein Pilot verlaere beim Update auf diese
+    /// Version die gepufferten Positionen seines laufenden Fluges.
+    #[test]
+    fn alter_queue_eintrag_ohne_id_laesst_sich_lesen() {
+        let alt = serde_json::json!({
+            "lat": 50.0,
+            "lon": 8.5,
+            "altitude": 3000.0,
+            "sim_time": "2026-08-21T20:01:32+00:00"
+        });
+        let p: PositionEntry = serde_json::from_value(alt).expect("alte Form muss lesbar bleiben");
+        assert!(p.id.is_empty());
+        assert_eq!(p.lat, 50.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Statusabfrage mit PIREP-Nummer (Haken im Loadsheet): die Nummer steht
+    /// codiert in der Abfrage; ohne Nummer bleibt die alte Form.
+    #[test]
+    fn kabinen_status_fragt_mit_pirep_nummer() {
+        let c = Client::new(Connection::new("https://example.com", "k").unwrap()).unwrap();
+        let url = c.endpoint(&kabinen_status_pfad(Some("a b&c=1"))).unwrap();
+        assert_eq!(url.path(), "/api/kabinenansagen/status");
+        assert_eq!(url.query(), Some("pirep_id=a%20b%26c%3D1"));
+        let url = c.endpoint(&kabinen_status_pfad(Some("Xy-9_z"))).unwrap();
+        assert_eq!(url.query(), Some("pirep_id=Xy-9_z"));
+        for ohne in [None, Some("")] {
+            let url = c.endpoint(&kabinen_status_pfad(ohne)).unwrap();
+            assert_eq!(url.path(), "/api/kabinenansagen/status");
+            assert_eq!(url.query(), None);
+        }
+    }
+
+    #[test]
+    fn kabinen_status_flug_aus_fehlt_bei_altem_modul() {
+        let alt: KabinenStatus = serde_json::from_value(serde_json::json!({ "beta": true, "bereit": true, "version": "1.0" })).unwrap();
+        assert!(alt.beta && alt.bereit && !alt.flug_aus);
+        let neu: KabinenStatus = serde_json::from_value(serde_json::json!({ "beta": false, "bereit": true, "flug_aus": true })).unwrap();
+        assert!(neu.flug_aus && !neu.beta);
+    }
+
+    /// Das Profil kommt ohne `rank.subfleets` (1,44 MB, ~8 s bei der GSG).
+    /// Geprueft wird die URL, die wirklich rausgeht — Pfad und Abfrage.
+    #[test]
+    fn profil_abfrage_laesst_die_flottenliste_weg() {
+        let c = Client::new(Connection::new("https://example.com", "k").unwrap()).unwrap();
+        let url = c.endpoint(PROFIL_PFAD).unwrap();
+        assert_eq!(url.path(), "/api/user");
+        let with: Vec<String> = url
+            .query_pairs()
+            .filter(|(k, _)| k == "with")
+            .map(|(_, v)| v.into_owned())
+            .collect();
+        assert_eq!(with.len(), 1, "genau ein with-Parameter: {url}");
+        // phpVMS laedt die Subfleets, sobald `with` fehlt ODER das Wort enthaelt.
+        assert!(!with[0].contains("subfleets"), "{url}");
+    }
+
+    // ---- same_host_redirect_decision (v0.19.x/v0.20.x FIX: X-API-Key redirect leak) ----
+
+    fn origin(url: &str) -> RedirectOrigin {
+        RedirectOrigin::from_url(&Url::parse(url).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn redirect_to_the_same_host_scheme_and_port_is_followed() {
+        assert_eq!(
+            same_host_redirect_decision(
+                Some(&origin("https://va.example.com/api/foo")),
+                &origin("https://va.example.com/api"),
+                0
+            ),
+            RedirectDecision::Follow
+        );
+    }
+
+    #[test]
+    fn redirect_to_a_different_host_is_stopped() {
+        // The exact vulnerability: a redirect to ANY other host used to
+        // carry X-API-Key straight along with it.
+        assert_eq!(
+            same_host_redirect_decision(
+                Some(&origin("https://attacker.evil/api")),
+                &origin("https://va.example.com/api"),
+                0
+            ),
+            RedirectDecision::Stop
+        );
+    }
+
+    #[test]
+    fn redirect_with_no_resolvable_host_is_stopped() {
+        assert_eq!(
+            same_host_redirect_decision(None, &origin("https://va.example.com/api"), 0),
+            RedirectDecision::Stop
+        );
+    }
+
+    #[test]
+    fn too_many_hops_is_rejected_even_on_the_same_host() {
+        assert_eq!(
+            same_host_redirect_decision(
+                Some(&origin("https://va.example.com/api")),
+                &origin("https://va.example.com/api"),
+                6
+            ),
+            RedirectDecision::TooMany
+        );
+    }
+
+    #[test]
+    fn same_host_https_to_http_downgrade_is_stopped() {
+        // v0.20.x FIX: the original host-only check missed this — same
+        // host, but the API key would now travel in cleartext.
+        assert_eq!(
+            same_host_redirect_decision(
+                Some(&origin("http://va.example.com/api")),
+                &origin("https://va.example.com/api"),
+                0
+            ),
+            RedirectDecision::Stop
+        );
+    }
+
+    #[test]
+    fn same_host_same_scheme_different_port_is_stopped() {
+        // v0.20.x FIX: same host, but a different port is a different
+        // service — no legitimate reason for the phpVMS API to redirect
+        // across ports, and the old check never looked at port at all.
+        assert_eq!(
+            same_host_redirect_decision(
+                Some(&origin("https://va.example.com:8443/api")),
+                &origin("https://va.example.com/api"),
+                0
+            ),
+            RedirectDecision::Stop
+        );
+    }
+
+    #[test]
+    fn same_host_http_to_https_upgrade_is_followed() {
+        // The legitimate case this port-awareness must not break: some
+        // phpVMS/load-balancer setups redirect a plaintext loopback dev
+        // request straight to https on the standard port.
+        assert_eq!(
+            same_host_redirect_decision(
+                Some(&origin("https://localhost/api")),
+                &origin("http://localhost/api"),
+                0
+            ),
+            RedirectDecision::Follow
+        );
+    }
+
+    #[test]
+    fn same_host_http_to_https_upgrade_to_a_non_standard_port_is_stopped() {
+        // v0.20.x QS fix: the upgrade exception must only cover the
+        // standard https port — not skip the port check outright.
+        assert_eq!(
+            same_host_redirect_decision(
+                Some(&origin("https://localhost:8443/api")),
+                &origin("http://localhost/api"),
+                0
+            ),
+            RedirectDecision::Stop
+        );
+    }
+
+    #[test]
+    fn rejects_non_http_scheme() {
+        let err = Connection::new("ftp://example.com", "k").unwrap_err();
+        assert!(matches!(err, ApiError::InvalidUrl(_)));
+    }
+
+    #[test]
+    fn accepts_https() {
+        Connection::new("https://example.com", "k").unwrap();
+    }
+
+    #[test]
+    fn accepts_http_localhost() {
+        Connection::new("http://localhost:8000", "k").unwrap();
+        // loopback IPs (v4 + v6) must also pass
+        Connection::new("http://127.0.0.1:8000", "k").unwrap();
+        Connection::new("http://[::1]:8000", "k").unwrap();
+    }
+
+    #[test]
+    fn rejects_http_to_routable_host() {
+        // C2c: plaintext http to a routable host would leak the API key.
+        for url in [
+            "http://german-sky-group.eu",
+            "http://example.com:8000",
+            "http://192.168.1.5:8000", // even a LAN host: only loopback is exempt
+        ] {
+            let err = Connection::new(url, "k").unwrap_err();
+            assert!(
+                matches!(err, ApiError::InvalidUrl(_)),
+                "expected InvalidUrl for {url}, got {err:?}"
+            );
+        }
+        // https to the same hosts stays fine.
+        Connection::new("https://german-sky-group.eu", "k").unwrap();
+    }
+
+    #[test]
+    fn strips_trailing_slash() {
+        let c = Connection::new("https://example.com/", "k").unwrap();
+        assert!(!c.base_url().ends_with("//"));
+    }
+
+    /// v0.16.17: `get_user_pireps_in_progress` must hit
+    /// `/api/user/pireps?state=0` — the server-side state filter is the
+    /// whole point (paginate() returns only 20/page newest-first, so a
+    /// client-side filter over page 1 misses older orphans; 24 corpses
+    /// cleaned manually in prod 2026-06-13). Guards both that the query
+    /// survives `endpoint()` URL-joining and that the path const doesn't
+    /// silently drift.
+    #[test]
+    fn in_progress_pireps_endpoint_keeps_state_query() {
+        let conn = Connection::new("https://example.com/", "k").unwrap();
+        let client = Client::new(conn).unwrap();
+        let url = client.endpoint(USER_PIREPS_IN_PROGRESS_PATH).unwrap();
+        assert_eq!(url.as_str(), "https://example.com/api/user/pireps?state=0");
+        assert_eq!(url.query(), Some("state=0"));
+        assert_eq!(url.path(), "/api/user/pireps");
+    }
+
+    #[test]
+    fn paxstudio_claim_endpoint_builds_correct_url() {
+        let conn = Connection::new("https://german-sky-group.eu", "k").unwrap();
+        let client = Client::new(conn).unwrap();
+        let path = format!("/api/paxstudio/ofp/{}/claim", "1777622821_5F3E3B3842");
+        let url = client.endpoint(&path).unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://german-sky-group.eu/api/paxstudio/ofp/1777622821_5F3E3B3842/claim"
+        );
+        assert_eq!(url.path(), "/api/paxstudio/ofp/1777622821_5F3E3B3842/claim");
+    }
+
+    #[test]
+    fn paxstudio_fares_decode_booked_from_envelope() {
+        // Shape returned by GET .../fares and POST .../claim (inside the {data:…} wrapper).
+        // The endpoint also sends `code`/`type` per fare — serde ignores them here.
+        let json = r#"{"data":{"ofp_id":"X","value_source":"booked","linked":true,
+            "fares":[{"id":6,"code":"Y","type":0,"count":150},
+                     {"id":7,"code":"CGO","type":1,"count":15000}]}}"#;
+        let env: DataEnvelope<PaxStudioFares> = serde_json::from_str(json).unwrap();
+        let res = env.data;
+        assert_eq!(res.value_source, "booked");
+        assert!(res.linked);
+        assert_eq!(res.fares.len(), 2);
+        assert_eq!((res.fares[0].id, res.fares[0].count), (6, 150));
+        assert_eq!((res.fares[1].id, res.fares[1].count), (7, 15000));
+    }
+
+    #[test]
+    fn paxstudio_fares_none_source_decodes_empty() {
+        let json = r#"{"data":{"ofp_id":"X","value_source":"none","fares":[]}}"#;
+        let env: DataEnvelope<PaxStudioFares> = serde_json::from_str(json).unwrap();
+        assert_eq!(env.data.value_source, "none");
+        assert!(env.data.fares.is_empty());
+        assert!(!env.data.linked); // defaults false when the key is absent
+    }
+
+    #[test]
+    fn simbrief_alternate_extracts_clean_icao_from_nested_xml() {
+        // Captured shape from a real SimBrief OFP — the <alternate>
+        // element is a wrapper around child fields. Pre-fix we
+        // returned the raw inner XML soup as the alternate string.
+        let xml = r#"
+            <ofp>
+                <fuel>
+                    <plan_ramp>9733</plan_ramp>
+                    <est_burn>5800</est_burn>
+                    <reserve>1300</reserve>
+                </fuel>
+                <weights>
+                    <est_zfw>71242</est_zfw>
+                    <est_tow>80700</est_tow>
+                    <est_ldw>75380</est_ldw>
+                </weights>
+                <alternate>
+                    <icao_code>LFBO</icao_code>
+                    <iata_code>TLS</iata_code>
+                    <faa_code/>
+                    <icao_region>LF</icao_region>
+                    <elevation>499</elevation>
+                    <pos_lat>43.635000</pos_lat>
+                    <pos_long>1.367778</pos_long>
+                </alternate>
+            </ofp>
+        "#;
+        let ofp = parse_simbrief_ofp(xml).expect("parses");
+        assert_eq!(ofp.alternate.as_deref(), Some("LFBO"));
+    }
+
+    /// „Zeiten gegen Flugplan" (13.10.2026): alle vier Planzeiten aus
+    /// `<times>`, jede fuer sich — `sched_off` darf nicht in `sched_out`
+    /// hineingelesen werden.
+    #[test]
+    fn simbrief_liest_alle_vier_planzeiten() {
+        let xml = r#"
+            <ofp>
+                <fuel><plan_ramp>9733</plan_ramp><est_burn>5800</est_burn><reserve>1300</reserve></fuel>
+                <weights><est_zfw>71242</est_zfw><est_tow>80700</est_tow><est_ldw>75380</est_ldw></weights>
+                <times>
+                    <sched_out>1791693000</sched_out>
+                    <sched_off>1791693900</sched_off>
+                    <sched_on>1791707940</sched_on>
+                    <sched_in>1791708480</sched_in>
+                </times>
+            </ofp>
+        "#;
+        let ofp = parse_simbrief_ofp(xml).expect("parses");
+        assert_eq!(ofp.sched_out_epoch, Some(1791693000));
+        assert_eq!(ofp.sched_off_epoch, Some(1791693900));
+        assert_eq!(ofp.sched_on_epoch, Some(1791707940));
+        assert_eq!(ofp.sched_in_epoch, Some(1791708480));
+    }
+
+    /// Kabinenansagen (Beta): Zeitzonen aus `<times>` (Stunden → Minuten),
+    /// halbe Stunden bleiben erhalten, Unsinn und Fehlen ergeben `None`.
+    /// Werte wie im phpVMS-Testdatensatz `acars_briefing.xml` (MKJP → MWCR).
+    #[test]
+    fn simbrief_liest_die_zeitzonen() {
+        let ofp_mit = |orig: &str, dest: &str| {
+            parse_simbrief_ofp(&format!(
+                r#"<ofp>
+                    <fuel><plan_ramp>9733</plan_ramp><est_burn>5800</est_burn><reserve>1300</reserve></fuel>
+                    <weights><est_zfw>71242</est_zfw><est_tow>80700</est_tow><est_ldw>75380</est_ldw></weights>
+                    <times>{orig}{dest}</times>
+                </ofp>"#
+            ))
+            .expect("parses")
+        };
+        let ofp = ofp_mit("<orig_timezone>-5</orig_timezone>", "<dest_timezone>5.5</dest_timezone>");
+        assert_eq!((ofp.orig_utc_offset_min, ofp.dest_utc_offset_min), (Some(-300), Some(330)));
+        let ofp = ofp_mit("<orig_timezone>99</orig_timezone>", "");
+        assert_eq!((ofp.orig_utc_offset_min, ofp.dest_utc_offset_min), (None, None));
+    }
+
+    /// Reproduces the live bug from a GSG pilot 2026-05-03: the
+    /// `/api/user/bids` response contained `"flight_number": 6431`
+    /// (integer, no quotes), failing the entire bids parse with
+    /// "invalid type: integer '6431', expected a string at line 1
+    /// column 289". After the fix all id-ish String fields tolerate
+    /// integers via de_str_or_int / de_opt_str_or_int.
+    #[test]
+    fn flight_parses_integer_flight_number_and_id() {
+        let json = r#"{
+            "id": 6431,
+            "flight_number": 6431,
+            "dpt_airport_id": 17,
+            "arr_airport_id": "LFMN",
+            "alt_airport_id": null,
+            "route_code": 42,
+            "callsign": 6431
+        }"#;
+        let f: Flight = serde_json::from_str(json).expect("parses");
+        assert_eq!(f.id, "6431");
+        assert_eq!(f.flight_number, "6431");
+        assert_eq!(f.dpt_airport_id, "17");
+        assert_eq!(f.arr_airport_id, "LFMN");
+        assert_eq!(f.alt_airport_id, None);
+        assert_eq!(f.route_code.as_deref(), Some("42"));
+        assert_eq!(f.callsign.as_deref(), Some("6431"));
+    }
+
+    /// Strings still parse as strings (regression guard — the
+    /// permissive deserializer must not break the canonical phpVMS
+    /// shape where everything is a string).
+    #[test]
+    fn flight_still_parses_canonical_string_shape() {
+        let json = r#"{
+            "id": "VL12A",
+            "flight_number": "VL12A",
+            "dpt_airport_id": "EDDF",
+            "arr_airport_id": "LEBL",
+            "alt_airport_id": "LEMD",
+            "route_code": "STAR1",
+            "callsign": "DLH123"
+        }"#;
+        let f: Flight = serde_json::from_str(json).expect("parses");
+        assert_eq!(f.id, "VL12A");
+        assert_eq!(f.flight_number, "VL12A");
+        assert_eq!(f.alt_airport_id.as_deref(), Some("LEMD"));
+    }
+
+    /// Bid wrapping a Flight — full path the live bug took.
+    #[test]
+    fn bid_with_integer_flight_number_parses() {
+        let json = r#"{
+            "id": 7,
+            "user_id": 42,
+            "flight_id": 6431,
+            "flight": {
+                "id": 6431,
+                "flight_number": 6431,
+                "dpt_airport_id": "LFMN",
+                "arr_airport_id": "EDLE"
+            }
+        }"#;
+        let b: Bid = serde_json::from_str(json).expect("parses");
+        assert_eq!(b.id, 7);
+        assert_eq!(b.flight_id, "6431");
+        assert_eq!(b.flight.flight_number, "6431");
+    }
+
+    /// QS 2026-08-04: hiess frueher `..._falls_back_to_root_icao_when_no_wrapper`
+    /// und sicherte einen "defensiven" Rueckfall ab (flaches <icao_code>
+    /// irgendwo im Dokument = Alternate). Genau dieser Rueckfall war der
+    /// Fehler: sein Fixture enthielt kein <origin>, und nur deshalb konnte
+    /// er nicht danebengreifen — siehe den Test darunter. Der Rueckfall ist
+    /// entfernt; ein flach geliefertes <icao_code> gilt jetzt bewusst NICHT
+    /// mehr als Ausweichziel, weil sich diese Form nicht zuverlaessig vom
+    /// <origin>-ICAO unterscheiden laesst.
+    #[test]
+    fn simbrief_alternate_ignores_a_bare_root_icao_code() {
+        let xml = r#"
+            <ofp>
+                <weights>
+                    <est_zfw>71242</est_zfw>
+                </weights>
+                <icao_code>LFBO</icao_code>
+            </ofp>
+        "#;
+        let ofp = parse_simbrief_ofp(xml).expect("parses");
+        assert_eq!(
+            ofp.alternate.as_deref(),
+            None,
+            "ein loses <icao_code> ist nicht unterscheidbar vom origin-ICAO"
+        );
+    }
+
+    /// QS 2026-08-04: der Test, der den Fehler aufgedeckt hat. Das Fixture
+    /// des Tests darueber hatte KEIN <origin> — genau die eine Form, in der
+    /// der fruehere `.or_else()`-Rueckfall nicht danebengreifen konnte. In
+    /// einem echten OFP steht <origin> VOR <alternate>, und `extract_tag`
+    /// nimmt das ERSTE Vorkommen im ganzen Dokument: ohne geplantes
+    /// Ausweichziel lieferte der Rueckfall damit den ABFLUGHAFEN. Das lief
+    /// ins Briefing, in die Live-Karte und ins PIREP-Feld "Plan Alternate"
+    /// — ein EDDL->EDDM-Flug briefte "Alternate: EDDL".
+    #[test]
+    fn simbrief_alternate_is_none_when_ofp_plans_no_alternate() {
+        // Realistische Element-Reihenfolge: origin vor destination vor
+        // (hier fehlendem) alternate.
+        let xml = r#"
+            <ofp>
+                <origin>
+                    <icao_code>EDDL</icao_code>
+                </origin>
+                <destination>
+                    <icao_code>EDDM</icao_code>
+                </destination>
+                <weights>
+                    <est_zfw>71242</est_zfw>
+                </weights>
+            </ofp>
+        "#;
+        let ofp = parse_simbrief_ofp(xml).expect("parses");
+        assert_eq!(
+            ofp.alternate.as_deref(),
+            None,
+            "ohne <alternate> darf NICHT der Abflughafen einlaufen"
+        );
+        assert_eq!(ofp.ofp_origin_icao, "EDDL");
+        assert_eq!(ofp.ofp_destination_icao, "EDDM");
+    }
+
+    /// Gegenstueck: ein echt geplantes Ausweichziel muss weiter ankommen.
+    #[test]
+    fn simbrief_alternate_is_read_from_the_alternate_block() {
+        let xml = r#"
+            <ofp>
+                <origin>
+                    <icao_code>EDDL</icao_code>
+                </origin>
+                <destination>
+                    <icao_code>EDDM</icao_code>
+                </destination>
+                <alternate>
+                    <icao_code>EDDN</icao_code>
+                </alternate>
+                <weights>
+                    <est_zfw>71242</est_zfw>
+                </weights>
+            </ofp>
+        "#;
+        let ofp = parse_simbrief_ofp(xml).expect("parses");
+        assert_eq!(ofp.alternate.as_deref(), Some("EDDN"));
+    }
+
+    /// v0.7.8: <params><request_id> ist die canonical changed-flag-
+    /// Quelle fuer SimBrief-direct Refresh. Spec §3.
+    #[test]
+    fn simbrief_parser_extracts_request_id_from_params() {
+        let xml = r#"
+            <ofp>
+                <params>
+                    <request_id>172403072</request_id>
+                    <static_id></static_id>
+                    <time_generated>1778461205</time_generated>
+                </params>
+                <weights>
+                    <est_zfw>71242</est_zfw>
+                </weights>
+            </ofp>
+        "#;
+        let ofp = parse_simbrief_ofp(xml).expect("parses");
+        assert_eq!(ofp.request_id, "172403072");
+    }
+
+    /// v0.7.8: Wenn <request_id> fehlt, bekommen wir leeren String
+    /// statt Parse-Fehler. (Should-not-happen-in-praxis, aber defensiv.)
+    #[test]
+    fn simbrief_parser_handles_missing_request_id_with_empty_string() {
+        let xml = r#"
+            <ofp>
+                <params>
+                    <time_generated>1778461205</time_generated>
+                </params>
+                <weights>
+                    <est_zfw>71242</est_zfw>
+                </weights>
+            </ofp>
+        "#;
+        let ofp = parse_simbrief_ofp(xml).expect("parses");
+        assert_eq!(ofp.request_id, "");
+    }
+
+    /// v0.21.x (#phase-v2 Fix A): geplante Cruise-Höhe aus
+    /// <general><initial_altitude> (in Fuß) → Cruise-Ref der Phasen-Engine.
+    #[test]
+    fn simbrief_parser_extracts_initial_cruise_altitude() {
+        let xml = r#"
+            <ofp>
+                <general>
+                    <initial_altitude>36000</initial_altitude>
+                    <stepclimb_string>FL360/FL380</stepclimb_string>
+                </general>
+                <weights>
+                    <est_zfw>71242</est_zfw>
+                </weights>
+            </ofp>
+        "#;
+        let ofp = parse_simbrief_ofp(xml).expect("parses");
+        assert_eq!(ofp.planned_cruise_alt_ft, Some(36000.0));
+    }
+
+    /// Fehlt der Tag, bleibt es None (→ Engine nutzt Bid-Level/240s-Fallback).
+    #[test]
+    fn simbrief_parser_cruise_altitude_absent_is_none() {
+        let xml = r#"
+            <ofp>
+                <weights>
+                    <est_zfw>71242</est_zfw>
+                </weights>
+            </ofp>
+        "#;
+        let ofp = parse_simbrief_ofp(xml).expect("parses");
+        assert_eq!(ofp.planned_cruise_alt_ft, None);
+    }
+
+    /// initial_altitude ist dokumentiert in FUSS — ein echter Tiefflug-Wert
+    /// darf NICHT wie ein Flight-Level (×100) hochskaliert werden.
+    #[test]
+    fn simbrief_parser_cruise_altitude_low_value_is_feet_not_flight_level() {
+        let xml = r#"
+            <ofp>
+                <general>
+                    <initial_altitude>9000</initial_altitude>
+                </general>
+                <weights>
+                    <est_zfw>71242</est_zfw>
+                </weights>
+            </ofp>
+        "#;
+        let ofp = parse_simbrief_ofp(xml).expect("parses");
+        assert_eq!(ofp.planned_cruise_alt_ft, Some(9000.0));
+    }
+
+    /// v1.0.0-Härtung: ein FL-artiger Wert (< 1000, z.B. "360" statt
+    /// "36000") wird als unplausibel verworfen → None, damit er nicht die
+    /// Premature-Cruise-Falle auslöst (near_or_above_ref immer wahr).
+    #[test]
+    fn simbrief_parser_cruise_altitude_flight_level_style_is_rejected() {
+        let xml = r#"
+            <ofp>
+                <general>
+                    <initial_altitude>360</initial_altitude>
+                </general>
+                <weights>
+                    <est_zfw>71242</est_zfw>
+                </weights>
+            </ofp>
+        "#;
+        let ofp = parse_simbrief_ofp(xml).expect("parses");
+        assert_eq!(ofp.planned_cruise_alt_ft, None);
+    }
+
+    // ── v0.7.18 (B-011 / R2-3): PirepSummary Regression-Guards ───────
+    //
+    // get_user_pireps() ist der Datenpfad für den Orphan-Cleanup-Cluster
+    // (B-011). Wenn nur ein einziger PIREP im Response-Array beim Parsen
+    // failt, schlägt der ganze Aufruf fehl → Pilot sieht keine Orphans.
+    // Diese Tests sichern die drei Shape-Varianten ab, die wir in der
+    // Wild bei phpVMS-Installationen gesehen haben.
+
+    /// flight_id als String — canonical phpVMS-Shape.
+    #[test]
+    fn pirep_summary_parses_string_flight_id() {
+        let json = r#"{
+            "id": "pirep_abc",
+            "flight_id": "flightid_42"
+        }"#;
+        let p: PirepSummary = serde_json::from_str(json).expect("parses");
+        assert_eq!(p.id, "pirep_abc");
+        assert_eq!(p.flight_id.as_deref(), Some("flightid_42"));
+    }
+
+    /// flight_id als Integer — manche VAs liefern numeric IDs (R1-3
+    /// QS-Fix: deserialize_with = "de_opt_str_or_int"). Ohne den
+    /// Deserializer wäre der ganze Array-Parse aus get_user_pireps()
+    /// gebrochen.
+    #[test]
+    fn pirep_summary_parses_integer_flight_id() {
+        let json = r#"{
+            "id": "pirep_abc",
+            "flight_id": 4711
+        }"#;
+        let p: PirepSummary = serde_json::from_str(json).expect("parses");
+        assert_eq!(p.flight_id.as_deref(), Some("4711"));
+    }
+
+    /// flight_id fehlend — Forward-/Backward-Compat für VAs ohne das
+    /// Feld. Darf nicht failen, sondern Option::None liefern.
+    #[test]
+    fn pirep_summary_parses_missing_flight_id_as_none() {
+        let json = r#"{
+            "id": "pirep_abc"
+        }"#;
+        let p: PirepSummary = serde_json::from_str(json).expect("parses");
+        assert_eq!(p.flight_id, None);
+    }
+
+    /// Voller IN_PROGRESS-Orphan wie ihn flight_list_orphans erwartet —
+    /// state=0, alle B-011-Felder dabei. Stellt sicher dass das Frontend
+    /// genug Kontext hat um den Cancel-Button anzuzeigen.
+    #[test]
+    fn pirep_summary_parses_in_progress_orphan_shape() {
+        let json = r#"{
+            "id": "pirep_orphan_1",
+            "state": 0,
+            "status": "ENR",
+            "flight_id": "flight_xyz",
+            "airline_id": 1,
+            "flight_number": "GSG123",
+            "dpt_airport_id": "EDDF",
+            "arr_airport_id": "LEBL",
+            "aircraft_icao": "B738",
+            "aircraft_registration": "D-AGSG"
+        }"#;
+        let p: PirepSummary = serde_json::from_str(json).expect("parses");
+        assert_eq!(p.state, Some(0));
+        assert_eq!(p.status.as_deref(), Some("ENR"));
+        assert_eq!(p.flight_id.as_deref(), Some("flight_xyz"));
+        assert_eq!(p.flight_number.as_deref(), Some("GSG123"));
+        assert_eq!(p.aircraft_icao.as_deref(), Some("B738"));
+        assert_eq!(p.aircraft_registration.as_deref(), Some("D-AGSG"));
+    }
+
+    /// v0.16.18: flight_id wird gesendet wenn vorhanden, sonst komplett
+    /// weggelassen (skip_serializing_if) — alte phpVMS-Installs sehen
+    /// keinen neuen Key, neue haengen den PIREP an den geplanten Flug.
+    #[test]
+    fn prefile_body_flight_id_serialization() {
+        let mut body = PrefileBody {
+            airline_id: 1,
+            aircraft_id: "170".into(),
+            flight_number: "434".into(),
+            dpt_airport_id: "EDDF".into(),
+            arr_airport_id: "KORD".into(),
+            source_name: "AeroACARS/test".into(),
+            ..Default::default()
+        };
+        let js = serde_json::to_string(&body).unwrap();
+        assert!(
+            !js.contains("flight_id"),
+            "None muss weggelassen werden: {js}"
+        );
+
+        body.flight_id = Some("N43EeJppON5wr3Rm".into());
+        let js = serde_json::to_string(&body).unwrap();
+        assert!(js.contains("\"flight_id\":\"N43EeJppON5wr3Rm\""), "{js}");
+    }
+
+    /// Weights-Block aus dem echten VF1224-OFP (EDDP→LTFE, AJet B38M,
+    /// 2026-07-25). `freight_added` wird optional weggelassen, um den
+    /// Fallback-Pfad zu testen.
+    fn ofp_with_weights(extra: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?>
+            <ofp>
+                <params><units>kgs</units></params>
+                <weights>
+                    <oew>45069</oew>
+                    <pax_count>146</pax_count>
+                    <bag_count>146</bag_count>
+                    <pax_weight>88</pax_weight>
+                    <bag_weight>20</bag_weight>
+                    {extra}
+                    <cargo>6120</cargo>
+                    <payload>18968</payload>
+                    <est_zfw>64037</est_zfw>
+                    <est_tow>73455</est_tow>
+                </weights>
+            </ofp>"#
+        )
+    }
+
+    /// SimBriefs `<weights><cargo>` ist Gepaeck + Fracht ZUSAMMEN. Die
+    /// Bid-Card weist aber "Cargo" aus, also muss `freight_kg` die reine
+    /// Fracht liefern — sonst meldet ein 146-PAX-Flug mit 3,2 t Fracht
+    /// 6,1 t "Cargo" (der Live-Befund, der diesen Fix ausgeloest hat).
+    #[test]
+    fn freight_kg_prefers_freight_added_over_combined_cargo() {
+        let xml = ofp_with_weights("<freight_added>3200</freight_added>");
+        let ofp = parse_simbrief_ofp(&xml).expect("parses");
+        assert_eq!(ofp.cargo_kg, 6120.0, "cargo_kg bleibt die Summe");
+        assert_eq!(ofp.freight_kg, 3200.0, "freight_kg ist die reine Fracht");
+    }
+
+    /// Ohne `freight_added` wird das Gepaeck von der Summe abgezogen.
+    /// ACHTUNG: `<bag_weight>` ist das Gewicht PRO Stueck (20), nicht das
+    /// Gesamtgepaeck — 6120 - 20 waere falsch, richtig ist 6120 - 146*20.
+    #[test]
+    fn freight_kg_falls_back_to_cargo_minus_bag_count_times_bag_weight() {
+        let xml = ofp_with_weights("");
+        let ofp = parse_simbrief_ofp(&xml).expect("parses");
+        assert_eq!(ofp.cargo_kg, 6120.0);
+        assert_eq!(ofp.freight_kg, 3200.0, "6120 - 146*20 = 3200");
+    }
+
+    /// Cargo-Only-Flug ohne Pax/Gepaeck: die Summe IST die Fracht.
+    #[test]
+    fn freight_kg_falls_back_to_combined_when_no_baggage_data() {
+        let xml = r#"<?xml version="1.0"?>
+            <ofp>
+                <params><units>kgs</units></params>
+                <weights>
+                    <oew>45069</oew>
+                    <pax_count>0</pax_count>
+                    <cargo>18000</cargo>
+                    <est_zfw>63069</est_zfw>
+                </weights>
+            </ofp>"#;
+        let ofp = parse_simbrief_ofp(xml).expect("parses");
+        assert_eq!(ofp.freight_kg, 18000.0);
+    }
+}
+
+#[cfg(test)]
+mod navlog_sprit_tests {
+    use super::*;
+
+    const XML: &str = r#"<OFP><params><units>lbs</units></params><general>
+<navlog>
+<fix><ident>NOSLI</ident><type>wpt</type><pos_lat>59.072</pos_lat><pos_long>17.9</pos_long>
+<distance>37</distance><altitude_feet>23600</altitude_feet><fuel_totalused>10216</fuel_totalused><time_total>513</time_total></fix>
+<fix><ident>TOD</ident><type>ltp</type><pos_lat>49.730</pos_lat><pos_long>12.1</pos_long>
+<distance>62</distance><altitude_feet>40000</altitude_feet><fuel_totalused>42666</fuel_totalused><time_total>4832</time_total></fix>
+</navlog></OFP>"#;
+
+    /// Die vier neuen Felder kommen je Fix an; Sprit wird von lbs nach kg
+    /// umgerechnet (42 666 lb → 19 353 kg wie im DLH370-OFP).
+    #[test]
+    fn navlog_sprit_felder_werden_gelesen() {
+        let fixes = extract_navlog_fixes(XML, true);
+        assert_eq!(fixes.len(), 2);
+        let tod = &fixes[1];
+        assert_eq!(tod.ident, "TOD");
+        assert_eq!(tod.segment_nm, Some(62.0));
+        assert_eq!(tod.hoehe_ft, Some(40000.0));
+        assert_eq!(tod.zeit_bis_hier_s, Some(4832.0));
+        let kg = tod.sprit_bis_hier_kg.expect("sprit");
+        assert!((kg - 19353.0).abs() < 2.0, "{kg}");
+    }
+
+    /// Ohne `wt_unit = lbs` bleibt der Wert, wie er im OFP steht.
+    #[test]
+    fn navlog_sprit_in_kg_bleibt_unveraendert() {
+        let fixes = extract_navlog_fixes(XML, false);
+        assert_eq!(fixes[1].sprit_bis_hier_kg, Some(42666.0));
+    }
+
+    /// Das Format, das SimBrief wirklich liefert: `<params><units>`. Ohne
+    /// diesen Test waere der Griff nach `<wt_unit>` unbemerkt geblieben —
+    /// er kommt in keinem echten OFP vor (Korpus-Pruefung ueber 40 OFPs).
+    #[test]
+    fn navlog_sprit_erkennt_einheit_aus_params() {
+        // Das Format, das SimBrief wirklich liefert — so steht es in allen
+        // 40 OFPs der Produktionsdatenbank.
+        assert!(ofp_unit_is_lb(
+            "<OFP><params><units>lbs</units></params></OFP>"
+        ));
+        assert!(!ofp_unit_is_lb(
+            "<OFP><params><units>kgs</units></params></OFP>"
+        ));
+        // Rueckfall, falls SimBrief das alte Tag doch irgendwo liefert.
+        assert!(ofp_unit_is_lb(
+            "<OFP><general><wt_unit>lbs</wt_unit></general></OFP>"
+        ));
+        // Und ohne jede Angabe bleibt es bei Kilogramm.
+        assert!(!ofp_unit_is_lb("<OFP><navlog></navlog></OFP>"));
+        // Ein pretty-printed OFP darf nicht still auf Kilogramm zurueckfallen.
+        assert!(ofp_unit_is_lb(
+            "<OFP><params><units>\n  LBS\n</units></params></OFP>"
+        ));
+        // Wirkung auf die Sprit-Felder: 42 666 lb sind 19 353 kg (DLH370).
+        let xml = r#"<OFP><params><units>lbs</units></params><navlog>
+<fix><ident>TOD</ident><type>ltp</type><pos_lat>49.7</pos_lat><pos_long>12.1</pos_long>
+<distance>62</distance><fuel_totalused>42666</fuel_totalused></fix></navlog></OFP>"#;
+        let fixes = extract_navlog_fixes(xml, ofp_unit_is_lb(xml));
+        let kg = fixes[0].sprit_bis_hier_kg.expect("sprit");
+        assert!((kg - 19_353.0).abs() < 2.0, "lbs nicht umgerechnet: {kg}");
+        // Die Strecke bleibt NM, nicht umgerechnet.
+        assert_eq!(fixes[0].segment_nm, Some(62.0));
+    }
+
+    /// Ein persistierter Fix aus einer aelteren Version kennt die Felder
+    /// nicht — er muss zu `None` werden, nie zu 0 (sonst gaebe es
+    /// „Plan bis Sinkflug = 0 kg" und eine erfundene Zerlegung).
+    #[test]
+    fn navlog_sprit_altbestand_ohne_felder_ist_none() {
+        let alt = r#"{"ident":"TOD","lat":49.73,"lon":12.1,"kind":"ltp"}"#;
+        let fix: RouteFix = serde_json::from_str(alt).expect("altbestand");
+        assert_eq!(fix.sprit_bis_hier_kg, None);
+        assert_eq!(fix.segment_nm, None);
+        assert_eq!(fix.hoehe_ft, None);
+        assert_eq!(fix.zeit_bis_hier_s, None);
+    }
+
+    /// Ein Fix ohne Sprit-Angabe bleibt ein gueltiger Fix (Position zaehlt).
+    #[test]
+    fn navlog_sprit_fehlende_tags_brechen_den_fix_nicht() {
+        let xml = r#"<navlog><fix><ident>A</ident><type>wpt</type><pos_lat>1</pos_lat><pos_long>2</pos_long></fix></navlog>"#;
+        let fixes = extract_navlog_fixes(xml, true);
+        assert_eq!(fixes.len(), 1);
+        assert_eq!(fixes[0].sprit_bis_hier_kg, None);
+    }
+}
+
+#[cfg(test)]
+mod zustellung_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// Ein Ein-Anfrage-Server, der mit `antwort` (Statuszeile) antwortet.
+    fn server(antwort: &'static str) -> String {
+        server_mit(antwort, "{}")
+    }
+
+    /// Wie [`server`], mit eigenem Antworttext.
+    fn server_mit(antwort: &'static str, body: &'static str) -> String {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let adresse = format!("http://{}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = l.accept() {
+                let mut puffer = [0u8; 8192];
+                let _ = s.read(&mut puffer);
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 {antwort}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        adresse
+    }
+
+    fn zustellen(basis: &str) -> Zustellung {
+        let client = Client::new(Connection::new(basis, "test").unwrap()).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(client.post_acars_logs_zustellung(
+            "P1",
+            &[LogEntry {
+                log: "Gear DOWN".into(),
+                ..Default::default()
+            }],
+        ))
+    }
+
+    #[test]
+    fn angenommen() {
+        assert!(matches!(
+            zustellen(&server("200 OK")),
+            Zustellung::Angekommen {
+                gespeichert: Gespeichert::KeineAngabe
+            }
+        ));
+    }
+
+    #[test]
+    fn meldet_gespeicherte_zahl() {
+        assert!(matches!(
+            zustellen(&server_mit(
+                "200 OK",
+                r#"{"message":"0 logs added","attrs":[],"count":0}"#
+            )),
+            Zustellung::Angekommen {
+                gespeichert: Gespeichert::Zahl(0)
+            }
+        ));
+    }
+
+    #[test]
+    fn ungueltige_erfolgsantwort_ist_ungueltig() {
+        for body in [
+            r#"{"count":"50"}"#,
+            r#"{"count":null}"#,
+            r#"{"count":-1}"#,
+            "kein json",
+            "[]",
+        ] {
+            assert!(
+                matches!(
+                    zustellen(&server_mit("200 OK", body)),
+                    Zustellung::Angekommen {
+                        gespeichert: Gespeichert::Ungueltig
+                    }
+                ),
+                "{body}"
+            );
+        }
+        assert!(matches!(
+            zustellen(&server_mit("200 OK", r#"{"message":"ok"}"#)),
+            Zustellung::Angekommen {
+                gespeichert: Gespeichert::KeineAngabe
+            }
+        ));
+    }
+
+    #[test]
+    fn nicht_verarbeitet_darf_wiederholt_werden() {
+        assert!(matches!(
+            zustellen(&server("429 Too Many Requests")),
+            Zustellung::NichtAngekommen(_)
+        ));
+        assert!(matches!(
+            zustellen(&server("503 Service Unavailable")),
+            Zustellung::NichtAngekommen(_)
+        ));
+        // Kein Server auf dem Port: Verbindung kommt nicht zustande.
+        let frei = TcpListener::bind("127.0.0.1:0").unwrap();
+        let adresse = format!("http://{}", frei.local_addr().unwrap());
+        drop(frei);
+        assert!(matches!(
+            zustellen(&adresse),
+            Zustellung::NichtAngekommen(_)
+        ));
+    }
+
+    #[test]
+    fn vielleicht_gespeichert_ist_unklar() {
+        assert!(matches!(
+            zustellen(&server("500 Internal Server Error")),
+            Zustellung::Unklar(_)
+        ));
+    }
+
+    #[test]
+    fn abgelehnt() {
+        assert!(matches!(
+            zustellen(&server("404 Not Found")),
+            Zustellung::Abgelehnt(ApiError::NotFound)
+        ));
+        assert!(matches!(
+            zustellen(&server("401 Unauthorized")),
+            Zustellung::Abgelehnt(ApiError::Unauthenticated)
+        ));
+    }
+}

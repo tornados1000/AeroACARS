@@ -1,0 +1,110 @@
+// Rohdaten zur Nachprüfung (aufklappbar): Koordinaten des Aufsetzpunkts,
+// Zeit, Kurse, Bahnbezug mit Vorzeichen.
+//
+// GESPIEGELT in die Webapp (scripts/anzeige-sync.mjs, DATEIEN). Bis
+// 05.10.2026 nur in der Webapp („Raw Data / Verification"); der Client hatte
+// die Koordinaten nicht in seiner Aufzeichnung.
+
+import type { ReactNode } from "react";
+import { distanzHinterSchwelle, fmtSigned } from "../lib/landungsFormat";
+import { useTranslation } from "react-i18next";
+import type { LandingRecord } from "../lib/landungsDatensatz";
+import "./rohdatenAbschnitt.css";
+import { useDruck } from "../lib/druck";
+
+/** ISO-Zeit in UTC, auf Millisekunden — unabhängig davon, wie die Quelle
+ *  sie geschrieben hat (Rust: bis Mikrosekunden, Webapp: Millisekunden). */
+function zeitUtc(iso: string): string {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? iso : d.toISOString();
+}
+
+export function RohdatenAbschnitt({ record }: { record: LandingRecord }) {
+  const { t } = useTranslation();
+  const druck = useDruck();
+  const lat = record.landing_lat;
+  const lon = record.landing_lon;
+  const koord = lat != null && lon != null ? `${lat.toFixed(7)}, ${lon.toFixed(7)}` : "—";
+  const karte =
+    lat != null && lon != null
+      ? `https://www.google.com/maps/place/${lat.toFixed(7)},${lon.toFixed(7)}/@${lat.toFixed(7)},${lon.toFixed(7)},19z`
+      : null;
+  const versatz = record.runway_match?.centerline_distance_m ?? null;
+  // Derselbe Wert wie Aufsetz-Qualität und Bahn-Grafik (vor v1.7.15 fehlt
+  // das Feld, dann der Rohwert) — QS Runde 12.
+  const schwelle = distanzHinterSchwelle(record);
+  // Rohdaten sind zum Nachprüfen da und bleiben stehen — bei unsicherer
+  // Bahngeometrie aber mit Vermerk, denn die übrigen Abschnitte lassen diese
+  // Werte dann weg (QS 06.10.2026).
+  const unsicher = record.runway_geometry_trusted === false ? ` · ${t("landing.rohdaten.unsicher")}` : "";
+  const zeile = (k: string, v: string, extra?: ReactNode) => (
+    <div className="rohdaten__zeile">
+      <span className="rohdaten__k">{k}</span>
+      <code className="rohdaten__v">{v}</code>
+      {extra}
+    </div>
+  );
+  return (
+    <details className="landing-section rohdaten" open={druck || undefined}>
+      <summary>{t("landing.rohdaten.title")}</summary>
+      <div className="rohdaten__liste">
+        {zeile(
+          t("landing.rohdaten.koordinaten"),
+          koord,
+          karte && (
+            // Bedienung, nicht aufs Papier (QS 06.10.2026).
+            <a className="rohdaten__link nur-bildschirm" href={karte} target="_blank" rel="noreferrer">
+              Google Maps ↗
+            </a>
+          ),
+        )}
+        {zeile(t("landing.rohdaten.zeit"), zeitUtc(record.touchdown_at))}
+        {zeile(
+          t("landing.rohdaten.kurs"),
+          `${record.landing_heading_true_deg != null ? `${record.landing_heading_true_deg.toFixed(2)}°T` : "—"} / ${
+            record.landing_heading_deg != null ? `${record.landing_heading_deg.toFixed(2)}°M` : "—"
+          }`,
+        )}
+        {zeile(
+          t("landing.rohdaten.bahn"),
+          `${record.runway_match?.airport_ident ?? "—"} / ${record.runway_match?.runway_ident ?? "—"}${
+            record.runway_match ? unsicher : ""
+          }`,
+        )}
+        {zeile(
+          t("landing.rohdaten.versatz"),
+          versatz != null
+            ? `${fmtSigned(versatz, 2)} m (${t(
+                // Richtung aus dem angezeigten (gerundeten) Wert — sonst „0.00 m (links)".
+                Number(versatz.toFixed(2)) > 0
+                  ? "landing.rohdaten.rechts"
+                  : Number(versatz.toFixed(2)) < 0
+                    ? "landing.rohdaten.links"
+                    : "landing.rohdaten.mitte",
+              )}${unsicher})`
+            : "—",
+        )}
+        {zeile(
+          t("landing.rohdaten.schwelle"),
+          // Einordnung wie in der früheren Webapp-Ansicht („UNDERSHOOT /
+          // knapp am Threshold / past Threshold"), QS 06.10.2026.
+          schwelle != null
+            ? `${fmtSigned(schwelle, 2)} m (${t(
+                Number(schwelle.toFixed(2)) < 0
+                  ? "landing.rohdaten.vor_schwelle"
+                  : schwelle < 50
+                    ? "landing.rohdaten.knapp_hinter_schwelle"
+                    : "landing.rohdaten.hinter_schwelle",
+              )}${unsicher})`
+            : "—",
+        )}
+        {zeile(
+          t("landing.rohdaten.ausrollen"),
+          record.rollout_distance_m != null ? `${record.rollout_distance_m.toFixed(0)} m` : "—",
+        )}
+        {zeile(t("landing.rohdaten.version"), record.client_version ?? "—")}
+      </div>
+      <p className="rohdaten__hinweis nur-bildschirm">{t("landing.rohdaten.hinweis")}</p>
+    </details>
+  );
+}

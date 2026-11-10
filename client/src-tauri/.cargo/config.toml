@@ -1,0 +1,8 @@
+# Build configuration shared by every cargo invocation in this workspace.
+
+[env]
+# bindgen needs libclang at build time (used by simconnect-sdk among others).
+# Default for `winget install LLVM.LLVM` on Windows. Developers on
+# macOS/Linux who already have LLVM installed elsewhere can override this
+# in their shell — `force = false` means we only set it if unset.
+LIBCLANG_PATH = { value = "C:\\Program Files\\LLVM\\bin", force = false }

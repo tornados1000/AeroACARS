@@ -1,0 +1,3078 @@
+//! Telemetrie-Monitor (v1.8): der Datenstrom fuer den Tab „Telemetrie".
+//!
+//! Aus jedem Messpunkt wird eine flache Werteliste gebaut — ein Eintrag je
+//! Kanal im [`KATALOG`]. Die Oberflaeche bekommt den Katalog einmal beim
+//! Oeffnen und danach nur noch die Wertelisten ([`Frame`]); Verlauf,
+//! Diagramme, Watch-Panel und CSV arbeiten alle auf derselben Form.
+//!
+//! Drei Quellen fuellen die Kanaele:
+//!   * der gewoehnliche [`SimSnapshot`] (Simulator und Addon-LVars),
+//!   * Zusatzwerte, die NUR gelesen werden, solange der Monitor offen ist
+//!     (MSFS: eigene Datendefinition, X-Plane: eigener Nummernbereich),
+//!   * daraus berechnete Werte (Vorhaltewinkel, Gegenwind, Sprit je Tank …).
+//!
+//! Die Landebewertung liest diese Werte nicht. Der Monitor ist reine
+//! Anzeige; ein Fehler hier darf keinen Flug beeinflussen.
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use serde::Serialize;
+use sim_core::{AircraftProfile, SimSnapshot, Simulator};
+
+/// Verlauf: 5 Minuten bei 10 Hz.
+pub const VERLAUF_HZ: u32 = 10;
+pub const VERLAUF_MAX: usize = 5 * 60 * VERLAUF_HZ as usize;
+/// Takt des Live-Stroms an die Oberflaeche.
+pub const STROM_TAKT: Duration = Duration::from_millis(50);
+/// v1.8.1: Praefix der Tablets (LAN-Bruecke) in der Zuschauerliste. Jedes
+/// Tablet meldet sich als `lan:<geraet>` — schliesst eines den Monitor,
+/// laeuft der Strom fuer die anderen ohne Aussetzer weiter.
+pub const LAN_ZUSCHAUER: &str = "lan";
+
+/// Zuschauerkennung eines Tablets. Die Geraetekennung kommt von der
+/// Oberflaeche; sie wird gekuerzt und auf harmlose Zeichen begrenzt, weil
+/// sie nur als Schluessel dient.
+pub fn lan_zuschauer(geraet: Option<&str>) -> String {
+    let rein: String = geraet
+        .unwrap_or("")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .take(40)
+        .collect();
+    if rein.is_empty() {
+        LAN_ZUSCHAUER.to_string()
+    } else {
+        format!("{LAN_ZUSCHAUER}:{rein}")
+    }
+}
+/// Jeder wievielte Takt geht ans Tablet: 20 Hz / 2 = 10 Frames je Sekunde.
+pub const LAN_JEDER_NTE: u32 = 2;
+
+/// Ohne Lebenszeichen der Oberflaeche endet der Strom nach dieser Zeit —
+/// ein abgestuerztes oder geschlossenes Fenster haelt ihn nicht offen.
+pub const HALTEN_DAUER: Duration = Duration::from_secs(15);
+
+const FT_S2_JE_G: f64 = 32.174;
+const LB_JE_KG: f64 = 2.204_622_6;
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Quelle {
+    /// Standardwert des Simulators, liest AeroACARS ohnehin.
+    Sim,
+    /// Kommt vom Addon (LVar, PMDG-SDK, Plugin).
+    Addon,
+    /// Rechnet AeroACARS selbst.
+    Berechnet,
+    /// Zusatzwert, nur gelesen solange der Monitor offen ist.
+    Zusatz,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Art {
+    Zahl,
+    Schalter,
+    Text,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Gruppe {
+    Flug,
+    Aero,
+    Wind,
+    Triebwerke,
+    Sprit,
+    Fahrwerk,
+    Steuerung,
+    Autopilot,
+    Anflug,
+    Systeme,
+    Licht,
+    Funk,
+    Umgebung,
+    Sim,
+    Flugzeug,
+}
+
+/// MSFS-Quelle eines Zusatzwerts: SimVar, angeforderte Einheit, Faktor.
+///
+/// SimVar und Einheit liest nur der Windows-Pfad (`msfs_zusatzfelder`);
+/// auf dem Mac gelten sie sonst als tot.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub struct MsfsQuelle {
+    pub simvar: &'static str,
+    pub einheit: &'static str,
+    pub faktor: f64,
+}
+
+/// X-Plane-Quelle eines Zusatzwerts: DataRef (mit `[i]`), Faktor.
+#[derive(Debug, Clone, Copy)]
+pub struct XpQuelle {
+    pub dataref: &'static str,
+    pub faktor: f64,
+}
+
+pub struct Kontext<'a> {
+    pub s: &'a SimSnapshot,
+    /// Zusatzwerte je Kanal-ID, Faktor schon angewendet.
+    pub z: &'a HashMap<String, f64>,
+}
+
+impl Kontext<'_> {
+    fn z(&self, id: &str) -> Option<f64> {
+        self.z.get(id).copied().filter(|v| v.is_finite())
+    }
+}
+
+type ZahlFn = fn(&Kontext) -> Option<f64>;
+type TextFn = fn(&Kontext) -> Option<String>;
+/// Pruefung nach dem Wert: `false` = der Wert gilt hier nicht (kein Wert).
+type PruefFn = fn(&Kontext, f64) -> bool;
+
+pub struct Kanal {
+    pub id: &'static str,
+    pub gruppe: Gruppe,
+    pub einheit: &'static str,
+    pub stellen: u8,
+    pub quelle: Quelle,
+    pub art: Art,
+    /// Nur Rechengrundlage, nicht in der Liste zeigen (z. B. Tankinhalt in
+    /// Gallonen, aus dem die kg-Kanaele entstehen).
+    pub intern: bool,
+    zahl: Option<ZahlFn>,
+    text: Option<TextFn>,
+    pruef: Option<PruefFn>,
+    pub msfs: Option<MsfsQuelle>,
+    pub xplane: Option<XpQuelle>,
+}
+
+const fn k(id: &'static str, gruppe: Gruppe, einheit: &'static str, stellen: u8) -> Kanal {
+    Kanal {
+        id,
+        gruppe,
+        einheit,
+        stellen,
+        quelle: Quelle::Sim,
+        art: Art::Zahl,
+        intern: false,
+        zahl: None,
+        text: None,
+        pruef: None,
+        msfs: None,
+        xplane: None,
+    }
+}
+
+impl Kanal {
+    const fn zahl(mut self, f: ZahlFn) -> Self {
+        self.zahl = Some(f);
+        self
+    }
+    const fn text(mut self, f: TextFn) -> Self {
+        self.text = Some(f);
+        self.art = Art::Text;
+        self
+    }
+    /// Wert nur zeigen, wenn die Pruefung ihn gelten laesst.
+    const fn pruef(mut self, f: PruefFn) -> Self {
+        self.pruef = Some(f);
+        self
+    }
+    const fn schalter(mut self) -> Self {
+        self.art = Art::Schalter;
+        self
+    }
+    const fn q(mut self, q: Quelle) -> Self {
+        self.quelle = q;
+        self
+    }
+    const fn intern(mut self) -> Self {
+        self.intern = true;
+        self
+    }
+    const fn msfs(mut self, simvar: &'static str, einheit: &'static str, faktor: f64) -> Self {
+        self.msfs = Some(MsfsQuelle {
+            simvar,
+            einheit,
+            faktor,
+        });
+        self
+    }
+    const fn xp(mut self, dataref: &'static str, faktor: f64) -> Self {
+        self.xplane = Some(XpQuelle { dataref, faktor });
+        self
+    }
+
+    fn zahl_wert(&self, k: &Kontext) -> Option<f64> {
+        self.zahl
+            .and_then(|f| f(k))
+            .or_else(|| k.z(self.id))
+            .filter(|v| v.is_finite())
+            .filter(|v| self.pruef.is_none_or(|p| p(k, *v)))
+    }
+}
+
+fn f(v: f32) -> Option<f64> {
+    Some(v as f64)
+}
+fn of(v: Option<f32>) -> Option<f64> {
+    v.map(|x| x as f64)
+}
+fn b(v: bool) -> Option<f64> {
+    Some(if v { 1.0 } else { 0.0 })
+}
+fn ob(v: Option<bool>) -> Option<f64> {
+    v.map(|x| if x { 1.0 } else { 0.0 })
+}
+
+fn ist_msfs(k: &Kontext) -> bool {
+    matches!(k.s.simulator, Simulator::Msfs2020 | Simulator::Msfs2024)
+}
+fn ist_xplane(k: &Kontext) -> bool {
+    matches!(k.s.simulator, Simulator::XPlane11 | Simulator::XPlane12)
+}
+
+/// Querlage fuer die Anzeige, positiv = rechts haengend (X-Plane-Konvention).
+///
+/// Pruefbericht 26.09.2026: MSFS `PLANE BANK DEGREES` ist positiv bei
+/// LINKSkurve (40 420 von 40 441 Proben aus 400 Fluegen), X-Plane `phi`
+/// positiv bei Rechtskurve. Umgedreht wird NUR hier im Monitor: der
+/// Snapshot-Wert `bank_deg` fliesst mit Vorzeichen in gespeicherte
+/// Landungen, PIREP-Felder („Landing Roll") und den Live-Server — dort
+/// wuerden Altdaten und neue Fluege sonst gegensaetzlich zaehlen.
+fn bank_anzeige(k: &Kontext) -> Option<f64> {
+    let b = k.s.bank_deg as f64;
+    Some(if ist_msfs(k) { -b } else { b })
+}
+
+/// iniBuilds A380 (MSFS): EGT und Schubhebel kommen NICHT aus den
+/// Standardvariablen, sondern aus iniBuilds-eigenen L:-Variablen.
+///
+/// Gemessen 30.09.2026 mit Thomas am Boden in EDDP (A380-800 RR Basic,
+/// Trent 972), Standard gegen ECAM:
+/// * **EGT**: Standard `GENERAL ENG EXHAUST GAS TEMPERATURE` 29–33 °C im
+///   Leerlauf, 136 °C bei ~70 % N1 — falsch. `L:INI_ENG{n}_EGT` 495 °C
+///   (IDLE) / 676 °C (CL); E/WD bei CL 627–637 °C.
+/// * **Schubhebel**: Standard `GENERAL ENG THROTTLE LEVER POSITION` zeigte
+///   bei CL, FLX und TOGA gleich ~62 % (das ist eher THR, nicht der Hebel).
+///   `L:INI_AUTOTHRUST_TLA:{n}` ist der Hebelwinkel: IDLE 0°, CL 25°
+///   (Airbus-Rasten: FLX/MCT 35°, TOGA 45°) → Anzeige in % von TOGA.
+/// * **N1**: Standard `TURB ENG N1` = `L:INI_ENG{n}_N1` = E/WD (69,7 % gegen
+///   69,6–70,0 % bei CL). Die Sperre vom 26.09. („N1 68,6 % bei MAN TOGA“)
+///   verwechselte die grosse E/WD-Rundanzeige — die ist beim A380 THR,
+///   nicht N1. N1 bleibt deshalb beim Standardwert.
+fn ini_a380(k: &Kontext) -> bool {
+    ist_msfs(k) && k.s.aircraft_profile == AircraftProfile::IniA380
+}
+/// Hebelwinkel TOGA beim Airbus (Grad) — 100 % der Hebelanzeige.
+const AIRBUS_TLA_TOGA_GRAD: f64 = 45.0;
+/// Beim A380 KEINEN Wert zeigen — auch nicht den Standardwert des Kanals.
+///
+/// `zahl_wert` faellt bei `None` auf den Standardwert zurueck; der ist beim
+/// A380 nachweislich falsch (QS-Befund 1, 30.09.2026). `NaN` verhindert den
+/// Rueckfall und wird danach als „kein Wert“ ausgefiltert.
+const KEIN_WERT_OHNE_RUECKFALL: Option<f64> = Some(f64::NAN);
+
+/// EGT beim iniBuilds A380 aus `L:INI_ENG{N}_EGT`, sonst Standard.
+fn egt<const N: usize>(k: &Kontext) -> Option<f64> {
+    if !ini_a380(k) {
+        return None; // → Standardwert des Kanals
+    }
+    // Genau 0 heisst: Variable gibt es nicht (MSFS liest unbekannte L:-Namen
+    // als 0) — gemessen ist nur Triebwerk 1. Lieber „–“ als „0 °C“ oder als
+    // der falsche Standardwert.
+    k.z(["egt_ini_1", "egt_ini_2", "egt_ini_3", "egt_ini_4"][N - 1])
+        .filter(|v| *v != 0.0)
+        .or(KEIN_WERT_OHNE_RUECKFALL)
+}
+/// Schubhebel beim iniBuilds A380 aus `L:INI_AUTOTHRUST_TLA:{N}` (Grad),
+/// als % von TOGA; Umkehrschub ergibt negative Werte. Sonst Standard.
+fn schubhebel<const N: usize>(k: &Kontext) -> Option<f64> {
+    if !ini_a380(k) {
+        return None;
+    }
+    k.z(["tla_ini_1", "tla_ini_2", "tla_ini_3", "tla_ini_4"][N - 1])
+        .map(|grad| grad / AIRBUS_TLA_TOGA_GRAD * 100.0)
+        .or(KEIN_WERT_OHNE_RUECKFALL)
+}
+
+/// Triebwerk `N` (1..4) gibt es laut `triebwerke_anzahl`. Ohne Angabe gilt
+/// jedes als vorhanden — sonst zeigte der Zweistrahler auf MSFS fuer
+/// Triebwerk 3 und 4 eine 0 statt „–".
+fn tw_da<const N: usize>(k: &Kontext, _: f64) -> bool {
+    match k.z("triebwerke_anzahl") {
+        Some(n) if n >= 1.0 => (N as f64) <= n.round(),
+        _ => true,
+    }
+}
+/// Luftdruck auf Meereshoehe: X-Plane 11 kennt `sealevel_pressure_pas`
+/// nicht, RREF liefert dann 0 — kein „0 hPa" zeigen. Gemessene Rekorde
+/// liegen bei 870 und 1084 hPa.
+fn luftdruck_plausibel(_: &Kontext, v: f64) -> bool {
+    (850.0..=1100.0).contains(&v)
+}
+/// Grenzfahrten: 0 oder weniger heisst „hat das Muster nicht".
+fn positiv(_: &Kontext, v: f64) -> bool {
+    v > 0.0
+}
+/// Anstroemwinkel sind unter 40 kt IAS Rauschen (am Stand springt der
+/// Schiebewinkel mit jedem Windhauch um 180°).
+const ANSTROEMUNG_AB_KT: f32 = 40.0;
+fn genug_fahrt(k: &Kontext, _: f64) -> bool {
+    k.s.indicated_airspeed_kt >= ANSTROEMUNG_AB_KT
+}
+/// MSFS `HYDRAULIC PRESSURE:1`: 0 heisst bei Mustern ohne Hydraulik-
+/// Modell „nicht belegt" — kein Wert statt 0 psi.
+fn hydraulik_belegt(k: &Kontext, v: f64) -> bool {
+    ist_msfs(k) && v > 0.0
+}
+
+/// Schluessel im Zusatz-Verzeichnis: Sprit an Bord beim Flugbeginn (kg),
+/// aus den Flugdaten (`initial_fob_kg`). Setzt der Takt in `lib.rs`.
+pub const SPRIT_BASIS: &str = "sprit_basis_kg";
+/// Schluessel: g-Spanne seit dem Abheben, fuehrt der [`Monitor`].
+pub const G_MIN_SEIT_ABHEBEN: &str = "g_min_seit_abheben";
+pub const G_MAX_SEIT_ABHEBEN: &str = "g_max_seit_abheben";
+
+/// Verbrauchter Sprit. Beide Adapter setzen `fuel_used_kg` auf 0 — der
+/// Positionstakt rechnet den Wert nur fuer seine eigene Kopie aus (FOB beim
+/// Flugbeginn minus FOB jetzt). Der Monitor bekam deshalb immer 0. Jetzt:
+/// lebende SimVar, sonst dieselbe Differenz, sonst (kein Flug) kein Wert.
+fn sprit_verbraucht(k: &Kontext) -> Option<f64> {
+    let simvar = k.s.fuel_used_kg as f64;
+    if simvar >= 0.5 {
+        return Some(simvar);
+    }
+    let basis = k.z(SPRIT_BASIS)?;
+    Some((basis - k.s.fuel_total_kg as f64).max(0.0))
+}
+
+/// Sim-Rate: Bei X-Plane zeigt der Monitor den Rohwert des Zusatzabos
+/// `sim/time/sim_speed` (Rueckfall in `zahl_wert`), ohne Abo kein Wert. Der
+/// Snapshot traegt ihn seit 29.09.2026 ebenfalls, setzt aber ohne Wert 1,0 —
+/// das waere hier ein erfundenes „Echtzeit".
+fn sim_rate(k: &Kontext) -> Option<f64> {
+    (!ist_xplane(k)).then_some(k.s.simulation_rate as f64)
+}
+/// Absturz: Bei X-Plane der Rohwert `sim/flightmodel2/misc/has_crashed`
+/// (Zusatzwert). Der Snapshot meldet nur die Flanke 0 → 1 (Unfall im Flug),
+/// der Monitor zeigt den Zustand.
+fn absturz(k: &Kontext) -> Option<f64> {
+    (!ist_xplane(k)).then(|| if k.s.crashed { 1.0 } else { 0.0 })
+}
+/// Ueberdrehzahl und Slew: X-Plane hat keinen passenden DataRef, der
+/// Snapshot haelt dort `false` fest — kein Wert statt ewig „aus".
+fn ueberdrehzahl(k: &Kontext) -> Option<f64> {
+    (!ist_xplane(k)).then(|| if k.s.overspeed_warning { 1.0 } else { 0.0 })
+}
+fn slew(k: &Kontext) -> Option<f64> {
+    (!ist_xplane(k)).then(|| if k.s.slew_mode { 1.0 } else { 0.0 })
+}
+
+/// X-Plane: `airspeed_dial_kts_mach` ist Knoten ODER Mach, je nach
+/// `airspeed_is_mach`.
+fn soll_ist_mach(k: &Kontext) -> bool {
+    k.z("soll_ist_mach").is_some_and(|v| v >= 0.5)
+}
+fn soll_fahrt(k: &Kontext) -> Option<f64> {
+    if let Some(v) = k.s.fcu_selected_speed_kt {
+        return Some(v as f64);
+    }
+    if soll_ist_mach(k) {
+        return None;
+    }
+    k.z("soll_fahrt_xp")
+}
+fn soll_mach(k: &Kontext) -> Option<f64> {
+    if k.s.fcu_selected_speed_kt.is_some() || !soll_ist_mach(k) {
+        return None;
+    }
+    k.z("soll_fahrt_xp")
+}
+
+/// N1 je Triebwerk. X-Plane (seit v1.9.12) fuellt `engine_signals.n1_pct`
+/// aus `ENGN_N1_` nur bei Turbinen (`acf_en_type`) — Kolbenmotoren zeigen wie
+/// bei MSFS kein N1. Die frueheren Zusatzabos `N1_percent[n]` sind deshalb
+/// weg (sie haetten Kolbenmotoren wieder ein N1 gegeben).
+fn n1<const I: usize>(k: &Kontext) -> Option<f64> {
+    if let Some(es) = &k.s.engine_signals {
+        if let Some(v) = es.n1_pct.get(I) {
+            return Some(*v);
+        }
+    }
+    k.s.eng_n1_pct.as_ref().and_then(|v| v.get(I).copied())
+}
+fn ff<const I: usize>(k: &Kontext) -> Option<f64> {
+    k.s.engine_signals
+        .as_ref()
+        .and_then(|es| es.fuel_flow_pph.get(I).copied())
+        .map(|pph| pph / LB_JE_KG)
+}
+fn laeuft<const I: usize>(k: &Kontext) -> Option<f64> {
+    let es = k.s.engine_signals.as_ref()?;
+    let an = es.eng_combustion.get(I).copied().unwrap_or(false)
+        || es.combustion_ex1.get(I).copied().unwrap_or(false)
+        || es.general_combustion.get(I).copied().unwrap_or(false);
+    b(an)
+}
+fn tank_pmdg<const I: usize>(k: &Kontext) -> Option<f64> {
+    k.s.fuel_per_tank_kg
+        .as_ref()
+        .and_then(|v| v.get(I).copied())
+}
+/// Die elf Standardtanks von MSFS (SDK „Aircraft Fuel Variables"), in der
+/// Reihenfolge links → Mitte → rechts → extern: (kg-Kanal, Menge in
+/// Gallonen, Fassungsvermoegen in Gallonen, Index im PMDG-Tankvektor).
+///
+/// Bis 26.09.2026 las der Monitor nur LEFT MAIN, CENTER und RIGHT MAIN —
+/// beim iniBuilds A380 (11 Tanks) standen dort 7 / 4160 / 7 kg, obwohl
+/// 18 480 kg an Bord waren. Das Muster legt seinen Sprit, wohin es will;
+/// sichtbar wird nur, was man auch abfragt.
+const MSFS_TANKS: [(&str, &str, &str, Option<usize>); 11] = [
+    (
+        "tank_links_tip",
+        "tank_links_tip_gal",
+        "tank_links_tip_kap_gal",
+        None,
+    ),
+    (
+        "tank_links_aux",
+        "tank_links_aux_gal",
+        "tank_links_aux_kap_gal",
+        None,
+    ),
+    (
+        "tank_links",
+        "tank_links_gal",
+        "tank_links_kap_gal",
+        Some(0),
+    ),
+    (
+        "tank_mitte",
+        "tank_mitte_gal",
+        "tank_mitte_kap_gal",
+        Some(1),
+    ),
+    (
+        "tank_mitte_2",
+        "tank_mitte_2_gal",
+        "tank_mitte_2_kap_gal",
+        None,
+    ),
+    (
+        "tank_mitte_3",
+        "tank_mitte_3_gal",
+        "tank_mitte_3_kap_gal",
+        None,
+    ),
+    (
+        "tank_rechts",
+        "tank_rechts_gal",
+        "tank_rechts_kap_gal",
+        Some(2),
+    ),
+    (
+        "tank_rechts_aux",
+        "tank_rechts_aux_gal",
+        "tank_rechts_aux_kap_gal",
+        None,
+    ),
+    (
+        "tank_rechts_tip",
+        "tank_rechts_tip_gal",
+        "tank_rechts_tip_kap_gal",
+        None,
+    ),
+    (
+        "tank_extern_1",
+        "tank_extern_1_gal",
+        "tank_extern_1_kap_gal",
+        None,
+    ),
+    (
+        "tank_extern_2",
+        "tank_extern_2_gal",
+        "tank_extern_2_kap_gal",
+        None,
+    ),
+];
+
+fn gal_zu_kg(k: &Kontext, gal: f64) -> Option<f64> {
+    let lb_je_gal = k.z("sprit_lb_je_gal")?;
+    Some(gal * lb_je_gal / LB_JE_KG)
+}
+
+/// MSFS-Tankinhalt in kg (Gallonen × Gewicht je Gallone). Bei PMDG liegen
+/// die Tanks schon in kg vor und gehen vor — dann zaehlen nur die
+/// PMDG-Tanks, die uebrigen Standardtanks bleiben leer (sonst doppelt).
+///
+/// Ein Tank mit Fassungsvermoegen 0 hat das Muster nicht: kein Wert. Ist
+/// das Fassungsvermoegen unbekannt, zaehlt der Tank nur mit Inhalt.
+fn tank_msfs<const I: usize>(k: &Kontext) -> Option<f64> {
+    let (_, gal_id, kap_id, pmdg) = MSFS_TANKS[I];
+    if let Some(v) = k.s.fuel_per_tank_kg.as_ref() {
+        return pmdg.and_then(|i| v.get(i).copied());
+    }
+    if neues_spritsystem(k) {
+        return None;
+    }
+    let gal = k.z(gal_id)?;
+    match k.z(kap_id) {
+        Some(kap) if kap <= 0.0 => return None,
+        None if gal <= 0.0 => return None,
+        _ => {}
+    }
+    gal_zu_kg(k, gal)
+}
+
+/// Fassungsvermoegen eines MSFS-Tanks in kg. Bei PMDG unbekannt (die
+/// Standardtanks muessen dort nicht zu den PMDG-Tanks passen).
+fn tank_msfs_kap<const I: usize>(k: &Kontext) -> Option<f64> {
+    if k.s.fuel_per_tank_kg.is_some() || neues_spritsystem(k) {
+        return None;
+    }
+    let kap = k.z(MSFS_TANKS[I].2)?;
+    if kap > 0.0 {
+        gal_zu_kg(k, kap)
+    } else {
+        None
+    }
+}
+
+/// MSFS 2024, modernes Treibstoffsystem (`[FUEL_SYSTEM]`, SDK „Aircraft
+/// Fuel Variables"): `NEW FUEL SYSTEM` = 1. Die Tanks heissen dort `Tank.N`
+/// (N ab 1) und sind ueber `FUELSYSTEM TANK WEIGHT:N` (Pfund) und
+/// `FUELSYSTEM TANK CAPACITY:N` (Gallonen) lesbar. Die elf Legacy-Tanks
+/// bilden solche Muster nur teilweise ab — ist das neue System aktiv,
+/// zaehlen allein seine Tanks (sonst doppelt).
+pub const FS_TANKS: usize = 12;
+const FS_TANK_LB: [&str; FS_TANKS] = [
+    "fs_tank_1_lb",
+    "fs_tank_2_lb",
+    "fs_tank_3_lb",
+    "fs_tank_4_lb",
+    "fs_tank_5_lb",
+    "fs_tank_6_lb",
+    "fs_tank_7_lb",
+    "fs_tank_8_lb",
+    "fs_tank_9_lb",
+    "fs_tank_10_lb",
+    "fs_tank_11_lb",
+    "fs_tank_12_lb",
+];
+const FS_TANK_KAP_GAL: [&str; FS_TANKS] = [
+    "fs_tank_1_kap_gal",
+    "fs_tank_2_kap_gal",
+    "fs_tank_3_kap_gal",
+    "fs_tank_4_kap_gal",
+    "fs_tank_5_kap_gal",
+    "fs_tank_6_kap_gal",
+    "fs_tank_7_kap_gal",
+    "fs_tank_8_kap_gal",
+    "fs_tank_9_kap_gal",
+    "fs_tank_10_kap_gal",
+    "fs_tank_11_kap_gal",
+    "fs_tank_12_kap_gal",
+];
+fn neues_spritsystem(k: &Kontext) -> bool {
+    k.z("neues_spritsystem").is_some_and(|v| v >= 0.5)
+}
+/// Tank N+1 des neuen Systems in kg. Fassungsvermoegen 0 = Tank gibt es
+/// nicht; ohne bekanntes Fassungsvermoegen zaehlt er nur mit Inhalt.
+fn tank_fs<const I: usize>(k: &Kontext) -> Option<f64> {
+    if k.s.fuel_per_tank_kg.is_some() || !neues_spritsystem(k) {
+        return None;
+    }
+    let lb = k.z(FS_TANK_LB[I])?;
+    match k.z(FS_TANK_KAP_GAL[I]) {
+        Some(kap) if kap <= 0.0 => return None,
+        None if lb <= 0.0 => return None,
+        _ => {}
+    }
+    Some(lb / LB_JE_KG)
+}
+fn tank_fs_kap<const I: usize>(k: &Kontext) -> Option<f64> {
+    if k.s.fuel_per_tank_kg.is_some() || !neues_spritsystem(k) {
+        return None;
+    }
+    let kap = k.z(FS_TANK_KAP_GAL[I])?;
+    if kap > 0.0 {
+        gal_zu_kg(k, kap)
+    } else {
+        None
+    }
+}
+
+/// X-Plane: `m_fuel[i]` (kg) fuer alle 9 Tanks. Ob das Muster den Tank hat,
+/// sagt `acf_tank_rat[i]` (DataRefs.txt: „ratio of 0.0 means tank is not
+/// used"). Ohne Verhaeltnis zaehlt der Tank nur mit Inhalt.
+fn xp_tank<const I: usize>(k: &Kontext) -> Option<f64> {
+    let v = k.z(XP_TANK_ROH[I])?;
+    match k.z(XP_TANK_RAT[I]) {
+        Some(rat) if rat <= 0.0 => None,
+        None if v <= 0.0 => None,
+        _ => Some(v),
+    }
+}
+const XP_TANK_ROH: [&str; 9] = [
+    "xp_tank_1_roh",
+    "xp_tank_2_roh",
+    "xp_tank_3_roh",
+    "xp_tank_4_roh",
+    "xp_tank_5_roh",
+    "xp_tank_6_roh",
+    "xp_tank_7_roh",
+    "xp_tank_8_roh",
+    "xp_tank_9_roh",
+];
+const XP_TANK_RAT: [&str; 9] = [
+    "xp_tank_1_rat",
+    "xp_tank_2_rat",
+    "xp_tank_3_rat",
+    "xp_tank_4_rat",
+    "xp_tank_5_rat",
+    "xp_tank_6_rat",
+    "xp_tank_7_rat",
+    "xp_tank_8_rat",
+    "xp_tank_9_rat",
+];
+
+/// Alle sichtbaren Tankkanaele — Grundlage der Summe.
+const TANK_FNS: [ZahlFn; 33] = [
+    tank_msfs::<0>,
+    tank_msfs::<1>,
+    tank_msfs::<2>,
+    tank_msfs::<3>,
+    tank_msfs::<4>,
+    tank_msfs::<5>,
+    tank_msfs::<6>,
+    tank_msfs::<7>,
+    tank_msfs::<8>,
+    tank_msfs::<9>,
+    tank_msfs::<10>,
+    tank_pmdg::<3>,
+    xp_tank::<0>,
+    xp_tank::<1>,
+    xp_tank::<2>,
+    xp_tank::<3>,
+    xp_tank::<4>,
+    xp_tank::<5>,
+    xp_tank::<6>,
+    xp_tank::<7>,
+    xp_tank::<8>,
+    tank_fs::<0>,
+    tank_fs::<1>,
+    tank_fs::<2>,
+    tank_fs::<3>,
+    tank_fs::<4>,
+    tank_fs::<5>,
+    tank_fs::<6>,
+    tank_fs::<7>,
+    tank_fs::<8>,
+    tank_fs::<9>,
+    tank_fs::<10>,
+    tank_fs::<11>,
+];
+
+/// Summe aller Tanks, die der Monitor kennt. Weicht sie vom Sprit an Bord
+/// ab, liegt Sprit in Tanks ausserhalb der Standardvariablen.
+fn tank_summe(k: &Kontext) -> Option<f64> {
+    let werte: Vec<f64> = TANK_FNS
+        .iter()
+        .filter_map(|f| f(k))
+        .filter(|v| v.is_finite())
+        .collect();
+    (!werte.is_empty()).then(|| werte.iter().sum())
+}
+
+/// Vorhaltewinkel aus der Koerpergeschwindigkeit (seitlich / laengs).
+fn vorhalt(k: &Kontext) -> Option<f64> {
+    let vx = k.s.velocity_body_x_fps? as f64;
+    let vz = k.s.velocity_body_z_fps? as f64;
+    if vz.abs() < 10.0 {
+        return None;
+    }
+    Some(vx.atan2(vz).to_degrees())
+}
+/// Bahnneigungswinkel aus V/S und Grundgeschwindigkeit.
+fn bahnwinkel(k: &Kontext) -> Option<f64> {
+    let gs = k.s.groundspeed_kt as f64;
+    if gs < 30.0 {
+        return None;
+    }
+    let vs_kt = k.s.vertical_speed_fpm as f64 / 101.268;
+    Some(vs_kt.atan2(gs).to_degrees())
+}
+/// Abweichung von der Standardatmosphaere.
+fn isa_abweichung(k: &Kontext) -> Option<f64> {
+    let oat = k.s.outside_air_temp_c? as f64;
+    let hoehe = k.s.altitude_pressure_ft.unwrap_or(k.s.altitude_msl_ft);
+    let isa = if hoehe < 36_089.0 {
+        15.0 - 1.9812 * hoehe / 1000.0
+    } else {
+        -56.5
+    };
+    Some(oat - isa)
+}
+/// Energiehoehe: Hoehe plus Fahrt als Hoehe (TAS²/2g), in ft.
+fn energiehoehe(k: &Kontext) -> Option<f64> {
+    let tas_fps = k.s.true_airspeed_kt as f64 * 1.687_81;
+    Some(k.s.altitude_msl_ft + tas_fps * tas_fps / (2.0 * FT_S2_JE_G))
+}
+fn ff_summe(k: &Kontext) -> Option<f64> {
+    if let Some(v) = k.s.fuel_flow_kg_per_h {
+        return Some(v as f64);
+    }
+    let summe: f64 = (0..4).filter_map(|i| k.z(XP_FF[i])).sum::<f64>();
+    (summe > 0.0).then_some(summe)
+}
+const XP_FF: [&str; 4] = ["ff_1", "ff_2", "ff_3", "ff_4"];
+
+fn fps_aus_periode(k: &Kontext) -> Option<f64> {
+    let p = k.z("sim_bildperiode")?;
+    (p > 0.0).then(|| 1.0 / p)
+}
+
+/// Der Kanalkatalog. Reihenfolge = Reihenfolge in der Werteliste.
+///
+/// ⚠ Nur anhaengen oder IDs neu vergeben, wenn auch die Texte in allen drei
+/// Sprachen (`telemetrie.kanal.<id>`) mitgezogen werden — der
+/// Vollstaendigkeitstest der Oberflaeche prueft das.
+pub static KATALOG: &[Kanal] = &[
+    // ---- Flugzustand ----
+    k("hoehe_msl", Gruppe::Flug, "ft", 0).zahl(|k| Some(k.s.altitude_msl_ft)),
+    k("hoehe_agl", Gruppe::Flug, "ft", 0).zahl(|k| Some(k.s.altitude_agl_ft)),
+    k("hoehe_angezeigt", Gruppe::Flug, "ft", 0).zahl(|k| k.s.altitude_indicated_ft),
+    k("hoehe_druck", Gruppe::Flug, "ft", 0)
+        .zahl(|k| k.s.altitude_pressure_ft)
+        .xp("sim/flightmodel2/position/pressure_altitude", 1.0),
+    k("radarhoehe", Gruppe::Flug, "ft", 0)
+        .q(Quelle::Zusatz)
+        .msfs("RADIO HEIGHT", "feet", 1.0)
+        .xp(
+            "sim/cockpit2/gauges/indicators/radio_altimeter_height_ft_pilot",
+            1.0,
+        ),
+    k("ias", Gruppe::Flug, "kt", 0).zahl(|k| f(k.s.indicated_airspeed_kt)),
+    k("tas", Gruppe::Flug, "kt", 0).zahl(|k| f(k.s.true_airspeed_kt)),
+    k("gs", Gruppe::Flug, "kt", 0).zahl(|k| f(k.s.groundspeed_kt)),
+    k("mach", Gruppe::Flug, "", 3).zahl(|k| of(k.s.mach)),
+    k("vs", Gruppe::Flug, "fpm", 0).zahl(|k| f(k.s.vertical_speed_fpm)),
+    k("vs_roh", Gruppe::Flug, "fpm", 0).zahl(|k| of(k.s.vertical_speed_raw_fpm)),
+    k("pitch", Gruppe::Flug, "°", 1).zahl(|k| f(k.s.pitch_deg)),
+    k("bank", Gruppe::Flug, "°", 1).zahl(bank_anzeige),
+    k("kurs_mw", Gruppe::Flug, "°", 0).zahl(|k| f(k.s.heading_deg_magnetic)),
+    k("kurs_rw", Gruppe::Flug, "°", 0).zahl(|k| f(k.s.heading_deg_true)),
+    k("vorhaltewinkel", Gruppe::Flug, "°", 1)
+        .q(Quelle::Berechnet)
+        .zahl(vorhalt),
+    k("bahnwinkel", Gruppe::Flug, "°", 2)
+        .q(Quelle::Berechnet)
+        .zahl(bahnwinkel),
+    k("energiehoehe", Gruppe::Flug, "ft", 0)
+        .q(Quelle::Berechnet)
+        .zahl(energiehoehe),
+    // ---- Aerodynamik ----
+    k("aoa", Gruppe::Aero, "°", 1)
+        .q(Quelle::Zusatz)
+        .msfs("INCIDENCE ALPHA", "degrees", 1.0)
+        .xp("sim/flightmodel/position/alpha", 1.0)
+        .pruef(genug_fahrt),
+    k("schiebewinkel", Gruppe::Aero, "°", 1)
+        .q(Quelle::Zusatz)
+        .msfs("INCIDENCE BETA", "degrees", 1.0)
+        .xp("sim/flightmodel/position/beta", 1.0)
+        .pruef(genug_fahrt),
+    k("aoa_abriss", Gruppe::Aero, "°", 1)
+        .q(Quelle::Zusatz)
+        .msfs("STALL ALPHA", "degrees", 1.0),
+    k("g", Gruppe::Aero, "g", 2).zahl(|k| f(k.s.g_force)),
+    k("g_laengs", Gruppe::Aero, "g", 2)
+        .q(Quelle::Zusatz)
+        .msfs(
+            "ACCELERATION BODY Z",
+            "feet per second squared",
+            1.0 / FT_S2_JE_G,
+        )
+        .xp("sim/flightmodel/forces/g_axil", 1.0),
+    k("g_seitlich", Gruppe::Aero, "g", 2)
+        .q(Quelle::Zusatz)
+        .msfs(
+            "ACCELERATION BODY X",
+            "feet per second squared",
+            1.0 / FT_S2_JE_G,
+        )
+        .xp("sim/flightmodel/forces/g_side", 1.0),
+    k("rate_rollen", Gruppe::Aero, "°/s", 1)
+        .q(Quelle::Zusatz)
+        .msfs("ROTATION VELOCITY BODY Z", "degrees per second", 1.0)
+        .xp("sim/flightmodel/position/P", 1.0),
+    k("rate_nicken", Gruppe::Aero, "°/s", 1)
+        .q(Quelle::Zusatz)
+        .msfs("ROTATION VELOCITY BODY X", "degrees per second", 1.0)
+        .xp("sim/flightmodel/position/Q", 1.0),
+    k("rate_gieren", Gruppe::Aero, "°/s", 1)
+        .q(Quelle::Zusatz)
+        .msfs("ROTATION VELOCITY BODY Y", "degrees per second", 1.0)
+        .xp("sim/flightmodel/position/R", 1.0),
+    k("kugel", Gruppe::Aero, "", 2).q(Quelle::Zusatz).msfs(
+        "TURN COORDINATOR BALL",
+        "position",
+        1.0,
+    ),
+    k("vs0", Gruppe::Aero, "kt", 0)
+        .q(Quelle::Zusatz)
+        .msfs("DESIGN SPEED VS0", "knots", 1.0)
+        .xp("sim/aircraft/view/acf_Vso", 1.0)
+        .pruef(positiv),
+    k("vs1", Gruppe::Aero, "kt", 0)
+        .q(Quelle::Zusatz)
+        .msfs("DESIGN SPEED VS1", "knots", 1.0)
+        .xp("sim/aircraft/view/acf_Vs", 1.0)
+        .pruef(positiv),
+    // MSFS: Grenze der AKTUELLEN Klappenstellung; ohne Klappen meldet das
+    // Muster 0 oder weniger — dann kein Wert.
+    k("vfe", Gruppe::Aero, "kt", 0)
+        .q(Quelle::Zusatz)
+        .msfs("FLAPS CURRENT SPEED LIMITATION", "knots", 1.0)
+        .pruef(positiv),
+    // X-Plane `acf_Vfe`: „max speed with full flaps extended" — eine feste
+    // Zahl, nicht die Grenze der aktuellen Stellung. Eigener Kanal, damit
+    // die Beschriftung stimmt.
+    k("vfe_voll", Gruppe::Aero, "kt", 0)
+        .q(Quelle::Zusatz)
+        .xp("sim/aircraft/view/acf_Vfe", 1.0)
+        .pruef(positiv),
+    k("vmo", Gruppe::Aero, "kt", 0)
+        .q(Quelle::Zusatz)
+        .msfs("AIRSPEED BARBER POLE", "knots", 1.0)
+        .pruef(positiv),
+    // X-Plane `acf_Vne`: never-exceed (Redline), keine VMO.
+    k("vne", Gruppe::Aero, "kt", 0)
+        .q(Quelle::Zusatz)
+        .xp("sim/aircraft/view/acf_Vne", 1.0)
+        .pruef(positiv),
+    // Pruefbericht 26.09.2026: `MAX/MIN G FORCE` fuehrt MSFS seit dem
+    // Laden des Fluges (und setzt sie bei manchen Mustern nie zurueck) —
+    // der Monitor fuehrt die Spanne jetzt selbst aus `g`, seit dem Abheben.
+    k("g_max", Gruppe::Aero, "g", 2)
+        .q(Quelle::Berechnet)
+        .zahl(|k| k.z(G_MAX_SEIT_ABHEBEN)),
+    k("g_min", Gruppe::Aero, "g", 2)
+        .q(Quelle::Berechnet)
+        .zahl(|k| k.z(G_MIN_SEIT_ABHEBEN)),
+    // ---- Wind ----
+    k("wind_richtung", Gruppe::Wind, "°", 0).zahl(|k| of(k.s.wind_direction_deg)),
+    k("wind_staerke", Gruppe::Wind, "kt", 0).zahl(|k| of(k.s.wind_speed_kt)),
+    k("gegenwind", Gruppe::Wind, "kt", 0)
+        .q(Quelle::Berechnet)
+        .zahl(|k| k.s.aircraft_wind_z_kt.map(|z| -(z as f64))),
+    k("seitenwind", Gruppe::Wind, "kt", 0)
+        .q(Quelle::Berechnet)
+        .zahl(|k| of(k.s.aircraft_wind_x_kt)),
+    k("vertikalwind", Gruppe::Wind, "fpm", 0)
+        .q(Quelle::Zusatz)
+        .msfs("AMBIENT WIND Y", "feet per minute", 1.0)
+        .xp("sim/weather/aircraft/wind_now_y_msc", 196.850_4),
+    k("oat", Gruppe::Wind, "°C", 0).zahl(|k| of(k.s.outside_air_temp_c)),
+    k("tat", Gruppe::Wind, "°C", 0)
+        .zahl(|k| of(k.s.total_air_temp_c))
+        .xp("sim/weather/aircraft/temperature_leadingedge_deg_c", 1.0),
+    k("isa_abweichung", Gruppe::Wind, "°C", 0)
+        .q(Quelle::Berechnet)
+        .zahl(isa_abweichung),
+    k("qnh", Gruppe::Wind, "hPa", 0).zahl(|k| of(k.s.qnh_hpa)),
+    k("dichtehoehe", Gruppe::Wind, "ft", 0)
+        .q(Quelle::Zusatz)
+        .msfs("DENSITY ALTITUDE", "feet", 1.0),
+    // ---- Triebwerke ----
+    k("triebwerke_anzahl", Gruppe::Triebwerke, "", 0)
+        .q(Quelle::Zusatz)
+        .msfs("NUMBER OF ENGINES", "number", 1.0)
+        .xp("sim/aircraft/engine/acf_num_engines", 1.0),
+    k("triebwerke_laufen", Gruppe::Triebwerke, "", 0).zahl(|k| Some(k.s.engines_running as f64)),
+    k("n1_1", Gruppe::Triebwerke, "%", 1)
+        .zahl(n1::<0>)
+        .pruef(tw_da::<1>),
+    k("n1_2", Gruppe::Triebwerke, "%", 1)
+        .zahl(n1::<1>)
+        .pruef(tw_da::<2>),
+    k("n1_3", Gruppe::Triebwerke, "%", 1)
+        .zahl(n1::<2>)
+        .pruef(tw_da::<3>),
+    k("n1_4", Gruppe::Triebwerke, "%", 1)
+        .zahl(n1::<3>)
+        .pruef(tw_da::<4>),
+    k("n2_1", Gruppe::Triebwerke, "%", 1)
+        .q(Quelle::Zusatz)
+        .msfs("TURB ENG N2:1", "percent", 1.0)
+        .xp("sim/cockpit2/engine/indicators/N2_percent[0]", 1.0)
+        .pruef(tw_da::<1>),
+    k("n2_2", Gruppe::Triebwerke, "%", 1)
+        .q(Quelle::Zusatz)
+        .msfs("TURB ENG N2:2", "percent", 1.0)
+        .xp("sim/cockpit2/engine/indicators/N2_percent[1]", 1.0)
+        .pruef(tw_da::<2>),
+    k("n2_3", Gruppe::Triebwerke, "%", 1)
+        .q(Quelle::Zusatz)
+        .msfs("TURB ENG N2:3", "percent", 1.0)
+        .xp("sim/cockpit2/engine/indicators/N2_percent[2]", 1.0)
+        .pruef(tw_da::<3>),
+    k("n2_4", Gruppe::Triebwerke, "%", 1)
+        .q(Quelle::Zusatz)
+        .msfs("TURB ENG N2:4", "percent", 1.0)
+        .xp("sim/cockpit2/engine/indicators/N2_percent[3]", 1.0)
+        .pruef(tw_da::<4>),
+    k("egt_1", Gruppe::Triebwerke, "°C", 0)
+        .q(Quelle::Zusatz)
+        .zahl(egt::<1>)
+        .msfs("GENERAL ENG EXHAUST GAS TEMPERATURE:1", "celsius", 1.0)
+        .xp("sim/flightmodel2/engines/EGT_deg_cel[0]", 1.0)
+        .pruef(tw_da::<1>),
+    k("egt_2", Gruppe::Triebwerke, "°C", 0)
+        .q(Quelle::Zusatz)
+        .zahl(egt::<2>)
+        .msfs("GENERAL ENG EXHAUST GAS TEMPERATURE:2", "celsius", 1.0)
+        .xp("sim/flightmodel2/engines/EGT_deg_cel[1]", 1.0)
+        .pruef(tw_da::<2>),
+    k("egt_3", Gruppe::Triebwerke, "°C", 0)
+        .q(Quelle::Zusatz)
+        .zahl(egt::<3>)
+        .msfs("GENERAL ENG EXHAUST GAS TEMPERATURE:3", "celsius", 1.0)
+        .xp("sim/flightmodel2/engines/EGT_deg_cel[2]", 1.0)
+        .pruef(tw_da::<3>),
+    k("egt_4", Gruppe::Triebwerke, "°C", 0)
+        .q(Quelle::Zusatz)
+        .zahl(egt::<4>)
+        .msfs("GENERAL ENG EXHAUST GAS TEMPERATURE:4", "celsius", 1.0)
+        .xp("sim/flightmodel2/engines/EGT_deg_cel[3]", 1.0)
+        .pruef(tw_da::<4>),
+    k("ff_1", Gruppe::Triebwerke, "kg/h", 0)
+        .zahl(ff::<0>)
+        .xp("sim/cockpit2/engine/indicators/fuel_flow_kg_sec[0]", 3600.0)
+        .pruef(tw_da::<1>),
+    k("ff_2", Gruppe::Triebwerke, "kg/h", 0)
+        .zahl(ff::<1>)
+        .xp("sim/cockpit2/engine/indicators/fuel_flow_kg_sec[1]", 3600.0)
+        .pruef(tw_da::<2>),
+    k("ff_3", Gruppe::Triebwerke, "kg/h", 0)
+        .zahl(ff::<2>)
+        .xp("sim/cockpit2/engine/indicators/fuel_flow_kg_sec[2]", 3600.0)
+        .pruef(tw_da::<3>),
+    k("ff_4", Gruppe::Triebwerke, "kg/h", 0)
+        .zahl(ff::<3>)
+        .xp("sim/cockpit2/engine/indicators/fuel_flow_kg_sec[3]", 3600.0)
+        .pruef(tw_da::<4>),
+    k("oeldruck_1", Gruppe::Triebwerke, "psi", 0)
+        .q(Quelle::Zusatz)
+        .msfs("GENERAL ENG OIL PRESSURE:1", "psi", 1.0)
+        .xp("sim/cockpit2/engine/indicators/oil_pressure_psi[0]", 1.0)
+        .pruef(tw_da::<1>),
+    k("oeldruck_2", Gruppe::Triebwerke, "psi", 0)
+        .q(Quelle::Zusatz)
+        .msfs("GENERAL ENG OIL PRESSURE:2", "psi", 1.0)
+        .xp("sim/cockpit2/engine/indicators/oil_pressure_psi[1]", 1.0)
+        .pruef(tw_da::<2>),
+    k("oeldruck_3", Gruppe::Triebwerke, "psi", 0)
+        .q(Quelle::Zusatz)
+        .msfs("GENERAL ENG OIL PRESSURE:3", "psi", 1.0)
+        .xp("sim/cockpit2/engine/indicators/oil_pressure_psi[2]", 1.0)
+        .pruef(tw_da::<3>),
+    k("oeldruck_4", Gruppe::Triebwerke, "psi", 0)
+        .q(Quelle::Zusatz)
+        .msfs("GENERAL ENG OIL PRESSURE:4", "psi", 1.0)
+        .xp("sim/cockpit2/engine/indicators/oil_pressure_psi[3]", 1.0)
+        .pruef(tw_da::<4>),
+    k("oeltemp_1", Gruppe::Triebwerke, "°C", 0)
+        .q(Quelle::Zusatz)
+        .msfs("GENERAL ENG OIL TEMPERATURE:1", "celsius", 1.0)
+        .pruef(tw_da::<1>),
+    k("oeltemp_2", Gruppe::Triebwerke, "°C", 0)
+        .q(Quelle::Zusatz)
+        .msfs("GENERAL ENG OIL TEMPERATURE:2", "celsius", 1.0)
+        .pruef(tw_da::<2>),
+    k("oeltemp_3", Gruppe::Triebwerke, "°C", 0)
+        .q(Quelle::Zusatz)
+        .msfs("GENERAL ENG OIL TEMPERATURE:3", "celsius", 1.0)
+        .pruef(tw_da::<3>),
+    k("oeltemp_4", Gruppe::Triebwerke, "°C", 0)
+        .q(Quelle::Zusatz)
+        .msfs("GENERAL ENG OIL TEMPERATURE:4", "celsius", 1.0)
+        .pruef(tw_da::<4>),
+    k("schubhebel_1", Gruppe::Triebwerke, "%", 0)
+        .q(Quelle::Zusatz)
+        .zahl(schubhebel::<1>)
+        .msfs("GENERAL ENG THROTTLE LEVER POSITION:1", "percent", 1.0)
+        .xp("sim/cockpit2/engine/actuators/throttle_ratio[0]", 100.0)
+        .pruef(tw_da::<1>),
+    k("schubhebel_2", Gruppe::Triebwerke, "%", 0)
+        .q(Quelle::Zusatz)
+        .zahl(schubhebel::<2>)
+        .msfs("GENERAL ENG THROTTLE LEVER POSITION:2", "percent", 1.0)
+        .xp("sim/cockpit2/engine/actuators/throttle_ratio[1]", 100.0)
+        .pruef(tw_da::<2>),
+    k("schubhebel_3", Gruppe::Triebwerke, "%", 0)
+        .q(Quelle::Zusatz)
+        .zahl(schubhebel::<3>)
+        .msfs("GENERAL ENG THROTTLE LEVER POSITION:3", "percent", 1.0)
+        .xp("sim/cockpit2/engine/actuators/throttle_ratio[2]", 100.0)
+        .pruef(tw_da::<3>),
+    k("schubhebel_4", Gruppe::Triebwerke, "%", 0)
+        .q(Quelle::Zusatz)
+        .zahl(schubhebel::<4>)
+        .msfs("GENERAL ENG THROTTLE LEVER POSITION:4", "percent", 1.0)
+        .xp("sim/cockpit2/engine/actuators/throttle_ratio[3]", 100.0)
+        .pruef(tw_da::<4>),
+    // iniBuilds A380: Quellen fuer egt_1 / schubhebel_1 (siehe `ini_a380`).
+    k("egt_ini_1", Gruppe::Triebwerke, "°C", 0)
+        .q(Quelle::Zusatz)
+        .msfs("L:INI_ENG1_EGT", "number", 1.0)
+        .intern(),
+    k("tla_ini_1", Gruppe::Triebwerke, "°", 1)
+        .q(Quelle::Zusatz)
+        .msfs("L:INI_AUTOTHRUST_TLA:1", "number", 1.0)
+        .intern(),
+    // iniBuilds A380: Quellen fuer egt_2 / schubhebel_2 (siehe `ini_a380`).
+    k("egt_ini_2", Gruppe::Triebwerke, "°C", 0)
+        .q(Quelle::Zusatz)
+        .msfs("L:INI_ENG2_EGT", "number", 1.0)
+        .intern(),
+    k("tla_ini_2", Gruppe::Triebwerke, "°", 1)
+        .q(Quelle::Zusatz)
+        .msfs("L:INI_AUTOTHRUST_TLA:2", "number", 1.0)
+        .intern(),
+    // iniBuilds A380: Quellen fuer egt_3 / schubhebel_3 (siehe `ini_a380`).
+    k("egt_ini_3", Gruppe::Triebwerke, "°C", 0)
+        .q(Quelle::Zusatz)
+        .msfs("L:INI_ENG3_EGT", "number", 1.0)
+        .intern(),
+    k("tla_ini_3", Gruppe::Triebwerke, "°", 1)
+        .q(Quelle::Zusatz)
+        .msfs("L:INI_AUTOTHRUST_TLA:3", "number", 1.0)
+        .intern(),
+    // iniBuilds A380: Quellen fuer egt_4 / schubhebel_4 (siehe `ini_a380`).
+    k("egt_ini_4", Gruppe::Triebwerke, "°C", 0)
+        .q(Quelle::Zusatz)
+        .msfs("L:INI_ENG4_EGT", "number", 1.0)
+        .intern(),
+    k("tla_ini_4", Gruppe::Triebwerke, "°", 1)
+        .q(Quelle::Zusatz)
+        .msfs("L:INI_AUTOTHRUST_TLA:4", "number", 1.0)
+        .intern(),
+    k("umkehr_1", Gruppe::Triebwerke, "%", 0)
+        .q(Quelle::Zusatz)
+        .msfs("TURB ENG REVERSE NOZZLE PERCENT:1", "percent", 1.0)
+        .xp(
+            "sim/flightmodel2/engines/thrust_reverser_deploy_ratio[0]",
+            100.0,
+        )
+        .pruef(tw_da::<1>),
+    k("umkehr_2", Gruppe::Triebwerke, "%", 0)
+        .q(Quelle::Zusatz)
+        .msfs("TURB ENG REVERSE NOZZLE PERCENT:2", "percent", 1.0)
+        .xp(
+            "sim/flightmodel2/engines/thrust_reverser_deploy_ratio[1]",
+            100.0,
+        )
+        .pruef(tw_da::<2>),
+    k("umkehr_3", Gruppe::Triebwerke, "%", 0)
+        .q(Quelle::Zusatz)
+        .msfs("TURB ENG REVERSE NOZZLE PERCENT:3", "percent", 1.0)
+        .xp(
+            "sim/flightmodel2/engines/thrust_reverser_deploy_ratio[2]",
+            100.0,
+        )
+        .pruef(tw_da::<3>),
+    k("umkehr_4", Gruppe::Triebwerke, "%", 0)
+        .q(Quelle::Zusatz)
+        .msfs("TURB ENG REVERSE NOZZLE PERCENT:4", "percent", 1.0)
+        .xp(
+            "sim/flightmodel2/engines/thrust_reverser_deploy_ratio[3]",
+            100.0,
+        )
+        .pruef(tw_da::<4>),
+    k("laeuft_1", Gruppe::Triebwerke, "", 0)
+        .schalter()
+        .zahl(laeuft::<0>)
+        .pruef(tw_da::<1>),
+    k("laeuft_2", Gruppe::Triebwerke, "", 0)
+        .schalter()
+        .zahl(laeuft::<1>)
+        .pruef(tw_da::<2>),
+    k("laeuft_3", Gruppe::Triebwerke, "", 0)
+        .schalter()
+        .zahl(laeuft::<2>)
+        .pruef(tw_da::<3>),
+    k("laeuft_4", Gruppe::Triebwerke, "", 0)
+        .schalter()
+        .zahl(laeuft::<3>)
+        .pruef(tw_da::<4>),
+    k("umkehrschub", Gruppe::Triebwerke, "", 0)
+        .q(Quelle::Addon)
+        .schalter()
+        .zahl(|k| ob(k.s.reverser_deployed)),
+    k("apu_drehzahl", Gruppe::Triebwerke, "%", 0).zahl(|k| of(k.s.apu_pct_rpm)),
+    // ---- Sprit und Gewicht ----
+    k("sprit_gesamt", Gruppe::Sprit, "kg", 0).zahl(|k| f(k.s.fuel_total_kg)),
+    k("sprit_verbraucht", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(sprit_verbraucht),
+    k("ff_gesamt", Gruppe::Sprit, "kg/h", 0).zahl(ff_summe),
+    k("tank_summe", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_summe),
+    k("tank_links_tip", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_msfs::<0>),
+    k("tank_links_aux", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_msfs::<1>),
+    k("tank_links", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_msfs::<2>),
+    k("tank_mitte", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_msfs::<3>),
+    k("tank_mitte_2", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_msfs::<4>),
+    k("tank_mitte_3", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_msfs::<5>),
+    k("tank_rechts", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_msfs::<6>),
+    k("tank_rechts_aux", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_msfs::<7>),
+    k("tank_rechts_tip", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_msfs::<8>),
+    k("tank_extern_1", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_msfs::<9>),
+    k("tank_extern_2", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_msfs::<10>),
+    k("tank_4", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Addon)
+        .zahl(tank_pmdg::<3>),
+    k("tank_links_tip_kap", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_msfs_kap::<0>),
+    k("tank_links_aux_kap", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_msfs_kap::<1>),
+    k("tank_links_kap", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_msfs_kap::<2>),
+    k("tank_mitte_kap", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_msfs_kap::<3>),
+    k("tank_mitte_2_kap", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_msfs_kap::<4>),
+    k("tank_mitte_3_kap", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_msfs_kap::<5>),
+    k("tank_rechts_kap", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_msfs_kap::<6>),
+    k("tank_rechts_aux_kap", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_msfs_kap::<7>),
+    k("tank_rechts_tip_kap", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_msfs_kap::<8>),
+    k("tank_extern_1_kap", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_msfs_kap::<9>),
+    k("tank_extern_2_kap", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_msfs_kap::<10>),
+    k("tank_links_tip_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUEL TANK LEFT TIP QUANTITY", "gallons", 1.0),
+    k("tank_links_tip_kap_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUEL TANK LEFT TIP CAPACITY", "gallons", 1.0),
+    k("tank_links_aux_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUEL TANK LEFT AUX QUANTITY", "gallons", 1.0),
+    k("tank_links_aux_kap_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUEL TANK LEFT AUX CAPACITY", "gallons", 1.0),
+    k("tank_links_gal", Gruppe::Sprit, "gal", 0).intern().msfs(
+        "FUEL TANK LEFT MAIN QUANTITY",
+        "gallons",
+        1.0,
+    ),
+    k("tank_links_kap_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUEL TANK LEFT MAIN CAPACITY", "gallons", 1.0),
+    k("tank_mitte_gal", Gruppe::Sprit, "gal", 0).intern().msfs(
+        "FUEL TANK CENTER QUANTITY",
+        "gallons",
+        1.0,
+    ),
+    k("tank_mitte_kap_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUEL TANK CENTER CAPACITY", "gallons", 1.0),
+    k("tank_mitte_2_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUEL TANK CENTER2 QUANTITY", "gallons", 1.0),
+    k("tank_mitte_2_kap_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUEL TANK CENTER2 CAPACITY", "gallons", 1.0),
+    k("tank_mitte_3_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUEL TANK CENTER3 QUANTITY", "gallons", 1.0),
+    k("tank_mitte_3_kap_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUEL TANK CENTER3 CAPACITY", "gallons", 1.0),
+    k("tank_rechts_gal", Gruppe::Sprit, "gal", 0).intern().msfs(
+        "FUEL TANK RIGHT MAIN QUANTITY",
+        "gallons",
+        1.0,
+    ),
+    k("tank_rechts_kap_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUEL TANK RIGHT MAIN CAPACITY", "gallons", 1.0),
+    k("tank_rechts_aux_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUEL TANK RIGHT AUX QUANTITY", "gallons", 1.0),
+    k("tank_rechts_aux_kap_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUEL TANK RIGHT AUX CAPACITY", "gallons", 1.0),
+    k("tank_rechts_tip_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUEL TANK RIGHT TIP QUANTITY", "gallons", 1.0),
+    k("tank_rechts_tip_kap_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUEL TANK RIGHT TIP CAPACITY", "gallons", 1.0),
+    k("tank_extern_1_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUEL TANK EXTERNAL1 QUANTITY", "gallons", 1.0),
+    k("tank_extern_1_kap_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUEL TANK EXTERNAL1 CAPACITY", "gallons", 1.0),
+    k("tank_extern_2_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUEL TANK EXTERNAL2 QUANTITY", "gallons", 1.0),
+    k("tank_extern_2_kap_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUEL TANK EXTERNAL2 CAPACITY", "gallons", 1.0),
+    k("sprit_lb_je_gal", Gruppe::Sprit, "lb", 2).intern().msfs(
+        "FUEL WEIGHT PER GALLON",
+        "pounds",
+        1.0,
+    ),
+    k("xp_tank_1", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Zusatz)
+        .zahl(xp_tank::<0>),
+    k("xp_tank_2", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Zusatz)
+        .zahl(xp_tank::<1>),
+    k("xp_tank_3", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Zusatz)
+        .zahl(xp_tank::<2>),
+    k("xp_tank_4", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Zusatz)
+        .zahl(xp_tank::<3>),
+    k("xp_tank_5", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Zusatz)
+        .zahl(xp_tank::<4>),
+    k("xp_tank_6", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Zusatz)
+        .zahl(xp_tank::<5>),
+    k("xp_tank_7", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Zusatz)
+        .zahl(xp_tank::<6>),
+    k("xp_tank_8", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Zusatz)
+        .zahl(xp_tank::<7>),
+    k("xp_tank_9", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Zusatz)
+        .zahl(xp_tank::<8>),
+    k("xp_tank_1_roh", Gruppe::Sprit, "kg", 0)
+        .intern()
+        .xp("sim/flightmodel/weight/m_fuel[0]", 1.0),
+    k("xp_tank_1_rat", Gruppe::Sprit, "", 3)
+        .intern()
+        .xp("sim/aircraft/overflow/acf_tank_rat[0]", 1.0),
+    k("xp_tank_2_roh", Gruppe::Sprit, "kg", 0)
+        .intern()
+        .xp("sim/flightmodel/weight/m_fuel[1]", 1.0),
+    k("xp_tank_2_rat", Gruppe::Sprit, "", 3)
+        .intern()
+        .xp("sim/aircraft/overflow/acf_tank_rat[1]", 1.0),
+    k("xp_tank_3_roh", Gruppe::Sprit, "kg", 0)
+        .intern()
+        .xp("sim/flightmodel/weight/m_fuel[2]", 1.0),
+    k("xp_tank_3_rat", Gruppe::Sprit, "", 3)
+        .intern()
+        .xp("sim/aircraft/overflow/acf_tank_rat[2]", 1.0),
+    k("xp_tank_4_roh", Gruppe::Sprit, "kg", 0)
+        .intern()
+        .xp("sim/flightmodel/weight/m_fuel[3]", 1.0),
+    k("xp_tank_4_rat", Gruppe::Sprit, "", 3)
+        .intern()
+        .xp("sim/aircraft/overflow/acf_tank_rat[3]", 1.0),
+    k("xp_tank_5_roh", Gruppe::Sprit, "kg", 0)
+        .intern()
+        .xp("sim/flightmodel/weight/m_fuel[4]", 1.0),
+    k("xp_tank_5_rat", Gruppe::Sprit, "", 3)
+        .intern()
+        .xp("sim/aircraft/overflow/acf_tank_rat[4]", 1.0),
+    k("xp_tank_6_roh", Gruppe::Sprit, "kg", 0)
+        .intern()
+        .xp("sim/flightmodel/weight/m_fuel[5]", 1.0),
+    k("xp_tank_6_rat", Gruppe::Sprit, "", 3)
+        .intern()
+        .xp("sim/aircraft/overflow/acf_tank_rat[5]", 1.0),
+    k("xp_tank_7_roh", Gruppe::Sprit, "kg", 0)
+        .intern()
+        .xp("sim/flightmodel/weight/m_fuel[6]", 1.0),
+    k("xp_tank_7_rat", Gruppe::Sprit, "", 3)
+        .intern()
+        .xp("sim/aircraft/overflow/acf_tank_rat[6]", 1.0),
+    k("xp_tank_8_roh", Gruppe::Sprit, "kg", 0)
+        .intern()
+        .xp("sim/flightmodel/weight/m_fuel[7]", 1.0),
+    k("xp_tank_8_rat", Gruppe::Sprit, "", 3)
+        .intern()
+        .xp("sim/aircraft/overflow/acf_tank_rat[7]", 1.0),
+    k("xp_tank_9_roh", Gruppe::Sprit, "kg", 0)
+        .intern()
+        .xp("sim/flightmodel/weight/m_fuel[8]", 1.0),
+    k("xp_tank_9_rat", Gruppe::Sprit, "", 3)
+        .intern()
+        .xp("sim/aircraft/overflow/acf_tank_rat[8]", 1.0),
+    k("neues_spritsystem", Gruppe::Sprit, "", 0)
+        .intern()
+        .msfs("NEW FUEL SYSTEM", "bool", 1.0),
+    k("fs_tank_1", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Zusatz)
+        .zahl(tank_fs::<0>),
+    k("fs_tank_2", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Zusatz)
+        .zahl(tank_fs::<1>),
+    k("fs_tank_3", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Zusatz)
+        .zahl(tank_fs::<2>),
+    k("fs_tank_4", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Zusatz)
+        .zahl(tank_fs::<3>),
+    k("fs_tank_5", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Zusatz)
+        .zahl(tank_fs::<4>),
+    k("fs_tank_6", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Zusatz)
+        .zahl(tank_fs::<5>),
+    k("fs_tank_7", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Zusatz)
+        .zahl(tank_fs::<6>),
+    k("fs_tank_8", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Zusatz)
+        .zahl(tank_fs::<7>),
+    k("fs_tank_9", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Zusatz)
+        .zahl(tank_fs::<8>),
+    k("fs_tank_10", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Zusatz)
+        .zahl(tank_fs::<9>),
+    k("fs_tank_11", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Zusatz)
+        .zahl(tank_fs::<10>),
+    k("fs_tank_12", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Zusatz)
+        .zahl(tank_fs::<11>),
+    k("fs_tank_1_kap", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_fs_kap::<0>),
+    k("fs_tank_2_kap", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_fs_kap::<1>),
+    k("fs_tank_3_kap", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_fs_kap::<2>),
+    k("fs_tank_4_kap", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_fs_kap::<3>),
+    k("fs_tank_5_kap", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_fs_kap::<4>),
+    k("fs_tank_6_kap", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_fs_kap::<5>),
+    k("fs_tank_7_kap", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_fs_kap::<6>),
+    k("fs_tank_8_kap", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_fs_kap::<7>),
+    k("fs_tank_9_kap", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_fs_kap::<8>),
+    k("fs_tank_10_kap", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_fs_kap::<9>),
+    k("fs_tank_11_kap", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_fs_kap::<10>),
+    k("fs_tank_12_kap", Gruppe::Sprit, "kg", 0)
+        .q(Quelle::Berechnet)
+        .zahl(tank_fs_kap::<11>),
+    k("fs_tank_1_lb", Gruppe::Sprit, "lb", 0).intern().msfs(
+        "FUELSYSTEM TANK WEIGHT:1",
+        "pounds",
+        1.0,
+    ),
+    k("fs_tank_1_kap_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUELSYSTEM TANK CAPACITY:1", "gallons", 1.0),
+    k("fs_tank_2_lb", Gruppe::Sprit, "lb", 0).intern().msfs(
+        "FUELSYSTEM TANK WEIGHT:2",
+        "pounds",
+        1.0,
+    ),
+    k("fs_tank_2_kap_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUELSYSTEM TANK CAPACITY:2", "gallons", 1.0),
+    k("fs_tank_3_lb", Gruppe::Sprit, "lb", 0).intern().msfs(
+        "FUELSYSTEM TANK WEIGHT:3",
+        "pounds",
+        1.0,
+    ),
+    k("fs_tank_3_kap_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUELSYSTEM TANK CAPACITY:3", "gallons", 1.0),
+    k("fs_tank_4_lb", Gruppe::Sprit, "lb", 0).intern().msfs(
+        "FUELSYSTEM TANK WEIGHT:4",
+        "pounds",
+        1.0,
+    ),
+    k("fs_tank_4_kap_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUELSYSTEM TANK CAPACITY:4", "gallons", 1.0),
+    k("fs_tank_5_lb", Gruppe::Sprit, "lb", 0).intern().msfs(
+        "FUELSYSTEM TANK WEIGHT:5",
+        "pounds",
+        1.0,
+    ),
+    k("fs_tank_5_kap_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUELSYSTEM TANK CAPACITY:5", "gallons", 1.0),
+    k("fs_tank_6_lb", Gruppe::Sprit, "lb", 0).intern().msfs(
+        "FUELSYSTEM TANK WEIGHT:6",
+        "pounds",
+        1.0,
+    ),
+    k("fs_tank_6_kap_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUELSYSTEM TANK CAPACITY:6", "gallons", 1.0),
+    k("fs_tank_7_lb", Gruppe::Sprit, "lb", 0).intern().msfs(
+        "FUELSYSTEM TANK WEIGHT:7",
+        "pounds",
+        1.0,
+    ),
+    k("fs_tank_7_kap_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUELSYSTEM TANK CAPACITY:7", "gallons", 1.0),
+    k("fs_tank_8_lb", Gruppe::Sprit, "lb", 0).intern().msfs(
+        "FUELSYSTEM TANK WEIGHT:8",
+        "pounds",
+        1.0,
+    ),
+    k("fs_tank_8_kap_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUELSYSTEM TANK CAPACITY:8", "gallons", 1.0),
+    k("fs_tank_9_lb", Gruppe::Sprit, "lb", 0).intern().msfs(
+        "FUELSYSTEM TANK WEIGHT:9",
+        "pounds",
+        1.0,
+    ),
+    k("fs_tank_9_kap_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUELSYSTEM TANK CAPACITY:9", "gallons", 1.0),
+    k("fs_tank_10_lb", Gruppe::Sprit, "lb", 0).intern().msfs(
+        "FUELSYSTEM TANK WEIGHT:10",
+        "pounds",
+        1.0,
+    ),
+    k("fs_tank_10_kap_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUELSYSTEM TANK CAPACITY:10", "gallons", 1.0),
+    k("fs_tank_11_lb", Gruppe::Sprit, "lb", 0).intern().msfs(
+        "FUELSYSTEM TANK WEIGHT:11",
+        "pounds",
+        1.0,
+    ),
+    k("fs_tank_11_kap_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUELSYSTEM TANK CAPACITY:11", "gallons", 1.0),
+    k("fs_tank_12_lb", Gruppe::Sprit, "lb", 0).intern().msfs(
+        "FUELSYSTEM TANK WEIGHT:12",
+        "pounds",
+        1.0,
+    ),
+    k("fs_tank_12_kap_gal", Gruppe::Sprit, "gal", 0)
+        .intern()
+        .msfs("FUELSYSTEM TANK CAPACITY:12", "gallons", 1.0),
+    k("gewicht", Gruppe::Sprit, "kg", 0).zahl(|k| of(k.s.total_weight_kg)),
+    k("zfw", Gruppe::Sprit, "kg", 0).zahl(|k| of(k.s.zfw_kg)),
+    k("zuladung", Gruppe::Sprit, "kg", 0).zahl(|k| of(k.s.payload_kg)),
+    k("schwerpunkt", Gruppe::Sprit, "% MAC", 1)
+        .q(Quelle::Zusatz)
+        .msfs("CG PERCENT", "percent", 1.0)
+        .xp("sim/flightmodel2/misc/cg_offset_z_mac", 1.0),
+    // ---- Fahrwerk und Bremsen ----
+    k("fahrwerk", Gruppe::Fahrwerk, "%", 0).zahl(|k| f(k.s.gear_position * 100.0)),
+    k("fahrwerkshebel", Gruppe::Fahrwerk, "", 0)
+        .q(Quelle::Zusatz)
+        .schalter()
+        .msfs("GEAR HANDLE POSITION", "bool", 1.0)
+        .xp("sim/cockpit2/controls/gear_handle_down", 1.0),
+    k("am_boden", Gruppe::Fahrwerk, "", 0)
+        .schalter()
+        .zahl(|k| b(k.s.on_ground)),
+    k("boden_bug", Gruppe::Fahrwerk, "", 0)
+        .q(Quelle::Zusatz)
+        .schalter()
+        .msfs("GEAR IS ON GROUND:0", "bool", 1.0)
+        .xp("sim/flightmodel2/gear/on_ground[0]", 1.0),
+    k("boden_links", Gruppe::Fahrwerk, "", 0)
+        .q(Quelle::Zusatz)
+        .schalter()
+        .msfs("GEAR IS ON GROUND:1", "bool", 1.0)
+        .xp("sim/flightmodel2/gear/on_ground[1]", 1.0),
+    k("boden_rechts", Gruppe::Fahrwerk, "", 0)
+        .q(Quelle::Zusatz)
+        .schalter()
+        .msfs("GEAR IS ON GROUND:2", "bool", 1.0)
+        .xp("sim/flightmodel2/gear/on_ground[2]", 1.0),
+    k("einfederung_bug", Gruppe::Fahrwerk, "%", 0)
+        .q(Quelle::Zusatz)
+        .msfs("CONTACT POINT COMPRESSION:0", "position", 100.0),
+    k("einfederung_links", Gruppe::Fahrwerk, "%", 0)
+        .q(Quelle::Zusatz)
+        .msfs("CONTACT POINT COMPRESSION:1", "position", 100.0),
+    k("einfederung_rechts", Gruppe::Fahrwerk, "%", 0)
+        .q(Quelle::Zusatz)
+        .msfs("CONTACT POINT COMPRESSION:2", "position", 100.0),
+    k("fahrwerk_kraft", Gruppe::Fahrwerk, "kN", 1)
+        .zahl(|k| k.s.gear_normal_force_n.map(|n| n as f64 / 1000.0)),
+    k("bremse_links", Gruppe::Fahrwerk, "%", 0)
+        .q(Quelle::Zusatz)
+        .msfs("BRAKE LEFT POSITION", "position", 100.0)
+        .xp("sim/cockpit2/controls/left_brake_ratio", 100.0),
+    k("bremse_rechts", Gruppe::Fahrwerk, "%", 0)
+        .q(Quelle::Zusatz)
+        .msfs("BRAKE RIGHT POSITION", "position", 100.0)
+        .xp("sim/cockpit2/controls/right_brake_ratio", 100.0),
+    k("parkbremse", Gruppe::Fahrwerk, "", 0)
+        .schalter()
+        .zahl(|k| b(k.s.parking_brake)),
+    k("autobrake", Gruppe::Fahrwerk, "", 0).text(|k| k.s.autobrake.clone()),
+    k("untergrund", Gruppe::Fahrwerk, "", 0)
+        .q(Quelle::Zusatz)
+        .msfs("SURFACE TYPE", "enum", 1.0),
+    k("auf_bahn", Gruppe::Fahrwerk, "", 0)
+        .q(Quelle::Zusatz)
+        .schalter()
+        .msfs("ON ANY RUNWAY", "bool", 1.0),
+    // ---- Steuerung ----
+    k("klappen", Gruppe::Steuerung, "%", 0).zahl(|k| f(k.s.flaps_position * 100.0)),
+    k("klappen_stufe", Gruppe::Steuerung, "", 0).zahl(|k| k.s.flap_handle_index.map(|v| v as f64)),
+    k("spoiler", Gruppe::Steuerung, "%", 0)
+        .zahl(|k| of(k.s.spoilers_handle_position).map(|v| v * 100.0)),
+    k("spoiler_armed", Gruppe::Steuerung, "", 0)
+        .schalter()
+        .zahl(|k| ob(k.s.spoilers_armed)),
+    k("bodenspoiler", Gruppe::Steuerung, "", 0)
+        .q(Quelle::Addon)
+        .schalter()
+        .zahl(|k| ob(k.s.ground_spoilers_active)),
+    k("hoehenruder", Gruppe::Steuerung, "%", 0)
+        .q(Quelle::Zusatz)
+        .msfs("ELEVATOR POSITION", "position", 100.0)
+        .xp("sim/cockpit2/controls/yoke_pitch_ratio", 100.0),
+    k("querruder", Gruppe::Steuerung, "%", 0)
+        .q(Quelle::Zusatz)
+        .msfs("AILERON POSITION", "position", 100.0)
+        .xp("sim/cockpit2/controls/yoke_roll_ratio", 100.0),
+    k("seitenruder", Gruppe::Steuerung, "%", 0)
+        .q(Quelle::Zusatz)
+        .msfs("RUDDER POSITION", "position", 100.0)
+        .xp("sim/cockpit2/controls/yoke_heading_ratio", 100.0),
+    k("trimmung", Gruppe::Steuerung, "%", 0)
+        .q(Quelle::Zusatz)
+        .msfs("ELEVATOR TRIM PCT", "percent", 1.0)
+        .xp("sim/cockpit2/controls/elevator_trim", 100.0),
+    // ---- Autopilot ----
+    k("ap", Gruppe::Autopilot, "", 0)
+        .schalter()
+        .zahl(|k| ob(k.s.autopilot_master)),
+    k("athr", Gruppe::Autopilot, "", 0)
+        .schalter()
+        .zahl(|k| ob(k.s.autothrottle_on)),
+    k("fma_lateral", Gruppe::Autopilot, "", 0)
+        .q(Quelle::Addon)
+        .text(|k| k.s.fma_lateral_mode.clone()),
+    k("fma_vertikal", Gruppe::Autopilot, "", 0)
+        .q(Quelle::Addon)
+        .text(|k| k.s.fma_vertical_mode.clone()),
+    k("fma_schub", Gruppe::Autopilot, "", 0)
+        .q(Quelle::Addon)
+        .text(|k| k.s.fma_thrust_mode.clone()),
+    k("soll_hoehe", Gruppe::Autopilot, "ft", 0)
+        .zahl(|k| k.s.fcu_selected_altitude_ft.map(|v| v as f64))
+        .msfs("AUTOPILOT ALTITUDE LOCK VAR", "feet", 1.0)
+        .xp("sim/cockpit2/autopilot/altitude_dial_ft", 1.0),
+    k("soll_fahrt", Gruppe::Autopilot, "kt", 0)
+        .zahl(soll_fahrt)
+        .msfs("AUTOPILOT AIRSPEED HOLD VAR", "knots", 1.0),
+    // X-Plane: Knoten oder Mach, je nach `airspeed_is_mach` (DataRefs.txt:
+    // „Airspeed hold value, knots or Mach").
+    k("soll_mach", Gruppe::Autopilot, "", 3).zahl(soll_mach),
+    k("soll_fahrt_xp", Gruppe::Autopilot, "", 3)
+        .intern()
+        .xp("sim/cockpit2/autopilot/airspeed_dial_kts_mach", 1.0),
+    k("soll_ist_mach", Gruppe::Autopilot, "", 0)
+        .intern()
+        .xp("sim/cockpit2/autopilot/airspeed_is_mach", 1.0),
+    k("soll_vs", Gruppe::Autopilot, "fpm", 0)
+        .zahl(|k| k.s.fcu_selected_vs_fpm.map(|v| v as f64))
+        .msfs("AUTOPILOT VERTICAL HOLD VAR", "feet per minute", 1.0)
+        .xp("sim/cockpit2/autopilot/vvi_dial_fpm", 1.0),
+    k("soll_kurs", Gruppe::Autopilot, "°", 0)
+        .zahl(|k| k.s.fcu_selected_heading_deg.map(|v| v as f64))
+        .msfs("AUTOPILOT HEADING LOCK DIR", "degrees", 1.0)
+        .xp("sim/cockpit2/autopilot/heading_dial_deg_mag_pilot", 1.0),
+    k("v1", Gruppe::Autopilot, "kt", 0)
+        .q(Quelle::Addon)
+        .zahl(|k| k.s.v1_kt),
+    k("vr", Gruppe::Autopilot, "kt", 0)
+        .q(Quelle::Addon)
+        .zahl(|k| k.s.vr_kt),
+    k("v2", Gruppe::Autopilot, "kt", 0)
+        .q(Quelle::Addon)
+        .zahl(|k| k.s.v2_kt),
+    k("vapp", Gruppe::Autopilot, "kt", 0)
+        .q(Quelle::Addon)
+        .zahl(|k| k.s.vapp_kt),
+    k("vls", Gruppe::Autopilot, "kt", 0)
+        .q(Quelle::Addon)
+        .zahl(|k| k.s.vls_kt),
+    k("vref", Gruppe::Autopilot, "kt", 0)
+        .q(Quelle::Addon)
+        .zahl(|k| k.s.vref_kt),
+    k("flex", Gruppe::Autopilot, "°C", 0)
+        .q(Quelle::Addon)
+        .zahl(|k| k.s.flex_temp_c),
+    k("schubrast", Gruppe::Autopilot, "", 0)
+        .q(Quelle::Addon)
+        .text(|k| k.s.thrust_gate.clone()),
+    // ---- Anflug und Navigation ----
+    k("loc_ablage", Gruppe::Anflug, "dots", 2)
+        .q(Quelle::Zusatz)
+        .msfs("NAV CDI:1", "number", 2.0 / 127.0)
+        .xp("sim/cockpit2/radios/indicators/nav1_hdef_dots_pilot", 1.0),
+    k("gs_ablage", Gruppe::Anflug, "dots", 2)
+        .q(Quelle::Zusatz)
+        // SDK: NAV GSI „+/- 119" fuer Vollausschlag (NAV CDI: 127).
+        .msfs("NAV GSI:1", "number", 2.0 / 119.0)
+        .xp("sim/cockpit2/radios/indicators/nav1_vdef_dots_pilot", 1.0),
+    k("loc_empfang", Gruppe::Anflug, "", 0)
+        .q(Quelle::Zusatz)
+        .schalter()
+        .msfs("NAV HAS LOCALIZER:1", "bool", 1.0)
+        .xp(
+            "sim/cockpit2/radios/indicators/nav1_display_horizontal",
+            1.0,
+        ),
+    k("gs_empfang", Gruppe::Anflug, "", 0)
+        .q(Quelle::Zusatz)
+        .schalter()
+        .msfs("NAV HAS GLIDE SLOPE:1", "bool", 1.0)
+        .xp("sim/cockpit2/radios/indicators/nav1_display_vertical", 1.0),
+    k("dme", Gruppe::Anflug, "NM", 1)
+        .q(Quelle::Zusatz)
+        .msfs("NAV DME:1", "nautical miles", 1.0)
+        .xp("sim/cockpit2/radios/indicators/nav1_dme_distance_nm", 1.0),
+    k("unter_gs", Gruppe::Anflug, "", 0)
+        .q(Quelle::Addon)
+        .schalter()
+        .zahl(|k| ob(k.s.below_gs_alert)),
+    k("minimum", Gruppe::Anflug, "ft", 0)
+        .q(Quelle::Addon)
+        .zahl(|k| k.s.minimums_baro_ft),
+    // ---- Systeme ----
+    k("kabinenhoehe", Gruppe::Systeme, "ft", 0)
+        .q(Quelle::Zusatz)
+        .msfs("PRESSURIZATION CABIN ALTITUDE", "feet", 1.0)
+        .xp(
+            "sim/cockpit2/pressurization/indicators/cabin_altitude_ft",
+            1.0,
+        ),
+    k("kabine_vs", Gruppe::Systeme, "fpm", 0)
+        .q(Quelle::Zusatz)
+        .msfs("PRESSURIZATION CABIN ALTITUDE RATE", "feet per minute", 1.0)
+        .xp("sim/cockpit2/pressurization/indicators/cabin_vvi_fpm", 1.0),
+    k("differenzdruck", Gruppe::Systeme, "psi", 1)
+        .q(Quelle::Zusatz)
+        .msfs("PRESSURIZATION PRESSURE DIFFERENTIAL", "psi", 1.0)
+        .xp(
+            "sim/cockpit2/pressurization/indicators/pressure_diffential_psi",
+            1.0,
+        ),
+    k("hydraulik", Gruppe::Systeme, "psi", 0)
+        .q(Quelle::Zusatz)
+        .msfs("HYDRAULIC PRESSURE:1", "psi", 1.0)
+        .pruef(hydraulik_belegt),
+    // X-Plane: „units set by Plane-Maker" (DataRefs.txt) — die Einheit legt
+    // das Muster fest, deshalb ohne psi.
+    k("hydraulik_xp_1", Gruppe::Systeme, "", 0)
+        .q(Quelle::Zusatz)
+        .xp(
+            "sim/cockpit2/hydraulics/indicators/hydraulic_pressure_1",
+            1.0,
+        ),
+    k("hydraulik_xp_2", Gruppe::Systeme, "", 0)
+        .q(Quelle::Zusatz)
+        .xp(
+            "sim/cockpit2/hydraulics/indicators/hydraulic_pressure_2",
+            1.0,
+        ),
+    k("hydraulik_xp_3", Gruppe::Systeme, "", 0)
+        .q(Quelle::Zusatz)
+        .xp(
+            "sim/cockpit2/hydraulics/indicators/hydraulic_pressure_3",
+            1.0,
+        ),
+    k("batteriespannung", Gruppe::Systeme, "V", 1)
+        .q(Quelle::Zusatz)
+        .msfs("ELECTRICAL BATTERY VOLTAGE:1", "volts", 1.0)
+        .xp(
+            "sim/cockpit2/electrical/battery_voltage_actual_volts[0]",
+            1.0,
+        ),
+    k("aussenstrom", Gruppe::Systeme, "", 0)
+        .q(Quelle::Zusatz)
+        .schalter()
+        .msfs("EXTERNAL POWER ON:1", "bool", 1.0)
+        .xp("sim/cockpit2/electrical/GPU_generator_on", 1.0),
+    k("batterie", Gruppe::Systeme, "", 0)
+        .schalter()
+        .zahl(|k| ob(k.s.battery_master)),
+    k("avionik", Gruppe::Systeme, "", 0)
+        .schalter()
+        .zahl(|k| ob(k.s.avionics_master)),
+    k("apu", Gruppe::Systeme, "", 0)
+        .schalter()
+        .zahl(|k| ob(k.s.apu_switch)),
+    k("pitotheizung", Gruppe::Systeme, "", 0)
+        .schalter()
+        .zahl(|k| ob(k.s.pitot_heat)),
+    k("enteisung_tw", Gruppe::Systeme, "", 0)
+        .schalter()
+        .zahl(|k| ob(k.s.engine_anti_ice)),
+    k("enteisung_fl", Gruppe::Systeme, "", 0)
+        .schalter()
+        .zahl(|k| ob(k.s.wing_anti_ice)),
+    k("vereisung", Gruppe::Systeme, "%", 0)
+        .q(Quelle::Zusatz)
+        .msfs("STRUCTURAL ICE PCT", "percent", 1.0),
+    // X-Plane: `frm_ice` ist laut X-Plane die LINKE Tragflaeche, nicht die
+    // ganze Zelle — eigener Kanal, damit die Beschriftung stimmt.
+    k("vereisung_fl_links", Gruppe::Systeme, "%", 0)
+        .q(Quelle::Zusatz)
+        .xp("sim/flightmodel/failures/frm_ice", 100.0),
+    k("pitot_vereisung", Gruppe::Systeme, "%", 0)
+        .q(Quelle::Zusatz)
+        .msfs("PITOT ICE PCT", "percent", 1.0)
+        .xp("sim/flightmodel/failures/pitot_ice", 100.0),
+    k("master_caution", Gruppe::Systeme, "", 0)
+        .schalter()
+        .zahl(|k| ob(k.s.master_caution))
+        .xp("sim/cockpit2/annunciators/master_caution", 1.0),
+    k("master_warning", Gruppe::Systeme, "", 0)
+        .schalter()
+        .zahl(|k| ob(k.s.master_warning))
+        .xp("sim/cockpit2/annunciators/master_warning", 1.0),
+    k("ueberziehwarnung", Gruppe::Systeme, "", 0)
+        .schalter()
+        .zahl(|k| b(k.s.stall_warning)),
+    k("ueberdrehzahl", Gruppe::Systeme, "", 0)
+        .schalter()
+        .zahl(ueberdrehzahl),
+    // Wahlschalter 0=OFF 1=AUTO 2=ON — eine Aufzaehlung, kein Schalter
+    // (als Schalter las sich AUTO wie ON).
+    k("anschnallzeichen", Gruppe::Systeme, "", 0).zahl(|k| k.s.seatbelts_sign.map(|v| v as f64)),
+    // ---- Licht ----
+    k("licht_lande", Gruppe::Licht, "", 0)
+        .schalter()
+        .zahl(|k| ob(k.s.light_landing)),
+    k("licht_beacon", Gruppe::Licht, "", 0)
+        .schalter()
+        .zahl(|k| ob(k.s.light_beacon)),
+    k("licht_strobe", Gruppe::Licht, "", 0)
+        .schalter()
+        .zahl(|k| ob(k.s.light_strobe)),
+    // Bordbuch-Audit 26.09.2026: Schalterstellung 0=OFF 1=AUTO 2=ON, wo das
+    // Muster sie liefert — `licht_strobe` zeigt bei manchen nur das Blitzen
+    // (Airbus AUTO blitzt am Boden nicht).
+    k("strobe_schalter", Gruppe::Licht, "", 0).zahl(|k| k.s.strobe_state.map(|v| v as f64)),
+    k("licht_taxi", Gruppe::Licht, "", 0)
+        .schalter()
+        .zahl(|k| ob(k.s.light_taxi)),
+    k("licht_nav", Gruppe::Licht, "", 0)
+        .schalter()
+        .zahl(|k| ob(k.s.light_nav)),
+    k("licht_logo", Gruppe::Licht, "", 0)
+        .schalter()
+        .zahl(|k| ob(k.s.light_logo)),
+    // ---- Funk ----
+    k("squawk", Gruppe::Funk, "", 0)
+        .zahl(|k| k.s.transponder_code.map(|v| v as f64))
+        .xp("sim/cockpit2/radios/actuators/transponder_code", 1.0),
+    k("transponder", Gruppe::Funk, "", 0).text(|k| k.s.xpdr_mode_label.clone()),
+    // Bordbuch-Audit 26.09.2026: woran das Flugzeug erkannt wurde und die
+    // Rohwerte der Schalter, deren Belegung noch gemessen wird.
+    k("flugzeug_pfad", Gruppe::Systeme, "", 0).text(|k| {
+        k.s.cockpit_rohwerte
+            .as_ref()
+            .and_then(|r| r.cfg_pfad.clone())
+    }),
+    k("cockpit_rohwerte", Gruppe::Systeme, "", 0).text(|k| {
+        k.s.cockpit_rohwerte
+            .as_ref()
+            .filter(|r| !r.werte.is_empty())
+            .map(|r| {
+                r.werte
+                    .iter()
+                    .map(|(name, wert)| format!("{name}={wert}"))
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            })
+    }),
+    k("com1", Gruppe::Funk, "MHz", 3).zahl(|k| of(k.s.com1_mhz)),
+    k("com2", Gruppe::Funk, "MHz", 3).zahl(|k| of(k.s.com2_mhz)),
+    k("nav1", Gruppe::Funk, "MHz", 2).zahl(|k| of(k.s.nav1_mhz)),
+    k("nav2", Gruppe::Funk, "MHz", 2).zahl(|k| of(k.s.nav2_mhz)),
+    // ---- Umgebung ----
+    k("sicht", Gruppe::Umgebung, "m", 0)
+        .q(Quelle::Zusatz)
+        .msfs("AMBIENT VISIBILITY", "meters", 1.0)
+        .xp("sim/weather/aircraft/visibility_reported_sm", 1609.344),
+    // `AMBIENT PRECIP RATE` in „millimeters of water" — ein Rohwert des
+    // Simulators, keine Rate je Stunde; ohne Zeit-Einheit beschriftet.
+    k("niederschlag", Gruppe::Umgebung, "mm", 1)
+        .q(Quelle::Zusatz)
+        .msfs("AMBIENT PRECIP RATE", "millimeters of water", 1.0),
+    k("in_wolke", Gruppe::Umgebung, "", 0)
+        .q(Quelle::Zusatz)
+        .schalter()
+        .msfs("AMBIENT IN CLOUD", "bool", 1.0),
+    k("bodenhoehe", Gruppe::Umgebung, "ft", 0)
+        .q(Quelle::Zusatz)
+        .msfs("GROUND ALTITUDE", "feet", 1.0),
+    // X-Plane: tatsaechlicher Luftdruck auf Meereshoehe in Pascal
+    // (DataRefs.txt 12.4.3; `sim/weather/barometer_sealevel_inhg` ist REPLACED).
+    k("qnh_meer", Gruppe::Umgebung, "hPa", 0)
+        .q(Quelle::Zusatz)
+        .msfs("SEA LEVEL PRESSURE", "millibars", 1.0)
+        .xp("sim/weather/region/sealevel_pressure_pas", 0.01)
+        .pruef(luftdruck_plausibel),
+    // ---- Sim ----
+    k("pause", Gruppe::Sim, "", 0)
+        .schalter()
+        .zahl(|k| b(k.s.paused)),
+    k("sim_rate", Gruppe::Sim, "×", 2)
+        .zahl(sim_rate)
+        .xp("sim/time/sim_speed", 1.0),
+    k("slew", Gruppe::Sim, "", 0).schalter().zahl(slew),
+    k("absturz", Gruppe::Sim, "", 0)
+        .schalter()
+        .zahl(absturz)
+        .xp("sim/flightmodel2/misc/has_crashed", 1.0),
+    k("sim_bildperiode", Gruppe::Sim, "s", 3)
+        .intern()
+        .xp("sim/time/framerate_period", 1.0),
+    k("bildrate", Gruppe::Sim, "fps", 0)
+        .q(Quelle::Berechnet)
+        .zahl(fps_aus_periode),
+    k("phase_flugzeug", Gruppe::Sim, "", 0)
+        .q(Quelle::Addon)
+        .text(|k| k.s.flight_phase_aircraft.clone()),
+    k("phase_acars", Gruppe::Sim, "", 0)
+        .q(Quelle::Berechnet)
+        .text(|k| k.s.shadow_phase.clone()),
+    // ---- Flugzeug ----
+    k("flugzeug", Gruppe::Flugzeug, "", 0).text(|k| k.s.aircraft_title.clone()),
+    k("muster", Gruppe::Flugzeug, "", 0).text(|k| k.s.aircraft_icao.clone()),
+    k("kennzeichen", Gruppe::Flugzeug, "", 0).text(|k| k.s.aircraft_registration.clone()),
+    // Kanaele, deren Wert dieses Muster nicht verlaesslich liefert
+    // (leerzeichengetrennte IDs). Die Oberflaeche graut sie aus. Derzeit
+    // keiner: Der iniBuilds A380 hat seit 30.09.2026 eigene Quellen fuer
+    // EGT und Schubhebel, N1 war richtig (siehe `ini_a380`).
+    k("nicht_verlaesslich", Gruppe::Flugzeug, "", 0).text(|_| None),
+];
+
+/// Katalog-Eintrag, wie ihn die Oberflaeche bekommt.
+#[derive(Debug, Clone, Serialize)]
+pub struct KanalDto {
+    pub id: &'static str,
+    pub gruppe: Gruppe,
+    pub einheit: &'static str,
+    pub stellen: u8,
+    pub quelle: Quelle,
+    pub art: Art,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct KatalogDto {
+    /// Zahl- und Schalterkanaele, in der Reihenfolge von `Frame::z`.
+    pub zahlen: Vec<KanalDto>,
+    /// Textkanaele, in der Reihenfolge von `Frame::s`.
+    pub texte: Vec<KanalDto>,
+}
+
+fn dto(k: &Kanal) -> KanalDto {
+    KanalDto {
+        id: k.id,
+        gruppe: k.gruppe,
+        einheit: k.einheit,
+        stellen: k.stellen,
+        quelle: k.quelle,
+        art: k.art,
+    }
+}
+
+fn zahl_kanaele() -> impl Iterator<Item = &'static Kanal> {
+    KATALOG.iter().filter(|k| k.art != Art::Text && !k.intern)
+}
+fn text_kanaele() -> impl Iterator<Item = &'static Kanal> {
+    KATALOG.iter().filter(|k| k.art == Art::Text && !k.intern)
+}
+
+pub fn katalog() -> KatalogDto {
+    KatalogDto {
+        zahlen: zahl_kanaele().map(dto).collect(),
+        texte: text_kanaele().map(dto).collect(),
+    }
+}
+
+/// Ein Messpunkt: Zeit in ms seit Epoche, Zahlen und Texte in
+/// Katalog-Reihenfolge. `None` = dieser Wert fehlt gerade.
+#[derive(Debug, Clone, Serialize)]
+pub struct Frame {
+    pub t: i64,
+    pub z: Vec<Option<f32>>,
+    pub s: Vec<Option<String>>,
+}
+
+fn runden(v: f64, stellen: u8) -> f32 {
+    // Eine Stelle mehr als angezeigt, damit Min/Max/Mittel nicht springen.
+    let m = 10f64.powi(stellen as i32 + 1);
+    ((v * m).round() / m) as f32
+}
+
+pub fn frame(s: &SimSnapshot, zusatz: &HashMap<String, f64>) -> Frame {
+    let k = Kontext { s, z: zusatz };
+    Frame {
+        t: s.timestamp.timestamp_millis(),
+        z: zahl_kanaele()
+            .map(|kanal| kanal.zahl_wert(&k).map(|v| runden(v, kanal.stellen)))
+            .collect(),
+        s: text_kanaele()
+            .map(|kanal| {
+                kanal
+                    .text
+                    .and_then(|f| f(&k))
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+            })
+            .collect(),
+    }
+}
+
+/// Zusatzfelder fuer MSFS: (Kanal-ID, SimVar, Einheit). Nur unter Windows
+/// aufgerufen; der Test `msfs_felder_sind_vollstaendig` haelt sie auch auf
+/// dem Mac lebendig.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub fn msfs_zusatzfelder() -> Vec<(String, String, String)> {
+    KATALOG
+        .iter()
+        .filter_map(|k| {
+            k.msfs.map(|q| {
+                (
+                    k.id.to_string(),
+                    q.simvar.to_string(),
+                    q.einheit.to_string(),
+                )
+            })
+        })
+        .collect()
+}
+
+/// Zusatzfelder fuer X-Plane: (Kanal-ID, DataRef).
+pub fn xplane_zusatzfelder() -> Vec<(String, String)> {
+    KATALOG
+        .iter()
+        .filter_map(|k| k.xplane.map(|q| (k.id.to_string(), q.dataref.to_string())))
+        .collect()
+}
+
+/// Rohwerte der Adapter mit dem Faktor des Kanals verrechnen.
+pub fn zusatz_umrechnen(roh: Vec<(String, f64)>, xplane: bool) -> HashMap<String, f64> {
+    let mut aus = HashMap::with_capacity(roh.len());
+    for (id, wert) in roh {
+        let Some(kanal) = KATALOG.iter().find(|k| k.id == id) else {
+            continue;
+        };
+        let faktor = if xplane {
+            kanal.xplane.map(|q| q.faktor)
+        } else {
+            kanal.msfs.map(|q| q.faktor)
+        };
+        if let Some(fk) = faktor {
+            aus.insert(id, wert * fk);
+        }
+    }
+    aus
+}
+
+/// Zustand des Monitors: Verlauf und ob gerade jemand zuschaut.
+#[derive(Default)]
+pub struct Monitor {
+    inner: Mutex<Inner>,
+}
+
+#[derive(Default)]
+struct Inner {
+    verlauf: VecDeque<Frame>,
+    /// Zuschauer (Fensterkennung) → gueltig bis. Je Fenster, damit das
+    /// Schliessen des Tabs nicht den Strom des eigenen Fensters beendet.
+    zuschauer: HashMap<String, Instant>,
+    letzte_aufnahme: Option<Instant>,
+    g_spanne: GSpanne,
+}
+
+/// g-Spanne seit dem Abheben: beim Uebergang Boden → Luft neu begonnen,
+/// danach bis zum naechsten Abheben weitergefuehrt — das Aufsetzen und der
+/// Ausrollvorgang zaehlen also noch zum Flug. Oeffnet der Monitor erst in
+/// der Luft, beginnt die Spanne dort. Vor dem ersten Abheben: kein Wert.
+#[derive(Default, Debug, Clone, Copy)]
+struct GSpanne {
+    war_am_boden: Option<bool>,
+    spanne: Option<(f64, f64)>,
+}
+
+impl GSpanne {
+    fn neu(&mut self, g: f64, am_boden: bool) -> Option<(f64, f64)> {
+        if !g.is_finite() {
+            return self.spanne;
+        }
+        let abheben = !am_boden && self.war_am_boden != Some(false);
+        let beginnt = abheben && (self.war_am_boden == Some(true) || self.spanne.is_none());
+        if beginnt {
+            self.spanne = Some((g, g));
+        } else if let Some((lo, hi)) = self.spanne {
+            self.spanne = Some((lo.min(g), hi.max(g)));
+        }
+        self.war_am_boden = Some(am_boden);
+        self.spanne
+    }
+}
+
+impl Monitor {
+    pub fn halten(&self, wer: &str, jetzt: Instant) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.zuschauer.insert(wer.to_string(), jetzt + HALTEN_DAUER);
+        }
+    }
+    pub fn beenden(&self, wer: &str) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.zuschauer.remove(wer);
+        }
+    }
+    /// Schaut irgendein Zuschauer mit diesem Praefix zu (alle Tablets)?
+    pub fn aktiv_mit_praefix(&self, praefix: &str, jetzt: Instant) -> bool {
+        self.inner
+            .lock()
+            .map(|g| {
+                g.zuschauer
+                    .iter()
+                    .any(|(k, bis)| k.starts_with(praefix) && *bis > jetzt)
+            })
+            .unwrap_or(false)
+    }
+    /// Schaut dieser Zuschauer (Fenster oder „lan") gerade zu?
+    pub fn aktiv_fuer(&self, wer: &str, jetzt: Instant) -> bool {
+        self.inner
+            .lock()
+            .map(|g| g.zuschauer.get(wer).is_some_and(|bis| *bis > jetzt))
+            .unwrap_or(false)
+    }
+    pub fn aktiv(&self, jetzt: Instant) -> bool {
+        self.inner
+            .lock()
+            .map(|mut g| {
+                g.zuschauer.retain(|_, bis| *bis > jetzt);
+                !g.zuschauer.is_empty()
+            })
+            .unwrap_or(false)
+    }
+    /// Nimmt den Frame in den Verlauf auf, hoechstens mit [`VERLAUF_HZ`].
+    pub fn aufnehmen(&self, frame: &Frame, jetzt: Instant) {
+        let Ok(mut g) = self.inner.lock() else {
+            return;
+        };
+        let abstand = Duration::from_millis(1000 / VERLAUF_HZ as u64);
+        // Kleine Toleranz, damit ein 50-ms-Takt nicht jeden zweiten 100-ms-
+        // Schritt knapp verfehlt.
+        if g.letzte_aufnahme
+            .is_some_and(|t| jetzt.duration_since(t) + Duration::from_millis(10) < abstand)
+        {
+            return;
+        }
+        // Derselbe Messpunkt nicht zweimal: Steht der Simulator (Pause,
+        // eingefrorene Daten), liefert der Adapter denselben Snapshot mit
+        // derselben Zeit — der Verlauf fuellte sich sonst mit Kopien, und die
+        // Oberflaeche bekam beim Nachladen doppelte Zeitstempel (Codex).
+        if g.verlauf.back().is_some_and(|l| l.t >= frame.t) {
+            return;
+        }
+        g.letzte_aufnahme = Some(jetzt);
+        if g.verlauf.len() >= VERLAUF_MAX {
+            g.verlauf.pop_front();
+        }
+        g.verlauf.push_back(frame.clone());
+    }
+    /// Fuehrt die g-Spanne seit dem Abheben mit und traegt sie unter
+    /// [`G_MIN_SEIT_ABHEBEN`] / [`G_MAX_SEIT_ABHEBEN`] ins Zusatz-Verzeichnis.
+    pub fn g_spanne_eintragen(&self, s: &SimSnapshot, zusatz: &mut HashMap<String, f64>) {
+        let Ok(mut g) = self.inner.lock() else {
+            return;
+        };
+        if let Some((lo, hi)) = g.g_spanne.neu(s.g_force as f64, s.on_ground) {
+            zusatz.insert(G_MIN_SEIT_ABHEBEN.to_string(), lo);
+            zusatz.insert(G_MAX_SEIT_ABHEBEN.to_string(), hi);
+        }
+    }
+    pub fn verlauf(&self) -> Vec<Frame> {
+        self.inner
+            .lock()
+            .map(|g| g.verlauf.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+    /// Bei Wechsel des Flugzeugs oder Simulators passt der alte Verlauf
+    /// nicht mehr zu den neuen Werten.
+    pub fn verlauf_leeren(&self) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.verlauf.clear();
+            g.letzte_aufnahme = None;
+            g.g_spanne = GSpanne::default();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sim_core::EngineSignals;
+
+    fn snap() -> SimSnapshot {
+        SimSnapshot {
+            altitude_msl_ft: 1200.0,
+            indicated_airspeed_kt: 137.4,
+            true_airspeed_kt: 140.0,
+            groundspeed_kt: 130.0,
+            vertical_speed_fpm: -700.0,
+            ..SimSnapshot::default()
+        }
+    }
+
+    fn wert(f: &Frame, id: &str) -> Option<f32> {
+        let i = zahl_kanaele().position(|k| k.id == id).expect(id);
+        f.z[i]
+    }
+
+    #[test]
+    fn ids_sind_eindeutig() {
+        let mut ids: Vec<_> = KATALOG.iter().map(|k| k.id).collect();
+        ids.sort();
+        let n = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), n, "doppelte Kanal-ID im Katalog");
+    }
+
+    #[test]
+    fn frame_passt_zum_katalog() {
+        let f = frame(&snap(), &HashMap::new());
+        let kat = katalog();
+        assert_eq!(f.z.len(), kat.zahlen.len());
+        assert_eq!(f.s.len(), kat.texte.len());
+        assert!(kat.zahlen.iter().all(|k| k.art != Art::Text));
+        assert!(kat.texte.iter().all(|k| k.art == Art::Text));
+    }
+
+    #[test]
+    fn interne_kanaele_bleiben_unsichtbar() {
+        let kat = katalog();
+        assert!(!kat.zahlen.iter().any(|k| k.id == "tank_links_gal"));
+        assert!(!kat.zahlen.iter().any(|k| k.id == "sim_bildperiode"));
+    }
+
+    #[test]
+    fn snapshot_werte_kommen_an() {
+        let f = frame(&snap(), &HashMap::new());
+        assert_eq!(wert(&f, "ias"), Some(137.4));
+        assert_eq!(wert(&f, "vs"), Some(-700.0));
+        assert_eq!(wert(&f, "aoa"), None, "ohne Zusatzwert kein AoA");
+    }
+
+    #[test]
+    fn zusatz_mit_faktor() {
+        // X-Plane liefert Schubhebel als Anteil 0..1, angezeigt wird %.
+        let roh = vec![("schubhebel_1".to_string(), 0.42), ("aoa".to_string(), 5.5)];
+        let z = zusatz_umrechnen(roh, true);
+        let f = frame(&snap(), &z);
+        assert_eq!(wert(&f, "schubhebel_1"), Some(42.0));
+        assert_eq!(wert(&f, "aoa"), Some(5.5));
+    }
+
+    #[test]
+    fn msfs_beschleunigung_wird_zu_g() {
+        let roh = vec![("g_laengs".to_string(), -FT_S2_JE_G * 0.25)];
+        let z = zusatz_umrechnen(roh, false);
+        let f = frame(&snap(), &z);
+        assert_eq!(wert(&f, "g_laengs"), Some(-0.25));
+    }
+
+    #[test]
+    fn unbekannte_zusatz_ids_werden_ignoriert() {
+        let z = zusatz_umrechnen(vec![("gibt_es_nicht".into(), 1.0)], false);
+        assert!(z.is_empty());
+    }
+
+    #[test]
+    fn snapshot_geht_vor_zusatz() {
+        // FCU-Sollwert des Addons schlaegt den Standard-AP-Wert.
+        let s = SimSnapshot {
+            fcu_selected_altitude_ft: Some(5000),
+            ..snap()
+        };
+        let z = zusatz_umrechnen(vec![("soll_hoehe".into(), 3000.0)], false);
+        assert_eq!(wert(&frame(&s, &z), "soll_hoehe"), Some(5000.0));
+        assert_eq!(wert(&frame(&snap(), &z), "soll_hoehe"), Some(3000.0));
+    }
+
+    #[test]
+    fn triebwerke_einzeln_aus_den_rohsignalen() {
+        let s = SimSnapshot {
+            engine_signals: Some(EngineSignals {
+                general_combustion: vec![true, false],
+                combustion_ex1: vec![false, false],
+                eng_combustion: vec![true, false],
+                n1_pct: vec![45.5, 21.0],
+                fuel_flow_pph: vec![2204.6226, 0.0],
+            }),
+            ..snap()
+        };
+        let f = frame(&s, &HashMap::new());
+        assert_eq!(wert(&f, "n1_1"), Some(45.5));
+        assert_eq!(wert(&f, "n1_2"), Some(21.0));
+        assert_eq!(wert(&f, "ff_1"), Some(1000.0));
+        assert_eq!(wert(&f, "laeuft_1"), Some(1.0));
+        assert_eq!(wert(&f, "laeuft_2"), Some(0.0));
+        assert_eq!(wert(&f, "n1_3"), None);
+    }
+
+    #[test]
+    fn tank_aus_gallonen() {
+        let z = zusatz_umrechnen(
+            vec![
+                ("tank_links_gal".into(), 1000.0),
+                ("sprit_lb_je_gal".into(), 6.7),
+            ],
+            false,
+        );
+        let f = frame(&snap(), &z);
+        let kg = wert(&f, "tank_links").unwrap();
+        assert!((kg - 3039.0).abs() < 1.0, "{kg}");
+        // PMDG-Tanks in kg gehen vor.
+        let s = SimSnapshot {
+            fuel_per_tank_kg: Some(vec![2000.0, 500.0, 2000.0]),
+            ..snap()
+        };
+        assert_eq!(wert(&frame(&s, &z), "tank_links"), Some(2000.0));
+    }
+
+    /// kg → Gallonen bei 6,7 lb/gal, wie MSFS sie liefern wuerde.
+    fn gal(kg: f64) -> f64 {
+        kg * LB_JE_KG / 6.7
+    }
+
+    #[test]
+    fn a380_alle_elf_tanks_und_summe() {
+        // iniBuilds A380 (MSFS 2024), ECAM FUEL vom 26.09.2026: Feed 1–4 =
+        // 4080/4160/4260/4020 kg, Outer L/R je 980, Inner/Mid/Trim leer.
+        // Die Zuordnung ECAM-Tank → MSFS-Standardtank ist hier gesetzt;
+        // Feed 2 in CENTER passt zu den 4160 kg, die der Monitor zeigte.
+        let belegung: [(&str, f64); 11] = [
+            ("tank_links_tip", 980.0),   // Outer L
+            ("tank_links_aux", 4080.0),  // Feed 1
+            ("tank_links", 0.0),         // Inner L
+            ("tank_mitte", 4160.0),      // Feed 2
+            ("tank_mitte_2", 4260.0),    // Feed 3
+            ("tank_mitte_3", 0.0),       // Trim
+            ("tank_rechts", 0.0),        // Inner R
+            ("tank_rechts_aux", 4020.0), // Feed 4
+            ("tank_rechts_tip", 980.0),  // Outer R
+            ("tank_extern_1", 0.0),      // Mid L
+            ("tank_extern_2", 0.0),      // Mid R
+        ];
+        let mut roh = vec![("sprit_lb_je_gal".to_string(), 6.7)];
+        for (id, kg) in belegung {
+            roh.push((format!("{id}_gal"), gal(kg)));
+            roh.push((format!("{id}_kap_gal"), gal(20_000.0)));
+        }
+        let z = zusatz_umrechnen(roh, false);
+        let s = SimSnapshot {
+            fuel_total_kg: 18_481.0,
+            ..snap()
+        };
+        let f = frame(&s, &z);
+        for (id, kg) in belegung {
+            let v = wert(&f, id).unwrap_or_else(|| panic!("{id} fehlt"));
+            assert!((v as f64 - kg).abs() < 0.5, "{id}: {v} statt {kg}");
+            let kap = wert(&f, &format!("{id}_kap")).unwrap();
+            assert!((kap - 20_000.0).abs() < 0.5, "{id}_kap: {kap}");
+        }
+        let summe = wert(&f, "tank_summe").unwrap();
+        assert!((summe - 18_480.0).abs() < 1.0, "Summe {summe}");
+        // Keine X-Plane-Tanks auf MSFS.
+        assert_eq!(wert(&f, "xp_tank_1"), None);
+    }
+
+    #[test]
+    fn msfs_tank_ohne_fassungsvermoegen_fehlt() {
+        // A320: nur drei Tanks, die uebrigen melden Fassungsvermoegen 0.
+        let z = zusatz_umrechnen(
+            vec![
+                ("sprit_lb_je_gal".into(), 6.7),
+                ("tank_links_gal".into(), gal(3000.0)),
+                ("tank_links_kap_gal".into(), gal(6000.0)),
+                ("tank_links_aux_gal".into(), 0.0),
+                ("tank_links_aux_kap_gal".into(), 0.0),
+                // Leerer Tank, den es gibt, bleibt sichtbar.
+                ("tank_mitte_gal".into(), 0.0),
+                ("tank_mitte_kap_gal".into(), gal(6500.0)),
+                // Ohne bekannte Groesse zaehlt nur ein Tank mit Inhalt.
+                ("tank_extern_1_gal".into(), 0.0),
+            ],
+            false,
+        );
+        let f = frame(&snap(), &z);
+        assert!(wert(&f, "tank_links").is_some());
+        assert_eq!(wert(&f, "tank_links_aux"), None);
+        assert_eq!(wert(&f, "tank_links_aux_kap"), None);
+        assert_eq!(wert(&f, "tank_mitte"), Some(0.0));
+        assert_eq!(wert(&f, "tank_extern_1"), None);
+        let summe = wert(&f, "tank_summe").unwrap();
+        assert!((summe - 3000.0).abs() < 0.5, "{summe}");
+    }
+
+    #[test]
+    fn pmdg_tanks_ersetzen_die_standardtanks() {
+        let z = zusatz_umrechnen(
+            vec![
+                ("sprit_lb_je_gal".into(), 6.7),
+                ("tank_links_aux_gal".into(), gal(500.0)),
+                ("tank_links_kap_gal".into(), gal(4000.0)),
+            ],
+            false,
+        );
+        let s = SimSnapshot {
+            fuel_per_tank_kg: Some(vec![3000.0, 1000.0, 3000.0, 400.0]),
+            ..snap()
+        };
+        let f = frame(&s, &z);
+        assert_eq!(wert(&f, "tank_links"), Some(3000.0));
+        assert_eq!(wert(&f, "tank_4"), Some(400.0));
+        assert_eq!(wert(&f, "tank_links_aux"), None, "nicht doppelt zaehlen");
+        assert_eq!(wert(&f, "tank_links_kap"), None);
+        assert_eq!(wert(&f, "tank_summe"), Some(7400.0));
+    }
+
+    #[test]
+    fn xplane_fuenf_tanks() {
+        // 5 von 9 Tanks benutzt (acf_tank_rat > 0), die uebrigen 0.
+        let inhalt = [2100.0, 2100.0, 5200.0, 800.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let rat = [0.2, 0.2, 0.4, 0.1, 0.1, 0.0, 0.0, 0.0, 0.0];
+        let mut roh = Vec::new();
+        for i in 0..9 {
+            roh.push((format!("xp_tank_{}_roh", i + 1), inhalt[i]));
+            roh.push((format!("xp_tank_{}_rat", i + 1), rat[i]));
+        }
+        let z = zusatz_umrechnen(roh, true);
+        let f = frame(&snap(), &z);
+        let da: Vec<_> = (1..=9)
+            .filter(|n| wert(&f, &format!("xp_tank_{n}")).is_some())
+            .collect();
+        assert_eq!(da, vec![1, 2, 3, 4, 5], "Tank 5 ist leer, aber vorhanden");
+        assert_eq!(wert(&f, "xp_tank_3"), Some(5200.0));
+        assert_eq!(wert(&f, "tank_summe"), Some(10_200.0));
+        assert_eq!(wert(&f, "tank_links"), None);
+    }
+
+    #[test]
+    fn msfs_liest_alle_elf_standardtanks() {
+        let felder = msfs_zusatzfelder();
+        for sv in [
+            "LEFT MAIN",
+            "RIGHT MAIN",
+            "LEFT AUX",
+            "RIGHT AUX",
+            "LEFT TIP",
+            "RIGHT TIP",
+            "CENTER",
+            "CENTER2",
+            "CENTER3",
+            "EXTERNAL1",
+            "EXTERNAL2",
+        ] {
+            for art in ["QUANTITY", "CAPACITY"] {
+                let name = format!("FUEL TANK {sv} {art}");
+                assert!(
+                    felder.iter().any(|(_, s, e)| *s == name && e == "gallons"),
+                    "{name} fehlt"
+                );
+            }
+        }
+        let xp = xplane_zusatzfelder();
+        assert!(xp
+            .iter()
+            .any(|(_, d)| d == "sim/flightmodel/weight/m_fuel[8]"));
+        assert!(xp
+            .iter()
+            .any(|(_, d)| d == "sim/aircraft/overflow/acf_tank_rat[8]"));
+    }
+
+    #[test]
+    fn gegenwind_ist_negativer_rueckenwind() {
+        let s = SimSnapshot {
+            aircraft_wind_z_kt: Some(-12.0),
+            aircraft_wind_x_kt: Some(4.0),
+            ..snap()
+        };
+        let f = frame(&s, &HashMap::new());
+        assert_eq!(wert(&f, "gegenwind"), Some(12.0));
+        assert_eq!(wert(&f, "seitenwind"), Some(4.0));
+    }
+
+    #[test]
+    fn nicht_endliche_werte_fallen_raus() {
+        let s = SimSnapshot {
+            mach: Some(f32::NAN),
+            ..snap()
+        };
+        assert_eq!(wert(&frame(&s, &HashMap::new()), "mach"), None);
+    }
+
+    #[test]
+    fn texte_werden_getrimmt_und_leer_zu_none() {
+        let s = SimSnapshot {
+            fma_lateral_mode: Some(" LOC ".into()),
+            fma_vertical_mode: Some("  ".into()),
+            ..snap()
+        };
+        let f = frame(&s, &HashMap::new());
+        let i = |id| text_kanaele().position(|k| k.id == id).unwrap();
+        assert_eq!(f.s[i("fma_lateral")].as_deref(), Some("LOC"));
+        assert_eq!(f.s[i("fma_vertikal")], None);
+    }
+
+    #[test]
+    fn verlauf_nimmt_hoechstens_zehnmal_je_sekunde_auf() {
+        let m = Monitor::default();
+        let t0 = Instant::now();
+        for i in 0..40u64 {
+            let mut f = frame(&snap(), &HashMap::new());
+            f.t = i as i64 * 50;
+            m.aufnehmen(&f, t0 + Duration::from_millis(i * 50));
+        }
+        // 2 s bei 50-ms-Takt = 40 Ticks → 20 Aufnahmen.
+        assert_eq!(m.verlauf().len(), 20);
+    }
+
+    #[test]
+    fn derselbe_messpunkt_kommt_nur_einmal_in_den_verlauf() {
+        // Stehender Simulator: gleiche Zeit, Takt laeuft weiter.
+        let m = Monitor::default();
+        let f = frame(&snap(), &HashMap::new());
+        let t0 = Instant::now();
+        for i in 0..40u64 {
+            m.aufnehmen(&f, t0 + Duration::from_millis(i * 100));
+        }
+        assert_eq!(m.verlauf().len(), 1);
+    }
+
+    #[test]
+    fn verlauf_ist_begrenzt() {
+        let m = Monitor::default();
+        let t0 = Instant::now();
+        for i in 0..(VERLAUF_MAX as u64 + 50) {
+            let mut f = frame(&snap(), &HashMap::new());
+            f.t = i as i64 * 100;
+            m.aufnehmen(&f, t0 + Duration::from_millis(i * 100));
+        }
+        assert_eq!(m.verlauf().len(), VERLAUF_MAX);
+    }
+
+    #[test]
+    fn halten_laeuft_ab() {
+        let m = Monitor::default();
+        let t0 = Instant::now();
+        assert!(!m.aktiv(t0));
+        m.halten("main", t0);
+        assert!(m.aktiv(t0 + Duration::from_secs(5)));
+        assert!(!m.aktiv(t0 + HALTEN_DAUER + Duration::from_millis(1)));
+        m.halten("main", t0);
+        m.beenden("main");
+        assert!(!m.aktiv(t0));
+    }
+
+    #[test]
+    fn tablets_stoeren_sich_nicht() {
+        let m = Monitor::default();
+        let t0 = Instant::now();
+        let a = lan_zuschauer(Some("ipad-1"));
+        let b = lan_zuschauer(Some("ipad-2"));
+        m.halten(&a, t0);
+        m.halten(&b, t0);
+        m.beenden(&a);
+        assert!(m.aktiv_mit_praefix(LAN_ZUSCHAUER, t0), "ipad-2 schaut noch");
+        m.beenden(&b);
+        assert!(!m.aktiv_mit_praefix(LAN_ZUSCHAUER, t0));
+        // Fenster zaehlen nicht als Tablet.
+        m.halten("main", t0);
+        assert!(!m.aktiv_mit_praefix(LAN_ZUSCHAUER, t0));
+    }
+
+    #[test]
+    fn geraetekennung_wird_bereinigt() {
+        assert_eq!(lan_zuschauer(None), "lan");
+        assert_eq!(lan_zuschauer(Some("")), "lan");
+        assert_eq!(lan_zuschauer(Some("ab-12")), "lan:ab-12");
+        assert_eq!(lan_zuschauer(Some("a/b c\\d")), "lan:abcd");
+        assert_eq!(lan_zuschauer(Some(&"x".repeat(100))).len(), 4 + 40);
+    }
+
+    #[test]
+    fn zuschauer_einzeln_abfragbar() {
+        let m = Monitor::default();
+        let t0 = Instant::now();
+        m.halten(LAN_ZUSCHAUER, t0);
+        assert!(m.aktiv_fuer(LAN_ZUSCHAUER, t0));
+        assert!(!m.aktiv_fuer("main", t0));
+        assert!(!m.aktiv_fuer(LAN_ZUSCHAUER, t0 + HALTEN_DAUER + Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn tab_schliessen_beendet_nicht_das_eigene_fenster() {
+        let m = Monitor::default();
+        let t0 = Instant::now();
+        m.halten("main", t0);
+        m.halten("telemetrie", t0);
+        m.beenden("main");
+        assert!(m.aktiv(t0), "das eigene Fenster schaut noch zu");
+        m.beenden("telemetrie");
+        assert!(!m.aktiv(t0));
+    }
+
+    #[test]
+    fn vorschau_katalog_der_oberflaeche_passt() {
+        // Die Vorschau (`?vorschau=telemetrie`) und die Texttests der
+        // Oberflaeche lesen diese Datei. Laeuft sie dem Katalog davon, fehlen
+        // dort Kanaele — dann die Datei aus dem Katalog neu erzeugen.
+        let datei: serde_json::Value = serde_json::from_str(include_str!(
+            "../../src/components/telemetrie/vorschauKatalog.json"
+        ))
+        .expect("vorschauKatalog.json ist gueltiges JSON");
+        let echt = serde_json::to_value(katalog()).expect("Katalog serialisierbar");
+        assert_eq!(
+            datei, echt,
+            "vorschauKatalog.json passt nicht mehr zum Katalog"
+        );
+    }
+
+    // ---- Pruefbericht 26.09.2026 ----
+
+    fn msfs() -> SimSnapshot {
+        SimSnapshot {
+            simulator: Simulator::Msfs2024,
+            ..snap()
+        }
+    }
+    fn xplane() -> SimSnapshot {
+        SimSnapshot {
+            simulator: Simulator::XPlane12,
+            ..snap()
+        }
+    }
+    fn text(f: &Frame, id: &str) -> Option<String> {
+        let i = text_kanaele().position(|k| k.id == id).expect(id);
+        f.s[i].clone()
+    }
+
+    #[test]
+    fn bank_im_monitor_rechts_positiv_auf_beiden_simulatoren() {
+        // Rechtskurve 25°: MSFS meldet −25 (positiv = links, 40 420/40 441
+        // Proben), X-Plane +25. Der Monitor zeigt beide als +25.
+        let m = SimSnapshot {
+            bank_deg: -25.0,
+            ..msfs()
+        };
+        let x = SimSnapshot {
+            bank_deg: 25.0,
+            ..xplane()
+        };
+        assert_eq!(wert(&frame(&m, &HashMap::new()), "bank"), Some(25.0));
+        assert_eq!(wert(&frame(&x, &HashMap::new()), "bank"), Some(25.0));
+    }
+
+    #[test]
+    fn sprit_verbraucht_aus_der_flugbasis() {
+        // Adapter liefert 0; Flugbeginn 18 481 kg, jetzt 14 230 kg.
+        let s = SimSnapshot {
+            fuel_used_kg: 0.0,
+            fuel_total_kg: 14_230.0,
+            ..msfs()
+        };
+        let mut z = HashMap::new();
+        assert_eq!(wert(&frame(&s, &z), "sprit_verbraucht"), None, "ohne Flug");
+        z.insert(SPRIT_BASIS.to_string(), 18_481.0);
+        assert_eq!(wert(&frame(&s, &z), "sprit_verbraucht"), Some(4251.0));
+        // Lebende SimVar gewinnt.
+        let s2 = SimSnapshot {
+            fuel_used_kg: 4300.0,
+            ..s
+        };
+        assert_eq!(wert(&frame(&s2, &z), "sprit_verbraucht"), Some(4300.0));
+    }
+
+    #[test]
+    fn xplane_sim_rate_und_absturz_aus_den_datarefs() {
+        // Snapshot: fest 1,0 / false. Zusatz: sim_speed 4, has_crashed 1.
+        let z = zusatz_umrechnen(
+            vec![("sim_rate".into(), 4.0), ("absturz".into(), 1.0)],
+            true,
+        );
+        let f = frame(&xplane(), &z);
+        assert_eq!(wert(&f, "sim_rate"), Some(4.0));
+        assert_eq!(wert(&f, "absturz"), Some(1.0));
+        let leer = frame(&xplane(), &HashMap::new());
+        assert_eq!(wert(&leer, "sim_rate"), None, "kein erfundenes 1,0");
+        assert_eq!(wert(&leer, "absturz"), None);
+        assert_eq!(wert(&leer, "ueberdrehzahl"), None);
+        assert_eq!(wert(&leer, "slew"), None);
+        // MSFS behaelt die Snapshot-Werte.
+        let m = SimSnapshot {
+            simulation_rate: 2.0,
+            ..msfs()
+        };
+        let f = frame(&m, &HashMap::new());
+        assert_eq!(wert(&f, "sim_rate"), Some(2.0));
+        assert_eq!(wert(&f, "ueberdrehzahl"), Some(0.0));
+    }
+
+    #[test]
+    fn anschnallzeichen_ist_eine_aufzaehlung() {
+        let k = KATALOG.iter().find(|k| k.id == "anschnallzeichen").unwrap();
+        assert_eq!(k.art, Art::Zahl, "AUTO ist nicht „an\"");
+        let s = SimSnapshot {
+            seatbelts_sign: Some(1),
+            ..msfs()
+        };
+        assert_eq!(
+            wert(&frame(&s, &HashMap::new()), "anschnallzeichen"),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn grenzfahrten_ohne_wert_bei_null() {
+        // MSFS ohne Klappen: FLAPS CURRENT SPEED LIMITATION = 0 bzw. −1.
+        for roh in [0.0, -1.0] {
+            let z = zusatz_umrechnen(vec![("vfe".into(), roh)], false);
+            assert_eq!(wert(&frame(&msfs(), &z), "vfe"), None, "{roh}");
+        }
+        let z = zusatz_umrechnen(vec![("vfe".into(), 230.0)], false);
+        assert_eq!(wert(&frame(&msfs(), &z), "vfe"), Some(230.0));
+        // X-Plane: Vfe (volle Klappen) und Vne in eigenen Kanaelen.
+        let z = zusatz_umrechnen(
+            vec![("vfe_voll".into(), 177.0), ("vne".into(), 340.0)],
+            true,
+        );
+        let f = frame(&xplane(), &z);
+        assert_eq!(wert(&f, "vfe_voll"), Some(177.0));
+        assert_eq!(wert(&f, "vne"), Some(340.0));
+        assert_eq!(wert(&f, "vfe"), None);
+        assert_eq!(wert(&f, "vmo"), None);
+        let xp = xplane_zusatzfelder();
+        assert!(xp.contains(&("vfe_voll".into(), "sim/aircraft/view/acf_Vfe".into())));
+        assert!(xp.contains(&("vne".into(), "sim/aircraft/view/acf_Vne".into())));
+    }
+
+    #[test]
+    fn anstroemwinkel_erst_ab_40_kt() {
+        let z = zusatz_umrechnen(
+            vec![("aoa".into(), 3.2), ("schiebewinkel".into(), -171.0)],
+            false,
+        );
+        let stand = SimSnapshot {
+            indicated_airspeed_kt: 12.0,
+            ..msfs()
+        };
+        let f = frame(&stand, &z);
+        assert_eq!(wert(&f, "aoa"), None);
+        assert_eq!(wert(&f, "schiebewinkel"), None);
+        let flug = SimSnapshot {
+            indicated_airspeed_kt: 140.0,
+            ..msfs()
+        };
+        assert_eq!(wert(&frame(&flug, &z), "aoa"), Some(3.2));
+    }
+
+    #[test]
+    fn g_spanne_seit_dem_abheben() {
+        let m = Monitor::default();
+        let schritt = |g: f32, boden: bool| {
+            let s = SimSnapshot {
+                g_force: g,
+                on_ground: boden,
+                ..msfs()
+            };
+            let mut z = HashMap::new();
+            m.g_spanne_eintragen(&s, &mut z);
+            let f = frame(&s, &z);
+            (wert(&f, "g_min"), wert(&f, "g_max"))
+        };
+        // Rollen mit Stoessen am Boden: noch kein Wert.
+        assert_eq!(schritt(1.35, true), (None, None));
+        // Abheben: beginnt neu, der Rollstoss zaehlt nicht.
+        assert_eq!(schritt(1.12, false), (Some(1.12), Some(1.12)));
+        schritt(0.86, false);
+        schritt(1.18, false);
+        // Aufsetzen mit 1,42 g zaehlt noch zum Flug.
+        assert_eq!(schritt(1.42, true), (Some(0.86), Some(1.42)));
+        // Naechstes Abheben: neue Spanne.
+        assert_eq!(schritt(1.05, false), (Some(1.05), Some(1.05)));
+        // Keine MSFS-SimVar mehr.
+        assert!(!msfs_zusatzfelder()
+            .iter()
+            .any(|(_, sv, _)| sv.contains("G FORCE")));
+    }
+
+    #[test]
+    fn gsi_vollausschlag_bei_119() {
+        let z = zusatz_umrechnen(
+            vec![("gs_ablage".into(), 119.0), ("loc_ablage".into(), 127.0)],
+            false,
+        );
+        let f = frame(&msfs(), &z);
+        assert_eq!(wert(&f, "gs_ablage"), Some(2.0));
+        assert_eq!(wert(&f, "loc_ablage"), Some(2.0));
+    }
+
+    #[test]
+    fn xplane_sollfahrt_knoten_oder_mach() {
+        let knoten = zusatz_umrechnen(
+            vec![
+                ("soll_fahrt_xp".into(), 250.0),
+                ("soll_ist_mach".into(), 0.0),
+            ],
+            true,
+        );
+        let f = frame(&xplane(), &knoten);
+        assert_eq!(wert(&f, "soll_fahrt"), Some(250.0));
+        assert_eq!(wert(&f, "soll_mach"), None);
+        let mach = zusatz_umrechnen(
+            vec![
+                ("soll_fahrt_xp".into(), 0.78),
+                ("soll_ist_mach".into(), 1.0),
+            ],
+            true,
+        );
+        let f = frame(&xplane(), &mach);
+        assert_eq!(wert(&f, "soll_fahrt"), None, "0,78 sind keine Knoten");
+        assert_eq!(wert(&f, "soll_mach"), Some(0.78));
+        // MSFS unveraendert.
+        let z = zusatz_umrechnen(vec![("soll_fahrt".into(), 210.0)], false);
+        assert_eq!(wert(&frame(&msfs(), &z), "soll_fahrt"), Some(210.0));
+    }
+
+    #[test]
+    fn hydraulik_xplane_ohne_psi_msfs_nur_belegt() {
+        let k = KATALOG.iter().find(|k| k.id == "hydraulik").unwrap();
+        assert!(k.xplane.is_none(), "X-Plane-Einheit ist nicht psi");
+        for n in 1..=3 {
+            let id = format!("hydraulik_xp_{n}");
+            let k = KATALOG.iter().find(|k| k.id == id).unwrap();
+            assert_eq!(k.einheit, "");
+            assert_eq!(
+                k.xplane.unwrap().dataref,
+                format!("sim/cockpit2/hydraulics/indicators/hydraulic_pressure_{n}")
+            );
+        }
+        let z = zusatz_umrechnen(vec![("hydraulik".into(), 0.0)], false);
+        assert_eq!(wert(&frame(&msfs(), &z), "hydraulik"), None);
+        let z = zusatz_umrechnen(vec![("hydraulik".into(), 3000.0)], false);
+        assert_eq!(wert(&frame(&msfs(), &z), "hydraulik"), Some(3000.0));
+    }
+
+    #[test]
+    fn zweistrahler_ohne_triebwerk_3_und_4() {
+        // MSFS liefert fuer nicht vorhandene Triebwerke 0.
+        let s = SimSnapshot {
+            engine_signals: Some(EngineSignals {
+                general_combustion: vec![true, true, false, false],
+                combustion_ex1: vec![false; 4],
+                eng_combustion: vec![true, true, false, false],
+                n1_pct: vec![84.1, 84.3, 0.0, 0.0],
+                fuel_flow_pph: vec![5600.0, 5620.0, 0.0, 0.0],
+            }),
+            ..msfs()
+        };
+        let z = zusatz_umrechnen(
+            vec![
+                ("triebwerke_anzahl".into(), 2.0),
+                ("umkehr_3".into(), 0.0),
+                ("egt_3".into(), 0.0),
+            ],
+            false,
+        );
+        let f = frame(&s, &z);
+        assert_eq!(wert(&f, "n1_2"), Some(84.3));
+        for id in [
+            "n1_3", "n1_4", "ff_3", "ff_4", "laeuft_3", "umkehr_3", "egt_3",
+        ] {
+            assert_eq!(wert(&f, id), None, "{id}");
+        }
+        // Ohne Anzahl bleibt es wie bisher.
+        assert_eq!(wert(&frame(&s, &HashMap::new()), "n1_3"), Some(0.0));
+    }
+
+    #[test]
+    fn schubumkehr_fuer_alle_vier_triebwerke() {
+        let felder = msfs_zusatzfelder();
+        let xp = xplane_zusatzfelder();
+        for n in 1..=4 {
+            let sv = format!("TURB ENG REVERSE NOZZLE PERCENT:{n}");
+            assert!(felder
+                .iter()
+                .any(|(id, s, _)| *id == format!("umkehr_{n}") && *s == sv));
+            let dr = format!(
+                "sim/flightmodel2/engines/thrust_reverser_deploy_ratio[{}]",
+                n - 1
+            );
+            assert!(xp
+                .iter()
+                .any(|(id, d)| *id == format!("umkehr_{n}") && *d == dr));
+        }
+    }
+
+    /// iniBuilds A380: EGT und Schubhebel aus den iniBuilds-L:-Variablen, N1
+    /// aus dem Standard — Werte der Messung vom 30.09.2026 (EDDP, CL).
+    #[test]
+    fn inibuilds_a380_egt_und_hebel_aus_ini_variablen_n1_standard() {
+        let s = SimSnapshot {
+            aircraft_profile: AircraftProfile::IniA380,
+            engine_signals: Some(EngineSignals {
+                general_combustion: vec![true; 4],
+                combustion_ex1: vec![true; 4],
+                eng_combustion: vec![true; 4],
+                n1_pct: vec![69.7; 4],
+                fuel_flow_pph: vec![14_330.0; 4],
+            }),
+            ..msfs()
+        };
+        let z = zusatz_umrechnen(
+            vec![
+                ("triebwerke_anzahl".into(), 4.0),
+                // Standard: falsch beim A380
+                ("egt_1".into(), 136.0),
+                ("schubhebel_1".into(), 62.0),
+                // iniBuilds
+                ("egt_ini_1".into(), 629.0),
+                ("egt_ini_4".into(), 637.0),
+                ("egt_ini_3".into(), 0.0),
+                // Standardwerte, die beim A380 NICHT durchkommen duerfen.
+                ("egt_2".into(), 31.0),
+                ("egt_3".into(), 30.0),
+                ("schubhebel_4".into(), 62.0),
+                ("tla_ini_1".into(), 25.0),
+                ("tla_ini_2".into(), 45.0),
+                ("tla_ini_3".into(), 0.0),
+                ("n2_1".into(), 84.8),
+            ],
+            false,
+        );
+        let f = frame(&s, &z);
+        assert_eq!(wert(&f, "n1_1"), Some(69.7), "N1 bleibt Standard");
+        assert_eq!(wert(&f, "n1_4"), Some(69.7));
+        assert_eq!(wert(&f, "egt_1"), Some(629.0), "EGT aus L:INI_ENG1_EGT");
+        assert_eq!(wert(&f, "egt_4"), Some(637.0));
+        assert_eq!(
+            wert(&f, "egt_2"),
+            None,
+            "keine INI-EGT → kein Wert, nicht der falsche Standard"
+        );
+        assert_eq!(wert(&f, "egt_3"), None, "0 = Variable fehlt → kein Wert");
+        // TLA 25° = CL → 56 % von TOGA (45°), TOGA = 100 %, IDLE = 0.
+        let cl = wert(&f, "schubhebel_1").expect("Hebel 1");
+        assert!((cl - 55.6).abs() < 0.1, "{cl}");
+        assert_eq!(wert(&f, "schubhebel_2"), Some(100.0));
+        assert_eq!(wert(&f, "schubhebel_3"), Some(0.0));
+        assert_eq!(
+            wert(&f, "schubhebel_4"),
+            None,
+            "ohne TLA kein Rueckfall auf den Standard"
+        );
+        assert_eq!(wert(&f, "n2_1"), Some(84.8), "N2 bleibt");
+        assert_eq!(
+            text(&f, "nicht_verlaesslich"),
+            None,
+            "nichts mehr ausgegraut"
+        );
+        // Die Quellkanaele erscheinen nicht in der Liste.
+        for id in ["egt_ini_1", "tla_ini_1"] {
+            assert!(
+                KATALOG.iter().any(|k| k.id == id && k.intern),
+                "{id} intern"
+            );
+        }
+        // Anderes Muster: Standardwerte, INI-Variablen werden ignoriert.
+        let andere = SimSnapshot {
+            aircraft_profile: AircraftProfile::default(),
+            ..s
+        };
+        let f = frame(&andere, &z);
+        assert_eq!(wert(&f, "egt_1"), Some(136.0));
+        assert_eq!(wert(&f, "schubhebel_1"), Some(62.0));
+        assert_eq!(wert(&f, "egt_4"), None);
+    }
+
+    #[test]
+    fn neues_spritsystem_ersetzt_die_legacy_tanks() {
+        // MSFS 2024, [FUEL_SYSTEM] mit fuenf Tanks: 2 × 4 500, 9 800,
+        // 2 × 400 kg. Die Legacy-Variablen melden daneben Teilwerte.
+        let belegung = [4500.0, 9800.0, 4500.0, 400.0, 400.0];
+        let mut roh = vec![
+            ("neues_spritsystem".to_string(), 1.0),
+            ("sprit_lb_je_gal".to_string(), 6.7),
+            ("tank_links_gal".to_string(), gal(4500.0)),
+            ("tank_links_kap_gal".to_string(), gal(6000.0)),
+        ];
+        for (i, kg) in belegung.iter().enumerate() {
+            roh.push((format!("fs_tank_{}_lb", i + 1), kg * LB_JE_KG));
+            roh.push((format!("fs_tank_{}_kap_gal", i + 1), gal(12_000.0)));
+        }
+        roh.push(("fs_tank_6_lb".into(), 0.0));
+        roh.push(("fs_tank_6_kap_gal".into(), 0.0));
+        let z = zusatz_umrechnen(roh, false);
+        let f = frame(&msfs(), &z);
+        for (i, kg) in belegung.iter().enumerate() {
+            let v = wert(&f, &format!("fs_tank_{}", i + 1)).unwrap();
+            assert!((v as f64 - kg).abs() < 0.5, "Tank {}: {v}", i + 1);
+            let kap = wert(&f, &format!("fs_tank_{}_kap", i + 1)).unwrap();
+            assert!((kap - 12_000.0).abs() < 0.5);
+        }
+        assert_eq!(wert(&f, "fs_tank_6"), None, "gibt es nicht");
+        assert_eq!(wert(&f, "tank_links"), None, "nicht doppelt");
+        let summe = wert(&f, "tank_summe").unwrap();
+        assert!((summe - 19_600.0).abs() < 1.0, "{summe}");
+        // Legacy-Muster: neue Tanks leer, alte wie bisher.
+        let mut z2 = z.clone();
+        z2.insert("neues_spritsystem".into(), 0.0);
+        let f = frame(&msfs(), &z2);
+        assert_eq!(wert(&f, "fs_tank_1"), None);
+        assert!(wert(&f, "tank_links").is_some());
+        // SimVars mit Index ab 1.
+        let felder = msfs_zusatzfelder();
+        assert!(felder
+            .iter()
+            .any(|(_, s, e)| s == "FUELSYSTEM TANK WEIGHT:1" && e == "pounds"));
+        assert!(felder
+            .iter()
+            .any(|(_, s, e)| s == "NEW FUEL SYSTEM" && e == "bool"));
+    }
+
+    #[test]
+    fn msfs_felder_sind_vollstaendig() {
+        let felder = msfs_zusatzfelder();
+        assert!(felder
+            .iter()
+            .any(|(id, sv, _)| id == "aoa" && sv == "INCIDENCE ALPHA"));
+        // Jede SimVar hat eine Einheit, jede ID gibt es im Katalog.
+        for (id, sv, einheit) in &felder {
+            assert!(!einheit.is_empty(), "{sv} ohne Einheit");
+            assert!(KATALOG.iter().any(|k| k.id == id));
+        }
+    }
+
+    /// Cloud-QS N4/N5: X-Plane-Kolbenmotor zeigt kein N1 (kein Zusatzabo
+    /// mehr), Turbine aus dem Beleg; Meeresdruck 0 (XP11) bleibt leer.
+    #[test]
+    fn xplane_n1_nur_turbine_und_meeresdruck_plausibel() {
+        assert!(!xplane_zusatzfelder()
+            .iter()
+            .any(|(_, d)| d.contains("N1_percent")));
+        let kolben = SimSnapshot {
+            engine_signals: Some(EngineSignals {
+                n1_pct: Vec::new(),
+                fuel_flow_pph: vec![20.0, 0.0, 0.0, 0.0],
+                eng_combustion: vec![true, false, false, false],
+                ..EngineSignals::default()
+            }),
+            ..xplane()
+        };
+        let f = frame(&kolben, &HashMap::new());
+        assert_eq!(wert(&f, "n1_1"), None);
+        assert_eq!(wert(&f, "laeuft_1"), Some(1.0));
+        let turbine = SimSnapshot {
+            engine_signals: Some(EngineSignals {
+                n1_pct: vec![61.5, 0.0, 0.0, 0.0],
+                ..EngineSignals::default()
+            }),
+            ..xplane()
+        };
+        assert_eq!(wert(&frame(&turbine, &HashMap::new()), "n1_1"), Some(61.5));
+        let z = zusatz_umrechnen(vec![("qnh_meer".into(), 0.0)], true);
+        assert_eq!(wert(&frame(&xplane(), &z), "qnh_meer"), None, "XP11: 0 Pa");
+        let z = zusatz_umrechnen(vec![("qnh_meer".into(), 101_720.0)], true);
+        let hpa = wert(&frame(&xplane(), &z), "qnh_meer").expect("hPa");
+        assert!((hpa - 1017.2).abs() < 0.01, "{hpa}");
+    }
+
+    #[test]
+    fn jede_quelle_hat_einen_weg_zum_wert() {
+        // Ein Zusatzkanal ohne Snapshot-Funktion braucht mindestens eine
+        // Simulator-Quelle, sonst bleibt er immer leer.
+        for kanal in KATALOG {
+            let hat = kanal.zahl.is_some()
+                || kanal.text.is_some()
+                || kanal.msfs.is_some()
+                || kanal.xplane.is_some();
+            assert!(hat, "Kanal {} hat keine Quelle", kanal.id);
+        }
+    }
+}

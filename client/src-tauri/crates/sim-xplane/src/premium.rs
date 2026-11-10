@@ -1,0 +1,872 @@
+//! Premium plugin UDP listener.
+//!
+//! When the optional **AeroACARS X-Plane Plugin** (v0.5.3+) is installed
+//! into the X-Plane plugins folder, it streams native flight-loop
+//! telemetry to `127.0.0.1:52000`. Two packet types:
+//!
+//!   * `"telemetry"` — every flight-loop tick (~20 Hz baseline / per-
+//!     frame near the ground). Same fields the RREF stream gives us
+//!     today, but read at flight-loop frequency without the RREF
+//!     subsystem's eviction quirks.
+//!
+//!   * `"touchdown"` — emitted exactly once per landing at the moment
+//!     `fnrml_gear` crosses the touchdown threshold. Carries the peak-
+//!     descent VS captured from a 500 ms lookback ring buffer
+//!     **inside the plugin**, plus pitch-corrected. This is the value
+//!     we want for "landing rate fpm" — frame-perfect, no UDP-
+//!     eviction race, no VSI smoothing artifacts.
+//!
+//! ## Why a separate module / port / format?
+//!
+//! The RREF protocol on UDP 49000 is X-Plane's native subscription
+//! mechanism — every X-Plane install speaks it. We can NEVER drop the
+//! RREF path because pilots without the plugin still need a working
+//! ACARS. So the plugin runs in parallel: same data, frame-perfect
+//! timing, on a different loopback port (52000) using a JSON wire
+//! format the plugin owns.
+//!
+//! ## Why 52000 (not 49001)
+//!
+//! X-Plane uses ports 49000-49003 for its own built-in UDP I/O —
+//! 49000 receives, 49001 is X-Plane's outgoing-data source port.
+//! v0.5.0-v0.5.2 mistakenly bound 49001 too, which collided with
+//! X-Plane and caused the in-sim error "Fehler bei der Initialisierung
+//! des UDP-Netzwerkausgangs (Port 49001). Lokales Netzwerk wird
+//! deaktiviert." 52000 is well outside the conflict range.
+//!
+//! ## Failure modes
+//!
+//! - Plugin not installed → port 52000 stays silent, `is_active()`
+//!   stays `false`, RREF path handles everything. Zero pilot impact.
+//! - Plugin sends malformed JSON → we log at `warn`, drop the packet,
+//!   keep listening. Cannot affect the rest of the adapter.
+//! - Bind failure (port held by another app) → log at `warn`, leave
+//!   the listener thread exited. RREF path keeps working.
+//!
+//! ## Threading
+//!
+//! Same pattern as the RREF listener: dedicated `std::thread`,
+//! `std::net::UdpSocket` with a short read timeout so it can re-check
+//! the shared `stop` flag and exit promptly on adapter shutdown.
+//!
+//! ## Protokoll 2 auf demselben Socket (AP7, ADR-0004)
+//!
+//! Das Plugin ab 1.0 ist zusaetzlich ein Dataref-Server (siehe
+//! `plugin2.rs`). Es antwortet an die Absenderadresse des letzten `HALLO`.
+//! Wir schicken `HALLO` von DIESEM Socket (127.0.0.1:52000) an den
+//! Steuerport 52001 — dann kommen Protokoll 1 (`"v":1`, Aufsetzpaket) und
+//! Protokoll 2 (`"p":2`) auf einem Socket in einem Faden an und werden nach
+//! `p` verteilt. Ein Faden, ein Zustand, keine geteilten Sockets.
+//! Protokoll 1 laeuft unveraendert weiter; ein altes Plugin (v0.5.x)
+//! antwortet auf `HALLO` nie und bleibt beim Aufsetzpaket.
+//!
+//! Folge: Ist 52000 belegt (zweite AeroACARS-Instanz), gibt es auch kein
+//! Protokoll 2 — die zweite Instanz wuerde der ersten sonst das Plugin
+//! wegnehmen (es antwortet nur einem Absender).
+
+use parking_lot::Mutex;
+use std::net::{SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+
+use crate::plugin2::{
+    antwort_lesen, ist_p2, version_reicht, Sitzung, SitzungsInfo, Ziel, PLUGIN2_PORT,
+};
+
+/// Loopback port the plugin sends to. Hardcoded by the plugin source —
+/// `xplane-plugin/src/plugin.cpp::AEROACARS_UDP_PORT`. Changing this
+/// requires a coordinated bump on both sides.
+///
+/// MUST be outside X-Plane's own 49000-49003 range. v0.5.0-v0.5.2
+/// used 49001, which collided with X-Plane's outgoing-data source
+/// port (in-sim error: "Fehler bei der Initialisierung des
+/// UDP-Netzwerkausgangs (Port 49001). Lokales Netzwerk wird
+/// deaktiviert."). 52000 is well clear of the conflict zone.
+pub const PREMIUM_UDP_PORT: u16 = 52000;
+
+/// How long a plugin packet keeps `is_active()` returning `true`.
+/// 3 s comfortably covers a paused-sim hiccup (the plugin stops
+/// emitting while paused) without flicking the badge off.
+const ACTIVE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Groesstes Datagramm, das wir annehmen. Protokoll 1 bleibt unter 2 KiB,
+/// Protokoll 2 unter 8 KiB (ADR); mit 64 KiB wird nie etwas abgeschnitten.
+const RECV_BUF_SIZE: usize = 64 * 1024;
+
+/// Empfangspuffer des Sockets. `LISTE` und die Vermessungswerte kommen in
+/// Schueben von einigen hundert KiB; der Windows-Standard (64 KiB) liefe
+/// dabei ueber.
+const SOCKET_PUFFER: usize = 1024 * 1024;
+
+/// Nach so vielen unbeantworteten `HALLO` bei laufendem Protokoll 1 gilt
+/// das Plugin als veraltet (v0.5.x kennt Protokoll 2 nicht).
+const HALLOS_BIS_VERALTET: u32 = 2;
+
+// =============================================================================
+// Wire types — must match xplane-plugin/src/plugin.cpp JSON format
+// =============================================================================
+//
+// We deliberately do NOT decode the full set of fields — we treat
+// extra fields as opt-in for future expansion. `serde(default)` on
+// every field means a future plugin version can add new fields
+// without breaking older clients.
+
+/// Common envelope for every premium packet. We dispatch on `type`.
+#[derive(Debug, Deserialize)]
+struct Envelope {
+    /// Schema version. Plugin emits `1` today. Any non-1 value gets
+    /// dropped at parse time so future incompatible upgrades don't
+    /// confuse us.
+    #[serde(default, deserialize_with = "null_als_standard")]
+    v: u32,
+    /// `"telemetry"` or `"touchdown"`. Anything else → dropped.
+    #[serde(default, rename = "type", deserialize_with = "null_als_standard")]
+    kind: String,
+    /// Plugin-Version, ab Plugin 1.0.0 in jedem Protokoll-1-Paket. Fehlt bei
+    /// v0.5.x.
+    #[serde(default)]
+    pv: Option<String>,
+}
+
+/// One-shot landing event from the plugin. Captured at the
+/// `fnrml_gear` edge (frame-perfect), with peak descent VS pulled
+/// from the plugin's 500 ms lookback ring buffer.
+///
+/// Field semantics:
+///   * `captured_vs_fpm` — pitch-corrected, lookback-peak. NEGATIVE
+///     for descent (matches AeroACARS convention).
+///   * `captured_g_normal` — vertical-axis g-force at edge.
+///   * `captured_pitch_deg`, `captured_bank_deg` — attitude at edge.
+///   * `captured_ias_kt`, `captured_gs_kt` — speeds at edge.
+///   * `captured_heading_deg` — true heading at edge.
+///   * `lat`, `lon` — touchdown position.
+///   * `ts` — plugin's sim-time-elapsed seconds at edge. Only
+///     useful for diagnostics (gap-detection across the seq
+///     counter is more reliable).
+///
+/// `null` (Plugin ab 1.0 schreibt nicht endliche Zahlen so, statt `NaN`):
+/// das Paket bleibt gueltig. Die Messwerte `captured_vs_fpm` und
+/// `captured_g_normal` werden dann `NaN` = „nicht gemessen" — nie 0, das
+/// waere eine erfundene Traumlandung; der Aufrufer nimmt nur endliche Werte.
+/// Alle anderen Felder: `null` wie fehlend (Standardwert).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PremiumTouchdown {
+    #[serde(default = "nicht_gemessen", deserialize_with = "zahl_oder_nan")]
+    pub captured_vs_fpm: f32,
+    #[serde(default = "nicht_gemessen", deserialize_with = "zahl_oder_nan")]
+    pub captured_g_normal: f32,
+    #[serde(default, deserialize_with = "null_als_standard")]
+    pub captured_pitch_deg: f32,
+    #[serde(default, deserialize_with = "null_als_standard")]
+    pub captured_bank_deg: f32,
+    #[serde(default, deserialize_with = "null_als_standard")]
+    pub captured_ias_kt: f32,
+    #[serde(default, deserialize_with = "null_als_standard")]
+    pub captured_gs_kt: f32,
+    #[serde(default, deserialize_with = "null_als_standard")]
+    pub captured_heading_deg: f32,
+    #[serde(default, deserialize_with = "null_als_standard")]
+    pub lat: f64,
+    #[serde(default, deserialize_with = "null_als_standard")]
+    pub lon: f64,
+    #[serde(default, deserialize_with = "null_als_standard")]
+    pub fnrml_gear_n: f32,
+    #[serde(default, deserialize_with = "null_als_standard")]
+    pub agl_ft: f32,
+    #[serde(default, deserialize_with = "null_als_standard")]
+    pub ts: f64,
+    /// v0.5.11 plugin diagnostic metadata (optional, plugins from
+    /// older versions don't send these). Lets the client log which
+    /// AGL-window tier the plugin used and how many samples it had.
+    #[serde(default, deserialize_with = "null_als_standard")]
+    pub captured_vs_source: String,
+    #[serde(default, deserialize_with = "null_als_standard")]
+    pub captured_vs_window_ms: i64,
+    #[serde(default, deserialize_with = "null_als_standard")]
+    pub captured_vs_samples: u32,
+    /// Wall-clock time we received this packet on the client side.
+    /// Useful for the UI layer ("touchdown captured 0.4 s ago").
+    /// `None` until set by the listener.
+    #[serde(skip)]
+    pub received_at: Option<std::time::SystemTime>,
+}
+
+/// Public premium status surface for the rest of the app.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PremiumStatus {
+    /// Have we ever received a packet? (Sticky — stays true after
+    /// disconnect so UI can show "plugin was here once".)
+    pub ever_seen: bool,
+    /// Are we receiving packets RIGHT NOW (within `ACTIVE_TIMEOUT`)?
+    /// This is the value that drives the "X-PLANE PREMIUM" badge.
+    pub active: bool,
+    /// Total packets received since adapter start. Diagnostic only.
+    pub packet_count: u64,
+    /// 2 = Sitzung im Protokoll 2 (Plugin liefert alle Werte), 1 = nur
+    /// Protokoll-1-Pakete (Aufsetzpaket), 0 = nichts.
+    pub protokoll: u8,
+    /// Version des Plugins laut `hallo`-Antwort.
+    pub plugin_version: Option<String>,
+    /// X-Plane-Version laut Plugin (z. B. 12100).
+    pub xplane_version: Option<u32>,
+    /// Plugin laeuft, spricht aber kein (passendes) Protokoll 2 — es wird
+    /// nur fuer das Aufsetzpaket genutzt. Anzeige „Plugin veraltet".
+    pub veraltet: bool,
+    /// Plugin ab 1.0 laeuft (Protokoll 1 mit `pv`), aber `HALLO` bleibt
+    /// unbeantwortet — z. B. Steuerport 52001 belegt. Kein Update noetig.
+    pub p2_nicht_erreichbar: bool,
+    /// Katalognamen, die das Plugin „da" meldet / „fehlt" meldet (vom
+    /// Adapter ergaenzt; fehlende gehoeren meist zu anderen Flugzeugen).
+    pub namen_da: u32,
+    pub namen_fehlen: u32,
+}
+
+// =============================================================================
+// Internal shared state
+// =============================================================================
+
+#[derive(Default)]
+struct PremiumShared {
+    last_packet_at: Mutex<Option<Instant>>,
+    /// Letztes Protokoll-1-Paket (fuer „Protokoll 1 aktiv" / „veraltet").
+    p1_last_at: Mutex<Option<Instant>>,
+    p1_seen: AtomicBool,
+    /// `pv` aus dem letzten Protokoll-1-Paket.
+    p1_version: Mutex<Option<String>>,
+    /// Stand der Protokoll-2-Sitzung (vom Faden gespiegelt).
+    p2_info: Mutex<SitzungsInfo>,
+    ever_seen: AtomicBool,
+    packet_count: std::sync::atomic::AtomicU64,
+    /// Most recent unconsumed touchdown event, if any. The flight
+    /// step loop calls `take_touchdown()` to drain it (one-shot).
+    pending_touchdown: Mutex<Option<PremiumTouchdown>>,
+    /// Last error that aborted the listener (e.g. bind failure).
+    /// `None` while running healthy. Surfaced via the existing
+    /// `XPlaneAdapter::last_error()` channel? — no, we keep it
+    /// separate to avoid clobbering RREF errors. UI exposes both.
+    last_error: Mutex<Option<String>>,
+    stop: AtomicBool,
+}
+
+/// Embedded inside the X-Plane adapter. Owns its own thread + UDP
+/// socket on `PREMIUM_UDP_PORT`. Idempotent `start` / `stop` like
+/// the RREF listener — adapter calls them in lock-step.
+pub struct PremiumListener {
+    shared: Arc<PremiumShared>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl Default for PremiumListener {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PremiumListener {
+    pub fn new() -> Self {
+        Self {
+            shared: Arc::new(PremiumShared::default()),
+            worker: None,
+        }
+    }
+
+    /// Start the listener. Idempotent — calling again restarts.
+    /// Returns silently on bind failure (most common cause: another
+    /// AeroACARS instance is already bound). The adapter logs the
+    /// reason via `tracing` so the pilot can see it in the dev
+    /// console; UI surfaces it via `last_error()`.
+    pub fn start(&mut self) {
+        self.start_mit(
+            PREMIUM_UDP_PORT,
+            SocketAddr::from(([127, 0, 0, 1], PLUGIN2_PORT)),
+            None,
+        );
+    }
+
+    /// Start mit eigenen Ports (Tests) und optional dem Ziel fuer
+    /// Protokoll 2. Ohne Ziel nur Protokoll 1 wie bisher.
+    pub(crate) fn start_mit(
+        &mut self,
+        p1_port: u16,
+        p2_ziel: SocketAddr,
+        ziel: Option<Arc<dyn Ziel>>,
+    ) {
+        self.stop();
+        // Reset state for a fresh run. We deliberately keep
+        // `ever_seen` sticky across stop/start so toggling the
+        // adapter doesn't make the UI badge flicker; it only
+        // resets to false when the whole process exits.
+        *self.shared.last_packet_at.lock() = None;
+        *self.shared.p1_last_at.lock() = None;
+        *self.shared.p1_version.lock() = None;
+        *self.shared.p2_info.lock() = SitzungsInfo::default();
+        *self.shared.pending_touchdown.lock() = None;
+        *self.shared.last_error.lock() = None;
+        self.shared.stop.store(false, Ordering::SeqCst);
+        let shared = Arc::clone(&self.shared);
+        let handle = std::thread::Builder::new()
+            .name("xplane-premium".into())
+            .spawn(move || run_listener(shared, p1_port, p2_ziel, ziel))
+            .expect("spawn xplane-premium thread");
+        self.worker = Some(handle);
+        tracing::info!(
+            port = p1_port,
+            "X-Plane premium listener started (waiting for plugin packets)"
+        );
+    }
+
+    pub fn stop(&mut self) {
+        if self.worker.is_some() {
+            self.shared.stop.store(true, Ordering::SeqCst);
+        }
+        if let Some(handle) = self.worker.take() {
+            // 500 ms is plenty — the recv loop has a 200 ms read
+            // timeout, so it'll see the stop flag within one cycle.
+            let _ = handle.join();
+        }
+    }
+
+    pub fn status(&self) -> PremiumStatus {
+        let frisch = |t: Option<Instant>| t.is_some_and(|t| t.elapsed() < ACTIVE_TIMEOUT);
+        let active = frisch(*self.shared.last_packet_at.lock());
+        let p1_aktiv = frisch(*self.shared.p1_last_at.lock());
+        let info = self.shared.p2_info.lock().clone();
+        let p1_version = self.shared.p1_version.lock().clone();
+        let p1_gesehen = self.shared.p1_seen.load(Ordering::Relaxed);
+        PremiumStatus {
+            ever_seen: self.shared.ever_seen.load(Ordering::Relaxed),
+            active,
+            packet_count: self.shared.packet_count.load(Ordering::Relaxed),
+            protokoll: if info.offen {
+                2
+            } else if p1_aktiv {
+                1
+            } else {
+                0
+            },
+            veraltet: ist_veraltet(&info, p1_gesehen, p1_version.as_deref()),
+            p2_nicht_erreichbar: p2_unerreichbar(&info, p1_version.as_deref()),
+            plugin_version: info.plugin_version.or(p1_version),
+            xplane_version: info.xplane_version,
+            namen_da: 0,
+            namen_fehlen: 0,
+        }
+    }
+
+    /// Drain the pending touchdown event (one-shot semantics).
+    /// Called from the flight sampler after each tick. Returns
+    /// `None` until the next plugin-emitted touchdown.
+    pub fn take_touchdown(&self) -> Option<PremiumTouchdown> {
+        self.shared.pending_touchdown.lock().take()
+    }
+
+    pub fn last_error(&self) -> Option<String> {
+        self.shared.last_error.lock().clone()
+    }
+}
+
+impl Drop for PremiumListener {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+// =============================================================================
+// Listener thread
+// =============================================================================
+
+/// Plugin veraltet? Antwortet mit zu alter Version bzw. lehnt Protokoll 2
+/// ab, oder schickt Protokoll 1 OHNE Version ≥ 1.0.0 (`pv`, v0.5.x kennt
+/// das Feld nicht) und hat nie auf `HALLO` geantwortet.
+fn ist_veraltet(info: &SitzungsInfo, p1_gesehen: bool, p1_version: Option<&str>) -> bool {
+    if info.offen {
+        return false;
+    }
+    let neues_plugin = p1_version.is_some_and(version_reicht);
+    info.zu_alt
+        || (p1_gesehen
+            && !neues_plugin
+            && !info.je_offen
+            && info.hallos_ohne_antwort >= HALLOS_BIS_VERALTET)
+}
+
+/// Neues Plugin (Protokoll 1 mit `pv` ≥ 1.0.0), aber keine Antwort auf
+/// `HALLO`: Protokoll 2 ist nicht erreichbar (QS AP7 N4) — nicht „veraltet".
+fn p2_unerreichbar(info: &SitzungsInfo, p1_version: Option<&str>) -> bool {
+    !info.offen
+        && !info.zu_alt
+        && p1_version.is_some_and(version_reicht)
+        && info.hallos_ohne_antwort >= HALLOS_BIS_VERALTET
+}
+
+fn run_listener(
+    shared: Arc<PremiumShared>,
+    p1_port: u16,
+    p2_ziel: SocketAddr,
+    ziel: Option<Arc<dyn Ziel>>,
+) {
+    // Bind to loopback only — the plugin sends to 127.0.0.1:52000 and
+    // we want to refuse traffic from any other interface for security
+    // (plugin packets contain telemetry that's no business of the LAN).
+    let bind_addr = format!("127.0.0.1:{p1_port}");
+    let socket = match UdpSocket::bind(&bind_addr) {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!(
+                "premium listener bind failed on {bind_addr}: {e} \
+                 (plugin telemetry will not be received this session)"
+            );
+            tracing::warn!("{msg}");
+            *shared.last_error.lock() = Some(msg);
+            return;
+        }
+    };
+    // 20 ms: der Sitzungstakt (HALLO/PING/Abos, grosse Datagramme mit
+    // Abstand) laeuft in derselben Schleife.
+    if let Err(e) = socket.set_read_timeout(Some(Duration::from_millis(20))) {
+        tracing::warn!(error = %e, "premium socket: set_read_timeout failed");
+    }
+    if let Err(e) = socket2::SockRef::from(&socket).set_recv_buffer_size(SOCKET_PUFFER) {
+        tracing::debug!(error = %e, "premium socket: Empfangspuffer nicht vergroessert");
+    }
+
+    let mut sitzung = Sitzung::neu(env!("CARGO_PKG_VERSION"));
+    let mut buf = vec![0u8; RECV_BUF_SIZE];
+    let mut icmp_gemeldet = false;
+    while !shared.stop.load(Ordering::SeqCst) {
+        match socket.recv_from(&mut buf) {
+            Ok((n, peer)) => {
+                // Loopback-only sanity check — if a packet somehow
+                // arrived from a non-loopback address we drop it.
+                // (We bound to 127.0.0.1 so this should be impossible,
+                // but defensive coding is cheap.)
+                if !peer.ip().is_loopback() {
+                    tracing::warn!(?peer, "premium: dropped non-loopback packet");
+                    continue;
+                }
+                icmp_gemeldet = false;
+                datagramm_verteilen(&buf[..n], &shared, &mut sitzung, ziel.as_deref());
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                // Idle tick — re-check stop flag and loop.
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                // Windows meldet ein HALLO an einen geschlossenen Steuerport
+                // (X-Plane aus, altes Plugin) als WSAECONNRESET auf DIESEM
+                // Socket — nur „niemand hoert zu", kein Fehler (vgl.
+                // `ist_icmp_rueckmeldung` im Adapter).
+                if !icmp_gemeldet {
+                    tracing::debug!(error = %e, "premium: Plugin-Steuerport hoert nicht zu");
+                    icmp_gemeldet = true;
+                }
+            }
+            Err(e) => {
+                // Unexpected — log + back off briefly so we don't
+                // hot-loop on a permanent error condition.
+                tracing::warn!(error = %e, "premium UDP recv error");
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+        if let Some(z) = ziel.as_deref() {
+            for d in sitzung.takt(Instant::now(), z) {
+                if let Err(e) = socket.send_to(&d, p2_ziel) {
+                    tracing::trace!(error = %e, "premium: Anfrage an das Plugin nicht gesendet");
+                }
+            }
+            let info = sitzung.info();
+            let mut geteilt = shared.p2_info.lock();
+            if *geteilt != *info {
+                *geteilt = info.clone();
+            }
+        }
+    }
+    // Abos abbestellen — das Plugin wuerde sonst noch 5 s liefern.
+    for d in sitzung.beenden() {
+        let _ = socket.send_to(&d, p2_ziel);
+    }
+    // Ohne laufenden Listener baut die App kein Band mehr (QS-Befund F2,
+    // 04.10.2026: nach Sim-Wechsel blieb „bereit" stehen und der 500-ms-Takt
+    // rechnete ins Leere). Bedingungslos, auch wenn nie „bereit" gemeldet wurde.
+    if let Some(z) = ziel.as_deref() {
+        z.band_bereit(false);
+    }
+    *shared.p2_info.lock() = sitzung.info().clone();
+    tracing::info!("X-Plane premium listener stopped");
+}
+
+/// Ein Datagramm nach Protokoll verteilen: `"p":2` an die Sitzung, alles
+/// andere unveraendert an den Protokoll-1-Pfad.
+fn datagramm_verteilen(
+    bytes: &[u8],
+    shared: &Arc<PremiumShared>,
+    sitzung: &mut Sitzung,
+    ziel: Option<&dyn Ziel>,
+) {
+    let trimmed = trim_trailing_ws(bytes);
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(trimmed) {
+        if ist_p2(&v) {
+            let Some(a) = antwort_lesen(&v) else {
+                tracing::debug!("premium: Protokoll-2-Paket ohne Pflichtfelder verworfen");
+                return;
+            };
+            let jetzt = Instant::now();
+            *shared.last_packet_at.lock() = Some(jetzt);
+            shared.ever_seen.store(true, Ordering::Relaxed);
+            shared.packet_count.fetch_add(1, Ordering::Relaxed);
+            if let Some(z) = ziel {
+                sitzung.empfangen(a, jetzt, z);
+            }
+            return;
+        }
+    }
+    handle_packet(bytes, shared);
+}
+
+/// Parse one UDP datagram. The plugin sends one JSON object per
+/// datagram (no batching), terminated with `\n`. We're tolerant of
+/// trailing whitespace and accept either `\n` or no terminator.
+fn handle_packet(bytes: &[u8], shared: &Arc<PremiumShared>) {
+    // Trim trailing newline / whitespace so serde_json sees a
+    // clean object. `from_slice` itself tolerates trailing space
+    // but we keep it explicit for clarity.
+    let trimmed = trim_trailing_ws(bytes);
+    if trimmed.is_empty() {
+        return;
+    }
+
+    // Two-phase decode: first the envelope so we know `kind`, then
+    // the typed body when it's a touchdown. Telemetry packets are
+    // dropped here — we just use them to update the activity
+    // heartbeat. (The RREF stream already gives us telemetry.)
+    let env: Envelope = match serde_json::from_slice(trimmed) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(error = %e, "premium: malformed JSON envelope");
+            return;
+        }
+    };
+
+    if env.v != 1 {
+        tracing::warn!(
+            v = env.v,
+            "premium: unsupported schema version (expected 1) — dropping packet. \
+             AeroACARS client may need an update."
+        );
+        return;
+    }
+
+    // ---- Heartbeat (any valid packet counts) ----
+    let jetzt = Instant::now();
+    *shared.last_packet_at.lock() = Some(jetzt);
+    *shared.p1_last_at.lock() = Some(jetzt);
+    shared.p1_seen.store(true, Ordering::Relaxed);
+    if env.pv.is_some() {
+        *shared.p1_version.lock() = env.pv.clone();
+    }
+    shared.ever_seen.store(true, Ordering::Relaxed);
+    shared.packet_count.fetch_add(1, Ordering::Relaxed);
+
+    match env.kind.as_str() {
+        "telemetry" => {
+            // Heartbeat done above. Body fields ignored — the RREF
+            // stream is authoritative for live telemetry. Future:
+            // overlay vs_fpm, g_normal etc. for the live ribbon.
+        }
+        "touchdown" => match serde_json::from_slice::<PremiumTouchdown>(trimmed) {
+            Ok(mut td) => {
+                td.received_at = Some(std::time::SystemTime::now());
+                tracing::info!(
+                    vs_fpm = td.captured_vs_fpm,
+                    g = td.captured_g_normal,
+                    ias_kt = td.captured_ias_kt,
+                    pitch_deg = td.captured_pitch_deg,
+                    "premium: touchdown event received from plugin"
+                );
+                *shared.pending_touchdown.lock() = Some(td);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "premium: touchdown packet decode failed (heartbeat still counted)"
+                );
+            }
+        },
+        other => {
+            tracing::debug!(
+                kind = %other,
+                "premium: unknown packet type (forward-compat ignore)"
+            );
+        }
+    }
+}
+
+/// `null` → Standardwert des Typs (wie ein fehlendes Feld).
+fn null_als_standard<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
+/// Messwert ohne Wert: `NaN` = „nicht gemessen".
+fn nicht_gemessen() -> f32 {
+    f32::NAN
+}
+
+/// Zahl oder `null` → `NaN`.
+fn zahl_oder_nan<'de, D>(d: D) -> Result<f32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<f32>::deserialize(d)?.unwrap_or(f32::NAN))
+}
+
+fn trim_trailing_ws(bytes: &[u8]) -> &[u8] {
+    let mut end = bytes.len();
+    while end > 0 && matches!(bytes[end - 1], b'\n' | b'\r' | b' ' | b'\t') {
+        end -= 1;
+    }
+    &bytes[..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// QS-Befund F2 (04.10.2026): Nach dem Stopp des Listeners (Sim-Wechsel)
+    /// muss „bereit" zurueckgesetzt sein, sonst baut die App weiter Baender ins
+    /// Leere. Auch dann, wenn die Sitzung selbst nie „bereit" gemeldet hat
+    /// (Plugin 1.0.0) - der Slot ist hier von aussen vorbelegt.
+    #[test]
+    fn stopp_setzt_band_bereit_zurueck() {
+        struct SlotZiel(Arc<crate::hud_band::BandSlot>);
+        impl Ziel for SlotZiel {
+            fn wunsch_generation(&self) -> u64 {
+                0
+            }
+            fn wuensche(&self) -> Vec<crate::plugin2::AboWunsch> {
+                Vec::new()
+            }
+            fn ereignis(&self, _e: crate::plugin2::Ereignis) {}
+            fn band_bereit(&self, b: bool) {
+                self.0.set_bereit(b);
+            }
+        }
+        let slot = Arc::new(crate::hud_band::BandSlot::default());
+        slot.set_bereit(true);
+        let p1 = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = p1.local_addr().unwrap().port();
+        drop(p1);
+        let p2 = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let p2_ziel = p2.local_addr().unwrap();
+        let mut l = PremiumListener::new();
+        l.start_mit(port, p2_ziel, Some(Arc::new(SlotZiel(Arc::clone(&slot)))));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        l.stop();
+        assert!(
+            !slot.bereit(),
+            "nach dem Stopp darf die App kein Band mehr bauen"
+        );
+    }
+
+    #[test]
+    fn parses_valid_touchdown_packet() {
+        let bytes = br#"{"v":1,"type":"touchdown","seq":42,"ts":1234.5,"lat":50.03,"lon":8.57,"captured_vs_fpm":-285.4,"captured_g_normal":1.18,"captured_pitch_deg":3.4,"captured_bank_deg":0.2,"captured_ias_kt":138.0,"captured_gs_kt":134.5,"captured_heading_deg":253.1,"fnrml_gear_n":52312.0,"agl_ft":0.4}"#;
+        let trimmed = trim_trailing_ws(bytes);
+        let env: Envelope = serde_json::from_slice(trimmed).unwrap();
+        assert_eq!(env.v, 1);
+        assert_eq!(env.kind, "touchdown");
+        let td: PremiumTouchdown = serde_json::from_slice(trimmed).unwrap();
+        assert!((td.captured_vs_fpm - -285.4).abs() < 0.01);
+        assert!((td.captured_g_normal - 1.18).abs() < 0.001);
+        assert_eq!(td.lat, 50.03);
+    }
+
+    #[test]
+    fn drops_unknown_schema_version() {
+        let shared = Arc::new(PremiumShared::default());
+        // v: 99 is unsupported; envelope decodes but heartbeat
+        // shouldn't tick.
+        handle_packet(br#"{"v":99,"type":"telemetry"}"#, &shared);
+        assert_eq!(shared.packet_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn telemetry_packet_increments_heartbeat_only() {
+        let shared = Arc::new(PremiumShared::default());
+        // Note: real plugin packets are terminated with a literal
+        // newline byte. We include it here to verify the trim path,
+        // hence the regular byte string + `\n` escape (raw byte
+        // strings would treat `\n` as two characters).
+        handle_packet(
+            b"{\"v\":1,\"type\":\"telemetry\",\"seq\":1,\"vs_fpm\":-450.0}\n",
+            &shared,
+        );
+        assert_eq!(shared.packet_count.load(Ordering::Relaxed), 1);
+        assert!(shared.pending_touchdown.lock().is_none());
+    }
+
+    #[test]
+    fn touchdown_packet_is_captured_and_drained_once() {
+        let shared = Arc::new(PremiumShared::default());
+        handle_packet(
+            br#"{"v":1,"type":"touchdown","captured_vs_fpm":-300.0,"captured_g_normal":1.2}"#,
+            &shared,
+        );
+        // First pickup returns Some, second returns None.
+        let td = shared.pending_touchdown.lock().take();
+        assert!(td.is_some());
+        assert_eq!(td.unwrap().captured_vs_fpm as i32, -300);
+        let td2 = shared.pending_touchdown.lock().take();
+        assert!(td2.is_none());
+    }
+
+    /// Plugin ab 1.0 schreibt nicht endliche Zahlen als `null`. Das Paket
+    /// bleibt gueltig; Sinkrate/g ohne Messung werden `NaN` („nicht
+    /// gemessen", nie 0), alle anderen Felder wie fehlend.
+    #[test]
+    fn touchdown_mit_null_wird_nicht_verworfen() {
+        let shared = Arc::new(PremiumShared::default());
+        handle_packet(
+            br#"{"v":1,"type":"touchdown","pv":"1.0.0","seq":3,"ts":null,"lat":50.1,"lon":null,"captured_vs_fpm":null,"captured_vs_source":"agl","captured_vs_window_ms":500,"captured_vs_samples":12,"captured_g_normal":null,"captured_pitch_deg":null,"captured_bank_deg":1.5,"captured_ias_kt":null,"captured_gs_kt":131.0,"captured_heading_deg":null,"fnrml_gear_n":null,"agl_ft":null}"#,
+            &shared,
+        );
+        assert_eq!(shared.packet_count.load(Ordering::Relaxed), 1);
+        let td = shared
+            .pending_touchdown
+            .lock()
+            .take()
+            .expect("Aufsetzpaket trotz null angenommen");
+        assert!(td.captured_vs_fpm.is_nan(), "keine erfundene 0 fpm");
+        assert!(td.captured_g_normal.is_nan());
+        assert_eq!(td.captured_pitch_deg, 0.0);
+        assert_eq!(td.lon, 0.0);
+        assert_eq!(td.ts, 0.0);
+        assert_eq!(td.lat, 50.1);
+        assert_eq!(td.captured_bank_deg, 1.5);
+        assert_eq!(td.captured_gs_kt, 131.0);
+        assert_eq!(td.captured_vs_samples, 12);
+        // Gemessene Werte bleiben, fehlende Felder wie bisher.
+        handle_packet(
+            br#"{"v":1,"type":"touchdown","captured_vs_fpm":-212.5,"captured_g_normal":1.31}"#,
+            &shared,
+        );
+        let td = shared.pending_touchdown.lock().take().unwrap();
+        assert_eq!(td.captured_vs_fpm, -212.5);
+        assert!((td.captured_g_normal - 1.31).abs() < 1e-6);
+        assert_eq!(td.captured_pitch_deg, 0.0);
+    }
+
+    #[test]
+    fn malformed_json_is_dropped_silently() {
+        let shared = Arc::new(PremiumShared::default());
+        handle_packet(b"not json {{", &shared);
+        assert_eq!(shared.packet_count.load(Ordering::Relaxed), 0);
+    }
+
+    /// Protokoll 2 geht nicht in den Protokoll-1-Pfad (keine Warnung ueber
+    /// die Schema-Version, kein Aufsetzpaket), zaehlt aber als Lebenszeichen.
+    /// Protokoll 1 laeuft auf demselben Socket unveraendert weiter.
+    #[test]
+    fn protokoll_wird_nach_p_verteilt() {
+        let shared = Arc::new(PremiumShared::default());
+        let mut s = Sitzung::neu("1.9.11");
+        datagramm_verteilen(
+            b"{\"p\":2,\"t\":\"hallo\",\"plugin\":\"1.0.0\"}\n",
+            &shared,
+            &mut s,
+            None,
+        );
+        assert_eq!(shared.packet_count.load(Ordering::Relaxed), 1);
+        assert!(!shared.p1_seen.load(Ordering::Relaxed));
+        assert!(shared.pending_touchdown.lock().is_none());
+        datagramm_verteilen(
+            br#"{"v":1,"type":"touchdown","captured_vs_fpm":-250.0}"#,
+            &shared,
+            &mut s,
+            None,
+        );
+        assert_eq!(shared.packet_count.load(Ordering::Relaxed), 2);
+        assert!(shared.p1_seen.load(Ordering::Relaxed));
+        let td = shared.pending_touchdown.lock().take().unwrap();
+        assert_eq!(td.captured_vs_fpm as i32, -250);
+        // Kaputtes JSON bleibt beim Protokoll-1-Pfad (verworfen, nicht gezaehlt).
+        datagramm_verteilen(b"{kaputt", &shared, &mut s, None);
+        assert_eq!(shared.packet_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn veraltet_erst_nach_unbeantworteten_hallos() {
+        let mut info = SitzungsInfo::default();
+        assert!(!ist_veraltet(&info, true, None));
+        info.hallos_ohne_antwort = HALLOS_BIS_VERALTET;
+        assert!(ist_veraltet(&info, true, None));
+        assert!(
+            !ist_veraltet(&info, false, None),
+            "ohne Plugin ist nichts veraltet"
+        );
+        assert!(ist_veraltet(&info, true, Some("0.5.11")));
+        info.je_offen = true;
+        assert!(!ist_veraltet(&info, true, None));
+        let zu_alt = SitzungsInfo {
+            zu_alt: true,
+            ..SitzungsInfo::default()
+        };
+        assert!(ist_veraltet(&zu_alt, false, None));
+        let offen = SitzungsInfo {
+            offen: true,
+            zu_alt: true,
+            ..SitzungsInfo::default()
+        };
+        assert!(!ist_veraltet(&offen, true, None));
+    }
+
+    /// N4: Protokoll 1 mit `pv` ≥ 1.0.0, HALLO unbeantwortet → „Protokoll 2
+    /// nicht erreichbar", nicht „veraltet".
+    #[test]
+    fn neues_plugin_ohne_antwort_ist_unerreichbar_nicht_veraltet() {
+        let info = SitzungsInfo {
+            hallos_ohne_antwort: HALLOS_BIS_VERALTET,
+            ..SitzungsInfo::default()
+        };
+        assert!(!ist_veraltet(&info, true, Some("1.0.0")));
+        assert!(p2_unerreichbar(&info, Some("1.0.0")));
+        assert!(!p2_unerreichbar(&info, None));
+        assert!(!p2_unerreichbar(&info, Some("0.5.11")));
+        let frisch = SitzungsInfo::default();
+        assert!(!p2_unerreichbar(&frisch, Some("1.0.0")));
+        let offen = SitzungsInfo {
+            offen: true,
+            ..info.clone()
+        };
+        assert!(!p2_unerreichbar(&offen, Some("1.0.0")));
+        // `pv` wird aus dem Protokoll-1-Paket gelesen.
+        let shared = Arc::new(PremiumShared::default());
+        handle_packet(br#"{"v":1,"type":"telemetry","pv":"1.0.0"}"#, &shared);
+        assert_eq!(shared.p1_version.lock().as_deref(), Some("1.0.0"));
+    }
+
+    #[test]
+    fn trims_trailing_whitespace_and_newlines() {
+        assert_eq!(trim_trailing_ws(b"abc\n"), b"abc");
+        assert_eq!(trim_trailing_ws(b"abc\r\n"), b"abc");
+        assert_eq!(trim_trailing_ws(b"abc \t \n"), b"abc");
+        assert_eq!(trim_trailing_ws(b"abc"), b"abc");
+        assert_eq!(trim_trailing_ws(b""), b"");
+    }
+}

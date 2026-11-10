@@ -1,0 +1,35 @@
+{
+  "name": "manfahrer-gf/aeroacars-integrity-gate",
+  "description": "phpVMS Module that gates PIREP-Filing through the AeroACARS-Live mid-session integrity validator (Stream G).",
+  "type": "phpvms-module",
+  "license": "GPL-3.0-or-later",
+  "authors": [
+    { "name": "MANFahrer-GF", "homepage": "https://github.com/MANFahrer-GF" }
+  ],
+  "require": {
+    "php": "^8.2",
+    "nwidart/laravel-modules": "^11.0",
+    "guzzlehttp/guzzle": "^7.5"
+  },
+  "require-dev": {
+    "phpunit/phpunit": "^10.0",
+    "orchestra/testbench": "^9.0"
+  },
+  "autoload": {
+    "psr-4": {
+      "Modules\\AeroACARSIntegrityGate\\": "app/"
+    }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "Modules\\AeroACARSIntegrityGate\\Tests\\": "tests/"
+    }
+  },
+  "extra": {
+    "laravel": {
+      "providers": [
+        "Modules\\AeroACARSIntegrityGate\\AeroACARSIntegrityGateServiceProvider"
+      ]
+    }
+  }
+}

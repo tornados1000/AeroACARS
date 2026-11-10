@@ -1,0 +1,375 @@
+import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { invoke, listen, openExternal as openUrl } from "../lib/ipc";
+import type {
+  ActiveFlightInfo,
+  FlightEndOutcome,
+  LoginResult,
+  SimSnapshot,
+} from "../types";
+import { ActiveFlightPanel } from "./ActiveFlightPanel";
+import { StableApproachBanner } from "./StableApproachBanner";
+
+// v0.12.12-dev: GSG-Wetter-Briefing-Seite. Login-basiert — wenn der Pilot
+// in seinem Standard-Browser bei phpVMS eingeloggt ist, zieht die Seite
+// den aktiven Bid automatisch.
+const WEATHER_BRIEFING_URL = "https://german-sky-group.eu/weatherbriefing";
+// v0.3.0: LoadsheetMonitor wird jetzt direkt im ActiveFlightPanel
+// gerendert (zwischen InfoStrip und WeatherBriefing), damit das
+// Loadsheet visuell zum aktiven Flug gehört statt als getrennte
+// Section unter dem WeatherBriefing zu hängen.
+import { DivertBanner } from "./DivertBanner";
+import { SimRateHinweis } from "./SimRateHinweis";
+import { KabinenHinweis } from "./kabine/KabinenHinweis";
+import { VdgsPlatte, useVdgsStand } from "./VdgsBand";
+import { BordbuchHinweis } from "./bordbuch/BordbuchHinweis";
+import { Notice } from "./ui";
+
+interface Props {
+  session: LoginResult;
+  activeFlight: ActiveFlightInfo | null;
+  setActiveFlight: (info: ActiveFlightInfo | null) => void;
+  simSnapshot: SimSnapshot | null;
+  /** Called when there's no active flight and the user wants to pick
+   *  one — UI nudges them to the briefing tab. */
+  onSwitchToBriefing: () => void;
+  /** v0.5.38: Stable-Approach-Banner anzeigen. Default ON. */
+  approachAdvisoriesEnabled: boolean;
+  /** Ein Flug, der AUSSERHALB des Cockpits abgeschlossen wurde (Sprung-
+   *  Banner im App-Rahmen). Das Cockpit zeigt dieselbe Meldung wie für
+   *  seine eigenen Abschlüsse. */
+  abschlussVonAussen?: FlightEndOutcome | null;
+  onAbschlussGezeigt?: () => void;
+}
+
+/**
+ * Cockpit tab — the in-flight pilot view. Shows the resume banner
+ * (when a stale flight is detected on startup), the active-flight
+ * panel with weather briefing and PIREP actions, and a friendly empty
+ * state when no flight is running.
+ *
+ * Deliberately no SimPanel here — sim telemetry lives in Settings →
+ * Debug. The pilot during a flight cares about phase, route and
+ * weather, not floating-point lat/lon.
+ */
+export function CockpitView({
+  activeFlight,
+  setActiveFlight,
+  simSnapshot,
+  onSwitchToBriefing,
+  approachAdvisoriesEnabled,
+  abschlussVonAussen,
+  onAbschlussGezeigt,
+}: Props) {
+  const { t } = useTranslation();
+  // v0.12.5 (LE7): how the last flight concluded — drives the post-flight
+  // banner. A *green* success banner ONLY for a genuine filing; a neutral
+  // notice for a discard. Replaces the old `filedFlightInfo` which blindly
+  // showed "PIREP filed" for cancel/forget/resume too (Bug F).
+  const [endNotice, setEndNotice] = useState<FlightEndOutcome | null>(null);
+  /** v0.12.12-dev: Wetter-Briefing-Lade-Hinweis. Erscheint beim Klick auf
+   *  den 🌦-Button (5 s sichtbar) statt als permanenter Schild. */
+  const [weatherLoadHint, setWeatherLoadHint] = useState(false);
+  useEffect(() => {
+    if (!endNotice) return;
+    const id = window.setTimeout(() => setEndNotice(null), 8000);
+    return () => window.clearTimeout(id);
+  }, [endNotice]);
+  // Abschluss von aussen (Sprung-Banner im App-Rahmen) einmal übernehmen.
+  useEffect(() => {
+    if (!abschlussVonAussen) return;
+    setEndNotice(abschlussVonAussen);
+    onAbschlussGezeigt?.();
+  }, [abschlussVonAussen, onAbschlussGezeigt]);
+
+  /** v0.12.5 (LE7): reload the active flight without claiming a PIREP was
+   *  filed. `flight_forget` → backend returns null → cockpit collapses;
+   *  disconnect-resume → backend keeps the flight → it stays. */
+  const refreshActiveFlight = () => {
+    void invoke<ActiveFlightInfo | null>("flight_status")
+      .then(setActiveFlight)
+      .catch(() => {});
+  };
+
+  /** v0.12.5 (LE7): a real PIREP concluded — show the outcome banner and
+   *  clear the flight. Shared by `ActiveFlightPanel` and `DivertBanner`. */
+  const handleFiledSuccess = (outcome: FlightEndOutcome) => {
+    setEndNotice(outcome);
+    setActiveFlight(null);
+  };
+
+  // v0.12.6: Auto-File läuft jetzt im **Backend** (Position-Streamer),
+  // window-unabhängig. Vorher war es ein Frontend-`useEffect` — der lief
+  // nur, wenn das AeroACARS-Fenster im Vordergrund UND der Cockpit-Tab
+  // aktiv war (sonst drosselt die WebView die JS-Timer). Pilot-Befund:
+  // der PIREP ging erst raus, nachdem der Pilot AeroACARS in den
+  // Vordergrund holte. Das Backend filet beim FSM-Latch auf `Arrived`
+  // selbst und emittiert `pirep_auto_filed` — wir zeigen darauf nur noch
+  // das LE7-Erfolgs-Banner.
+  useEffect(() => {
+    const unlisten = listen<{ callsign: string; dpt: string; arr: string }>(
+      "pirep_auto_filed",
+      (e) => {
+        setEndNotice({ kind: "filed", ...e.payload });
+        setActiveFlight(null);
+      },
+    );
+    return () => {
+      void unlisten.then((f) => f());
+    };
+  }, [setActiveFlight]);
+
+  // v0.13.7: Backend emittiert `pirep_cancelled_remotely` wenn phpVMS einen
+  // 404 auf einen laufenden PIREP liefert (= Inaktivitäts-Timeout oder
+  // VA-Admin hat den PIREP entfernt). Activity-Log enthält den Eintrag
+  // bereits durchgehend; hier räumen wir zusätzlich den lokalen
+  // Flugzustand auf, damit der Pilot nicht weiterklickt auf einem PIREP
+  // der serverseitig nicht mehr existiert.
+  useEffect(() => {
+    const unlisten = listen<{ pirep_id: string; source: string }>(
+      "pirep_cancelled_remotely",
+      () => {
+        setEndNotice({ kind: "cancelled_remotely" });
+        setActiveFlight(null);
+      },
+    );
+    return () => {
+      void unlisten.then((f) => f());
+    };
+  }, [setActiveFlight]);
+
+  // v0.12.5 (LE7): post-flight notice banner — green ✅ for a real filing,
+  // neutral for a discard. Rendered above both the empty state and the
+  // active-flight panel so it's visible whichever way the tree resolves.
+  const noticeBanner = endNotice && (
+    <div
+      className={
+        endNotice.kind === "filed" || endNotice.kind === "filed_instead"
+          ? "cockpit-pirep-success"
+          : "cockpit-pirep-success cockpit-pirep-success--neutral"
+      }
+      role="status"
+    >
+      <div className="cockpit-pirep-success__icon">
+        {endNotice.kind === "filed" || endNotice.kind === "filed_instead"
+          ? "✅"
+          : endNotice.kind === "queued"
+          ? "⏳"
+          : "ℹ"}
+      </div>
+      <div className="cockpit-pirep-success__text">
+        {endNotice.kind === "filed" && (
+          <>
+            <strong>{t("cockpit.pirep_filed_title")}</strong>
+            <span>
+              {t("cockpit.pirep_filed_detail", {
+                callsign: endNotice.callsign,
+                dpt: endNotice.dpt,
+                arr: endNotice.arr,
+              })}
+            </span>
+          </>
+        )}
+        {endNotice.kind === "filed_instead" && (
+          <>
+            <strong>{t("cockpit.filed_instead_title")}</strong>
+            <span>
+              {t("cockpit.filed_instead_detail", {
+                pirep_id: endNotice.pirep_id,
+              })}
+            </span>
+          </>
+        )}
+        {endNotice.kind === "queued" && (
+          <>
+            <strong>{t("cockpit.queued_title")}</strong>
+            <span>
+              {t("cockpit.queued_detail", { pirep_id: endNotice.pirep_id })}
+            </span>
+          </>
+        )}
+        {endNotice.kind === "cancelled" && (
+          <>
+            <strong>{t("cockpit.cancelled_title")}</strong>
+            <span>{t("cockpit.cancelled_detail")}</span>
+          </>
+        )}
+        {endNotice.kind === "cancelled_remotely" && (
+          <>
+            <strong>{t("cockpit.cancelled_remotely_title")}</strong>
+            <span>{t("cockpit.cancelled_remotely_detail")}</span>
+          </>
+        )}
+      </div>
+      <button
+        type="button"
+        className="cockpit-pirep-success__close"
+        onClick={() => setEndNotice(null)}
+        aria-label={t("cockpit.pirep_filed_dismiss")}
+      >
+        ✕
+      </button>
+    </div>
+  );
+
+  // v0.12.12-dev: Wetter-Briefing-Knopf öffnet die GSG-Briefing-Seite im
+  // System-Browser. Login-basiert, die Seite zieht den aktiven Bid auto-
+  // matisch. Der Lade-Hinweis erscheint per Toast beim Klick (5 s sichtbar)
+  // statt als permanenter Schild — der Pilot soll bemerken dass die Seite
+  // ihre Daten live holt (METAR/TAF/NOTAMs/Runway), Ladezeit bis zu 30 s.
+  const handleOpenWeatherBriefing = () => {
+    setWeatherLoadHint(true);
+    window.setTimeout(() => setWeatherLoadHint(false), 5000);
+    void openUrl(WEATHER_BRIEFING_URL).catch(() => {});
+  };
+
+  // Field feedback (2026-08-03): with an active flight, this button used to
+  // float alone in its own row above everything else, top-right — visually
+  // disconnected from (and read as a confusing duplicate of) the actual
+  // Wetter-Briefing card + the Flug-beenden/Route-sync/OFP-refresh action
+  // row further down. It now renders INSIDE ActiveFlightPanel's own action
+  // row, alongside those buttons. Kept here (as its own top row) only for
+  // the no-active-flight empty state, which has no action row to join.
+  const quickActionRow = (
+    <div className="cockpit-actions">
+      <button
+        type="button"
+        className="button cockpit-actions__weather"
+        onClick={handleOpenWeatherBriefing}
+        title={t("cockpit.weather_briefing_hint")}
+      >
+        🌦 {t("cockpit.weather_briefing")}
+      </button>
+    </div>
+  );
+
+  // VDGS-Band: nur vor dem Abheben und nur, wenn der Flug im CDM-System
+  // gefuehrt wird. Der Haken muss VOR dem `if (!activeFlight) return`
+  // stehen — Hooks duerfen nicht hinter einem Rueckgabezweig sitzen.
+  const [vdgsStand] = useVdgsStand(
+    !!activeFlight && activeFlight.takeoff_at === null,
+  );
+
+  const weatherLoadToast = weatherLoadHint && (
+    <div className="cockpit-weather-toast" role="status">
+      🌦 {t("cockpit.weather_briefing_load_hint")}
+    </div>
+  );
+
+  if (!activeFlight) {
+    return (
+      <>
+        {/* v0.12.5 (LE7): post-flight notice — 8 s auto-dismiss. */}
+        {noticeBanner}
+        <section className="cockpit-empty">
+          <div className="cockpit-empty__icon" aria-hidden="true">
+            ✈
+          </div>
+          <h2 className="cockpit-empty__title">{t("cockpit.empty_title")}</h2>
+          <p className="cockpit-empty__hint">{t("cockpit.empty_hint")}</p>
+          <button
+            type="button"
+            className="button button--primary"
+            onClick={onSwitchToBriefing}
+          >
+            {t("cockpit.go_briefing")}
+          </button>
+        </section>
+        {quickActionRow}
+        {weatherLoadToast}
+      </>
+    );
+  }
+
+  return (
+    <>
+      {noticeBanner}
+      {/* Ganz oben, solange die Abflugfolge laeuft: das Geraet vom Gate.
+          Zeigt sich von allein nur, wenn es etwas zu zeigen gibt. */}
+      <VdgsPlatte antwort={vdgsStand} />
+      {/* was_just_resumed: ActiveFlightPanel (and its action row, below)
+          doesn't render at all yet — the resume banner owns the screen
+          instead — so the weather button still needs its own top row here,
+          same as the no-active-flight empty state. Once resumed it moves
+          into ActiveFlightPanel's own action row. */}
+      {/* Nach einem Neustart wartet der Flug, bis der Simulator geladen und
+          ruhig ist. Der Pilot sieht, worauf — vorher stand der Grund nur im
+          Debug-Log, und das Warten war unsichtbar (Cloud-QS 24.09.2026). */}
+      {/* Nur am Wartegrund, NICHT an was_just_resumed: Nach einer sauberen
+          Positionspruefung ist was_just_resumed schon false, das Gate wartet
+          aber noch — dann fehlte der Hinweis (Cloud-QS 24.09.2026). */}
+      {activeFlight.resume_wartet_grund && (
+        <Notice
+          tone={(activeFlight.resume_wartet_s ?? 0) >= 120 ? "warn" : "info"}
+          level={t("resume.wartet_titel")}
+          data-testid="resume-wartet"
+          detail={
+            <span>
+              {activeFlight.resume_wartet_grund}
+              {(activeFlight.resume_wartet_s ?? 0) >= 120 && (
+                <>
+                  {" "}
+                  {t("resume.wartet_lange")}
+                </>
+              )}
+            </span>
+          }
+        />
+      )}
+      {activeFlight.was_just_resumed && quickActionRow}
+      {activeFlight.was_just_resumed && weatherLoadToast}
+      {/* ⚠ Der Wiederaufnahme-Banner stand bis v1.7.9 HIER — und damit in
+          einem Zweig, den `if (!activeFlight) return …` (weiter oben) gar
+          nicht erreicht. Seine Suche nach verwaisten Flügen läuft aber nur
+          OHNE aktiven Flug. Zwei Bedingungen, die sich ausschließen: Die
+          Suche konnte nie laufen. Dazu lebte er nur, solange der Cockpit-
+          Reiter offen war. Er hängt jetzt im App-Rahmen. */}
+
+      {!activeFlight.was_just_resumed && (
+        <DivertBanner
+          activeFlight={activeFlight}
+          onFiledSuccess={handleFiledSuccess}
+        />
+      )}
+
+      {/* Sim-Rate-Hinweis (03.10.2026): erst nach 2 Minuten Abweichung von 1×. */}
+      <SimRateHinweis
+        rate={simSnapshot?.simulation_rate}
+        aktiv={!activeFlight.was_just_resumed}
+      />
+      {/* Kabine wartet auf das Anschnallzeichen (Kabinenansagen, 18.10.2026). */}
+      <KabinenHinweis />
+
+      {/* Der Sprung-Banner hängt im App-Rahmen (App.tsx), damit er auf
+          JEDEM Reiter erscheint — siehe dortigen Kommentar. */}
+
+      {/* v0.5.38: Visual Stable-Approach-Advisory. Steht ÜBER dem
+          ActiveFlightPanel sodass es bei jedem Flugzustand sichtbar
+          ist. Banner blendet sich selbst aus wenn der Anflug stabil
+          ist — null Visual-Footprint im Normal-Fall. */}
+      <StableApproachBanner
+        activeFlight={activeFlight}
+        simSnapshot={simSnapshot}
+        enabled={approachAdvisoriesEnabled}
+      />
+
+      {/* Bordbuch (26.09.2026): leiser Hinweis an Schlüsselstellen. Ein-/
+          ausschalten unter Einstellungen → Bordbuch. */}
+      <BordbuchHinweis aktiv={!activeFlight.was_just_resumed} />
+
+      {!activeFlight.was_just_resumed && (
+        <ActiveFlightPanel
+          info={activeFlight}
+          simSnapshot={simSnapshot}
+          onFiledSuccess={handleFiledSuccess}
+          onRefreshActiveFlight={refreshActiveFlight}
+          onOpenWeatherBriefing={handleOpenWeatherBriefing}
+          weatherLoadHint={weatherLoadHint}
+        />
+      )}
+
+      {/* Live-Loadsheet wird seit v0.3.0 direkt im ActiveFlightPanel
+          gerendert — siehe Import-Kommentar oben. */}
+    </>
+  );
+}

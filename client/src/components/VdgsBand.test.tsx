@@ -1,0 +1,645 @@
+// Das VDGS-Band.
+//
+// Drei Dinge sind hier nicht Kosmetik:
+//   1. Der Tageswechsel. Eine TSAT um 23:58 liegt um 00:03 fünf Minuten
+//      ZURÜCK — nicht 1435 Minuten voraus. Wer das falsch rechnet, zeigt
+//      im Cockpit einen Countdown über einen ganzen Tag.
+//   2. Das Band erscheint nur mit Eintrag. Kein leeres Gerät im Cockpit.
+//   3. Ohne laufende Abflugfolge wird die fremde Seite gar nicht erst
+//      gefragt — Etikette gegenüber einem Dienst, den wir nicht bezahlen.
+
+import { describe, it, expect, vi, afterEach } from "vitest";
+import { render, screen, cleanup, act, fireEvent, waitFor } from "@testing-library/react";
+
+vi.mock("react-i18next", () => ({
+  useTranslation: () => ({
+    t: (_k: string, fallback?: unknown, opts?: Record<string, unknown>) =>
+      typeof fallback === "string"
+        ? fallback.replace(/\{\{(\w+)\}\}/g, (_m, k: string) => String(opts?.[k] ?? ""))
+        : _k,
+  }),
+}));
+
+// Standardmaessig ein Promise: Der Code haengt `.catch(...)` an jeden
+// Aufruf. Ohne Rueckgabewert wirft das im Klick-Handler, und zwar als
+// UNBEHANDELTE Rejection — der Lauf endet dann mit Rueckgabewert 1,
+// waehrend die Zusammenfassung "grün" meldet (Abnahme 20.09.2026).
+const invoke = vi.fn(() => Promise.resolve(null));
+const openExternal = vi.fn(() => Promise.resolve());
+// Umschaltbar: App (Tauri) oder LAN-Browser auf dem Tablet.
+let istTauri = true;
+vi.mock("../lib/ipc", () => ({
+  invoke: (...a: unknown[]) => invoke(...a),
+  openExternal: (...a: unknown[]) => openExternal(...a),
+  get isTauri() {
+    return istTauri;
+  },
+}));
+
+import deCommon from "../locales/de/common.json";
+import {
+  VdgsPlatte,
+  ampel,
+  anlassfenster,
+  minutenBis,
+  referenz,
+  sperre,
+  zeitPlus,
+  useVdgsStand,
+  type VdgsStand,
+} from "./VdgsBand";
+
+const STAND: VdgsStand = {
+  callsign: "GSG421",
+  departure: "LEBL",
+  eobt: "15:50",
+  tobt: "15:44",
+  tsat: "15:46",
+  ctot: "",
+  taxi_min: 9,
+  cdm_sts: "COMPLY",
+  regulierung: "",
+  rwy_sid: "24L/OLOXO3Q",
+  aobt: "",
+};
+
+const um = (hhmm: string) => new Date(`2026-09-20T${hhmm}:00Z`);
+
+afterEach(() => {
+  vi.useRealTimers();
+  cleanup();
+  invoke.mockReset();
+  openExternal.mockReset();
+  istTauri = true;
+});
+
+describe("minutenBis", () => {
+  it("rechnet innerhalb desselben Tages", () => {
+    expect(minutenBis("15:46", um("15:42"))).toBe(4);
+    expect(minutenBis("15:42", um("15:46"))).toBe(-4);
+  });
+
+  it("dreht über Mitternacht auf die kurze Seite", () => {
+    // Ohne die Drehung käme hier 1435 heraus.
+    expect(minutenBis("23:58", um("00:03"))).toBe(-5);
+    expect(minutenBis("00:03", um("23:58"))).toBe(5);
+  });
+
+  it("verschweigt, was keine Uhrzeit ist", () => {
+    expect(minutenBis("", um("12:00"))).toBeNull();
+    expect(minutenBis("--:--", um("12:00"))).toBeNull();
+    expect(minutenBis("25:00", um("12:00"))).toBeNull();
+    expect(minutenBis("1546", um("12:00"))).toBeNull();
+  });
+});
+
+describe("ampel", () => {
+  it("wird grün, wenn die TSAT in Reichweite ist", () => {
+    expect(ampel(STAND, um("15:43"))).toBe("frei");
+  });
+
+  it("bleibt bernstein, solange die TSAT weit weg ist", () => {
+    // Gegenprobe zur Zeile darüber: gleiche Daten, nur andere Uhrzeit.
+    expect(ampel(STAND, um("15:00"))).toBe("warten");
+  });
+
+  it("wird rot bei Suspend und bei FLS-NRA", () => {
+    expect(ampel({ ...STAND, cdm_sts: "SUSPENDED" }, um("15:43"))).toBe(
+      "achtung",
+    );
+    expect(ampel({ ...STAND, cdm_sts: "FLS-NRA" }, um("15:43"))).toBe(
+      "achtung",
+    );
+  });
+
+  it("wird ohne bestätigte TOBT nicht grün", () => {
+    expect(ampel({ ...STAND, tobt: "" }, um("15:43"))).toBe("warten");
+  });
+});
+
+describe("VdgsPlatte", () => {
+  it("zeigt nichts ohne Eintrag", () => {
+    const { container } = render(<VdgsPlatte antwort={null} />);
+    expect(container.firstChild).toBeNull();
+  });
+
+  it("zeigt Rufzeichen, Platz, Bahn und die Zeiten", () => {
+    render(<VdgsPlatte antwort={{ gefragt_als: STAND.callsign, stand: STAND }} />);
+    const band = screen.getByTestId("vdgs-band");
+    expect(band.textContent).toContain("GSG421");
+    expect(band.textContent).toContain("LEBL");
+    expect(band.textContent).toContain("24L/OLOXO3Q");
+    expect(band.textContent).toContain("15:50");
+    expect(band.textContent).toContain("15:44");
+    expect(band.textContent).toContain("15:46");
+    expect(band.textContent).toContain("COMPLY");
+  });
+
+  it("fordert zum Setzen auf, wenn keine TOBT gesetzt ist", async () => {
+    // Ohne TOBT gibt es keine TSAT und kein Sequencing — der Flug steht
+    // nicht in der Folge. Das ist kein Leerwert, sondern eine offene
+    // Aufgabe (Thomas, 20.09.2026: "die muss doch gesetzt werden").
+    render(<VdgsPlatte antwort={{ gefragt_als: STAND.callsign, stand: { ...STAND, tobt: "", tsat: "" } }} />);
+    expect(screen.getByText("TOBT SETZEN")).toBeTruthy();
+    // Und keine grosse Leerzahl mehr an der Stelle. (In der kleinen
+    // Feldreihe darunter steht weiter "--:--" fuer CTOT usw. — geprueft
+    // wird die HAUPTZAHL.)
+    expect(document.querySelector(".vdgs__gross")).toBeNull();
+    // Gesetzt wird sie auf vats.im/vdgs — der Klick fuehrt dorthin.
+    invoke.mockClear();
+    screen.getByText("TOBT SETZEN").closest("button")!.click();
+    expect(invoke).toHaveBeenCalledWith("vdgs_fenster_oeffnen");
+  });
+
+  it("zeigt die Restzeit nicht, solange keine TOBT steht", () => {
+    // Sie haette keinen Bezug: Ohne TOBT gibt es nichts, worauf man
+    // wartet.
+    render(<VdgsPlatte antwort={{ gefragt_als: STAND.callsign, stand: { ...STAND, tobt: "", tsat: "" } }} />);
+    expect(screen.queryByText(/in \d+ min|vor \d+ min/)).toBeNull();
+  });
+
+  it("nimmt die TOBT als Hauptzahl, wo es keine TSAT gibt", () => {
+    // Plätze ohne CDM-Sequenzierung (EDDF, EGLL) liefern keine TSAT —
+    // dort stünde sonst dauerhaft „--:--" als größte Zahl im Bild.
+    render(<VdgsPlatte antwort={{ gefragt_als: STAND.callsign, stand: { ...STAND, tsat: "" } }} />);
+    const gross = screen.getByTestId("vdgs-band").querySelector(".vdgs__gross");
+    expect(gross?.textContent).toContain("TOBT");
+    expect(gross?.textContent).toContain("15:44");
+    expect(gross?.textContent).not.toContain("TSAT");
+  });
+
+  it("nimmt die TSAT, sobald es eine gibt", () => {
+    render(<VdgsPlatte antwort={{ gefragt_als: STAND.callsign, stand: STAND }} />);
+    const gross = screen.getByTestId("vdgs-band").querySelector(".vdgs__gross");
+    expect(gross?.textContent).toContain("TSAT");
+    expect(gross?.textContent).toContain("15:46");
+  });
+});
+
+/** Probe-Komponente: ruft nur den Haken auf, damit sein Verhalten
+ *  prüfbar ist, ohne das ganze Cockpit zu rendern. */
+function Probe({ aktiv }: { aktiv: boolean }) {
+  const [antwort] = useVdgsStand(aktiv);
+  return <span data-testid="probe">{antwort?.stand ? antwort.stand.callsign : "leer"}</span>;
+}
+
+describe("Rufzeichen in der Platte", () => {
+  it("zeigt bei fehlendem Eintrag eine schmale Zeile MIT dem Rufzeichen", () => {
+    // Vorher verschwand die Platte ganz — und damit die einzige
+    // Auskunft darueber, WOMIT gefragt wurde. Genau daran blieb ein
+    // falsches Rufzeichen unbemerkt (Thomas, 20.09.2026).
+    render(<VdgsPlatte antwort={{ gefragt_als: "GSG421", stand: null }} />);
+    expect(screen.getByTestId("vdgs-band-leer")).toBeTruthy();
+    expect(screen.getByText("GSG421")).toBeTruthy();
+    // Und der Weg steht DABEI, nicht nur im Tooltip: Wer im Cockpit
+    // sitzt, faehrt nicht mit der Maus ueber eine schmale Zeile, um zu
+    // erfahren, wo sein Rufzeichen herkommt (Thomas, 21.09.2026).
+    //
+    // Beide Aussagen einzeln geprueft — mit einem ODER-Muster bliebe
+    // der Test gruen, wenn genau der Wegweiser wieder verschwindet.
+    const zeile = screen.getByTestId("vdgs-band-leer");
+    expect(zeile.textContent).toMatch(/kein CDM-Eintrag/i);
+    expect(zeile.textContent).toMatch(/PDC\/CPDLC/i);
+    // Und es ist KEINE volle Platte — sonst stuende an jedem Platz
+    // ohne A-CDM ein leeres Geraet im Cockpit.
+    expect(screen.queryByTestId("vdgs-band")).toBeNull();
+  });
+
+  it("setzt keinen Bindestrich vor Tab, der mitten im Wort bricht", () => {
+    // Zwei Befunde in Folge an derselben Zeile, beide am laufenden
+    // Korpus gesehen:
+    //
+    //   1. „PDC/CPDLC-Tab" brach bei 480 px Bandbreite mitten im Wort
+    //      auf — Browser behandeln einen Bindestrich als weiche
+    //      Trennstelle. Dieselbe Falle steht schon bei
+    //      `.datalink-block__label` in App.css.
+    //   2. Mein erster Fix dafuer war ein geschuetzter Bindestrich
+    //      (U+2011). Den kennt B612 Mono nicht — die Schrift des
+    //      Bandes. Im Cockpit waere dort eine Ersatzglyphe erschienen
+    //      oder der Browser auf eine fremde Schrift gesprungen, mitten
+    //      im Wort, in einer Monospace-Zeile. Schlechter als der
+    //      Umbruch, den es beheben sollte.
+    //
+    // Antwort auf beides: die Reihenfolge drehen. „im Tab PDC/CPDLC"
+    // braucht gar keinen Bindestrich, also faellt der Umbruch auf ein
+    // Leerzeichen — wie im Englischen und Italienischen, die nie
+    // betroffen waren.
+    //
+    // Gegen den WIEDEREINBAU eines exotischen Zeichens steht nicht
+    // dieser Test, sondern scripts/pruefe-schriftzeichen.mjs: Der
+    // vergleicht alle Bandtexte mit dem echten Zeichenvorrat der
+    // Schrift. Hier geht es nur um die Trennstelle.
+    render(<VdgsPlatte antwort={{ gefragt_als: "GSG421", stand: null }} />);
+    const text = screen.getByTestId("vdgs-band-leer").textContent ?? "";
+    expect(text).toContain("Tab PDC/CPDLC");
+    expect(
+      text,
+      "Bindestrich vor Tab — bricht bei schmalem Band mitten im Wort",
+    ).not.toMatch(/[-\u2010-\u2015]Tab/);
+
+    // Und die SPRACHDATEI mit, nicht nur der Ersatztext im Quelltext.
+    //
+    // Das ist hier kein Beiwerk: Die `react-i18next`-Attrappe oben gibt
+    // den Ersatztext zurueck, den `t()` im Quelltext mitbekommt — die
+    // Datei unter locales/ fasst sie nie an. Im Betrieb ist es genau
+    // umgekehrt. Ohne diese Zeilen waere der Test blind fuer den Text,
+    // den der Pilot wirklich sieht.
+    expect(deCommon.cdm.band.kein_eintrag_wo_aendern).toContain("Tab PDC/CPDLC");
+    expect(deCommon.cdm.band.kein_eintrag_wo_aendern).not.toMatch(/[-\u2010-\u2015]Tab/);
+  });
+
+  it("nennt den Weg zum Rufzeichen NUR bei fehlendem Eintrag, nicht bei Stoerung", () => {
+    // Die Gegenprobe zum Test darueber, und der eigentliche Grund fuer
+    // die Trennung: Antwortet der Dienst nicht, ist das Rufzeichen
+    // nicht das Problem. Ein Wegweiser waere dort eine falsche Faehrte
+    // — der Pilot tauscht ein Rufzeichen aus, an dem nichts falsch ist.
+    render(
+      <VdgsPlatte antwort={{ gefragt_als: "GSG421", stand: null, stoerung: true }} />,
+    );
+    const zeile = screen.getByTestId("vdgs-band-leer");
+    expect(zeile.textContent).toMatch(/nicht erreichbar/i);
+    expect(zeile.textContent).not.toMatch(/PDC\/CPDLC/i);
+  });
+
+  it("sagt bei Stoerung, dass die gezeigten Zahlen alt sind", () => {
+    // Faellt der Dienst aus, liefert das Backend den letzten guten Stand
+    // bis zu zehn Minuten weiter, damit das Band nicht flackert. Ohne
+    // Hinweis sieht das aus wie eine normale Platte — und eine TSAT von
+    // vor neun Minuten gilt als aktuell (Codex-Abnahme, dritte Runde).
+    render(
+      <VdgsPlatte
+        antwort={{ gefragt_als: STAND.callsign, stand: STAND, stoerung: true }}
+      />,
+    );
+    // Die volle Platte steht da (der Stand ist ja noch brauchbar) …
+    expect(screen.getByTestId("vdgs-band")).toBeTruthy();
+    expect(screen.getByText(STAND.tsat)).toBeTruthy();
+    // … aber mit Warnung, und die nennt BEIDES: dass der Dienst nicht
+    // antwortet UND wie alt die Zahlen sein koennen.
+    //
+    // Das Muster war erst `/10 Minuten|nicht erreichbar/` — mit ODER.
+    // Damit blieb der Test gruen, wenn die Altersangabe verschwindet,
+    // also genau der Teil, der den Befund behoben hat (Codex, vierte
+    // Runde). Jetzt beide Aussagen einzeln.
+    const hinweis = screen.getByTestId("vdgs-alt-hinweis");
+    expect(hinweis.textContent).toMatch(/nicht erreichbar/i);
+    expect(hinweis.textContent).toMatch(/10 Minuten/i);
+
+    // Und die Platte traegt die Alt-Kennzeichnung, die ihre linke Kante
+    // auf Rot setzt — sonst wirkt eine gruene Ampel auf alten Zahlen
+    // beruhigend.
+    expect(screen.getByTestId("vdgs-band").className).toMatch(/\bvdgs--alt\b/);
+  });
+
+  it("zeigt ohne Stoerung KEINEN Alt-Hinweis", () => {
+    // Gegenprobe zum Test darueber: Sonst stuende die Warnung immer da
+    // und wuerde bedeutungslos.
+    render(
+      <VdgsPlatte
+        antwort={{ gefragt_als: STAND.callsign, stand: STAND, stoerung: false }}
+      />,
+    );
+    expect(screen.queryByTestId("vdgs-alt-hinweis")).toBeNull();
+    expect(screen.getByTestId("vdgs-band").className).not.toMatch(/\bvdgs--alt\b/);
+  });
+
+  it("laesst das Rufzeichen hier NICHT aendern", () => {
+    // Bewusst nur anzeigen (Thomas, 20.09.2026). Am Funk haengt die
+    // Identitaet: Hoppie merkt sich das Rufzeichen beim VERBINDEN, und
+    // ohne Neuaufbau funkt eine laufende Verbindung weiter unter dem
+    // alten, waehrend VDGS schon das neue nimmt — zwei Identitaeten
+    // gleichzeitig (Codex-Abnahme, zweite Runde). Geaendert wird es im
+    // CPDLC-Fenster, das den Neuaufbau selbst macht.
+    invoke.mockClear();
+    render(<VdgsPlatte antwort={{ gefragt_als: "GSG421", stand: null }} />);
+    const zeichen = screen.getByText("GSG421");
+    // Kein Knopf, kein Eingabefeld — nur Text mit Erklaerung, woher es
+    // kommt.
+    expect(zeichen.closest("button")).toBeNull();
+    expect(zeichen.tagName).toBe("SPAN");
+    expect(zeichen.getAttribute("title")).toMatch(/CPDLC/);
+
+    // WIRKLICH ANFASSEN, nicht nur ansehen.
+    //
+    // Die erste Fassung prüfte `invoke` gleich nach dem Rendern. Ein
+    // wieder eingebauter Schreibweg per `onClick` am selben `<span>`
+    // wäre damit unentdeckt geblieben (Codex-Abnahme, dritte Runde).
+    fireEvent.click(zeichen);
+    fireEvent.doubleClick(zeichen);
+    fireEvent.keyDown(zeichen, { key: "Enter" });
+    fireEvent.focus(zeichen);
+    fireEvent.blur(zeichen);
+    // Und es entsteht auch kein Eingabefeld.
+    expect(screen.queryByRole("textbox")).toBeNull();
+    // Von hier aus wird nichts geschrieben — kein Befehl ueberhaupt.
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+});
+
+describe("useVdgsStand", () => {
+  it("fragt die fremde Seite gar nicht, solange nichts läuft", () => {
+    invoke.mockResolvedValue({ gefragt_als: STAND.callsign, stand: STAND });
+    render(<Probe aktiv={false} />);
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("fragt genau einmal, sobald die Abflugfolge läuft", async () => {
+    // Gegenprobe zur Zeile darüber — sonst wäre „nicht gefragt" auch
+    // dann grün, wenn der Haken überhaupt nie abriefe.
+    invoke.mockResolvedValue({ gefragt_als: STAND.callsign, stand: STAND });
+    render(<Probe aktiv={true} />);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith("vdgs_stand");
+    expect(await screen.findByText("GSG421")).toBeTruthy();
+  });
+
+  it("bleibt still, wenn der Dienst nicht antwortet", async () => {
+    // Erst einen Stand liefern, DANN den Fehler — sonst prueft der Test
+    // nichts: "leer" ist auch der Anfangszustand, und mit ihm blieb er
+    // gruen, selbst wenn man den ganzen Fehlerzweig entfernte
+    // (Abnahme 20.09.2026, per Mutation nachgemessen).
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    invoke.mockResolvedValueOnce({ gefragt_als: STAND.callsign, stand: STAND });
+    render(<Probe aktiv={true} />);
+    expect(await screen.findByText(STAND.callsign)).toBeTruthy();
+
+    // Jetzt faellt der Dienst aus, und der 60-Sekunden-Takt laeuft
+    // erneut. NICHT ueber `aktiv={false}` gehen: Dieser Zweig leert den
+    // Stand selbst, und der Test waere wieder blind fuer den
+    // Fehlerzweig (zweiter Anlauf, 20.09.2026).
+    invoke.mockRejectedValue(new Error("offline"));
+    await act(async () => {
+      vi.advanceTimersByTime(60_000);
+    });
+    expect(await screen.findByText("leer")).toBeTruthy();
+  });
+});
+
+/** AIB4TK EDDC→LEPA, 21.09.2026: kein CDM-Platz, also keine TSAT —
+ *  die Seite von VATSIM Spain zeigte dazu „Suggested startup window
+ *  2040Z to 2051Z". */
+const EDDC: VdgsStand = {
+  ...STAND,
+  callsign: "AIB4TK",
+  departure: "EDDC",
+  eobt: "20:45",
+  tobt: "20:45",
+  tsat: "",
+  taxi_min: 10,
+  rwy_sid: "",
+};
+
+describe("Anlassfenster (VATSIM A-CDM: TSAT -5/+5, ab +6 verpasst)", () => {
+  it("rechnet das Fenster wie die Seite von VATSIM Spain", () => {
+    expect(anlassfenster("20:45")).toEqual(["20:40", "20:51"]);
+    expect(anlassfenster("--:--")).toBeNull();
+  });
+
+  it("rechnet über Mitternacht", () => {
+    expect(zeitPlus("23:58", 6)).toBe("00:04");
+    expect(zeitPlus("00:02", -5)).toBe("23:57");
+  });
+
+  it("ist grün von -5 bis +5 und ab der sechsten Minute rot", () => {
+    // Vorher reichte grün bis +10 — dann stand „anlassen" da, obwohl der
+    // Flug laut CDM schon aus der Folge war.
+    expect(ampel(STAND, um("15:40"))).toBe("warten");
+    expect(ampel(STAND, um("15:41"))).toBe("frei");
+    expect(ampel(STAND, um("15:51"))).toBe("frei");
+    expect(ampel(STAND, um("15:52"))).toBe("achtung");
+  });
+
+  it("gilt ohne TSAT genauso für die TOBT", () => {
+    expect(ampel(EDDC, um("20:50"))).toBe("frei");
+    expect(ampel(EDDC, um("20:52"))).toBe("achtung");
+  });
+
+  it("wird nicht rot, wenn der Flug schon off-block ist", () => {
+    expect(ampel({ ...EDDC, aobt: "20:42" }, um("20:53"))).toBe("frei");
+  });
+
+  it("zeigt das Fenster unter dem Countdown", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(um("20:17"));
+    render(<VdgsPlatte antwort={{ gefragt_als: "AIB4TK", stand: EDDC }} />);
+    expect(screen.getByTestId("vdgs-fenster").textContent).toBe("Anlassen 20:40–20:51");
+    expect(screen.queryByTestId("vdgs-verpasst")).toBeNull();
+  });
+
+  it("zeigt nach dem Off-Block die Off-Block-Zeit statt des Fensters", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(um("20:53"));
+    render(<VdgsPlatte antwort={{ gefragt_als: "AIB4TK", stand: { ...EDDC, aobt: "20:42" } }} />);
+    expect(screen.getByTestId("vdgs-offblock").textContent).toBe("Off-Block 20:42");
+    expect(screen.queryByTestId("vdgs-fenster")).toBeNull();
+    expect(screen.queryByTestId("vdgs-verpasst")).toBeNull();
+  });
+
+  it("fordert nach verpasstem Fenster eine neue TOBT und führt dorthin", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(um("20:52"));
+    render(<VdgsPlatte antwort={{ gefragt_als: "AIB4TK", stand: EDDC }} />);
+    invoke.mockImplementation(() => Promise.resolve(null));
+    const knopf = screen.getByTestId("vdgs-verpasst");
+    expect(knopf.textContent).toBe("Anlassfenster verpasst — neue TOBT setzen");
+    knopf.click();
+    expect(invoke).toHaveBeenCalledWith("vdgs_fenster_oeffnen");
+  });
+});
+
+describe("Verpasst ist eine Frage der Zeit", () => {
+  it("meldet bei FLS-NRA mit TSAT weit voraus KEIN verpasstes Fenster", () => {
+    // Am Bild gefunden (Vorschau, 21.09.2026): Der Hinweis hing an der
+    // roten Farbe — und rot ist das Band auch bei Regulierung.
+    vi.useFakeTimers();
+    vi.setSystemTime(um("15:00"));
+    render(
+      <VdgsPlatte antwort={{ gefragt_als: "GSG7L", stand: { ...STAND, cdm_sts: "FLS-NRA" } }} />,
+    );
+    expect(screen.getByTestId("vdgs-band").className).toContain("vdgs--achtung");
+    expect(screen.queryByTestId("vdgs-verpasst")).toBeNull();
+  });
+});
+
+describe("TOBT ändern", () => {
+  it("ist auch mit gesetzter TOBT erreichbar", () => {
+    // Thomas, 21.09.2026: Mit gesetzter TOBT gab es im Band keinen Weg
+    // mehr zu vats.im/vdgs — den Link musste er selbst suchen.
+    render(<VdgsPlatte antwort={{ gefragt_als: "AIB4TK", stand: EDDC }} />);
+    invoke.mockImplementation(() => Promise.resolve(null));
+    const knopf = screen.getByTestId("vdgs-tobt-aendern");
+    expect(knopf.textContent).toBe("TOBT ÄNDERN");
+    knopf.click();
+    expect(invoke).toHaveBeenCalledWith("vdgs_fenster_oeffnen");
+  });
+
+  it("verdoppelt ohne TOBT nicht den großen Auftrag", () => {
+    render(<VdgsPlatte antwort={{ gefragt_als: "AIB4TK", stand: { ...EDDC, tobt: "" } }} />);
+    expect(screen.queryByTestId("vdgs-tobt-aendern")).toBeNull();
+    expect(screen.getByText("TOBT SETZEN")).toBeTruthy();
+  });
+
+  it("hat die neuen Texte auch in der Sprachdatei", () => {
+    expect(deCommon.cdm.band.tobt_aendern).toBe("TOBT ÄNDERN");
+    expect(deCommon.cdm.band.anlassfenster).toBe("Anlassen {{von}}–{{bis}}");
+    expect(deCommon.cdm.band.verpasst).toContain("neue TOBT");
+  });
+});
+
+describe("Codex-Abnahme 21.09.2026", () => {
+  it("nimmt die Referenz in der Reihenfolge von VATSIM Spain", () => {
+    expect(referenz(STAND)).toEqual({ zeit: "15:46", art: "TSAT" });
+    // Regulierung ohne TSAT: CTOT minus Rollzeit, nicht die TOBT.
+    const reg = { ...STAND, tsat: "", tobt: "12:00", ctot: "12:45", taxi_min: 15 };
+    expect(referenz(reg)).toEqual({ zeit: "12:30", art: "CTOT" });
+    // Ohne Rollzeit lässt sich aus der CTOT nichts rechnen.
+    expect(referenz({ ...reg, taxi_min: null })).toEqual({ zeit: "12:00", art: "TOBT" });
+    expect(referenz({ ...STAND, tsat: "", tobt: "" })).toEqual({ zeit: "15:50", art: "EOBT" });
+  });
+
+  it("legt bei Regulierung ohne TSAT Fenster und Ampel um CTOT minus Rollzeit", () => {
+    const reg = { ...STAND, tsat: "", tobt: "12:00", ctot: "12:45", taxi_min: 15 };
+    // 12:10 ist nach dem TOBT-Fenster — früher schon rot.
+    expect(ampel(reg, um("12:10"))).toBe("warten");
+    expect(ampel(reg, um("12:26"))).toBe("frei");
+    expect(ampel(reg, um("12:36"))).toBe("achtung");
+    vi.useFakeTimers();
+    vi.setSystemTime(um("12:10"));
+    render(<VdgsPlatte antwort={{ gefragt_als: "GSG1", stand: reg }} />);
+    expect(screen.getByTestId("vdgs-fenster").textContent).toBe("Anlassen 12:25–12:36");
+    const gross = screen.getByTestId("vdgs-band").querySelector(".vdgs__gross");
+    expect(gross?.textContent).toContain("ANLASSEN");
+    expect(gross?.textContent).toContain("12:30");
+    expect(screen.queryByTestId("vdgs-verpasst")).toBeNull();
+  });
+
+  it("erkennt jede FLS-Aussetzung", () => {
+    expect(sperre("FLS-GS")).toBe("gs");
+    expect(sperre("FLS-MR")).toBe("mr");
+    expect(sperre("fls-cdm")).toBe("cdm");
+    expect(sperre("FLS-NRA")).toBe("sonst");
+    expect(sperre("SUSPENDED")).toBe("sonst");
+    expect(sperre("COMPLY")).toBeNull();
+    expect(sperre("REA")).toBeNull();
+    expect(sperre("")).toBeNull();
+    // Früher grün möglich: FLS-MR mitten im Fenster.
+    expect(ampel({ ...STAND, cdm_sts: "FLS-MR" }, um("15:43"))).toBe("achtung");
+  });
+
+  it("sagt bei Aussetzung, was zu tun ist — keine neue TOBT", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(um("16:10"));
+    render(<VdgsPlatte antwort={{ gefragt_als: "GSG1", stand: { ...STAND, cdm_sts: "FLS-MR" } }} />);
+    expect(screen.getByTestId("vdgs-sperre").textContent).toContain("Route im Flugplan korrigieren");
+    // Zeitlich verpasst, aber eine neue TOBT behebt eine Routenverletzung nicht.
+    expect(screen.queryByTestId("vdgs-verpasst")).toBeNull();
+  });
+
+  it("stellt Off-Block vor jeden Status", () => {
+    expect(ampel({ ...STAND, cdm_sts: "FLS-NRA", aobt: "15:45" }, um("16:10"))).toBe("frei");
+    render(
+      <VdgsPlatte
+        antwort={{ gefragt_als: "GSG1", stand: { ...STAND, cdm_sts: "FLS-NRA", aobt: "15:45" } }}
+      />,
+    );
+    expect(screen.getByTestId("vdgs-offblock").textContent).toBe("Off-Block 15:45");
+    expect(screen.queryByTestId("vdgs-sperre")).toBeNull();
+  });
+
+  it("zeigt Off-Block auch ohne TOBT — und keinen Auftrag, sie zu setzen", () => {
+    render(
+      <VdgsPlatte antwort={{ gefragt_als: "GSG1", stand: { ...STAND, tobt: "", aobt: "15:45" } }} />,
+    );
+    expect(screen.getByTestId("vdgs-offblock").textContent).toBe("Off-Block 15:45");
+    expect(screen.queryByText("TOBT SETZEN")).toBeNull();
+  });
+
+  it("öffnet auf dem Tablet vats.im/vdgs im Browser statt still nichts zu tun", () => {
+    istTauri = false;
+    render(<VdgsPlatte antwort={{ gefragt_als: "AIB4TK", stand: EDDC }} />);
+    screen.getByTestId("vdgs-tobt-aendern").click();
+    expect(openExternal).toHaveBeenCalledWith("https://vats.im/vdgs");
+    expect(invoke).not.toHaveBeenCalledWith("vdgs_fenster_oeffnen");
+  });
+
+  it("hat die neuen Texte in allen Sprachen", () => {
+    for (const k of ["kopf_aus_ctot", "sperre_gs", "sperre_mr", "sperre_cdm", "sperre_sonst"]) {
+      expect((deCommon.cdm.band as Record<string, string>)[k], k).toBeTruthy();
+    }
+  });
+});
+
+describe("Wunsch-TOBT, ASRT, Grund, Platz ohne CDM (2.0.11)", () => {
+  it("bleibt nach dem Fenster grün, wenn die Anlassbereitschaft gemeldet ist", () => {
+    // rpuig2001/CDM: "will not invalidate at TSAT+6 if ASRT is set".
+    expect(ampel(EDDC, um("20:52"))).toBe("achtung");
+    expect(ampel({ ...EDDC, asrt: "20:44" }, um("20:52"))).toBe("frei");
+  });
+
+  it("hält mit ASRT auch bei TSAT, aber nicht beim Fenster aus CTOT minus Rollzeit", () => {
+    // STAND: TSAT 15:46 → ab 15:52 verpasst, mit ASRT nicht.
+    expect(ampel({ ...STAND, asrt: "15:40" }, um("15:52"))).toBe("frei");
+    // Regulierung ohne TSAT: Fenster um CTOT minus Rollzeit (16:00 − 9 = 15:51).
+    const reg = { ...STAND, tsat: "", ctot: "16:00", asrt: "15:40" };
+    expect(referenz(reg)?.art).toBe("CTOT");
+    expect(ampel(reg, um("15:58"))).toBe("achtung");
+  });
+
+  it("meldet mit ASRT kein verpasstes Fenster, zeigt aber die ASRT", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(um("20:52"));
+    render(<VdgsPlatte antwort={{ gefragt_als: "AIB4TK", stand: { ...EDDC, asrt: "20:44" } }} />);
+    expect(screen.queryByTestId("vdgs-verpasst")).toBeNull();
+    expect(screen.getByTestId("vdgs-asrt").textContent).toBe("Anlassbereit 20:44");
+  });
+
+  it("zeigt eine angefragte TOBT statt erneut zum Setzen aufzufordern", () => {
+    render(
+      <VdgsPlatte
+        antwort={{ gefragt_als: "AIB4TK", stand: { ...EDDC, tobt: "", tobt_wunsch: "20:55" } }}
+      />,
+    );
+    expect(screen.getByTestId("vdgs-tobt-angefragt").textContent).toBe("TOBT 20:55 ANGEFRAGT");
+    expect(screen.queryByText("TOBT SETZEN")).toBeNull();
+  });
+
+  it("nennt eine neue Wunsch-TOBT neben der geltenden", () => {
+    render(
+      <VdgsPlatte antwort={{ gefragt_als: "AIB4TK", stand: { ...EDDC, tobt_wunsch: "21:05" } }} />,
+    );
+    expect(screen.getByTestId("vdgs-tobt-wunsch").textContent).toBe("Neue TOBT 21:05 angefragt");
+  });
+
+  it("zeigt den Grund des CDM", () => {
+    render(
+      <VdgsPlatte antwort={{ gefragt_als: "AIB4TK", stand: { ...EDDC, grund: "Ground delay" } }} />,
+    );
+    expect(screen.getByTestId("vdgs-grund").textContent).toBe("Ground delay");
+  });
+
+  it("schickt an einem Platz ohne CDM nicht auf die Suche nach dem Rufzeichen", () => {
+    render(<VdgsPlatte antwort={{ gefragt_als: "GSG421", stand: null, cdm_platz: false }} />);
+    const zeile = screen.getByTestId("vdgs-band-leer");
+    expect(zeile.textContent).toMatch(/ohne CDM/);
+    expect(zeile.textContent).not.toMatch(/PDC\/CPDLC/);
+  });
+
+  it("behält den Rufzeichen-Hinweis an CDM-Plätzen und wenn es unbekannt ist", () => {
+    for (const cdm_platz of [true, null, undefined]) {
+      render(<VdgsPlatte antwort={{ gefragt_als: "GSG421", stand: null, cdm_platz }} />);
+      expect(screen.getByTestId("vdgs-band-leer").textContent).toMatch(/PDC\/CPDLC/);
+      cleanup();
+    }
+  });
+
+  it("hat die neuen Texte in allen Sprachen", async () => {
+    const en = (await import("../locales/en/common.json")).default;
+    const itL = (await import("../locales/it/common.json")).default;
+    for (const k of ["kein_cdm_platz", "tobt_angefragt", "tobt_angefragt_grund", "asrt", "tobt_wunsch"]) {
+      for (const l of [deCommon, en, itL]) {
+        expect((l.cdm.band as Record<string, string>)[k], k).toBeTruthy();
+      }
+    }
+  });
+});

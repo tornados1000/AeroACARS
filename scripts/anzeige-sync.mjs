@@ -1,0 +1,542 @@
+#!/usr/bin/env node
+// Die Landebahn-Anzeige an EINER Stelle pflegen.
+//
+// # Warum es dieses Skript gibt
+//
+// Dieselbe Grafik lief zweimal: einmal im Pilot-Client, einmal in der
+// Webapp auf dem Server. Zwei Kopien, zwei Repos, keine Verbindung. Am
+// 23.08.2026 gemessen unterschieden sie sich in **1066 von 1743 Zeilen** —
+// die Webapp-Fassung kannte die halbe v1.7.0-Anzeige nicht, ohne dass
+// irgendwo ein Fehler auftauchte. Der Pilot sah im Client eine Queransicht
+// mit Spurband und auf der Webseite dieselbe Landung ohne.
+//
+// Das ist die Fehlerklasse aus `[[aeroacars-landebewertung-zweitimplemen-
+// tierungen]]`: Zwei Stellen, die dasselbe zeigen sollen, driften
+// auseinander, sobald sie nicht dieselbe Quelle haben. Die Antwort darauf
+// ist nicht Sorgfalt, sondern eine Quelle.
+//
+// # Was kanonisch ist
+//
+// `client/src` im Repo `aeroacars-src`. Dort wird entwickelt, dort laufen
+// die Prüfungen (`RunwayQS.test.tsx`, `RunwayLesbarkeit.test.tsx`), dort
+// liegt die Demo mit allen Varianten. Die Webapp bekommt eine Kopie.
+//
+// # Was NICHT synchronisiert wird
+//
+// Die **Mapper**. `runwayDiagramV2Mapper.ts` gibt es beidseitig, aber sie
+// lesen verschiedene Quellen: der Client einen `LandingRecord`, die Webapp
+// ein `TouchdownDto.payload` von der Leitung. Sie sind absichtlich
+// verschieden und müssen es bleiben — was sie erzeugen, ist identisch.
+//
+// Das **Glossar-Modal**. Es zeigt beidseitig dieselben Texte, sitzt aber
+// im jeweils eigenen Dialog-Baustein (`./ui`), und die beiden haben
+// verschiedene Schnittstellen — die Client-Fassung übersetzt sich nicht.
+// Es ist Rahmen, nicht Grafik: Wer eine Erklärung ändert, ändert den
+// i18n-Schlüssel, und der liegt ohnehin in beiden Sprachdateien.
+//
+// # Aufruf
+//
+//   node scripts/anzeige-sync.mjs            # prüfen (Rückgabewert 1 bei Drift)
+//   node scripts/anzeige-sync.mjs --schreiben # kopieren
+//
+// Der Prüfmodus läuft in `client/src/components/AnzeigeSync.test.tsx` mit.
+
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const HIER = dirname(fileURLToPath(import.meta.url));
+const CLIENT = resolve(HIER, "..", "client", "src");
+// Die Webapp liegt in einem anderen Repo. Auf dem Mac nebenan, in einer
+// CI ohne dieses Repo gar nicht — dann meldet das Skript das und endet
+// ohne Fehler, statt einen Abgleich vorzutäuschen, den es nicht geführt hat.
+const WEBAPP = resolve(HIER, "..", "..", "aeroacars-live", "webapp", "src");
+
+/** Die Dateien der Anzeige. Der Abhängigkeitsbaum ist geschlossen. */
+export const DATEIEN = [
+  "components/RunwayDiagramV2.tsx",
+  "components/RunwayDisciplinePanel.tsx",
+  // Seit Variante B (22.10.2026) ohne Queransicht; ihre gemeinsamen Hilfen.
+  "components/bahnHilfen.ts",
+  // v1.7.40: Lupe „Abrollen im echten Massstab" unter der Queransicht.
+  "components/RunwayExitLupe.tsx",
+  // Variante B (22.10.2026): Spur, Band und Queransicht-Stücke in der
+  // Draufsicht, mit Quermassstab und Reifen-Aussenkante.
+  "components/BahnSpurOverlay.tsx",
+  "lib/bahnQuerMassstab.ts",
+  "components/SkinContext.tsx",
+  // Die Farbtabelle. Sie stand nicht in der ersten Fassung dieser Liste,
+  // und der Baum-Test hat sie gefunden: Die Webapp-Fassung schleppte noch
+  // das `labels`-Feld mit, das der Client in v0.19.x als toten Vertrag
+  // entfernt hat (definiert, befüllt, gemerged — und von keiner
+  // Komponente gelesen, weil beide längst i18next benutzen). Ohne diese
+  // Zeile wären zwei Anzeigen mit denselben Bausteinen und verschiedenen
+  // Farben möglich gewesen.
+  "components/runwayV2Skin.ts",
+  "lib/runwayProjection.ts",
+  "lib/useBahnZoom.ts",
+  // Soll-Sinkrate im Anflug (16.09.2026): Rechnung der Anflug-Grafik,
+  // identisch zur Bewertung. Beide Grafiken (LandingPanel, _ApproachChart)
+  // zeichnen das Band nur hieraus.
+  "lib/anflugSollband.ts",
+  // v1.7.36: Die Sprit-Auswertung. Sie lief bis dahin zweimal — Client und
+  // Live-Uebersicht mit je eigener Fassung, beide mit Kommentaren, die
+  // Gleichheit zusagten, und trotzdem auseinander: In der Webapp waren
+  // `strecke_anflug_nm`, `plan_strecke_anflug_nm` und `takeoff_fuel_kg`
+  // typisiert und wurden nie angezeigt, die Sprit-Leiter fehlte ganz.
+  // Dieselbe Fehlerklasse wie bei der Bahn-Grafik, dieselbe Antwort.
+  "components/SpritSektion.tsx",
+  // v1.7.40: Sprit je Wegpunkt — in der Sprit-Sektion der Landeauswertung.
+  "components/SpritWegpunkte.tsx",
+  "lib/sprit.ts",
+  // Lernpaket AP4/AP5 (Entscheid Thomas 29.09.2026): Gleitpfad und
+  // Anflugruhe — Info-Zeilen ohne Note. Client: aus dem LandingRecord;
+  // Webapp: aus dem PIREP-Payload (`anflug_gleitpfad` / `anflug_ruhe`,
+  // dieselbe JSON-Form). Keine Importe ausser React/react-i18next.
+  "components/AnflugForensikInfo.tsx",
+  // Score-Version 19 (QS 05.10.2026): Stable-Gate-Urteil, Deckel-Texte und
+  // Hinweis-Marken — eine Quelle für Client und Webapp.
+  "lib/stableGate.ts",
+  // Score-Version 24: Wind im Anflug (Texte zum eingefrorenen approach_wind).
+  "lib/anflugWind.ts",
+  "lib/landungsUrteil.ts",
+  // Gleichheitstest: dieselben Fälle und Erwartungen auf beiden Seiten.
+  "lib/landungsFaelle.ts",
+  // 06.10.2026: die ganze Seite eines echten Flugs (THY39) — Zerlegung in
+  // Zeilen und der erwartete Text, beide byte-gleich.
+  "lib/seitenText.ts",
+  "lib/landungsFaelle.thy39.txt",
+  // Abschnitte der Landungsanzeige — ein Code für Client und Webapp
+  // (QS 05.10.2026, „alles genau bei beiden angezeigt").
+  "lib/landungsDatensatz.ts",
+  "lib/bewertungsGrenzen.ts",
+  "components/AnflugGrafik.tsx",
+  "components/anflugGrafik.css",
+  "components/SinkrateForensik.tsx",
+  "components/GForceForensik.tsx",
+  "components/landungForensik.css",
+  "lib/landungsFormat.ts",
+  // 05.10.2026: Druck-Schalter — der PDF-Bericht druckt die Abschnitte
+  // aufgeklappt (Rohdaten, Sinkrate-Details).
+  "lib/druck.ts",
+  "components/TouchdownAbschnitt.tsx",
+  "components/touchdownAbschnitt.css",
+  "components/FlareAbschnitt.tsx",
+  "components/flareAbschnitt.css",
+  "components/LandingQualitaet.tsx",
+  "components/InfoBadge.tsx",
+  "components/infoBadge.css",
+  "components/LadeblattAbschnitt.tsx",
+  "components/ladeblattAbschnitt.css",
+  // „Zeiten gegen Flugplan" (13.10.2026): Rechnung + Abschnitt + Kurzform.
+  "lib/flugzeiten.ts",
+  "components/FlugzeitenAbschnitt.tsx",
+  "components/flugzeitenAbschnitt.css",
+  "components/MetarAbschnitt.tsx",
+  "components/metarAbschnitt.css",
+  "components/RohdatenAbschnitt.tsx",
+  "components/rohdatenAbschnitt.css",
+  "components/ApproachStabilityCard.tsx",
+  "components/ApproachStabilityHilfeInhalt.tsx",
+  "components/approachStabilityHilfe.css",
+  "components/LandungsBewertung.tsx",
+  "components/landungsBewertung.css",
+  "components/ForensicsBadge.tsx",
+  "components/RunwayUtilizationHilfeInhalt.tsx",
+  "lib/callsign.ts",
+  "lib/runwayGeometry.ts",
+  "components/bordbuch/BordbuchLandungsAnzeige.tsx",
+  "components/bordbuch/BordbuchCheckliste.tsx",
+  "components/bordbuch/Symbole.tsx",
+  "components/bordbuch/gesehen.ts",
+  "components/bordbuch/bordbuchLandung.css",
+  "lib/bordbuch.ts",
+];
+
+/**
+ * Was zur Grafik gehört, aber bewusst repo-eigen bleibt.
+ *
+ * Jeder Eintrag braucht einen Grund — sonst ist diese Liste nur ein Weg,
+ * den Baum-Test ruhigzustellen.
+ */
+export const AUSNAHMEN = {
+  "./RunwayUtilizationHelpModal":
+    "Dialog-Hülle der Hilfe zur Bahn-Auslastung — repo-eigener " +
+    "Dialog-Baustein; der Inhalt (RunwayUtilizationHilfeInhalt.tsx) ist " +
+    "gespiegelt",
+  "./ApproachStabilityHelpModal":
+    "Dialog-Hülle der Anflug-Hilfe — sitzt wie das Glossar im repo-eigenen " +
+    "Dialog-Baustein; der Inhalt (ApproachStabilityHilfeInhalt.tsx) ist " +
+    "gespiegelt",
+  "./RunwayGlossaryModal":
+    "sitzt im repo-eigenen Dialog-Baustein (./ui) mit anderer " +
+    "Schnittstelle; zeigt nur i18n-Texte, die ohnehin in beiden " +
+    "Sprachdateien liegen",
+};
+
+/** Die drei Sprachen, die beide Seiten führen. */
+export const SPRACHEN = ["de", "en", "it"];
+
+/**
+ * Dateien, die jede Seite SELBST führt (die Hüllen der Hilfe-Dialoge), deren
+ * Beschriftungen aber dieselben sein müssen. Sie werden nicht kopiert, nur
+ * auf Schlüssel gelesen — QS 06.10.2026: Titel und Schließen-Knopf beider
+ * Dialoge fehlten der Webapp.
+ */
+export const NUR_SCHLUESSEL = [
+  "components/ApproachStabilityHelpModal.tsx",
+  "components/RunwayUtilizationHelpModal.tsx",
+];
+
+const summe = (t) => createHash("sha256").update(t).digest("hex").slice(0, 16);
+
+/**
+ * Die i18n-Schlüssel, die die synchronisierten Bauteile benutzen.
+ *
+ * Gleiche Datei heisst nicht gleiche Anzeige. Am 24.08.2026 waren die
+ * sieben Dateien oben byteweise identisch — und in der Webapp fehlten
+ * **46 von 108** Schlüsseln des `runway_v2`-Blocks. `t()` fällt bei einem
+ * fehlenden Schlüssel stillschweigend auf seinen `defaultValue` zurück,
+ * und der ist im Quelltext deutsch. Ein englischsprachiger Pilot sah in
+ * der Landeanalyse die halbe Grafik auf Deutsch: „AUSROLLEN ENDE" neben
+ * „ROLLOUT". Kein Fehler, kein roter Test, keine Meldung.
+ *
+ * Der Bauteil-Abgleich konnte das nicht sehen — er vergleicht Dateien,
+ * und die Sprachdateien stehen nicht in seiner Liste. Sie DÜRFEN auch
+ * nicht drin stehen: Beide Repos haben eigene Beschriftungen ausserhalb
+ * der Grafik. Geprüft wird deshalb die Schnittmenge, die die Grafik
+ * wirklich anfasst.
+ */
+function schluesselAusQuelltext(text) {
+  const raus = new Set();
+  // t("a.b") und t("a.b", { … }) — beide Anführungsformen.
+  for (const m of text.matchAll(/\bt\(\s*["'`]([\w.]+)["'`]/g)) raus.add(m[1]);
+  return raus;
+}
+
+/**
+ * Zusammengesetzte Schlüssel: t(`a.b.${x}`).
+ *
+ * Die erste Fassung dieser Prüfung kannte nur feste Namen und war eine
+ * Stunde nach ihrer Einführung schon einmal blind: Die Begründungen,
+ * warum die Queransicht entfällt, stehen unter
+ * `runway_v2.discipline_skip.${grund}` — in der Webapp fehlten fünf der
+ * elf, darunter die vier häufigsten (Graspiste, Belag unbekannt,
+ * Spurweite unbekannt, kein Rollweg). Der Wächter war grün.
+ *
+ * Ein zusammengesetzter Name lässt sich nicht auflösen, ohne den Code
+ * auszuführen. Prüfbar ist aber der VORSPANN: Was der Client unter
+ * `runway_v2.discipline_skip` führt, muss die Webapp auch führen — sonst
+ * fällt genau der Fall, den der Client kennt, drüben auf den deutschen
+ * Vorgabetext zurück.
+ */
+function vorspaenneAusQuelltext(text) {
+  const raus = new Set();
+  for (const m of text.matchAll(/\bt\(\s*`([\w.]+)\.\$\{/g)) raus.add(m[1]);
+  // Auch ausserhalb von t(): `coachTipKey` baut `landing.tip.${grund}` in
+  // einer Hilfsfunktion. Das sah der Abgleich nicht — der Webapp fehlten bis
+  // zum 05.10.2026 54 Coach-Tipps, sie zeigte den rohen Schluessel. Was kein
+  // Sprachpfad ist, liefert unter `blaetter()` nichts und schadet nicht.
+  for (const m of text.matchAll(/`([a-z_][\w]*(?:\.[\w]+)+)\.\$\{/g)) raus.add(m[1]);
+  return raus;
+}
+
+/**
+ * Alle Blattpfade unterhalb eines Vorspanns — in jeder Tiefe.
+ *
+ * QS 06.10.2026: `tiles.${k}.label` hat unter dem Vorspann Objekte, keine
+ * Texte. Mit nur der ersten Ebene fand der Abgleich dort nichts, und der
+ * Webapp fehlten sämtliche Texte beider Hilfe-Dialoge (Anflug-Stabilität,
+ * Bahn-Auslastung) — sie zeigte rohe Schlüssel. Der Wächter war grün.
+ */
+function blaetter(baum, pfad) {
+  let k = baum;
+  for (const teil of pfad.split(".")) {
+    if (k == null || typeof k !== "object") return [];
+    k = k[teil];
+  }
+  if (k == null || typeof k !== "object") return [];
+  return Object.keys(k).flatMap((n) =>
+    typeof k[n] === "string" ? [`${pfad}.${n}`] : blaetter(k, n).map((b) => `${pfad}.${b}`),
+  );
+}
+
+function sprachdatei(wurzel, sprache) {
+  const p = resolve(wurzel, "locales", sprache, "common.json");
+  return existsSync(p) ? JSON.parse(readFileSync(p, "utf-8")) : null;
+}
+
+function hatSchluessel(baum, punktpfad) {
+  let k = baum;
+  for (const teil of punktpfad.split(".")) {
+    if (k == null || typeof k !== "object" || !(teil in k)) return false;
+    k = k[teil];
+  }
+  return typeof k === "string";
+}
+
+/** Alle Textpfade einer Sprachdatei, z. B. `landing.wert.td_ziel`. */
+function alleSchluessel(baum, pfad = "") {
+  if (typeof baum === "string") return [pfad];
+  if (baum == null || typeof baum !== "object") return [];
+  return Object.entries(baum).flatMap(([k, v]) => alleSchluessel(v, pfad ? `${pfad}.${k}` : k));
+}
+
+/** Welche Schlüssel die Grafik braucht — aus dem kanonischen Quelltext. */
+export function benoetigteSchluessel() {
+  const alle = new Set();
+  const vorspaenne = new Set();
+  for (const rel of [...DATEIEN, ...NUR_SCHLUESSEL]) {
+    const p = resolve(CLIENT, rel);
+    if (!existsSync(p)) continue;
+    const text = readFileSync(p, "utf-8");
+    for (const k of schluesselAusQuelltext(text)) alle.add(k);
+    for (const v of vorspaenneAusQuelltext(text)) vorspaenne.add(v);
+  }
+  // Unter einem zusammengesetzten Namen zählt jeder Eintrag, den die
+  // kanonische Seite kennt — die deutsche Datei ist dafür der Massstab,
+  // weil sie den Bestand führt.
+  const de = sprachdatei(CLIENT, "de");
+  if (de != null) {
+    for (const v of vorspaenne) for (const b of blaetter(de, v)) alle.add(b);
+    // Schlüssel, die die Bewertung in Rust setzt (`value_key`, `rationale_key`,
+    // `label_key`) und die Anzeige nur weiterreicht. QS 06.10.2026: die fünf
+    // Werttexte `landing.wert.*` fehlten der Webapp, sie zeigte rohe Schlüssel.
+    const rust = resolve(CLIENT, "..", "src-tauri", "crates", "landing-scoring", "src");
+    if (existsSync(rust)) {
+      for (const datei of readdirSync(rust, { recursive: true })) {
+        if (!String(datei).endsWith(".rs")) continue;
+        // Kommentare nennen Schlüssel nur als Beispiel — nicht mitzählen.
+        const text = readFileSync(resolve(rust, String(datei)), "utf-8")
+          .split("\n")
+          .filter((z) => !z.trim().startsWith("//"))
+          .join("\n");
+        for (const m of text.matchAll(/"(landing\.[\w.]+)"/g)) {
+          // Auch zusammengesetzt: `landing.wert.sprit` + `_mehrweg…` — jeder
+          // Text, dessen Schlüssel so beginnt. Findet sich gar keiner, fehlt
+          // er schon im Client: abbrechen statt still weglassen.
+          // Ein eigener Schlüssel zählt allein; sonst nur Fortsetzungen nach
+          // „." oder „_" (nicht `overrun` → `overrun_risk`).
+          const lit = m[1];
+          const treffer = hatSchluessel(de, lit)
+            ? [lit]
+            : alleSchluessel(de).filter(
+                (k) => k.startsWith(lit) && (/[._]$/.test(lit) || /[._]/.test(k[lit.length] ?? "")),
+              );
+          if (treffer.length === 0) {
+            throw new Error(`Rust benutzt ${lit} (${datei}), die deutsche Sprachdatei kennt ihn nicht`);
+          }
+          for (const k of treffer) alle.add(k);
+        }
+      }
+    }
+    // Schlüssel als Zeichenkette ausserhalb eines direkten t("…")-Aufrufs —
+    // etwa `t(bedingung ? "landing.a" : "landing.b")`. Am 05.10.2026 fehlten
+    // der Webapp so drei Texte (u. a. „Bei 200 ft stabil"); sie zeigte den
+    // rohen Schlüssel. Gezählt wird jede Zeichenkette, die in der deutschen
+    // Datei ein Text ist.
+    for (const rel of [...DATEIEN, ...NUR_SCHLUESSEL]) {
+      const p = resolve(CLIENT, rel);
+      if (!existsSync(p)) continue;
+      const text = readFileSync(p, "utf-8");
+      for (const m of text.matchAll(/["'`]([a-z_][a-z0-9_]*(?:\.[\w]+)+)["'`]/g)) {
+        if (hatSchluessel(de, m[1])) alle.add(m[1]);
+      }
+      // Zusammengesetzt ohne Punkt vor dem Platzhalter: t(`a.b_${x}`) —
+      // jeder Text, dessen Schlüssel mit „a.b_" beginnt. So fehlten der
+      // Webapp „runway_v2.tooltip_word_after/left" (Bahn-Tooltip zeigte den
+      // rohen Schlüssel).
+      for (const m of text.matchAll(/\bt\(\s*`([a-z_][a-z0-9_]*(?:\.[\w]+)*\.[\w]*[_\w])\$\{/g)) {
+        const vorspann = m[1];
+        const punkt = vorspann.lastIndexOf(".");
+        const eltern = vorspann.slice(0, punkt);
+        const anfang = vorspann.slice(punkt + 1);
+        for (const b of blaetter(de, eltern)) {
+          if (b.slice(eltern.length + 1).startsWith(anfang)) alle.add(b);
+        }
+      }
+    }
+  }
+  return [...alle].sort();
+}
+
+/**
+ * Fehlt eine Beschriftung — auf welcher Seite auch immer?
+ *
+ * Auch der Client wird geprüft. Ein `defaultValue` im Quelltext ist eine
+ * deutsche Notlösung, kein Ersatz für einen Eintrag: Solange er trägt,
+ * ist die Zeile in EN und IT still deutsch.
+ */
+export function fehlendeSchluessel() {
+  const noetig = benoetigteSchluessel();
+  const luecken = [];
+  const seiten = [{ name: "Client", wurzel: CLIENT }];
+  if (existsSync(WEBAPP)) seiten.push({ name: "Webapp", wurzel: WEBAPP });
+  for (const seite of seiten) {
+    for (const sprache of SPRACHEN) {
+      const baum = sprachdatei(seite.wurzel, sprache);
+      if (baum == null) {
+        luecken.push({ seite: seite.name, sprache, schluessel: "(Sprachdatei fehlt)" });
+        continue;
+      }
+      for (const k of noetig) {
+        if (!hatSchluessel(baum, k)) {
+          luecken.push({ seite: seite.name, sprache, schluessel: k });
+        }
+      }
+    }
+  }
+
+  // Und: dieselbe Beschriftung darf nicht zwei verschiedene Texte haben.
+  //
+  // # Warum das dazugehoert
+  //
+  // Bis zum 26.08.2026 hat der Abgleich nur ERGAENZT. Wer den Text eines
+  // vorhandenen Schluessels aenderte, aenderte ihn nur im Client — die
+  // Webapp behielt still den alten. So stand auf live.kant.ovh weiter
+  // „Grösster Versatz", waehrend der Client schon „Grösster Versatz bis
+  // auf 60 kt" sagte: genau die angeforderte Berichtigung kam dort nie
+  // an, und nichts hat es gemeldet.
+  if (existsSync(WEBAPP)) {
+    for (const sprache of SPRACHEN) {
+      const a = sprachdatei(CLIENT, sprache);
+      const b = sprachdatei(WEBAPP, sprache);
+      if (a == null || b == null) continue;
+      for (const k of noetig) {
+        if (!hatSchluessel(a, k) || !hatSchluessel(b, k)) continue;
+        if (wert(a, k) !== wert(b, k)) {
+          luecken.push({
+            seite: "Webapp",
+            sprache,
+            schluessel: `${k} (Text weicht ab: „${wert(b, k)}" statt „${wert(a, k)}")`,
+          });
+        }
+      }
+    }
+  }
+  return luecken;
+}
+
+/** Den Wert eines punktgetrennten Schluessels holen. */
+function wert(baum, k) {
+  let z = baum;
+  for (const t of k.split(".")) {
+    if (z == null || typeof z !== "object") return undefined;
+    z = z[t];
+  }
+  return z;
+}
+
+/** Die fehlenden Einträge aus dem Client in die Webapp übernehmen. */
+function schreibeSchluessel() {
+  if (!existsSync(WEBAPP)) return 0;
+  const noetig = benoetigteSchluessel();
+  let n = 0;
+  for (const sprache of SPRACHEN) {
+    const quelle = sprachdatei(CLIENT, sprache);
+    const ziel = sprachdatei(WEBAPP, sprache);
+    if (quelle == null || ziel == null) continue;
+    let geaendert = 0;
+    for (const k of noetig) {
+      if (!hatSchluessel(quelle, k)) continue;
+      // Vorhanden UND gleich → nichts zu tun. Vorhanden und ANDERS →
+      // ueberschreiben: Der Client ist die Quelle der Wahrheit.
+      if (hatSchluessel(ziel, k) && wert(ziel, k) === wert(quelle, k)) continue;
+      const teile = k.split(".");
+      let q = quelle;
+      let z = ziel;
+      for (const t of teile.slice(0, -1)) {
+        q = q[t];
+        if (z[t] == null || typeof z[t] !== "object") z[t] = {};
+        z = z[t];
+      }
+      z[teile[teile.length - 1]] = q[teile[teile.length - 1]];
+      geaendert++;
+    }
+    if (geaendert > 0) {
+      writeFileSync(
+        resolve(WEBAPP, "locales", sprache, "common.json"),
+        JSON.stringify(ziel, null, 2) + "\n",
+        "utf-8",
+      );
+      console.log(`  ${geaendert} Beschriftung(en) in locales/${sprache} übernommen`);
+      n += geaendert;
+    }
+  }
+  return n;
+}
+
+export function vergleiche() {
+  if (!existsSync(WEBAPP)) return { erreichbar: false, drift: [] };
+  const drift = [];
+  for (const rel of DATEIEN) {
+    const a = resolve(CLIENT, rel);
+    const b = resolve(WEBAPP, rel);
+    const links = existsSync(a) ? readFileSync(a, "utf-8") : null;
+    const rechts = existsSync(b) ? readFileSync(b, "utf-8") : null;
+    if (links == null) {
+      drift.push({ rel, grund: "fehlt im Client — die kanonische Seite" });
+    } else if (rechts == null) {
+      drift.push({ rel, grund: "fehlt in der Webapp" });
+    } else if (links !== rechts) {
+      drift.push({
+        rel,
+        grund: `Inhalt weicht ab (${summe(links)} gegen ${summe(rechts)})`,
+      });
+    }
+  }
+  return { erreichbar: true, drift };
+}
+
+function schreibe() {
+  let n = 0;
+  for (const rel of DATEIEN) {
+    const a = resolve(CLIENT, rel);
+    if (!existsSync(a)) throw new Error(`fehlt im Client: ${rel}`);
+    const b = resolve(WEBAPP, rel);
+    const alt = existsSync(b) ? readFileSync(b, "utf-8") : null;
+    const neu = readFileSync(a, "utf-8");
+    if (alt !== neu) {
+      // Unterordner (z. B. components/bordbuch) gibt es in der Webapp evtl.
+      // noch nicht.
+      mkdirSync(dirname(b), { recursive: true });
+      writeFileSync(b, neu, "utf-8");
+      console.log(`  kopiert  ${rel}`);
+      n++;
+    }
+  }
+  const k = schreibeSchluessel();
+  if (n === 0 && k === 0) console.log("Nichts zu tun — die Anzeige ist gleich.");
+  else console.log(`${n} Datei(en) übernommen, ${k} Beschriftung(en) ergänzt.`);
+}
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  if (!existsSync(WEBAPP)) {
+    console.log(`Webapp nicht gefunden (${WEBAPP}) — nichts abgeglichen.`);
+    process.exit(0);
+  }
+  if (process.argv.includes("--schreiben")) {
+    schreibe();
+  } else {
+    const { drift } = vergleiche();
+    const luecken = fehlendeSchluessel();
+    if (luecken.length > 0) {
+      console.error("Beschriftungen fehlen:\n");
+      for (const l of luecken.slice(0, 30)) {
+        console.error(`  ${l.seite}/${l.sprache}: ${l.schluessel}`);
+      }
+      if (luecken.length > 30) console.error(`  … und ${luecken.length - 30} weitere`);
+      console.error("\n  node scripts/anzeige-sync.mjs --schreiben");
+      process.exit(1);
+    }
+    if (drift.length === 0) {
+      console.log("Die Anzeige ist auf beiden Seiten gleich.");
+    } else {
+      console.error("Die Anzeige ist auseinandergelaufen:\n");
+      for (const d of drift) console.error(`  ${d.rel}\n    ${d.grund}`);
+      console.error("\n  node scripts/anzeige-sync.mjs --schreiben");
+      process.exit(1);
+    }
+  }
+}

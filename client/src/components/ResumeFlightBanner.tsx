@@ -1,0 +1,1021 @@
+import { useEffect, useRef, useState } from "react";
+import { invoke } from "../lib/ipc";
+import { useTranslation } from "react-i18next";
+import type { ActiveFlightInfo, ResumableFlight, SimStatus } from "../types";
+import { useConfirm } from "./ConfirmDialog";
+import { resolveFlightIdent } from "../lib/callsign";
+import { Notice } from "./ui";
+
+const COUNTDOWN_SECONDS = 30;
+
+/** Toleranzen für die "grün/rot"-Färbung der Δ-Spalte im Vergleichsblock. */
+const TOL_POSITION_NM = 5.0;
+const TOL_ALT_FT = 500;
+const TOL_FUEL_KG = 500;
+const TOL_WEIGHT_KG = 1000;
+
+interface Props {
+  /** Already-attached active flight (e.g. restored from disk). */
+  activeFlight: ActiveFlightInfo | null;
+  /** Notify the dashboard when adoption succeeded. */
+  onAdopted: (info: ActiveFlightInfo) => void;
+  /** Notify the dashboard when the flight was cancelled. */
+  onCancelled: () => void;
+}
+
+type Mode =
+  | { kind: "idle" }
+  | {
+      kind: "auto_resumed";
+      flight: ActiveFlightInfo;
+      secondsLeft: number;
+      busy: boolean;
+    }
+  | {
+      kind: "discovered";
+      flight: ResumableFlight;
+      secondsLeft: number;
+      busy: boolean;
+    };
+
+export function ResumeFlightBanner({
+  activeFlight,
+  onAdopted,
+  onCancelled,
+}: Props) {
+  const { t } = useTranslation();
+  const { confirm, dialog: confirmDialog } = useConfirm();
+  const [mode, setMode] = useState<Mode>({ kind: "idle" });
+  const consumedRef = useRef(false);
+  const confirmingRef = useRef(false);
+  const zurueckgestelltRef = useRef(false);
+  // Der Stand, zu dem zuletzt bestätigt wurde — siehe „erneutFragen".
+  const bestaetigtBeiRef = useRef<ActiveFlightInfo | null>(null);
+  // v0.13.12 (Michel-Befund): positionSuspect als reactive Value statt Ref.
+  // Vorher: positionSuspectRef wurde via useEffect aktualisiert — React-Refs
+  // triggern KEINEN Re-Render und keine erneute Auswertung von dependent
+  // useEffects. Wenn der Backend-Status flippte (Pilot positioniert nach
+  // Sim-Crash zurueck → on_ground=false → positionSuspect false), blieb der
+  // Countdown-Effect bei positionSuspectRef.current=true haengen und der
+  // Countdown lief nie an. Mit reactive Value triggert der Countdown-Effect
+  // ueber die [mode, positionSuspect] dep automatisch erneut.
+  const positionSuspect = activeFlight?.resume_position_suspect === true;
+  // 27.09.2026 (Thomas, SIA 375): Nach einem Sim-Absturz lief der Countdown
+  // „wird fortgesetzt", obwohl noch gar kein Simulator verbunden war — erst
+  // danach kam die rote Karte. Ohne Simulator gibt es nichts zu pruefen:
+  // kein Countdown, sondern „Warte auf den Simulator" mit dem letzten Punkt.
+  const simDa = useSimVerbunden(mode.kind === "auto_resumed");
+  // Auch solange die erste Antwort fehlt (`null`): kein Countdown aufblitzen
+  // lassen (Codex-Befund).
+  const warteAufSim = mode.kind === "auto_resumed" && simDa !== true;
+
+  // v0.13.10 (QS-Round-1 Fix): consumedRef zuruecksetzen sobald
+  // was_just_resumed im Backend auf false transitioniert (Pilot hat den
+  // Banner via Re-Check, Force-Resume oder Cancel resolved). Ohne diesen
+  // Reset wuerde ein zweiter Mid-Session-Sim-Crash NICHT erneut den Banner
+  // anzeigen — exakt das Pattern was wir bei Pilot Michel (3x XP12-Crash
+  // pro Flug) beobachtet haben. Mit Reset triggert jeder Crash neu.
+  useEffect(() => {
+    if (activeFlight && !activeFlight.was_just_resumed) {
+      consumedRef.current = false;
+      // Auch die Sperre gegen doppeltes Fortsetzen freigeben — sonst liefe
+      // der Countdown nach einem zweiten Absturz im selben Flug ins Leere.
+      confirmingRef.current = false;
+    }
+  }, [activeFlight?.was_just_resumed]);
+
+  // v0.13.12 (Michel-Befund): Wenn das Backend was_just_resumed cleared
+  // (z.B. spawn_resume_sim_gate hat einen frischen Sim-Snapshot bekommen
+  // und schaltet den Flug scharf, oder flight_resume_check_position ist
+  // clean durchgelaufen) MUSS das Banner verschwinden. Vorher: mode blieb
+  // in "auto_resumed" haengen, Banner war weiter sichtbar obwohl der
+  // Resume bereits durchgelaufen war. Pilot konnte zwar Resume-Now
+  // druecken, aber das Banner sollte sich selbst schliessen sobald der
+  // Backend-Status sagt "fertig".
+  useEffect(() => {
+    if (
+      mode.kind === "auto_resumed" &&
+      activeFlight &&
+      !activeFlight.was_just_resumed
+    ) {
+      setMode({ kind: "idle" });
+    }
+  }, [activeFlight?.was_just_resumed, mode.kind]);
+
+  // Jeder Abschluss (fortgesetzt, abgebrochen, Fehler) gibt die Sperre frei.
+  useEffect(() => {
+    if (mode.kind === "idle") confirmingRef.current = false;
+  }, [mode.kind]);
+
+  // Disk-resume Banner
+  useEffect(() => {
+    // Wieder fragen, wenn die Lage nicht passt und kein Fortsetzen mehr läuft
+    // — etwa wenn das Sim-Gate nach dem Bestätigen eine neue, unpassende Lage
+    // sah (Codex-Abnahme 24.10.2026). Erst ab einem frischen Stand nach dem
+    // Bestätigen: Der alte kennt das gerade gestartete Gate noch nicht.
+    const erneutFragen =
+      activeFlight?.resume_position_suspect === true &&
+      activeFlight.resume_gate_laeuft !== true &&
+      activeFlight !== bestaetigtBeiRef.current;
+    if (
+      activeFlight &&
+      activeFlight.was_just_resumed &&
+      mode.kind === "idle" &&
+      (!consumedRef.current || erneutFragen)
+    ) {
+      consumedRef.current = true;
+      setMode({
+        kind: "auto_resumed",
+        flight: activeFlight,
+        secondsLeft: COUNTDOWN_SECONDS,
+        busy: false,
+      });
+    }
+  }, [activeFlight, mode.kind]);
+
+  // phpVMS-discovered
+  useEffect(() => {
+    if (activeFlight) return;
+    if (mode.kind !== "idle") return;
+    // „Nicht jetzt" gilt für diese Sitzung — sonst stünde das Banner sofort
+    // wieder da.
+    if (zurueckgestelltRef.current) return;
+    let cancelled = false;
+    let timer: number | undefined;
+    // ⚠ Bis v1.7.9 war das EIN Versuch, dessen Fehler stumm verschluckt wurde
+    // (`catch { /* ignore */ }`), und der Effect lief nie erneut — seine
+    // Abhängigkeiten ändern sich beim Anmelden nicht. Lief die Suche eine
+    // Sekunde zu früh, meldete das Backend `not_logged_in`, und der verwaiste
+    // Flug war für die ganze Sitzung unauffindbar. Ohne jede Spur für den
+    // Piloten: Er sah nur seinen Flug als "buchbar".
+    const VERSUCHE = 5;
+    const ABSTAND_MS = 2000;
+    void (async function suchen(versuch = 1): Promise<void> {
+      try {
+        const list = await invoke<ResumableFlight[]>(
+          "flight_discover_resumable",
+        );
+        if (cancelled) return;
+        if (list.length > 0) {
+          consumedRef.current = true;
+          setMode({
+            kind: "discovered",
+            flight: list[0]!,
+            secondsLeft: COUNTDOWN_SECONDS,
+            busy: false,
+          });
+        }
+      } catch (err) {
+        if (cancelled) return;
+        if (versuch < VERSUCHE) {
+          // Typischer Fall: Die Sitzung steht noch nicht. Nachfassen, statt
+          // aufzugeben — der Flug des Piloten hängt daran.
+          timer = window.setTimeout(() => void suchen(versuch + 1), ABSTAND_MS);
+          return;
+        }
+        // Nach dem letzten Versuch wenigstens eine Spur hinterlassen. Ein
+        // stummer Fehlschlag ist hier das Schlimmste: Der Pilot glaubt, es
+        // gebe keinen Flug zum Aufnehmen.
+        console.warn(
+          "[resume] Suche nach unterbrochenem Flug endgültig fehlgeschlagen:",
+          err,
+        );
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [activeFlight, mode.kind]);
+
+  // Countdown ticker
+  // v0.13.12 (Michel-Befund): positionSuspect zur dep-Liste hinzugefuegt,
+  // damit der Effect erneut laeuft sobald der Backend-Flag flippt (z.B.
+  // Pilot positioniert nach Sim-Crash zurueck — Hard-Stop weicht dem
+  // normalen Countdown). Vorher blieb der Countdown eingefroren weil
+  // positionSuspectRef.current als Ref kein Re-Render ausloest.
+  useEffect(() => {
+    // Nur der eigene, auf diesem Gerät gespeicherte Flug zählt herunter. Ein
+    // nur auf dem Server gefundener Flug kann gerade auf einem anderen Gerät
+    // laufen — übernommen wird er ausschließlich per Klick (24.10.2026: Mac
+    // geöffnet, während der Flug auf Windows lief).
+    if (mode.kind !== "auto_resumed") return;
+    if (mode.busy) return;
+    if (mode.kind === "auto_resumed" && positionSuspect) return;
+    // Ohne Simulator nicht herunterzaehlen — und nach dem Verbinden wieder
+    // mit vollem Countdown beginnen.
+    if (mode.kind === "auto_resumed" && simDa !== true) {
+      if (mode.secondsLeft !== COUNTDOWN_SECONDS) {
+        setMode((prev) => (prev.kind === "auto_resumed" ? { ...prev, secondsLeft: COUNTDOWN_SECONDS } : prev));
+      }
+      return;
+    }
+    if (mode.secondsLeft <= 0) {
+      if (confirmingRef.current) return;
+      confirmingRef.current = true;
+      if (mode.kind === "auto_resumed") {
+        // Unmittelbar vor dem Fortsetzen noch einmal fragen: bricht der
+        // Simulator in der letzten Sekunde weg, nicht fortsetzen, sondern
+        // zurueck ins Warten (Codex-Befund 27.09.2026).
+        void (async () => {
+          let da = false;
+          try {
+            // Hoechstens 3 s — ueber die LAN-Bruecke kann eine Anfrage sonst
+            // haengen, und die Sperre blockierte auch den Knopf.
+            const st = await Promise.race([
+              invoke<SimStatus>("sim_status"),
+              new Promise<null>((r) => setTimeout(() => r(null), 3000)),
+            ]);
+            da = st?.snapshot != null;
+          } catch {
+            da = false;
+          }
+          if (da) {
+            void doConfirm();
+          } else {
+            confirmingRef.current = false;
+            setMode((prev) => (prev.kind === "auto_resumed" ? { ...prev, secondsLeft: COUNTDOWN_SECONDS } : prev));
+          }
+        })();
+        return;
+      }
+      void doConfirm();
+      return;
+    }
+    const timer = setTimeout(() => {
+      setMode((prev) =>
+        prev.kind === "auto_resumed" || prev.kind === "discovered"
+          ? { ...prev, secondsLeft: prev.secondsLeft - 1 }
+          : prev,
+      );
+    }, 1000);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, positionSuspect, simDa]);
+
+  /** `force` NUR vom Knopf „Trotzdem fortsetzen": Der Pilot hat die
+   *  Warnung gelesen und führt bewusst weiter. Das Backend vermerkt es
+   *  dann im Bericht (Cloud-QS 23.09.2026). */
+  async function doConfirm(force = false, vomBoden = false) {
+    if (mode.kind === "auto_resumed") {
+      bestaetigtBeiRef.current = activeFlight;
+      setMode((prev) =>
+        prev.kind === "auto_resumed" ? { ...prev, busy: true } : prev,
+      );
+      try {
+        await invoke(
+          "flight_resume_confirm",
+          vomBoden ? { force: true, vomBoden: true } : force ? { force: true } : {},
+        );
+        setMode({ kind: "idle" });
+      } catch (err) {
+        const msg = errMsg(err);
+        alert(`${t("resume.confirm_failed")}\n\n${msg}`);
+        setMode({ kind: "idle" });
+      }
+      return;
+    }
+    if (mode.kind === "discovered") {
+      const pirepId = mode.flight.pirep_id;
+      const trotzAnderemGeraet = mode.flight.laeuft_woanders;
+      if (
+        trotzAnderemGeraet &&
+        !(await confirm({
+          message: t("resume.woanders_bestaetigen"),
+          destructive: true,
+        }))
+      ) {
+        confirmingRef.current = false;
+        return;
+      }
+      setMode((prev) =>
+        prev.kind === "discovered" ? { ...prev, busy: true } : prev,
+      );
+      try {
+        const info = await invoke<ActiveFlightInfo>("flight_adopt", {
+          pirepId,
+          trotzAnderemGeraet,
+        });
+        await invoke("flight_resume_confirm");
+        onAdopted(info);
+        setMode({ kind: "idle" });
+      } catch (err) {
+        const msg = errMsg(err);
+        alert(`${t("resume.adopt_failed")}\n\n${msg}`);
+        setMode({ kind: "idle" });
+      }
+    }
+  }
+
+  async function doCancel() {
+    if (mode.kind !== "auto_resumed" && mode.kind !== "discovered") return;
+    if (
+      !(await confirm({
+        message: t("resume.confirm_cancel"),
+        destructive: true,
+      }))
+    )
+      return;
+    setMode((prev) =>
+      prev.kind === "auto_resumed" || prev.kind === "discovered"
+        ? { ...prev, busy: true }
+        : prev,
+    );
+    try {
+      if (mode.kind === "discovered") {
+        // Verwerfen beendet den Flug auch auf dem anderen Gerät — dort
+        // dieselbe ausdrückliche Rückfrage wie beim Übernehmen.
+        if (
+          mode.flight.laeuft_woanders &&
+          !(await confirm({
+            message: t("resume.woanders_bestaetigen"),
+            destructive: true,
+          }))
+        ) {
+          setMode((prev) => (prev.kind === "discovered" ? { ...prev, busy: false } : prev));
+          return;
+        }
+        await invoke<ActiveFlightInfo>("flight_adopt", {
+          pirepId: mode.flight.pirep_id,
+          trotzAnderemGeraet: mode.flight.laeuft_woanders,
+        });
+      }
+      await invoke("flight_cancel");
+      onCancelled();
+      setMode({ kind: "idle" });
+    } catch (err) {
+      const msg = errMsg(err);
+      alert(`${t("resume.cancel_failed")}\n\n${msg}`);
+      setMode({ kind: "idle" });
+    }
+  }
+
+  if (mode.kind === "idle") return null;
+
+  // v0.13.12: lokale JSX-Variable umbenannt — `positionSuspect` ist jetzt
+  // oben als reactive Value definiert. Diese hier kombiniert sie mit dem
+  // Mode-Check fuer die JSX-Variantenwahl (Hard-Stop vs Normal-Countdown).
+  const showHardStop = mode.kind === "auto_resumed" && positionSuspect;
+
+  const flight =
+    mode.kind === "auto_resumed"
+      ? {
+          callsign: mode.flight.airline_icao
+            ? `${mode.flight.airline_icao} ${resolveFlightIdent(mode.flight.flight_number, mode.flight.callsign)}`
+            : resolveFlightIdent(mode.flight.flight_number, mode.flight.callsign),
+          dpt_airport: mode.flight.dpt_airport,
+          arr_airport: mode.flight.arr_airport,
+        }
+      : {
+          // "discovered" = an orphaned in-progress PIREP found on phpVMS
+          // (no local resume file). Sourced from `Pirep`, which has no
+          // `callsign` column at all (only `Flight` does) — fixing this
+          // branch would need an extra Flight lookup per discovered PIREP
+          // for a rare edge case. Left as flight_number-only, same as
+          // before; tracked as a known remaining gap, not silently fixed.
+          callsign: mode.flight.flight_number,
+          dpt_airport: mode.flight.dpt_airport,
+          arr_airport: mode.flight.arr_airport,
+        };
+
+  // ─────────────────────────────────────────────────────────────────
+  // v0.13.0 Stream F: Hard-Stop-Variante — Banner im Pause-Banner-
+  // Look (rote Variante), Vergleichs-Grid statt Pause-Grid, 3-Button-
+  // Recheck-Workflow statt Single-Resume-Button.
+  // ─────────────────────────────────────────────────────────────────
+  if (showHardStop) {
+    return (
+      <section
+        className="active-flight__paused-banner active-flight__paused-banner--hard"
+        role="alert"
+        aria-live="polite"
+      >
+        {confirmDialog}
+        <div className="active-flight__paused-header">
+          <span className="active-flight__paused-icon" aria-hidden="true">
+            ⚠
+          </span>
+          <div>
+            <strong>{t("resume.hard_stop_title")}</strong>
+            <span className="active-flight__paused-since">
+              {flight.callsign} · {flight.dpt_airport} → {flight.arr_airport}
+            </span>
+          </div>
+        </div>
+        <p className="active-flight__paused-instructions">
+          {t("resume.hard_stop_body")}
+        </p>
+        <LetzterPunkt flight={activeFlight} />
+        <ComparisonGrid activeFlight={activeFlight} />
+        <RecheckActions
+          busy={mode.busy}
+          vomBoden={activeFlight?.resume_vom_boden_moeglich === true}
+          onConfirm={() => {
+            if (confirmingRef.current) return;
+            confirmingRef.current = true;
+            // Aus dem Hard-Stop-Dialog: ausdrückliches „Trotzdem fortsetzen".
+            void doConfirm(true);
+          }}
+          onVomBoden={() => {
+            if (confirmingRef.current) return;
+            confirmingRef.current = true;
+            // Ausdrücklich „Vom Boden weiterfliegen" (GAF 278).
+            void doConfirm(true, true);
+          }}
+          onCancel={() => void doCancel()}
+        />
+      </section>
+    );
+  }
+
+  // ─── Simulator noch nicht verbunden: warten, Punkt zeigen ─────────
+  if (warteAufSim) {
+    return (
+      <section className="active-flight__paused-banner" role="status" aria-live="polite">
+        {confirmDialog}
+        <div className="active-flight__paused-header">
+          <span className="active-flight__paused-icon" aria-hidden="true">
+            ⏳
+          </span>
+          <div>
+            <strong>{t("resume.warte_titel")}</strong>
+            <span className="active-flight__paused-since">
+              {flight.callsign} · {flight.dpt_airport} → {flight.arr_airport}
+            </span>
+          </div>
+        </div>
+        <p className="active-flight__paused-instructions">{t("resume.warte_text")}</p>
+        <LetzterPunkt flight={mode.flight} />
+        <div className="active-flight__paused-actions">
+          <button
+            type="button"
+            className="resume-modal__danger"
+            onClick={() => void doCancel()}
+            disabled={mode.busy}
+          >
+            {t("resume.cancel_flight")}
+          </button>
+        </div>
+      </section>
+    );
+  }
+
+  // ─── Standard-Variante: normaler Resume mit Countdown ────────────
+  return (
+    <section className="resume-modal" role="status" aria-live="polite">
+      {confirmDialog}
+      <div className="resume-modal__header">
+        <span className="resume-modal__icon" aria-hidden="true">
+          ✈
+        </span>
+        <h2 className="resume-modal__title">{t("resume.title")}</h2>
+      </div>
+
+      <div className="resume-modal__route">
+        <div className="resume-modal__icao">{flight.dpt_airport}</div>
+        <div className="resume-modal__arrow">→</div>
+        <div className="resume-modal__icao">{flight.arr_airport}</div>
+      </div>
+
+      <div className="resume-modal__callsign">{flight.callsign}</div>
+
+      {mode.kind === "auto_resumed" && <LetzterPunkt flight={mode.flight} />}
+
+      {mode.kind === "auto_resumed" ? (
+        <div className="resume-modal__countdown">
+          <div
+            className="resume-modal__countdown-bar"
+            style={{
+              width: `${(mode.secondsLeft / COUNTDOWN_SECONDS) * 100}%`,
+            }}
+          />
+          <span className="resume-modal__countdown-text">
+            {t("resume.countdown", { seconds: mode.secondsLeft })}
+          </span>
+        </div>
+      ) : (
+        mode.flight.laeuft_woanders ? (
+          <Notice
+            tone="warn"
+            role="alert"
+            detail={t("resume.woanders_hinweis", {
+              minuten: Math.max(1, Math.round((mode.flight.zuletzt_gemeldet_vor_s ?? 0) / 60)),
+            })}
+          />
+        ) : (
+          <p className="resume-modal__countdown-text">{t("resume.gefunden_nur_klick")}</p>
+        )
+      )}
+
+      <div className="resume-modal__actions">
+        <button
+          type="button"
+          className="button button--primary resume-modal__primary"
+          onClick={() => {
+            if (confirmingRef.current) return;
+            confirmingRef.current = true;
+            void doConfirm();
+          }}
+          disabled={mode.busy}
+        >
+          {mode.busy ? t("resume.adopting") : t("resume.adopt_now")}
+        </button>
+        <button
+          type="button"
+          className="resume-modal__danger"
+          onClick={() => void doCancel()}
+          disabled={mode.busy}
+        >
+          {t("resume.cancel_flight")}
+        </button>
+        {mode.kind === "discovered" && (
+          <button
+            type="button"
+            className="button"
+            onClick={() => {
+              zurueckgestelltRef.current = true;
+              setMode({ kind: "idle" });
+            }}
+            disabled={mode.busy}
+          >
+            {t("resume.nicht_jetzt")}
+          </button>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function errMsg(err: unknown): string {
+  if (typeof err === "object" && err !== null && "message" in err) {
+    return String((err as { message: string }).message);
+  }
+  return String(err);
+}
+
+// ─── v0.13.0 Stream F: Live-Vergleichs-Grid ──────────────────────────
+//
+// Drei Spalten pro Parameter:
+//   GESPEICHERT  |  SIM JETZT  |  Δ
+//
+// Sim-Werte werden via Polling von `sim_status` Tauri-Command live
+// abgerufen (1 s Intervall, nur solange das Banner sichtbar ist).
+// Δ-Spalte ist grün wenn innerhalb der Toleranz (TOL_* Konstanten),
+// rot wenn drüber, grau wenn nicht vergleichbar (z. B. ZFW null im Sim).
+
+function ComparisonGrid({
+  activeFlight,
+}: {
+  activeFlight: ActiveFlightInfo | null;
+}) {
+  // QS 2026-08-04: diese Tabelle war als einzige im ganzen Banner nicht
+  // übersetzt — und dabei gemischt deutsch/englisch fest verdrahtet
+  // ("Gespeichert"/"Sim jetzt" neben "Altitude"/"Fuel"/"Total Weight").
+  // Ein Pilot mit englischer oder italienischer Oberfläche bekam die
+  // Kreuzung aus beidem zu sehen.
+  const { t } = useTranslation();
+  const [sim, setSim] = useState<SimStatus | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    async function poll() {
+      try {
+        const next = await invoke<SimStatus>("sim_status");
+        if (!alive) return;
+        setSim(next);
+      } catch {
+        // ignore — Sim noch nicht hochgefahren, Grid zeigt "—" für Sim-Spalte
+      }
+      if (alive) timer = setTimeout(() => void poll(), 1000);
+    }
+    void poll();
+    return () => {
+      alive = false;
+      if (timer) clearTimeout(timer);
+    };
+  }, []);
+
+  const snap = sim?.snapshot ?? null;
+
+  // ── Saved-Werte
+  const sLat = activeFlight?.last_known_lat;
+  const sLon = activeFlight?.last_known_lon;
+  const sAlt = activeFlight?.last_known_alt_ft;
+  const sFuel = activeFlight?.last_known_fuel_kg;
+  const sZfw = activeFlight?.last_known_zfw_kg;
+  const sTow = activeFlight?.last_known_total_weight_kg;
+  const sAircraft = activeFlight?.last_known_aircraft_icao;
+  const sHdg = activeFlight?.last_known_heading_deg;
+
+  // ── Sim-Werte
+  const cLat = snap?.lat;
+  const cLon = snap?.lon;
+  const cAlt = snap?.altitude_msl_ft;
+  const cHdg = snap?.heading_deg_true;
+  const cFuel = snap?.fuel_total_kg;
+  const cZfw = snap?.zfw_kg ?? null;
+  const cTow = snap?.total_weight_kg ?? null;
+  const cAircraft = snap?.aircraft_icao ?? null;
+
+  // ── Δ-Berechnungen
+  const posDriftNm =
+    sLat !== undefined &&
+    sLon !== undefined &&
+    cLat !== undefined &&
+    cLon !== undefined
+      ? haversineNm(sLat, sLon, cLat, cLon)
+      : null;
+  const fuelDelta =
+    sFuel !== undefined && cFuel !== undefined ? cFuel - sFuel : null;
+  const zfwDelta =
+    sZfw !== undefined && cZfw !== null && cZfw !== undefined
+      ? cZfw - sZfw
+      : null;
+  const towDelta =
+    sTow !== undefined && cTow !== null && cTow !== undefined
+      ? cTow - sTow
+      : null;
+  const altDelta =
+    sAlt !== undefined && cAlt !== undefined ? cAlt - sAlt : null;
+  const aircraftMatch =
+    sAircraft && cAircraft
+      ? sAircraft.toUpperCase() === cAircraft.toUpperCase()
+      : null;
+
+  return (
+    <div className="resume-compare" role="table">
+      <div className="resume-compare__head">&nbsp;</div>
+      <div className="resume-compare__head">{t("resume.compare_head_saved")}</div>
+      <div className="resume-compare__head">{t("resume.compare_head_sim")}</div>
+      <div className="resume-compare__head">Δ</div>
+
+      {/* Position */}
+      <div className="resume-compare__label">{t("resume.compare_position")}</div>
+      <Val>{sLat !== undefined && sLon !== undefined ? fmtPos(sLat, sLon) : null}</Val>
+      <Val>{cLat !== undefined && cLon !== undefined ? fmtPos(cLat, cLon) : null}</Val>
+      <Delta
+        value={posDriftNm}
+        format={(v) => `${v.toFixed(1)} nm`}
+        ok={(v) => v < TOL_POSITION_NM}
+        signed={false}
+      />
+
+      {/* Altitude */}
+      <div className="resume-compare__label">{t("resume.compare_altitude")}</div>
+      <Val>{sAlt !== undefined ? `${sAlt.toLocaleString()} ft` : null}</Val>
+      <Val>{cAlt !== undefined ? `${Math.round(cAlt).toLocaleString()} ft` : null}</Val>
+      <Delta
+        value={altDelta}
+        format={(v) => `${Math.round(v).toLocaleString()} ft`}
+        ok={(v) => Math.abs(v) < TOL_ALT_FT}
+        signed
+      />
+
+      {/* Heading */}
+      <div className="resume-compare__label">{t("resume.compare_heading")}</div>
+      <Val>{sHdg !== undefined ? `${sHdg}°` : null}</Val>
+      <Val>{cHdg !== undefined ? `${Math.round(cHdg)}°` : null}</Val>
+      <div className="resume-compare__delta resume-compare__delta--neutral">
+        —
+      </div>
+
+      {/* Aircraft */}
+      <div className="resume-compare__label">{t("resume.compare_aircraft")}</div>
+      <Val>{sAircraft ?? null}</Val>
+      <Val>{cAircraft ?? null}</Val>
+      <div
+        className={`resume-compare__delta ${
+          aircraftMatch === null
+            ? "resume-compare__delta--neutral"
+            : aircraftMatch
+            ? "resume-compare__delta--ok"
+            : "resume-compare__delta--bad"
+        }`}
+      >
+        {aircraftMatch === null ? "—" : aircraftMatch ? "✓ match" : "⚠ mismatch"}
+      </div>
+
+      {/* Fuel */}
+      <div className="resume-compare__label">{t("resume.compare_fuel")}</div>
+      <Val>{sFuel !== undefined ? fmtKg(sFuel) : null}</Val>
+      <Val>{cFuel !== undefined ? fmtKg(cFuel) : null}</Val>
+      <Delta
+        value={fuelDelta}
+        format={(v) => fmtKg(v)}
+        ok={(v) => Math.abs(v) < TOL_FUEL_KG}
+        signed
+      />
+
+      {/* ZFW */}
+      <div className="resume-compare__label">{t("resume.compare_zfw")}</div>
+      <Val>{sZfw !== undefined ? fmtKg(sZfw) : null}</Val>
+      <Val>{cZfw !== null && cZfw !== undefined ? fmtKg(cZfw) : null}</Val>
+      <Delta
+        value={zfwDelta}
+        format={(v) => fmtKg(v)}
+        ok={(v) => Math.abs(v) < TOL_WEIGHT_KG}
+        signed
+      />
+
+      {/* Total Weight */}
+      <div className="resume-compare__label">{t("resume.compare_total_weight")}</div>
+      <Val>{sTow !== undefined ? fmtKg(sTow) : null}</Val>
+      <Val>{cTow !== null && cTow !== undefined ? fmtKg(cTow) : null}</Val>
+      <Delta
+        value={towDelta}
+        format={(v) => fmtKg(v)}
+        ok={(v) => Math.abs(v) < TOL_WEIGHT_KG}
+        signed
+      />
+    </div>
+  );
+}
+
+function Val({ children }: { children: string | null | undefined }) {
+  if (children === null || children === undefined || children === "") {
+    return <div className="resume-compare__val resume-compare__val--missing">—</div>;
+  }
+  return <div className="resume-compare__val">{children}</div>;
+}
+
+function Delta({
+  value,
+  format,
+  ok,
+  signed,
+}: {
+  value: number | null;
+  format: (v: number) => string;
+  ok: (v: number) => boolean;
+  signed: boolean;
+}) {
+  if (value === null) {
+    return <div className="resume-compare__delta resume-compare__delta--neutral">—</div>;
+  }
+  const cls = ok(value)
+    ? "resume-compare__delta--ok"
+    : "resume-compare__delta--bad";
+  const sign = signed ? (value > 0 ? "+" : value < 0 ? "−" : "±") : "";
+  const txt = signed ? sign + format(Math.abs(value)) : format(value);
+  const icon = ok(value) ? "✓" : "⚠";
+  return (
+    <div className={`resume-compare__delta ${cls}`}>
+      {icon} {txt}
+    </div>
+  );
+}
+
+// Formatter
+/** Ist ein Simulator verbunden (Snapshot vorhanden)? `null`, solange noch
+ *  keine Antwort da ist. Fragt nur, solange `aktiv`. */
+function useSimVerbunden(aktiv: boolean): boolean | null {
+  const [da, setDa] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (!aktiv) {
+      setDa(null);
+      return;
+    }
+    let alive = true;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    // Ein einzelner Aussetzer soll nicht flackern: „weg" erst nach drei
+    // Fehlversuchen in Folge, wenn der Simulator vorher da war.
+    let fehlt = 0;
+    let zuletzt: boolean | null = null;
+    async function poll() {
+      let jetzt: boolean;
+      try {
+        const st = await invoke<SimStatus>("sim_status");
+        jetzt = st?.snapshot != null;
+      } catch {
+        jetzt = false;
+      }
+      if (!alive) return;
+      if (jetzt) {
+        fehlt = 0;
+        zuletzt = true;
+        setDa(true);
+      } else {
+        fehlt += 1;
+        if (zuletzt !== true || fehlt >= 3) {
+          zuletzt = false;
+          setDa(false);
+        }
+      }
+      timer = setTimeout(() => void poll(), 1000);
+    }
+    void poll();
+    return () => {
+      alive = false;
+      if (timer) clearTimeout(timer);
+    };
+  }, [aktiv]);
+  return da;
+}
+
+/** Grad und Dezimalminuten („N21°17.57' E086°15.46'"), wie X-Plane und MSFS
+ *  sie im Positionsdialog erwarten. */
+export function fmtGradMinuten(lat: number, lon: number): string {
+  const teil = (v: number, pos: string, neg: string, stellen: number) => {
+    const a = Math.abs(v);
+    let grad = Math.floor(a);
+    let min = Math.round((a - grad) * 60 * 100) / 100;
+    if (min >= 60) {
+      grad += 1;
+      min = 0;
+    }
+    return `${v >= 0 ? pos : neg}${String(grad).padStart(stellen, "0")}°${min.toFixed(2).padStart(5, "0")}'`;
+  };
+  return `${teil(lat, "N", "S", 2)} ${teil(lon, "E", "W", 3)}`;
+}
+
+/** Der letzte gespeicherte Punkt — immer sichtbar, damit der Pilot nach
+ *  einem Sim-Absturz genau dorthin zurückstellen kann (Thomas, 27.09.2026:
+ *  „immer die Daten anzeigen"). */
+export function LetzterPunkt({ flight }: { flight: ActiveFlightInfo | null }) {
+  const { t } = useTranslation();
+  const [kopiert, setKopiert] = useState(false);
+  const lat = flight?.last_known_lat;
+  const lon = flight?.last_known_lon;
+  if (lat === undefined || lon === undefined) return null;
+  const alt = flight?.last_known_alt_ft;
+  const hdg = flight?.last_known_heading_deg;
+  const gs = flight?.last_known_gs_kt;
+  const at = flight?.last_known_at ? Date.parse(flight.last_known_at) : NaN;
+  const min = Number.isFinite(at) ? Math.max(0, Math.round((Date.now() - at) / 60000)) : null;
+  const text = `${fmtPos(lat, lon)}  (${fmtGradMinuten(lat, lon)})`;
+  const kopieren = async () => {
+    try {
+      await navigator.clipboard.writeText(
+        [fmtGradMinuten(lat, lon), `${lat.toFixed(5)}, ${lon.toFixed(5)}`, alt !== undefined ? `${alt} ft` : "", hdg !== undefined ? `HDG ${hdg}°` : ""]
+          .filter(Boolean)
+          .join(" · "),
+      );
+      setKopiert(true);
+      setTimeout(() => setKopiert(false), 2000);
+    } catch {
+      /* ohne Zwischenablage (Browser ohne Freigabe) — Werte stehen ja da */
+    }
+  };
+  return (
+    <div className="resume-punkt">
+      <div className="resume-punkt__titel">{t("resume.punkt_titel")}</div>
+      <div className="resume-punkt__pos">{text}</div>
+      <dl className="resume-punkt__werte">
+        <div>
+          <dt>{t("resume.punkt_hoehe")}</dt>
+          <dd>{alt !== undefined ? `${alt.toLocaleString()} ft` : "—"}</dd>
+        </div>
+        <div>
+          <dt>{t("resume.punkt_kurs")}</dt>
+          <dd>{hdg !== undefined ? `${String(hdg).padStart(3, "0")}°` : "—"}</dd>
+        </div>
+        <div>
+          <dt>{t("resume.punkt_tempo")}</dt>
+          <dd>{gs !== undefined ? `${gs} kt` : "—"}</dd>
+        </div>
+        <div>
+          <dt>{t("resume.punkt_zeit")}</dt>
+          <dd>{min === null ? "—" : min === 0 ? t("resume.punkt_gerade") : t("resume.punkt_vor", { min })}</dd>
+        </div>
+      </dl>
+      <button type="button" className="button resume-punkt__kopieren" onClick={() => void kopieren()}>
+        {kopiert ? t("resume.punkt_kopiert") : t("resume.punkt_kopieren")}
+      </button>
+    </div>
+  );
+}
+
+function fmtPos(lat: number, lon: number): string {
+  const latH = lat >= 0 ? "N" : "S";
+  const lonH = lon >= 0 ? "E" : "W";
+  return `${Math.abs(lat).toFixed(4)}°${latH} · ${Math.abs(lon).toFixed(4)}°${lonH}`;
+}
+
+function fmtKg(kg: number): string {
+  return `${Math.round(kg).toLocaleString()} kg`;
+}
+
+function haversineNm(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const R_NM = 3440.065;
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R_NM * c;
+}
+
+// ─── RecheckActions (im Pause-Banner-Action-Look) ────────────────────
+
+function RecheckActions({
+  busy,
+  vomBoden,
+  onConfirm,
+  onVomBoden,
+  onCancel,
+}: {
+  busy: boolean;
+  /** Auf einem anderen Platz am Boden neu geladen (GAF 278): MSFS kann viele
+   *  Flüge nicht in der Luft laden — dann von dort weiterfliegen. */
+  vomBoden: boolean;
+  onConfirm: () => void;
+  onVomBoden: () => void;
+  onCancel: () => void;
+}) {
+  const { t } = useTranslation();
+  const [checking, setChecking] = useState(false);
+  const [lastError, setLastError] = useState<string | null>(null);
+  const [showForce, setShowForce] = useState(false);
+
+  async function doRecheck() {
+    setChecking(true);
+    setLastError(null);
+    try {
+      const r = await invoke<{ ok: boolean; detail: string }>(
+        "flight_resume_check_position",
+      );
+      if (r.ok) {
+        onConfirm();
+      } else {
+        setLastError(r.detail);
+      }
+    } catch (err) {
+      setLastError(errMsg(err));
+    } finally {
+      setChecking(false);
+    }
+  }
+
+  return (
+    <>
+      {lastError && (
+        <p className="active-flight__paused-error" role="alert">
+          ⚠ {lastError}
+        </p>
+      )}
+      {vomBoden && (
+        <p className="active-flight__paused-instructions">{t("resume.vom_boden_hinweis")}</p>
+      )}
+      <div className="active-flight__paused-actions">
+        {vomBoden ? (
+          <button
+            type="button"
+            className="button"
+            style={{
+              background: "rgba(251,191,36,0.15)",
+              borderColor: "rgba(251,191,36,0.5)",
+              color: "#fbbf24",
+            }}
+            onClick={onVomBoden}
+            disabled={busy || checking}
+          >
+            {t("resume.vom_boden_weiterfliegen")}
+          </button>
+        ) : !showForce ? (
+          <button
+            type="button"
+            className="button"
+            style={{ opacity: 0.7 }}
+            onClick={() => setShowForce(true)}
+            disabled={busy || checking}
+          >
+            {t("resume.recheck_show_force")}
+          </button>
+        ) : (
+          <button
+            type="button"
+            className="button"
+            style={{
+              background: "rgba(251,191,36,0.15)",
+              borderColor: "rgba(251,191,36,0.5)",
+              color: "#fbbf24",
+            }}
+            onClick={onConfirm}
+            disabled={busy || checking}
+          >
+            ⚠ {t("resume.hard_stop_force_resume")}
+          </button>
+        )}
+        <button
+          type="button"
+          className="resume-modal__danger"
+          onClick={onCancel}
+          disabled={busy || checking}
+        >
+          {t("resume.hard_stop_discard")}
+        </button>
+        <button
+          type="button"
+          className="button button--primary"
+          onClick={() => void doRecheck()}
+          disabled={busy || checking}
+        >
+          {checking ? t("resume.recheck_checking") : t("resume.recheck_check_now")}
+        </button>
+      </div>
+    </>
+  );
+}
